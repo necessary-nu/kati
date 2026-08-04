@@ -20,7 +20,7 @@ use std::{
     ffi::OsString,
     fmt::Debug,
     os::unix::ffi::OsStrExt,
-    sync::{Arc, LazyLock},
+    sync::Arc,
 };
 
 use anyhow::Result;
@@ -32,8 +32,9 @@ use crate::{
     error, error_loc,
     eval::Frame,
     loc::Loc,
+    session::{Context, Session},
     strutil::{WordWriter, has_path_prefix},
-    symtab::{Symtab, with_symtab},
+    symtab::{Interner, Symtab},
     warn_loc,
 };
 use crate::{
@@ -122,18 +123,36 @@ impl Variable {
     }
     pub fn used(&self, ev: &Evaluator, sym: &Symbol) -> Result<()> {
         if let Some(obsolete) = &self.obsolete {
-            error_loc!(ev.loc.as_ref(), "*** {sym} is obsolete{obsolete}.");
+            error_loc!(
+                ev,
+                ev.loc.as_ref(),
+                "*** {} is obsolete{obsolete}.",
+                sym.display(ev)
+            );
         }
         if let Some(deprecated) = &self.deprecated {
-            warn_loc!(ev.loc.as_ref(), "{sym} has been deprecated{deprecated}.");
+            warn_loc!(
+                ev,
+                ev.loc.as_ref(),
+                "{} has been deprecated{deprecated}.",
+                sym.display(ev)
+            );
         }
         Ok(())
     }
-    pub fn set_visibility_prefix(&mut self, prefixes: Vec<OsString>, name: &Symbol) -> Result<()> {
+    pub fn set_visibility_prefix(
+        &mut self,
+        names: &impl Interner,
+        prefixes: Vec<OsString>,
+        name: &Symbol,
+    ) -> Result<()> {
         if self.visibility_prefix.is_none() {
             self.visibility_prefix = Some(prefixes);
         } else if self.visibility_prefix != Some(prefixes) {
-            error!("Visibility prefix conflict on variable: {name}");
+            error!(
+                "Visibility prefix conflict on variable: {}",
+                name.display(names)
+            );
         }
         Ok(())
     }
@@ -142,6 +161,7 @@ impl Variable {
     }
     pub fn append_var(
         &mut self,
+        ctx: &impl Context,
         v: Arc<Value>,
         frame: Arc<Frame>,
         loc: Option<&Loc>,
@@ -162,14 +182,24 @@ impl Variable {
                 self.definition = Some(frame);
             }
             InnerVar::AutoCommand(sym, _) => {
-                error_loc!(loc, "appending to ${sym} is not supported");
+                error_loc!(
+                    ctx,
+                    loc,
+                    "appending to ${} is not supported",
+                    sym.display(ctx)
+                );
             }
             InnerVar::ShellStatus => panic!(),
             InnerVar::VariableNames { .. } => panic!(),
         }
         Ok(())
     }
-    pub fn append_str(&mut self, buf: &Bytes, frame: Arc<Frame>) -> Result<()> {
+    pub fn append_str(
+        &mut self,
+        names: &impl Interner,
+        buf: &Bytes,
+        frame: Arc<Frame>,
+    ) -> Result<()> {
         match &mut self.value {
             InnerVar::Simple(s) => {
                 s.push(b' ');
@@ -188,21 +218,26 @@ impl Variable {
                 self.definition = Some(frame);
             }
             InnerVar::AutoCommand(sym, _) => {
-                error!("appending to ${sym} is not supported");
+                error!("appending to ${} is not supported", sym.display(names));
             }
             InnerVar::ShellStatus => panic!(),
             InnerVar::VariableNames { .. } => panic!(),
         }
         Ok(())
     }
-    pub fn check_current_referencing_file(&self, loc: &Option<Loc>, sym: Symbol) -> Result<()> {
+    pub fn check_current_referencing_file(
+        &self,
+        names: &impl Interner,
+        loc: &Option<Loc>,
+        sym: Symbol,
+    ) -> Result<()> {
         let Some(prefixes) = &self.visibility_prefix else {
             return Ok(());
         };
         let loc = loc.clone().unwrap_or_default();
         let mut valid = false;
         for prefix in prefixes {
-            if has_path_prefix(&loc.filename.as_bytes(), prefix.as_bytes()) {
+            if has_path_prefix(&loc.filename.as_bytes(names), prefix.as_bytes()) {
                 valid = true;
                 break;
             }
@@ -214,26 +249,26 @@ impl Variable {
                 .collect::<Vec<Cow<str>>>()
                 .join("\n");
             error!(
-                "{} is not a valid file to reference variable {sym}. Line #{}.\nValid file prefixes:\n{s}",
-                loc.filename, loc.line
+                "{} is not a valid file to reference variable {}. Line #{}.\nValid file prefixes:\n{s}",
+                loc.filename.display(names),
+                sym.display(names),
+                loc.line
             );
         }
         Ok(())
     }
-    pub fn string(&self) -> Result<Cow<'_, [u8]>> {
+    pub fn string(&self, session: &Session) -> Result<Cow<'_, [u8]>> {
         Ok(match &self.value {
             InnerVar::Simple(s) => Cow::Borrowed(s.as_slice()),
             InnerVar::Recursive { v: _, orig } => Cow::Borrowed(orig),
             InnerVar::AutoCommand(sym, _) => {
-                error!("$(value {sym}) is not implemented yet");
+                error!("$(value {}) is not implemented yet", sym.display(session));
             }
-            InnerVar::ShellStatus => {
-                Cow::Owned(if let Some(status) = SHELL_STATUS.lock().as_ref() {
-                    status.to_string().as_bytes().to_vec()
-                } else {
-                    Vec::new()
-                })
-            }
+            InnerVar::ShellStatus => Cow::Owned(if let Some(status) = session.shell_status {
+                status.to_string().as_bytes().to_vec()
+            } else {
+                Vec::new()
+            }),
             InnerVar::VariableNames { name, .. } => Cow::Borrowed(name),
         })
     }
@@ -377,22 +412,23 @@ impl Evaluable for Variable {
             InnerVar::ShellStatus => {
                 if ev.is_evaluating_command {
                     error_loc!(
+                        ev,
                         ev.loc.as_ref(),
                         "Kati does not support using .SHELLSTATUS inside of a rule"
                     );
                 }
 
-                if let Some(status) = SHELL_STATUS.lock().as_ref() {
+                if let Some(status) = ev.session.shell_status {
                     out.put_slice(format!("{status}").as_bytes());
                 }
             }
             InnerVar::VariableNames { all, .. } => {
                 let mut ww = WordWriter::new(out);
-                let symbols = global_var_names(|var| !var.read().obsolete());
+                let symbols = ev.session.global_var_names(|var| !var.read().obsolete());
                 for (sym, entry) in symbols {
                     if !*all
-                        && let Some(var) = peek_global_var(sym)
-                        && var.read().is_func()
+                        && let Some(var) = ev.session.peek_global_var(sym)
+                        && var.read().is_func(&ev.session.symtab)
                     {
                         continue;
                     }
@@ -402,25 +438,16 @@ impl Evaluable for Variable {
         }
         Ok(())
     }
-    fn is_func(&self) -> bool {
+    fn is_func(&self, names: &Symtab) -> bool {
         match &self.value {
             InnerVar::Simple(_) => false,
-            InnerVar::Recursive { v, .. } => v.is_func(),
+            InnerVar::Recursive { v, .. } => v.is_func(names),
             InnerVar::AutoCommand(_, _) => true,
             InnerVar::ShellStatus => false,
             InnerVar::VariableNames { .. } => false,
         }
     }
 }
-
-static SHELL_STATUS: LazyLock<Mutex<Option<i32>>> = LazyLock::new(|| Mutex::new(None));
-
-pub fn set_shell_status_var(status: i32) {
-    *SHELL_STATUS.lock() = Some(status)
-}
-
-pub static USED_ENV_VARS: LazyLock<Mutex<HashSet<Symbol>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Make's global variable scope: the bindings of the outermost scope, keyed by
 /// interned [`Symbol`].
@@ -449,21 +476,17 @@ impl GlobalVars {
 
     /// A scope carrying the bindings kati defines before any makefile is read.
     ///
-    /// This is the one place the two halves meet, and only because the builtin
-    /// names have to be interned somewhere: the scope keeps no reference to
-    /// `symtab` afterwards.
-    pub fn with_builtins(symtab: &mut Symtab) -> Self {
+    /// No interner is needed: the builtin names are among the ones every
+    /// interner preloads, so their handles are `const`.
+    pub fn with_builtins() -> Self {
         let mut vars = Self::new();
+        vars.define(Symbol::SHELLSTATUS, Variable::new_shell_status_var());
         vars.define(
-            symtab.intern(".SHELLSTATUS"),
-            Variable::new_shell_status_var(),
-        );
-        vars.define(
-            symtab.intern(".VARIABLES"),
+            Symbol::VARIABLES,
             Variable::new_variable_names(b".VARIABLES", true),
         );
         vars.define(
-            symtab.intern(".KATI_SYMBOLS"),
+            Symbol::KATI_SYMBOLS,
             Variable::new_variable_names(b".KATI_SYMBOLS", false),
         );
         vars
@@ -494,6 +517,7 @@ impl GlobalVars {
     /// which can decline the assignment silently.
     pub fn assign(
         &mut self,
+        names: &impl Interner,
         sym: Symbol,
         var: Var,
         is_override: bool,
@@ -509,7 +533,10 @@ impl GlobalVars {
                 if let Some(readonly) = readonly {
                     *readonly = true;
                 } else {
-                    error!("*** cannot assign to readonly variable: {sym}");
+                    error!(
+                        "*** cannot assign to readonly variable: {}",
+                        sym.display(names)
+                    );
                 }
                 return Ok(());
             } else if let Some(readonly) = readonly {
@@ -546,106 +573,6 @@ impl GlobalVars {
     }
 }
 
-/// The process-global variable scope.
-///
-/// Temporary: `kati-session-value` moves this into the session. It is a
-/// separate lock from the interner's, so a diagnostic that renders a symbol may
-/// be raised while it is held.
-static GLOBAL_VARS: LazyLock<Mutex<GlobalVars>> =
-    LazyLock::new(|| Mutex::new(with_symtab(GlobalVars::with_builtins)));
-
-/// Read a global variable without recording the read.
-pub fn peek_global_var(sym: Symbol) -> Option<Var> {
-    GLOBAL_VARS.lock().peek(sym)
-}
-
-/// Read a global variable, recording it if it came from the environment.
-pub fn get_global_var(sym: Symbol) -> Option<Var> {
-    let var = GLOBAL_VARS.lock().peek(sym)?;
-    match var.read().origin() {
-        VarOrigin::Environment | VarOrigin::EnvironmentOverride => {
-            USED_ENV_VARS.lock().insert(sym);
-        }
-        _ => {}
-    }
-    Some(var)
-}
-
-/// Assign to a global variable under Make's precedence rules.
-pub fn set_global_var(
-    sym: Symbol,
-    var: Var,
-    is_override: bool,
-    readonly: Option<&mut bool>,
-) -> Result<()> {
-    GLOBAL_VARS.lock().assign(sym, var, is_override, readonly)
-}
-
-/// The names of the global variables satisfying `filter`, in symbol order.
-pub fn global_var_names<F: Fn(&Var) -> bool>(filter: F) -> Vec<(Symbol, Bytes)> {
-    // The scope lock is released before the interner is consulted: these are
-    // two structures with two locks, and nothing takes both.
-    let matched = GLOBAL_VARS.lock().matching(filter);
-    with_symtab(|symtab| {
-        matched
-            .into_iter()
-            .map(|(sym, _)| (sym, symtab.name(sym)))
-            .collect()
-    })
-}
-
-/// Bind `sym` to `var` for the duration of `f`, then put back whatever the
-/// symbol was bound to before — including nothing at all.
-///
-/// This is the explicit form of the scope-restoring `Drop` guard it replaces.
-/// The restore runs on the error path as well as the value path, which is the
-/// one thing `Drop` was genuinely buying: Make evaluation propagates errors
-/// straight out of `foreach` and `call`, so a body that fails partway must not
-/// leave an automatic variable bound behind it.
-///
-/// The scope is a parameter of the save and of the restore, never of `f`. `f`
-/// re-enters evaluation and reaches the scope for itself, so nothing that
-/// borrows or locks the scope can be held across it — the lock is not
-/// reentrant, and the borrow would be the evaluator's. That is what rules out
-/// the `globals.with_bound(sym, var, |globals| ...)` shape here. The body is
-/// two [`GlobalVars::replace`] calls around a call, so when the scope becomes
-/// session-owned only the way it is reached has to change.
-///
-/// A panic unwinding out of `f` does not restore, unlike `Drop`. Evaluation
-/// reports every failure it is meant to survive as an `Err`; a panic is a bug,
-/// and the scope it would corrupt does not outlive it.
-pub fn with_global_var_bound<T>(sym: Symbol, var: Var, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let orig = GLOBAL_VARS.lock().replace(sym, Some(var));
-    let result = f();
-    GLOBAL_VARS.lock().replace(sym, orig);
-    result
-}
-
-/// [`with_global_var_bound`] for several symbols at once: all bound before `f`,
-/// all restored after it, in reverse order so nesting still holds if a symbol
-/// were ever to repeat. `$(call)` needs this — it binds every positional
-/// argument around a single body.
-pub fn with_global_vars_bound<T>(
-    bindings: Vec<(Symbol, Var)>,
-    f: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    let mut saved = Vec::with_capacity(bindings.len());
-    {
-        let mut globals = GLOBAL_VARS.lock();
-        for (sym, var) in bindings {
-            saved.push((sym, globals.replace(sym, Some(var))));
-        }
-    }
-    let result = f();
-    {
-        let mut globals = GLOBAL_VARS.lock();
-        for (sym, orig) in saved.into_iter().rev() {
-            globals.replace(sym, orig);
-        }
-    }
-    result
-}
-
 pub struct Vars(pub Mutex<HashMap<Symbol, Var>>);
 
 impl Default for Vars {
@@ -659,11 +586,13 @@ impl Vars {
         Vars(Mutex::new(HashMap::new()))
     }
 
-    pub fn lookup(&self, sym: Symbol) -> Option<Var> {
+    /// The binding for `sym`, recording the read in `used_env_vars` if it came
+    /// from the environment.
+    pub fn lookup(&self, used_env_vars: &mut HashSet<Symbol>, sym: Symbol) -> Option<Var> {
         let ret = self.0.lock().get(&sym).cloned()?;
         match ret.read().origin() {
             VarOrigin::Environment | VarOrigin::EnvironmentOverride => {
-                USED_ENV_VARS.lock().insert(sym);
+                used_env_vars.insert(sym);
             }
             _ => {}
         }
@@ -750,6 +679,7 @@ impl Drop for ScopedVar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::symtab::Symtab;
 
     /// Interning a name must not create, read, or modify a binding.
     // [spec:ronin:req:make.scope-separation/test]
@@ -772,6 +702,7 @@ mod tests {
         let mut first = GlobalVars::new();
         first
             .assign(
+                &symtab,
                 sym,
                 Variable::with_simple_string(
                     Bytes::from_static(b"-O2"),
@@ -783,8 +714,15 @@ mod tests {
                 None,
             )
             .unwrap();
+        let session = Session::new();
         assert_eq!(
-            first.peek(sym).unwrap().read().string().unwrap().as_ref(),
+            first
+                .peek(sym)
+                .unwrap()
+                .read()
+                .string(&session)
+                .unwrap()
+                .as_ref(),
             b"-O2"
         );
 
@@ -802,13 +740,11 @@ mod tests {
     /// The builtins live in the scope, not the interner.
     #[test]
     fn test_builtins_are_scope_state() {
-        let mut symtab = Symtab::new();
-        let scope = GlobalVars::with_builtins(&mut symtab);
-        let shell_status = symtab.intern(".SHELLSTATUS");
-        assert!(scope.peek(shell_status).is_some());
-        // Same interner, a scope without builtins: the name interns to the same
-        // handle but has no binding.
-        assert!(GlobalVars::new().peek(shell_status).is_none());
+        let scope = GlobalVars::with_builtins();
+        assert!(scope.peek(Symbol::SHELLSTATUS).is_some());
+        // A scope without builtins: the name is interned all the same but has
+        // no binding.
+        assert!(GlobalVars::new().peek(Symbol::SHELLSTATUS).is_none());
     }
 
     #[test]
@@ -820,67 +756,5 @@ mod tests {
         assert!(scope.replace(sym, Some(var)).is_none());
         assert!(scope.replace(sym, None).is_some());
         assert!(scope.peek(sym).is_none());
-    }
-
-    fn automatic(value: &'static [u8]) -> Var {
-        Variable::with_simple_string(Bytes::from_static(value), VarOrigin::Automatic, None, None)
-    }
-
-    fn string_of(var: Var) -> String {
-        String::from_utf8(var.read().string().unwrap().into_owned()).unwrap()
-    }
-
-    /// Restoring the *absence* of a binding is a different case from restoring
-    /// a value, and it is the one a body that fails partway has to get right.
-    #[test]
-    fn test_with_global_var_bound_restores_absence_on_error() {
-        let sym = crate::symtab::intern("KATI_TEST_BOUND_ABSENT");
-        assert!(peek_global_var(sym).is_none());
-
-        let result: Result<()> = with_global_var_bound(sym, automatic(b"inner"), || {
-            assert_eq!(string_of(peek_global_var(sym).unwrap()), "inner");
-            error!("body failed")
-        });
-
-        assert!(result.is_err());
-        assert!(peek_global_var(sym).is_none());
-    }
-
-    /// The same on the error path when there was a binding to go back to.
-    #[test]
-    fn test_with_global_var_bound_restores_previous_on_error() {
-        let sym = crate::symtab::intern("KATI_TEST_BOUND_PREVIOUS");
-        GLOBAL_VARS.lock().replace(sym, Some(automatic(b"outer")));
-
-        let result: Result<()> = with_global_var_bound(sym, automatic(b"inner"), || {
-            assert_eq!(string_of(peek_global_var(sym).unwrap()), "inner");
-            error!("body failed")
-        });
-
-        assert!(result.is_err());
-        assert_eq!(string_of(peek_global_var(sym).unwrap()), "outer");
-    }
-
-    /// Every binding of a group is restored when the body fails, whether it had
-    /// a previous value or none.
-    #[test]
-    fn test_with_global_vars_bound_restores_every_binding_on_error() {
-        let kept = crate::symtab::intern("KATI_TEST_BOUND_MANY_KEPT");
-        let absent = crate::symtab::intern("KATI_TEST_BOUND_MANY_ABSENT");
-        GLOBAL_VARS.lock().replace(kept, Some(automatic(b"outer")));
-        assert!(peek_global_var(absent).is_none());
-
-        let result: Result<()> = with_global_vars_bound(
-            vec![(kept, automatic(b"inner")), (absent, automatic(b"inner"))],
-            || {
-                assert_eq!(string_of(peek_global_var(kept).unwrap()), "inner");
-                assert_eq!(string_of(peek_global_var(absent).unwrap()), "inner");
-                error!("body failed")
-            },
-        );
-
-        assert!(result.is_err());
-        assert_eq!(string_of(peek_global_var(kept).unwrap()), "outer");
-        assert!(peek_global_var(absent).is_none());
     }
 }

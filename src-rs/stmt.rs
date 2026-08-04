@@ -25,7 +25,7 @@ use crate::{
     expr::{Evaluable, Value},
     loc::Loc,
     strutil::no_line_break,
-    symtab::{Symbol, intern},
+    symtab::Symbol,
 };
 
 pub type Stmt = Arc<dyn Statement + Send + Sync>;
@@ -94,7 +94,7 @@ impl Debug for RuleStmt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "RuleStmt(lhs={:?} sep={:?} rhs={:?} loc={})",
+            "RuleStmt(lhs={:?} sep={:?} rhs={:?} loc={:?})",
             self.lhs, self.sep, self.rhs, self.loc
         )
     }
@@ -144,7 +144,7 @@ impl Debug for AssignStmt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "AssignStmt(lhs={:?} rhs={:?} ({}) opstr={:?} dir={:?} loc={})",
+            "AssignStmt(lhs={:?} rhs={:?} ({}) opstr={:?} dir={:?} loc={:?})",
             self.lhs,
             self.rhs,
             no_line_break(String::from_utf8_lossy(&self.orig_rhs)),
@@ -181,21 +181,21 @@ impl AssignStmt {
     pub fn get_lhs_symbol(&self, ev: &mut Evaluator) -> Result<Symbol> {
         if let Value::Literal(_, v) = &*self.lhs {
             if v.is_empty() {
-                error_loc!(Some(&self.loc), "*** empty variable name.");
+                error_loc!(ev, Some(&self.loc), "*** empty variable name.");
             }
 
             let mut cache = self.lhs_sym_cache.lock();
             if cache.is_none() {
-                *cache = Some(intern(v.clone()));
+                *cache = Some(ev.session.intern(v.clone()));
             }
             return Ok((*cache).unwrap());
         }
 
         let buf = self.lhs.eval_to_buf(ev)?;
         if buf.is_empty() {
-            error_loc!(Some(&self.loc), "*** empty variable name.");
+            error_loc!(ev, Some(&self.loc), "*** empty variable name.");
         }
-        Ok(intern(buf))
+        Ok(ev.session.intern(buf))
     }
 }
 
@@ -220,7 +220,7 @@ impl Statement for CommandStmt {
 
 impl Debug for CommandStmt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CommandStmt({:?}, loc={})", self.expr, self.loc)
+        write!(f, "CommandStmt({:?}, loc={:?})", self.expr, self.loc)
     }
 }
 
@@ -257,7 +257,7 @@ impl Debug for IfStmt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "IfStmt(op={:?}, lhs={:?}, rhs={:?} t={} f={} loc={}",
+            "IfStmt(op={:?}, lhs={:?}, rhs={:?} t={} f={} loc={:?}",
             self.op,
             self.lhs,
             self.rhs,
@@ -304,7 +304,7 @@ impl Statement for IncludeStmt {
 
 impl Debug for IncludeStmt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "IncludeStmt({:?}, loc={})", self.expr, self.loc)
+        write!(f, "IncludeStmt({:?}, loc={:?})", self.expr, self.loc)
     }
 }
 
@@ -343,7 +343,7 @@ impl Debug for ExportStmt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ExportStmt({:?}, {}, loc={})",
+            "ExportStmt({:?}, {}, loc={:?})",
             self.expr, self.is_export, self.loc
         )
     }

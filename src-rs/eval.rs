@@ -19,27 +19,29 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::BufWriter;
 use std::os::unix::ffi::OsStringExt;
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::{Arc, Weak};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bytes::{Buf, Bytes};
 use memchr::{memchr, memchr2};
 use parking_lot::Mutex;
 
 use crate::expr::Evaluable;
 use crate::expr::Value;
-use crate::flags::FLAGS;
+use crate::flags::Flags;
 use crate::loc::Loc;
 use crate::parser::{parse_assign_statement, parse_buf_no_stats};
 use crate::rule::{Rule, is_pattern_rule};
+use crate::session::{Context, Session};
+use crate::stats::StatsRegistry;
 use crate::stmt::{
     AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt, IncludeStmt, RuleSep, RuleStmt,
     Statement,
 };
 use crate::strutil::{is_space_byte, trim_leading_curdir, trim_right_space, word_scanner};
-use crate::symtab::{ALLOW_RULES_SYM, KATI_READONLY_SYM, MAKEFILE_LIST, SHELL_SYM, Symbol, intern};
-use crate::var::{Var, VarOrigin, Variable, Vars, get_global_var, peek_global_var, set_global_var};
-use crate::{collect_stats_with_slow_report, error_loc, file_cache, log, warn_loc};
+use crate::symtab::{Interner, Symbol, Symtab};
+use crate::var::{Var, VarOrigin, Variable, Vars};
+use crate::{collect_stats_with_slow_report, error_loc, log, warn_loc};
 
 pub enum RulesAllowed {
     Allowed,
@@ -100,7 +102,12 @@ impl Frame {
         self.children.lock().push(child);
     }
 
-    fn print_json_trace(&self, tf: &mut dyn std::io::Write, indent: usize) -> Result<()> {
+    fn print_json_trace(
+        &self,
+        names: &impl Interner,
+        tf: &mut dyn std::io::Write,
+        indent: usize,
+    ) -> Result<()> {
         if self.frame_type == FrameType::Root {
             return Ok(());
         }
@@ -108,7 +115,7 @@ impl Frame {
         let indent_string = " ".repeat(indent);
         let mut desc = String::from_utf8_lossy(&self.name);
         if let Some(loc) = &self.location {
-            desc = Cow::Owned(format!("{desc} @ {loc}"));
+            desc = Cow::Owned(format!("{desc} @ {}", loc.display(names)));
         }
 
         let parent = self.parent.clone().unwrap().upgrade();
@@ -122,7 +129,7 @@ impl Frame {
         };
         writeln!(tf, "{indent_string}\"{desc}\"{comma}")?;
         if let Some(parent) = parent {
-            parent.print_json_trace(tf, indent)?;
+            parent.print_json_trace(names, tf, indent)?;
         }
         Ok(())
     }
@@ -236,10 +243,16 @@ impl IncludeGraph {
     }
 }
 
-static USED_UNDEFINED_VARS: LazyLock<Mutex<HashSet<Symbol>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-
+/// Make evaluation, over a session it owns.
+///
+/// Every diagnostic raised during evaluation renders a symbol or a location, so
+/// the session has to be reachable from here; that is why it lives on the
+/// evaluator rather than beside it.
+// [spec:ronin:req:make.no-ambient-state]
 pub struct Evaluator {
+    /// Everything that used to be a process global.
+    pub session: Session,
+
     pub rule_vars: HashMap<Symbol, Arc<Vars>>,
     pub rules: Vec<Rule>,
     pub exports: HashMap<Symbol, bool>,
@@ -266,7 +279,6 @@ pub struct Evaluator {
     // error).
     pub delayed_output_commands: Vec<Bytes>,
 
-    posix_sym: Symbol,
     is_posix: bool,
 
     /// Whether `export`/`unexport` directives are allowed.
@@ -279,13 +291,31 @@ pub struct Evaluator {
 
 impl Default for Evaluator {
     fn default() -> Self {
-        Self::new()
+        Self::new(Session::new())
+    }
+}
+
+impl Interner for Evaluator {
+    fn symtab(&self) -> &Symtab {
+        &self.session.symtab
+    }
+}
+
+impl Context for Evaluator {
+    fn flags(&self) -> &Flags {
+        &self.session.flags
+    }
+    fn stats(&self) -> &StatsRegistry {
+        &self.session.stats
     }
 }
 
 impl Evaluator {
-    pub fn new() -> Self {
+    pub fn new(session: Session) -> Self {
+        let trace = session.flags.dump_variable_assignment_trace.is_some()
+            || session.flags.dump_include_graph.is_some();
         Self {
+            session,
             rule_vars: HashMap::new(),
             rules: Vec::new(),
             exports: HashMap::new(),
@@ -298,8 +328,7 @@ impl Evaluator {
             is_bootstrap: false,
             is_commandline: false,
 
-            trace: FLAGS.dump_variable_assignment_trace.is_some()
-                || FLAGS.dump_include_graph.is_some(),
+            trace,
             stack: Arc::new(Mutex::new(vec![Arc::new(Frame::new(
                 FrameType::Root,
                 None,
@@ -313,7 +342,6 @@ impl Evaluator {
             eval_depth: 0,
             delayed_output_commands: Vec::new(),
 
-            posix_sym: crate::symtab::intern(".POSIX"),
             is_posix: false,
 
             export_allowed: ExportAllowed::Allowed,
@@ -325,9 +353,10 @@ impl Evaluator {
     }
 
     pub fn start(&mut self) -> Result<()> {
-        let Some(filename) = &FLAGS.dump_variable_assignment_trace else {
+        let Some(filename) = self.session.flags.dump_variable_assignment_trace.clone() else {
             return Ok(());
         };
+        let filename = filename.as_os_str();
 
         if filename == "-" {
             self.assignment_tracefile = Some(Box::new(std::io::stderr()));
@@ -418,18 +447,23 @@ impl Evaluator {
                 if let Some(prev) = prev.clone() {
                     if prev.read().readonly {
                         error_loc!(
+                            self,
                             self.loc.as_ref(),
-                            "*** cannot assign to readonly variable: {lhs}"
+                            "*** cannot assign to readonly variable: {}",
+                            lhs.display(self)
                         );
                     }
                     result = prev;
                     if result.read().immediate_eval() {
                         let buf = rhs_v.eval_to_buf(self)?;
-                        result.write().append_str(&buf, self.current_frame())?;
+                        let frame = self.current_frame();
+                        result.write().append_str(&self.session, &buf, frame)?;
                     } else {
+                        let frame = self.current_frame();
                         result.write().append_var(
+                            &self.session,
                             rhs_v,
-                            self.current_frame(),
+                            frame,
                             self.loc.as_ref(),
                         )?;
                     }
@@ -477,12 +511,17 @@ impl Evaluator {
         self.in_rule = false;
         let lhs = stmt.get_lhs_symbol(self)?;
 
-        if lhs == *KATI_READONLY_SYM {
+        if lhs == Symbol::KATI_READONLY {
             let rhs = stmt.rhs.eval_to_buf(self)?;
             for name in word_scanner(&rhs) {
-                let name = intern(rhs.slice_ref(name));
-                let Some(var) = get_global_var(name) else {
-                    error_loc!(self.loc.as_ref(), "*** unknown variable: {name}");
+                let name = self.session.intern(rhs.slice_ref(name));
+                let Some(var) = self.session.get_global_var(name) else {
+                    error_loc!(
+                        self,
+                        self.loc.as_ref(),
+                        "*** unknown variable: {}",
+                        name.display(self)
+                    );
                 };
                 var.write().readonly = true;
             }
@@ -499,11 +538,14 @@ impl Evaluator {
         )?;
         if needs_assign {
             let mut readonly = false;
-            set_global_var(lhs, var.clone(), is_override, Some(&mut readonly))?;
+            self.session
+                .set_global_var(lhs, var.clone(), is_override, Some(&mut readonly))?;
             if readonly {
                 error_loc!(
+                    self,
                     self.loc.as_ref(),
-                    "*** cannot assign to readonly variable: {lhs}"
+                    "*** cannot assign to readonly variable: {}",
+                    lhs.display(self)
                 );
             }
         }
@@ -520,11 +562,12 @@ impl Evaluator {
     // parses <before_term> into Symbol instances until encountering ':'
     // Returns the remainder of <before_term>.
     pub fn parse_rule_targets(
+        session: &mut Session,
         loc: &Loc,
         before_term: &Bytes,
     ) -> Result<(Bytes, Vec<Symbol>, bool)> {
         let Some(idx) = memchr(b':', before_term) else {
-            error_loc!(Some(loc), "*** missing separator.");
+            error_loc!(session, Some(loc), "*** missing separator.");
         };
         let targets_string = before_term.slice(0..idx);
         let after = before_term.slice(idx + 1..);
@@ -532,7 +575,7 @@ impl Evaluator {
         let mut targets: Vec<Symbol> = Vec::new();
         for word in word_scanner(&targets_string) {
             let target = targets_string.slice_ref(trim_leading_curdir(word));
-            targets.push(intern(target.clone()));
+            targets.push(session.intern(target.clone()));
             if is_pattern_rule(&target) {
                 pattern_rule_count += 1;
             }
@@ -540,6 +583,7 @@ impl Evaluator {
         // Check consistency: either all outputs are patterns or none.
         if pattern_rule_count > 0 && pattern_rule_count != targets.len() {
             error_loc!(
+                session,
                 Some(loc),
                 "*** mixed implicit and normal rules: deprecated syntax"
             );
@@ -561,10 +605,16 @@ impl Evaluator {
 
     pub fn mark_vars_readonly(&mut self, vars_list: &Value) -> Result<()> {
         let vars_list_string = vars_list.eval_to_buf(self)?;
+        let scope = self.current_scope.clone().unwrap();
         for name in word_scanner(&vars_list_string) {
-            let name = intern(vars_list_string.slice_ref(name));
-            let Some(var) = self.current_scope.as_ref().unwrap().lookup(name) else {
-                error_loc!(self.loc.as_ref(), "*** unknown variable: {name}");
+            let name = self.session.intern(vars_list_string.slice_ref(name));
+            let Some(var) = scope.lookup(&mut self.session.used_env_vars, name) else {
+                error_loc!(
+                    self,
+                    self.loc.as_ref(),
+                    "*** unknown variable: {}",
+                    name.display(self)
+                );
             };
             var.write().readonly = true;
         }
@@ -579,7 +629,7 @@ impl Evaluator {
         separator_pos: usize,
     ) -> Result<()> {
         let assign = parse_assign_statement(after_targets, separator_pos);
-        let var_sym = intern(after_targets.slice_ref(assign.lhs));
+        let var_sym = self.session.intern(after_targets.slice_ref(assign.lhs));
         let is_final = stmt.sep == RuleSep::FinalEq;
         for target in targets {
             let scope = self
@@ -612,7 +662,7 @@ impl Evaluator {
             };
 
             self.current_scope = Some(scope);
-            if var_sym == *KATI_READONLY_SYM {
+            if var_sym == Symbol::KATI_READONLY {
                 if let Some(rhs) = rhs {
                     self.mark_vars_readonly(&rhs)?;
                 }
@@ -634,8 +684,10 @@ impl Evaluator {
                     )?;
                     if readonly {
                         error_loc!(
+                            self,
                             self.loc.as_ref(),
-                            "*** cannot assign to readonly variable: {var_sym}"
+                            "*** cannot assign to readonly variable: {}",
+                            var_sym.display(self)
                         );
                     }
                 }
@@ -656,13 +708,14 @@ impl Evaluator {
         // See semicolon.mk.
         if before_term.iter().all(|c| b" \t\n;".contains(c)) {
             if stmt.sep == RuleSep::Semicolon {
-                error_loc!(self.loc.as_ref(), "*** missing rule before commands.");
+                error_loc!(self, self.loc.as_ref(), "*** missing rule before commands.");
             }
             return Ok(());
         }
 
+        let loc = self.loc.clone().unwrap();
         let (mut after_targets, targets, is_pattern_rule) =
-            Evaluator::parse_rule_targets(self.loc.as_ref().unwrap(), &before_term)?;
+            Evaluator::parse_rule_targets(&mut self.session, &loc, &before_term)?;
         let is_double_colon = after_targets.starts_with(b":");
         if is_double_colon {
             after_targets.advance(1);
@@ -694,7 +747,7 @@ impl Evaluator {
         if separator_pos == Some(0) {
             // We used to make this a warning and otherwise accept it, but Make 4.1
             // calls this out as an error, so let's follow.
-            error_loc!(self.loc.as_ref(), "*** empty variable name.");
+            error_loc!(self, self.loc.as_ref(), "*** empty variable name.");
         }
 
         let mut rule = Rule::new(self.loc.clone().unwrap(), is_double_colon);
@@ -703,14 +756,14 @@ impl Evaluator {
         } else {
             rule.outputs = targets;
         }
-        rule.parse_prerequisites(&after_targets, separator_pos, stmt)?;
+        rule.parse_prerequisites(&mut self.session, &after_targets, separator_pos, stmt)?;
 
         if stmt.sep == RuleSep::Semicolon {
             rule.cmds.push(stmt.rhs.clone().unwrap());
         }
 
         for o in &rule.outputs {
-            if o == &self.posix_sym {
+            if o == &Symbol::POSIX {
                 self.is_posix = true;
             }
         }
@@ -719,6 +772,7 @@ impl Evaluator {
         match self.get_allow_rules()? {
             RulesAllowed::Warning => {
                 warn_loc!(
+                    self,
                     self.loc.as_ref(),
                     "warning: Rule not allowed here for target: {}",
                     Evaluator::format_rule_error(&before_term)
@@ -726,6 +780,7 @@ impl Evaluator {
             }
             RulesAllowed::Error => {
                 error_loc!(
+                    self,
                     self.loc.as_ref(),
                     "*** Rule not allowed here for target: {}",
                     Evaluator::format_rule_error(&before_term),
@@ -742,7 +797,7 @@ impl Evaluator {
         self.loc = Some(stmt.loc());
 
         if !self.in_rule {
-            let stmts = parse_buf_no_stats(&stmt.orig(), stmt.loc())?;
+            let stmts = parse_buf_no_stats(&mut self.session, &stmt.orig(), stmt.loc())?;
             let stmts = stmts.lock();
             for a in &*stmts {
                 a.eval(self)?;
@@ -768,13 +823,17 @@ impl Evaluator {
                 let var_name = stmt.lhs.eval_to_buf(self)?;
                 let lhs = trim_right_space(&var_name);
                 if lhs.iter().any(is_space_byte) {
-                    error_loc!(self.loc.as_ref(), "*** invalid syntax in conditional.");
+                    error_loc!(
+                        self,
+                        self.loc.as_ref(),
+                        "*** invalid syntax in conditional."
+                    );
                 }
-                let lhs = intern(var_name.slice_ref(lhs));
+                let lhs = self.session.intern(var_name.slice_ref(lhs));
                 if let Some(v) = self.lookup_var_in_current_scope(lhs)? {
                     let v = v.read();
                     v.used(self, &lhs)?;
-                    v.string()?.is_empty() == (stmt.op == CondOp::Ifndef)
+                    v.string(&self.session)?.is_empty() == (stmt.op == CondOp::Ifndef)
                 } else {
                     stmt.op == CondOp::Ifndef
                 }
@@ -804,10 +863,11 @@ impl Evaluator {
 
     pub fn do_include(&mut self, fname: &Bytes) -> Result<()> {
         let filename = OsString::from_vec(fname.to_vec());
-        collect_stats_with_slow_report!("included makefiles", &filename);
+        collect_stats_with_slow_report!(self, "included makefiles", &filename);
 
-        let Some(mk) = file_cache::get_makefile(&filename)? else {
+        let Some(mk) = self.session.get_makefile(&filename)? else {
             error_loc!(
+                self,
                 self.loc.as_ref(),
                 "{} does not exist",
                 filename.to_string_lossy()
@@ -815,29 +875,28 @@ impl Evaluator {
         };
 
         let v = fname.slice_ref(trim_leading_curdir(fname));
-        if let Some(var_list) = self.lookup_var(*MAKEFILE_LIST)? {
-            var_list.write().append_str(&v, self.current_frame())?;
+        if let Some(var_list) = self.lookup_var(Symbol::MAKEFILE_LIST)? {
+            let frame = self.current_frame();
+            var_list.write().append_str(&self.session, &v, frame)?;
         } else {
-            set_global_var(
-                *MAKEFILE_LIST,
-                Variable::with_simple_string(
-                    v,
-                    VarOrigin::File,
-                    Some(self.current_frame()),
-                    self.loc.clone(),
-                ),
+            let frame = self.current_frame();
+            let loc = self.loc.clone();
+            self.session.set_global_var(
+                Symbol::MAKEFILE_LIST,
+                Variable::with_simple_string(v, VarOrigin::File, Some(frame), loc),
                 false,
                 None,
             )?;
         }
-        for stmt in mk.stmts.lock().iter() {
+        let stmts = mk.stmts.lock().clone();
+        for stmt in stmts {
             log!("{stmt:?}");
             stmt.eval(self)?;
         }
 
         if !self.profiled_files.is_empty() {
             for mk in std::mem::take(&mut self.profiled_files) {
-                STATS.mark_interesting(mk);
+                crate::stats::mark_interesting(self, "included makefiles", mk);
             }
         }
         Ok(())
@@ -850,13 +909,14 @@ impl Evaluator {
         let pats = stmt.expr.eval_to_buf(self)?;
         for pat in word_scanner(&pats) {
             let pat = pats.slice_ref(pat);
-            let files = crate::fileutil::glob(pat.clone());
+            let files = self.session.glob(pat.clone());
 
             if stmt.should_exist {
                 match files.as_ref() {
                     Err(err) => {
                         // TODO: Kati does not support building a missing include file.
                         error_loc!(
+                            self,
                             self.loc.as_ref(),
                             "{}: {err}",
                             String::from_utf8_lossy(&pat)
@@ -865,6 +925,7 @@ impl Evaluator {
                     Ok(files) => {
                         if files.is_empty() {
                             error_loc!(
+                                self,
                                 self.loc.as_ref(),
                                 "{}: Not found",
                                 String::from_utf8_lossy(&pat)
@@ -876,10 +937,13 @@ impl Evaluator {
             let Ok(files) = files.as_ref() else {
                 continue;
             };
+            let files = files.clone();
 
-            for fname in files {
+            for fname in &files {
                 if !stmt.should_exist
-                    && FLAGS
+                    && self
+                        .session
+                        .flags
                         .ignore_optional_include_pattern
                         .as_ref()
                         .map(|p| p.matches(fname))
@@ -890,8 +954,11 @@ impl Evaluator {
 
                 {
                     let _frame = self.enter(FrameType::Parse, fname.clone(), stmt.loc());
-                    self.do_include(fname)
-                        .with_context(|| format!("In file included from {}:", stmt.loc()))?;
+                    let included_from = format!(
+                        "In file included from {}:",
+                        stmt.loc().display(&self.session)
+                    );
+                    anyhow::Context::with_context(self.do_include(fname), || included_from)?;
                 }
             }
         }
@@ -919,29 +986,33 @@ impl Evaluator {
             } else {
                 lhs = tok;
             }
-            let sym = intern(exports.slice_ref(lhs));
+            let sym = self.session.intern(exports.slice_ref(lhs));
             self.exports.insert(sym, stmt.is_export);
 
             let prefix = if stmt.is_export { "" } else { "un" };
             match &self.export_allowed {
                 ExportAllowed::Allowed => {}
                 ExportAllowed::Error(msg) => error_loc!(
+                    self,
                     self.loc.as_ref(),
-                    "*** {sym}: {prefix}export is obsolete{msg}."
+                    "*** {}: {prefix}export is obsolete{msg}.",
+                    sym.display(self)
                 ),
                 ExportAllowed::Warning(msg) => warn_loc!(
+                    self,
                     self.loc.as_ref(),
-                    "{sym}: {prefix}export has been deprecated{msg}."
+                    "{}: {prefix}export has been deprecated{msg}.",
+                    sym.display(self)
                 ),
             }
         }
         Ok(())
     }
 
-    pub fn lookup_var_global(&self, name: Symbol) -> Option<Var> {
-        let v = get_global_var(name);
+    pub fn lookup_var_global(&mut self, name: Symbol) -> Option<Var> {
+        let v = self.session.get_global_var(name);
         if v.is_none() {
-            USED_UNDEFINED_VARS.lock().insert(name);
+            self.session.note_undefined_var(name);
         }
         v
     }
@@ -952,12 +1023,12 @@ impl Evaluator {
         }
 
         // trace every variable unless filtered
-        if FLAGS.traced_variables_pattern.is_empty() {
+        if self.session.flags.traced_variables_pattern.is_empty() {
             return true;
         }
 
-        let name = name.as_bytes();
-        for pat in FLAGS.traced_variables_pattern.iter() {
+        let name = name.as_bytes(&self.session);
+        for pat in self.session.flags.traced_variables_pattern.iter() {
             if pat.matches(&name) {
                 return true;
             }
@@ -975,17 +1046,19 @@ impl Evaluator {
             return Ok(());
         }
         let current_frame = self.current_frame();
+        let name_str = name.display(&self.session).to_string();
+        let session = &self.session;
+        let sep = std::mem::replace(&mut self.assignment_sep, ",\n".to_string());
         let Some(tf) = self.assignment_tracefile.as_mut() else {
             return Ok(());
         };
-        write!(tf, "{}", self.assignment_sep)?;
-        self.assignment_sep = ",\n".to_string();
+        write!(tf, "{sep}")?;
         writeln!(tf, "    {{")?;
-        writeln!(tf, "      \"name\": \"{name}\",")?;
+        writeln!(tf, "      \"name\": \"{name_str}\",")?;
         writeln!(tf, "      \"operation\": \"{operation}\",")?;
         writeln!(tf, "      \"defined\": {},", var.is_some())?;
         writeln!(tf, "      \"reference_stack\": [")?;
-        current_frame.print_json_trace(tf, 8)?;
+        current_frame.print_json_trace(session, tf, 8)?;
         writeln!(tf, "      ]")?;
         write!(tf, "    }}")?;
         Ok(())
@@ -995,19 +1068,21 @@ impl Evaluator {
         if !self.is_traced(name) {
             return Ok(());
         }
+        let name_str = name.display(&self.session).to_string();
+        let session = &self.session;
+        let sep = std::mem::replace(&mut self.assignment_sep, ",\n".to_string());
         let Some(tf) = self.assignment_tracefile.as_mut() else {
             return Ok(());
         };
-        write!(tf, "{}", self.assignment_sep)?;
-        self.assignment_sep = ",\n".to_string();
+        write!(tf, "{sep}")?;
         writeln!(tf, "    {{")?;
-        writeln!(tf, "      \"name\": \"{name}\",")?;
+        writeln!(tf, "      \"name\": \"{name_str}\",")?;
         writeln!(tf, "      \"operation\": \"assign\",")?;
         write!(tf, "      \"value\": \"{var:?}\"")?;
         if let Some(definition) = var.read().definition().clone() {
             writeln!(tf, ",\n")?;
             writeln!(tf, "      \"value_stack\": [")?;
-            definition.print_json_trace(tf, 8)?;
+            definition.print_json_trace(session, tf, 8)?;
             writeln!(tf, "      ]")?;
         }
         write!(tf, "    }}")?;
@@ -1017,9 +1092,12 @@ impl Evaluator {
     pub fn lookup_var_for_eval(&mut self, name: Symbol) -> Result<Option<Var>> {
         if let Some(var) = self.lookup_var(name)? {
             if self.symbols_for_eval.contains(&name) {
+                let loc = var.read().loc().clone();
                 error_loc!(
-                    var.read().loc().as_ref(),
-                    "*** Recursive variable \"{name}\" references itself (eventually)."
+                    self,
+                    loc.as_ref(),
+                    "*** Recursive variable \"{}\" references itself (eventually).",
+                    name.display(self)
                 );
             }
             self.symbols_for_eval.insert(name);
@@ -1035,8 +1113,8 @@ impl Evaluator {
     pub fn lookup_var(&mut self, name: Symbol) -> Result<Option<Var>> {
         let mut result = None;
 
-        if let Some(current_scope) = &self.current_scope {
-            result = current_scope.lookup(name);
+        if let Some(current_scope) = self.current_scope.clone() {
+            result = current_scope.lookup(&mut self.session.used_env_vars, name);
         }
 
         if result.is_none() {
@@ -1055,15 +1133,15 @@ impl Evaluator {
         }
 
         if result.is_none() {
-            result = peek_global_var(name);
+            result = self.session.peek_global_var(name);
         }
 
         result
     }
 
     pub fn lookup_var_in_current_scope(&mut self, name: Symbol) -> Result<Option<Var>> {
-        let result = if let Some(current_scope) = &self.current_scope {
-            current_scope.lookup(name)
+        let result = if let Some(current_scope) = self.current_scope.clone() {
+            current_scope.lookup(&mut self.session.used_env_vars, name)
         } else {
             self.lookup_var_global(name)
         };
@@ -1076,7 +1154,7 @@ impl Evaluator {
         if let Some(current_scope) = &self.current_scope {
             current_scope.peek(name)
         } else {
-            peek_global_var(name)
+            self.session.peek_global_var(name)
         }
     }
 
@@ -1099,7 +1177,7 @@ impl Evaluator {
     }
 
     pub fn get_shell(&mut self) -> Result<Bytes> {
-        self.eval_var(*SHELL_SYM)
+        self.eval_var(Symbol::SHELL)
     }
 
     pub fn get_shell_flag(&self) -> &'static [u8] {
@@ -1107,7 +1185,7 @@ impl Evaluator {
     }
 
     fn get_allow_rules(&mut self) -> Result<RulesAllowed> {
-        Ok(match self.eval_var(*ALLOW_RULES_SYM)?.as_ref() {
+        Ok(match self.eval_var(Symbol::KATI_ALLOW_RULES)?.as_ref() {
             b"warning" => RulesAllowed::Warning,
             b"error" => RulesAllowed::Error,
             _ => RulesAllowed::Allowed,
@@ -1128,7 +1206,134 @@ impl Evaluator {
         Ok(())
     }
 
-    pub fn used_undefined_vars() -> HashSet<Symbol> {
-        USED_UNDEFINED_VARS.lock().clone()
+    /// Bind `sym` to `var` for the duration of `f`, then put back whatever the
+    /// symbol was bound to before — including nothing at all.
+    ///
+    /// This is the session-owned form of the explicit save and restore that
+    /// replaced the scope-restoring `Drop` guard. The scope is reached at the
+    /// save and at the restore and never handed to `f`: `f` re-enters
+    /// evaluation and reaches the scope for itself, so a borrow of it held
+    /// across the body would be the evaluator's own. Reborrowing `self` into
+    /// the closure is legal where handing out a `&mut` to a field is not.
+    ///
+    /// The restore runs on the error path as well as the value path, which is
+    /// the one thing `Drop` was genuinely buying: Make evaluation propagates
+    /// errors straight out of `foreach` and `call`, so a body that fails
+    /// partway must not leave an automatic variable bound behind it. A panic
+    /// unwinding out of `f` does not restore, unlike `Drop`; evaluation reports
+    /// every failure it is meant to survive as an `Err`, and the session a
+    /// panic would corrupt does not outlive it.
+    // [spec:ronin:req:make.no-ambient-state]
+    pub fn with_bound<T>(
+        &mut self,
+        sym: Symbol,
+        var: Var,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let orig = self.session.globals.replace(sym, Some(var));
+        let result = f(self);
+        self.session.globals.replace(sym, orig);
+        result
+    }
+
+    /// [`Self::with_bound`] for several symbols at once: all bound before `f`,
+    /// all restored after it, in reverse order so nesting still holds if a
+    /// symbol were ever to repeat. `$(call)` needs this — it binds every
+    /// positional argument around a single body.
+    pub fn with_bounds<T>(
+        &mut self,
+        bindings: Vec<(Symbol, Var)>,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let mut saved = Vec::with_capacity(bindings.len());
+        for (sym, var) in bindings {
+            saved.push((sym, self.session.globals.replace(sym, Some(var))));
+        }
+        let result = f(self);
+        for (sym, orig) in saved.into_iter().rev() {
+            self.session.globals.replace(sym, orig);
+        }
+        result
+    }
+
+    pub fn used_undefined_vars(&self) -> HashSet<Symbol> {
+        self.session.used_undefined_vars.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::var::VarOrigin;
+
+    fn automatic(value: &'static [u8]) -> Var {
+        Variable::with_simple_string(Bytes::from_static(value), VarOrigin::Automatic, None, None)
+    }
+
+    fn string_of(session: &Session, var: Var) -> String {
+        String::from_utf8(var.read().string(session).unwrap().into_owned()).unwrap()
+    }
+
+    /// Restoring the *absence* of a binding is a different case from restoring
+    /// a value, and it is the one a body that fails partway has to get right.
+    #[test]
+    fn test_with_bound_restores_absence_on_error() {
+        let mut ev = Evaluator::new(Session::new());
+        let sym = ev.session.intern("KATI_TEST_BOUND_ABSENT");
+        assert!(ev.session.peek_global_var(sym).is_none());
+
+        let result: Result<()> = ev.with_bound(sym, automatic(b"inner"), |ev| {
+            let bound = ev.session.peek_global_var(sym).unwrap();
+            assert_eq!(string_of(&ev.session, bound), "inner");
+            crate::error!("body failed")
+        });
+
+        assert!(result.is_err());
+        assert!(ev.session.peek_global_var(sym).is_none());
+    }
+
+    /// The same on the error path when there was a binding to go back to.
+    #[test]
+    fn test_with_bound_restores_previous_on_error() {
+        let mut ev = Evaluator::new(Session::new());
+        let sym = ev.session.intern("KATI_TEST_BOUND_PREVIOUS");
+        ev.session.globals.replace(sym, Some(automatic(b"outer")));
+
+        let result: Result<()> = ev.with_bound(sym, automatic(b"inner"), |ev| {
+            let bound = ev.session.peek_global_var(sym).unwrap();
+            assert_eq!(string_of(&ev.session, bound), "inner");
+            crate::error!("body failed")
+        });
+
+        assert!(result.is_err());
+        let bound = ev.session.peek_global_var(sym).unwrap();
+        assert_eq!(string_of(&ev.session, bound), "outer");
+    }
+
+    /// Every binding of a group is restored when the body fails, whether it had
+    /// a previous value or none.
+    #[test]
+    fn test_with_bounds_restores_every_binding_on_error() {
+        let mut ev = Evaluator::new(Session::new());
+        let kept = ev.session.intern("KATI_TEST_BOUND_MANY_KEPT");
+        let absent = ev.session.intern("KATI_TEST_BOUND_MANY_ABSENT");
+        ev.session.globals.replace(kept, Some(automatic(b"outer")));
+        assert!(ev.session.peek_global_var(absent).is_none());
+
+        let result: Result<()> = ev.with_bounds(
+            vec![(kept, automatic(b"inner")), (absent, automatic(b"inner"))],
+            |ev| {
+                let a = ev.session.peek_global_var(kept).unwrap();
+                let b = ev.session.peek_global_var(absent).unwrap();
+                assert_eq!(string_of(&ev.session, a), "inner");
+                assert_eq!(string_of(&ev.session, b), "inner");
+                crate::error!("body failed")
+            },
+        );
+
+        assert!(result.is_err());
+        let bound = ev.session.peek_global_var(kept).unwrap();
+        assert_eq!(string_of(&ev.session, bound), "outer");
+        assert!(ev.session.peek_global_var(absent).is_none());
     }
 }

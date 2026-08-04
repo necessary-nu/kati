@@ -17,54 +17,61 @@ limitations under the License.
 use std::{
     collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
-    sync::{Arc, LazyLock},
+    sync::Arc,
 };
 
 use anyhow::Result;
-use parking_lot::Mutex;
 
-use crate::file::Makefile;
+use crate::{file::Makefile, session::Session};
 
-static CACHE: LazyLock<Mutex<MakefileCacheManager>> = LazyLock::new(|| {
-    Mutex::new(MakefileCacheManager {
-        cache: HashMap::new(),
-        extra_file_deps: HashSet::new(),
-    })
-});
-
-struct MakefileCacheManager {
+/// Parsed makefiles and extra file dependencies, for one session.
+// [spec:ronin:req:make.no-ambient-state]
+pub struct MakefileCache {
     cache: HashMap<OsString, Option<Arc<Makefile>>>,
     extra_file_deps: HashSet<OsString>,
 }
 
-impl MakefileCacheManager {
-    fn get_makefile(&mut self, filename: &OsStr) -> Result<Option<Arc<Makefile>>> {
-        if let Some(mk) = self.cache.get(filename) {
-            return Ok(mk.clone());
+impl Default for MakefileCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MakefileCache {
+    pub fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+            extra_file_deps: HashSet::new(),
         }
-        let filename = filename.to_os_string();
-        let mk = Makefile::from_file(&filename)?;
-        self.cache.insert(filename, mk.clone());
-        Ok(mk)
+    }
+
+    pub fn add_extra_file_dep(&mut self, filename: OsString) {
+        self.extra_file_deps.insert(filename);
+    }
+
+    /// Every file the session read, which is what the regeneration stamp
+    /// records.
+    pub fn all_filenames(&self) -> HashSet<OsString> {
+        let mut ret = HashSet::new();
+        for p in self.cache.keys() {
+            ret.insert(p.clone());
+        }
+        for f in &self.extra_file_deps {
+            ret.insert(f.clone());
+        }
+        ret
     }
 }
 
-pub fn get_makefile(filename: &OsStr) -> Result<Option<Arc<Makefile>>> {
-    CACHE.lock().get_makefile(filename)
-}
-
-pub fn add_extra_file_dep(filename: OsString) {
-    CACHE.lock().extra_file_deps.insert(filename);
-}
-
-pub fn get_all_filenames() -> HashSet<OsString> {
-    let manager = CACHE.lock();
-    let mut ret = HashSet::new();
-    for p in manager.cache.keys() {
-        ret.insert(p.clone());
+/// The parsed form of `filename`, read and parsed on first use.
+///
+/// Parsing interns, so this takes the whole session rather than the cache.
+pub fn get_makefile(session: &mut Session, filename: &OsStr) -> Result<Option<Arc<Makefile>>> {
+    if let Some(mk) = session.makefiles.cache.get(filename) {
+        return Ok(mk.clone());
     }
-    for f in &manager.extra_file_deps {
-        ret.insert(f.clone());
-    }
-    ret
+    let filename = filename.to_os_string();
+    let mk = Makefile::from_file(session, &filename)?;
+    session.makefiles.cache.insert(filename, mk.clone());
+    Ok(mk)
 }

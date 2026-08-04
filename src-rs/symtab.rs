@@ -25,49 +25,101 @@ use std::{
     collections::HashMap,
     fmt::{Debug, Display},
     num::NonZeroUsize,
-    sync::LazyLock,
     vec,
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
-use parking_lot::Mutex;
 
-static SYMTAB: LazyLock<Mutex<Symtab>> = LazyLock::new(|| Mutex::new(Symtab::new()));
-
-/// Run `f` with exclusive access to the process-global interner.
+/// Anything that can hand out the interner a [`Symbol`] was minted from.
 ///
-/// Temporary: `kati-session-value` replaces this with an interner reached
-/// through the session. Nothing called from `f` may intern or render a symbol,
-/// because the interner lock is not reentrant.
-pub fn with_symtab<R>(f: impl FnOnce(&mut Symtab) -> R) -> R {
-    f(&mut SYMTAB.lock())
+/// A `Symbol` is an index, so rendering one needs the interner that produced
+/// it. This is the smallest thing a caller can hold to be able to do that: the
+/// interner itself, or a value that owns one.
+pub trait Interner {
+    fn symtab(&self) -> &Symtab;
 }
 
-pub static SHELL_SYM: LazyLock<Symbol> = LazyLock::new(|| intern("SHELL"));
-pub static ALLOW_RULES_SYM: LazyLock<Symbol> = LazyLock::new(|| intern(".KATI_ALLOW_RULES"));
-pub static KATI_READONLY_SYM: LazyLock<Symbol> = LazyLock::new(|| intern(".KATI_READONLY"));
-pub static VARIABLES_SYM: LazyLock<Symbol> = LazyLock::new(|| intern(".VARIABLES"));
-pub static KATI_SYMBOLS_SYM: LazyLock<Symbol> = LazyLock::new(|| intern(".KATI_SYMBOLS"));
-pub static MAKEFILE_LIST: LazyLock<Symbol> = LazyLock::new(|| intern("MAKEFILE_LIST"));
+impl Interner for Symtab {
+    fn symtab(&self) -> &Symtab {
+        self
+    }
+}
+
+impl<T: Interner + ?Sized> Interner for &T {
+    fn symtab(&self) -> &Symtab {
+        (**self).symtab()
+    }
+}
+
+/// Names every interner preloads, at fixed indices immediately after the 255
+/// single-byte names.
+///
+/// This is what makes [`Symbol::SHELL`] and friends `const` rather than a
+/// lazily interned static. A static would hold an index into whichever
+/// interner happened to touch it first, which is a wrong answer or a panic
+/// against any other one. Preloading the same names in the same order in every
+/// interner makes the index the same everywhere, so the handle is meaningful in
+/// every session. [`Symtab::new`] asserts it.
+const WELL_KNOWN: &[&[u8]] = &[
+    b"<unknown>",
+    b"SHELL",
+    b".KATI_ALLOW_RULES",
+    b".KATI_READONLY",
+    b".VARIABLES",
+    b".KATI_SYMBOLS",
+    b"MAKEFILE_LIST",
+    b".POSIX",
+    b".SHELLSTATUS",
+];
+
+/// Slot 0 is reserved and slots 1..=255 are the single-byte names.
+const WELL_KNOWN_BASE: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Symbol(NonZeroUsize);
 
-impl Display for Symbol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", String::from_utf8_lossy(&self.as_bytes()))
-    }
-}
-
+/// `Symbol` renders only through [`Symbol::display`], which takes the interner.
+/// `Debug` says what a bare handle can say for itself without one.
 impl Debug for Symbol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}({})", self.as_bytes(), self.0.get())
+        write!(f, "Symbol({})", self.0.get())
     }
 }
 
 impl Symbol {
-    pub fn as_bytes(&self) -> Bytes {
-        with_symtab(|symtab| symtab.name(*self))
+    const fn well_known(i: usize) -> Symbol {
+        match NonZeroUsize::new(WELL_KNOWN_BASE + i) {
+            Some(n) => Symbol(n),
+            None => unreachable!(),
+        }
+    }
+
+    pub const UNKNOWN_FILENAME: Symbol = Symbol::well_known(0);
+    pub const SHELL: Symbol = Symbol::well_known(1);
+    pub const KATI_ALLOW_RULES: Symbol = Symbol::well_known(2);
+    pub const KATI_READONLY: Symbol = Symbol::well_known(3);
+    pub const VARIABLES: Symbol = Symbol::well_known(4);
+    pub const KATI_SYMBOLS: Symbol = Symbol::well_known(5);
+    pub const MAKEFILE_LIST: Symbol = Symbol::well_known(6);
+    pub const POSIX: Symbol = Symbol::well_known(7);
+    pub const SHELLSTATUS: Symbol = Symbol::well_known(8);
+
+    /// The bytes this handle was interned from, as borrowed from `names`.
+    // [spec:ronin:req:make.no-ambient-state]
+    pub fn as_bytes(&self, names: &impl Interner) -> Bytes {
+        names.symtab().name(*self)
+    }
+
+    /// A borrowing wrapper that renders this handle through `names`.
+    ///
+    /// This replaces the inherent `Display` the symbol used to have, which
+    /// could only work by reaching for a process-global interner.
+    // [spec:ronin:req:make.no-ambient-state]
+    pub fn display<'a, T: Interner + ?Sized>(&self, names: &'a T) -> SymbolDisplay<'a> {
+        SymbolDisplay {
+            symtab: names.symtab(),
+            sym: *self,
+        }
     }
 
     /// The interner slot this handle names. Only the interner and the variable
@@ -79,6 +131,29 @@ impl Symbol {
     /// The handle for interner slot `index`, or `None` for the reserved slot 0.
     pub(crate) fn from_index(index: usize) -> Option<Self> {
         NonZeroUsize::new(index).map(Self)
+    }
+}
+
+/// What [`Symbol::display`] returns: a symbol's name, borrowed from the
+/// interner that was passed in.
+pub struct SymbolDisplay<'a> {
+    symtab: &'a Symtab,
+    sym: Symbol,
+}
+
+impl Display for SymbolDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            String::from_utf8_lossy(&self.symtab.name(self.sym))
+        )
+    }
+}
+
+impl Debug for SymbolDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.symtab.name(self.sym))
     }
 }
 
@@ -101,7 +176,8 @@ impl Default for Symtab {
 impl Symtab {
     /// An interner preloaded with the 255 single-byte names, which are interned
     /// at the slot equal to their byte so that `intern` can answer for them
-    /// without consulting the map.
+    /// without consulting the map, followed by the [`WELL_KNOWN`] names at
+    /// fixed slots.
     pub fn new() -> Self {
         let mut symtab = Self {
             symbols: vec![Bytes::new()],
@@ -113,6 +189,16 @@ impl Symtab {
             let sym = Symbol(NonZeroUsize::new(i.into()).unwrap());
             symtab.symbols.push(name.clone());
             symtab.index.insert(name, sym);
+        }
+        for (i, name) in WELL_KNOWN.iter().enumerate() {
+            let sym = symtab.intern(*name);
+            assert!(
+                sym == Symbol::well_known(i),
+                "well-known symbol {} landed at slot {}, not {}",
+                String::from_utf8_lossy(name),
+                sym.index(),
+                WELL_KNOWN_BASE + i
+            );
         }
         symtab
     }
@@ -143,11 +229,8 @@ impl Symtab {
     }
 }
 
-pub fn intern<T: Into<Bytes> + AsRef<[u8]>>(s: T) -> Symbol {
-    with_symtab(|symtab| symtab.intern(s))
-}
-
-pub fn join_symbols(symbols: &[Symbol], sep: &[u8]) -> Bytes {
+pub fn join_symbols(names: &impl Interner, symbols: &[Symbol], sep: &[u8]) -> Bytes {
+    let symtab = names.symtab();
     let mut r = BytesMut::new();
     let mut first = true;
     for s in symbols {
@@ -156,13 +239,9 @@ pub fn join_symbols(symbols: &[Symbol], sep: &[u8]) -> Bytes {
         } else {
             first = false;
         }
-        r.put_slice(&s.as_bytes());
+        r.put_slice(&symtab.name(*s));
     }
     r.freeze()
-}
-
-pub fn symbol_count() -> usize {
-    with_symtab(|symtab| symtab.count())
 }
 
 #[cfg(test)]
@@ -171,22 +250,25 @@ mod tests {
 
     #[test]
     fn test_intern() {
-        let sym = intern("foo");
-        let sym2 = intern("bar");
-        let sym3 = intern("foo");
+        let mut symtab = Symtab::new();
+        let sym = symtab.intern("foo");
+        let sym2 = symtab.intern("bar");
+        let sym3 = symtab.intern("foo");
         assert_ne!(sym, sym2);
         assert_eq!(sym, sym3);
     }
 
     #[test]
     fn test_symbol_to_string() {
-        let sym = intern("foo");
-        assert_eq!(sym.to_string(), "foo");
+        let mut symtab = Symtab::new();
+        let sym = symtab.intern("foo");
+        assert_eq!(sym.display(&symtab).to_string(), "foo");
     }
 
     #[test]
     fn test_single_letter_symbol() {
-        let sym = intern("a");
+        let mut symtab = Symtab::new();
+        let sym = symtab.intern("a");
         assert_eq!(sym.0.get(), 'a' as usize);
     }
 
@@ -199,5 +281,30 @@ mod tests {
         // A private interner is unaffected by every name interned elsewhere.
         assert_eq!(b.count(), Symtab::new().count());
         assert_eq!(b.intern("foo"), foo);
+    }
+
+    /// The well-known handles must name the same bytes in any interner, which
+    /// is the whole reason they can be `const`.
+    // [spec:ronin:req:make.no-ambient-state/test]
+    #[test]
+    fn test_well_known_symbols_agree_across_interners() {
+        let a = Symtab::new();
+        let mut b = Symtab::new();
+        b.intern("something else entirely");
+        for sym in [
+            Symbol::UNKNOWN_FILENAME,
+            Symbol::SHELL,
+            Symbol::KATI_ALLOW_RULES,
+            Symbol::KATI_READONLY,
+            Symbol::VARIABLES,
+            Symbol::KATI_SYMBOLS,
+            Symbol::MAKEFILE_LIST,
+            Symbol::POSIX,
+            Symbol::SHELLSTATUS,
+        ] {
+            assert_eq!(a.name(sym), b.name(sym));
+        }
+        assert_eq!(a.name(Symbol::SHELL), Bytes::from_static(b"SHELL"));
+        assert_eq!(b.intern("SHELL"), Symbol::SHELL);
     }
 }

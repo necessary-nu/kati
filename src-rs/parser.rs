@@ -25,6 +25,7 @@ use crate::{
     collect_stats, error_loc,
     expr::{ParseExprOpt, Value, parse_expr, parse_expr_impl, parse_expr_impl_ext},
     loc::Loc,
+    session::Session,
     stmt::{
         AssignDirective, AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt,
         IncludeStmt, RuleSep, RuleStmt, Stmt,
@@ -42,7 +43,11 @@ struct IfState {
     num_nest: i32,
 }
 
-struct Parser {
+struct Parser<'a> {
+    /// Parsing interns and raises located diagnostics, so it needs the session
+    /// as much as evaluation does.
+    // [spec:ronin:req:make.no-ambient-state]
+    session: &'a mut Session,
     buf: Bytes,
     l: usize,
     // Represents if we just parsed a rule or an expression.
@@ -68,9 +73,16 @@ struct Parser {
     fixed_lineno: bool,
 }
 
-impl Parser {
-    fn with_buf(buf: &Bytes, loc: Loc, stmts: Arc<Mutex<Vec<Stmt>>>, fixed_lineno: bool) -> Self {
+impl<'a> Parser<'a> {
+    fn with_buf(
+        session: &'a mut Session,
+        buf: &Bytes,
+        loc: Loc,
+        stmts: Arc<Mutex<Vec<Stmt>>>,
+        fixed_lineno: bool,
+    ) -> Self {
         Self {
+            session,
             buf: buf.clone(),
             l: 0,
             after_rule: false,
@@ -122,12 +134,16 @@ impl Parser {
         if !self.if_stack.is_empty() {
             let mut loc = self.loc.clone();
             loc.line += 1;
-            error_loc!(Some(&loc), "*** missing `endif'.");
+            error_loc!(&*self.session, Some(&loc), "*** missing `endif'.");
         }
         if self.define_name.is_some() {
             let mut loc = self.loc.clone();
             loc.line = self.define_start_line;
-            error_loc!(Some(&loc), "*** missing `endef', unterminated `define'.",);
+            error_loc!(
+                &*self.session,
+                Some(&loc),
+                "*** missing `endef', unterminated `define'.",
+            );
         }
 
         Ok(())
@@ -147,7 +163,12 @@ impl Parser {
         if line.starts_with(b"\t") && self.after_rule {
             let loc = self.loc.clone();
             let mut mutable_loc = self.loc.clone();
-            let expr = parse_expr(&mut mutable_loc, line.slice(1..), ParseExprOpt::Command)?;
+            let expr = parse_expr(
+                self.session,
+                &mut mutable_loc,
+                line.slice(1..),
+                ParseExprOpt::Command,
+            )?;
             self.out_stmts
                 .lock()
                 .push(CommandStmt::new(loc, line, expr));
@@ -204,6 +225,7 @@ impl Parser {
 
         if orig_line.starts_with(b"\t") {
             error_loc!(
+                &*self.session,
                 Some(&self.loc),
                 "*** commands commence before first target."
             );
@@ -221,6 +243,7 @@ impl Parser {
         if let Some(mut found) = found {
             found += sep_plus_one;
             rule_lhs = parse_expr(
+                self.session,
                 &mut mutable_loc,
                 line.slice_ref(trim_space(&line[..found])),
                 ParseExprOpt::Normal,
@@ -238,12 +261,13 @@ impl Parser {
                 _ => ParseExprOpt::Normal,
             };
             rule_rhs = Some(parse_expr(
+                self.session,
                 &mut mutable_loc,
                 line.slice_ref(trim_left_space(&line[found + 1..])),
                 opt,
             )?);
         } else {
-            rule_lhs = parse_expr(&mut mutable_loc, line, ParseExprOpt::Normal)?;
+            rule_lhs = parse_expr(self.session, &mut mutable_loc, line, ParseExprOpt::Normal)?;
             rule_rhs = None;
         }
         self.after_rule = true;
@@ -255,7 +279,11 @@ impl Parser {
 
     fn parse_assign(&mut self, line: Bytes, separator_pos: usize) -> Result<()> {
         if separator_pos == 0 {
-            error_loc!(Some(&self.loc), "*** empty variable name ***");
+            error_loc!(
+                &*self.session,
+                Some(&self.loc),
+                "*** empty variable name ***"
+            );
         }
         let mut assign = parse_assign_statement(&line, separator_pos);
 
@@ -272,12 +300,18 @@ impl Parser {
         let assign_loc = self.loc.clone();
         let mut mutable_loc = self.loc.clone();
         let lhs = parse_expr(
+            self.session,
             &mut mutable_loc,
             line.slice_ref(assign.lhs),
             ParseExprOpt::Normal,
         )?;
         let orig_rhs = line.slice_ref(assign.rhs);
-        let rhs = parse_expr(&mut mutable_loc, orig_rhs.clone(), ParseExprOpt::Normal)?;
+        let rhs = parse_expr(
+            self.session,
+            &mut mutable_loc,
+            orig_rhs.clone(),
+            ParseExprOpt::Normal,
+        )?;
 
         self.after_rule = false;
         self.out_stmts.lock().push(AssignStmt::new(
@@ -295,7 +329,7 @@ impl Parser {
     fn parse_include(&mut self, line: Bytes, directive: &[u8]) -> Result<()> {
         let loc = self.loc.clone();
         let mut mutable_loc = loc.clone();
-        let expr = parse_expr(&mut mutable_loc, line, ParseExprOpt::Normal)?;
+        let expr = parse_expr(self.session, &mut mutable_loc, line, ParseExprOpt::Normal)?;
         self.out_stmts
             .lock()
             .push(IncludeStmt::new(loc, expr, directive.starts_with(b"i")));
@@ -305,7 +339,7 @@ impl Parser {
 
     fn parse_define(&mut self, line: Bytes) -> Result<()> {
         if line.is_empty() {
-            error_loc!(Some(&self.loc), "*** empty variable name.");
+            error_loc!(&*self.session, Some(&self.loc), "*** empty variable name.");
         }
         self.define_name = Some(line);
         self.num_define_nest = 1;
@@ -334,7 +368,11 @@ impl Parser {
             &line["endef".len()..],
         )));
         if !rest.is_empty() {
-            warn_loc!(Some(&self.loc), "extraneous text after `endef' directive");
+            warn_loc!(
+                &*self.session,
+                Some(&self.loc),
+                "extraneous text after `endef' directive"
+            );
         }
 
         let assign_loc = Loc {
@@ -343,6 +381,7 @@ impl Parser {
         };
         let mut mutable_loc = assign_loc.clone();
         let lhs = parse_expr(
+            self.session,
             &mut mutable_loc,
             self.define_name.clone().unwrap(),
             ParseExprOpt::Normal,
@@ -353,7 +392,12 @@ impl Parser {
         } else {
             Bytes::new()
         };
-        let rhs = parse_expr(&mut mutable_loc, orig_rhs.clone(), ParseExprOpt::Define)?;
+        let rhs = parse_expr(
+            self.session,
+            &mut mutable_loc,
+            orig_rhs.clone(),
+            ParseExprOpt::Define,
+        )?;
 
         self.out_stmts.lock().push(AssignStmt::new(
             assign_loc,
@@ -385,7 +429,7 @@ impl Parser {
             CondOp::Ifdef
         };
         let mut mutable_loc = loc.clone();
-        let lhs = parse_expr(&mut mutable_loc, line, ParseExprOpt::Normal)?;
+        let lhs = parse_expr(self.session, &mut mutable_loc, line, ParseExprOpt::Normal)?;
         let stmt = IfStmt::new(loc, op, lhs, None);
         self.out_stmts.lock().push(stmt.clone());
         self.enter_if(stmt);
@@ -401,7 +445,11 @@ impl Parser {
         };
 
         if line.is_empty() {
-            error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
+            error_loc!(
+                &*self.session,
+                Some(&self.loc),
+                "*** invalid syntax in conditional."
+            );
         }
 
         let mut mutable_loc = loc.clone();
@@ -412,6 +460,7 @@ impl Parser {
             let terms = vec![b','];
             let mut n;
             (n, lhs) = parse_expr_impl(
+                self.session,
                 &mut mutable_loc,
                 line.clone(),
                 Some(&terms),
@@ -420,10 +469,15 @@ impl Parser {
             )?;
             line.advance(n);
             if line.first() != Some(&b',') {
-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
+                error_loc!(
+                    &*self.session,
+                    Some(&self.loc),
+                    "*** invalid syntax in conditional."
+                );
             }
             line = line.slice_ref(trim_left_space(&line[1..]));
             (n, rhs) = parse_expr_impl_ext(
+                self.session,
                 &mut mutable_loc,
                 line.clone(),
                 None,
@@ -434,16 +488,29 @@ impl Parser {
             line = line.slice_ref(trim_left_space(&line[n.min(line.len())..]));
         } else {
             if line.is_empty() {
-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
+                error_loc!(
+                    &*self.session,
+                    Some(&self.loc),
+                    "*** invalid syntax in conditional."
+                );
             }
             let quote = line[0];
             if quote != b'\'' && quote != b'"' {
-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
+                error_loc!(
+                    &*self.session,
+                    Some(&self.loc),
+                    "*** invalid syntax in conditional."
+                );
             }
             let Some(end) = memchr(quote, &line[1..]) else {
-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
+                error_loc!(
+                    &*self.session,
+                    Some(&self.loc),
+                    "*** invalid syntax in conditional."
+                );
             };
             lhs = parse_expr(
+                self.session,
                 &mut mutable_loc,
                 line.slice(1..end + 1),
                 ParseExprOpt::Normal,
@@ -452,16 +519,29 @@ impl Parser {
             line = line.slice_ref(trim_left_space(&line[end + 2..]));
 
             if line.is_empty() {
-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
+                error_loc!(
+                    &*self.session,
+                    Some(&self.loc),
+                    "*** invalid syntax in conditional."
+                );
             }
             let quote = line[0];
             if quote != b'\'' && quote != b'"' {
-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
+                error_loc!(
+                    &*self.session,
+                    Some(&self.loc),
+                    "*** invalid syntax in conditional."
+                );
             }
             let Some(end) = memchr(quote, &line[1..]) else {
-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
+                error_loc!(
+                    &*self.session,
+                    Some(&self.loc),
+                    "*** invalid syntax in conditional."
+                );
             };
             rhs = parse_expr(
+                self.session,
                 &mut mutable_loc,
                 line.slice(1..end + 1),
                 ParseExprOpt::Normal,
@@ -470,7 +550,11 @@ impl Parser {
         }
 
         if !line.is_empty() {
-            warn_loc!(Some(&self.loc), "extraneous text after `ifeq' directive")
+            warn_loc!(
+                &*self.session,
+                Some(&self.loc),
+                "extraneous text after `ifeq' directive"
+            )
         }
 
         let stmt = IfStmt::new(loc, op, lhs, Some(rhs));
@@ -483,7 +567,11 @@ impl Parser {
         self.check_if_stack("else")?;
         let st = self.if_stack.last_mut().unwrap();
         if st.is_in_else {
-            error_loc!(Some(&self.loc), "*** only one `else' per conditional.");
+            error_loc!(
+                &*self.session,
+                Some(&self.loc),
+                "*** only one `else' per conditional."
+            );
         }
         st.is_in_else = true;
         self.out_stmts = st.stmt.false_stmts.clone();
@@ -495,7 +583,11 @@ impl Parser {
 
         self.num_if_nest = st.num_nest + 1;
         if !self.handle_else_if_directive(&line.slice_ref(next_if))? {
-            warn_loc!(Some(&self.loc), "extraneous text after `else' directive");
+            warn_loc!(
+                &*self.session,
+                Some(&self.loc),
+                "extraneous text after `else' directive"
+            );
         }
         self.num_if_nest = 0;
         Ok(())
@@ -504,7 +596,11 @@ impl Parser {
     fn parse_endif(&mut self, line: Bytes) -> Result<()> {
         self.check_if_stack("endif")?;
         if !line.is_empty() {
-            error_loc!(Some(&self.loc), "extraneous text after `endif` directive");
+            error_loc!(
+                &*self.session,
+                Some(&self.loc),
+                "extraneous text after `endif` directive"
+            );
         }
         let num_nest = self.if_stack.last().unwrap().num_nest;
         for _ in 0..=num_nest {
@@ -529,7 +625,12 @@ impl Parser {
     fn create_export(&mut self, line: &Bytes, is_export: bool) -> Result<()> {
         let loc = self.loc.clone();
         let mut mutable_loc = loc.clone();
-        let expr = parse_expr(&mut mutable_loc, line.clone(), ParseExprOpt::Normal)?;
+        let expr = parse_expr(
+            self.session,
+            &mut mutable_loc,
+            line.clone(),
+            ParseExprOpt::Normal,
+        )?;
         self.out_stmts
             .lock()
             .push(ExportStmt::new(loc, expr, is_export));
@@ -566,7 +667,11 @@ impl Parser {
 
     fn check_if_stack(&self, keyword: &'static str) -> Result<()> {
         if self.if_stack.is_empty() {
-            error_loc!(Some(&self.loc), "*** extraneous `{keyword}'.");
+            error_loc!(
+                &*self.session,
+                Some(&self.loc),
+                "*** extraneous `{keyword}'."
+            );
         }
         Ok(())
     }
@@ -637,28 +742,37 @@ impl Parser {
     }
 }
 
-pub fn parse_file(buf: &Bytes, filename: Symbol) -> Result<Arc<Mutex<Vec<Stmt>>>> {
-    collect_stats!("parse file time");
+pub fn parse_file(
+    session: &mut Session,
+    buf: &Bytes,
+    filename: Symbol,
+) -> Result<Arc<Mutex<Vec<Stmt>>>> {
+    collect_stats!(&*session, "parse file time");
     let loc = Loc { filename, line: 0 };
-    parse_buf_no_stats_impl(buf, loc, false)
+    parse_buf_no_stats_impl(session, buf, loc, false)
 }
 
-pub fn parse_buf(buf: &Bytes, loc: Loc) -> Result<Arc<Mutex<Vec<Stmt>>>> {
-    collect_stats!("parse eval time");
-    parse_buf_no_stats_impl(buf, loc, true)
+pub fn parse_buf(session: &mut Session, buf: &Bytes, loc: Loc) -> Result<Arc<Mutex<Vec<Stmt>>>> {
+    collect_stats!(&*session, "parse eval time");
+    parse_buf_no_stats_impl(session, buf, loc, true)
 }
 
-pub fn parse_buf_no_stats(buf: &Bytes, loc: Loc) -> Result<Arc<Mutex<Vec<Stmt>>>> {
-    parse_buf_no_stats_impl(buf, loc, true)
+pub fn parse_buf_no_stats(
+    session: &mut Session,
+    buf: &Bytes,
+    loc: Loc,
+) -> Result<Arc<Mutex<Vec<Stmt>>>> {
+    parse_buf_no_stats_impl(session, buf, loc, true)
 }
 
 fn parse_buf_no_stats_impl(
+    session: &mut Session,
     buf: &Bytes,
     loc: Loc,
     fixed_lineno: bool,
 ) -> Result<Arc<Mutex<Vec<Stmt>>>> {
     let stmts = Arc::new(Mutex::new(Vec::new()));
-    let mut p = Parser::with_buf(buf, loc, stmts.clone(), fixed_lineno);
+    let mut p = Parser::with_buf(session, buf, loc, stmts.clone(), fixed_lineno);
     p.parse()?;
     Ok(stmts)
 }

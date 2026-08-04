@@ -16,24 +16,27 @@ limitations under the License.
 
 use std::time::Instant;
 
+use crate::session::Context;
+
 pub struct ScopedTimeReporter {
     name: String,
     start: Instant,
+    enabled: bool,
 }
 
 impl ScopedTimeReporter {
-    pub fn new(name: &str) -> Self {
-        let start = std::time::Instant::now();
+    pub fn new(ctx: &impl Context, name: &str) -> Self {
         Self {
             name: name.to_string(),
-            start,
+            start: std::time::Instant::now(),
+            enabled: ctx.flags().enable_stat_logs,
         }
     }
 }
 
 impl Drop for ScopedTimeReporter {
     fn drop(&mut self) {
-        if crate::flags::FLAGS.enable_stat_logs {
+        if self.enabled {
             let dur = self.start.elapsed();
             eprintln!("*kati*: {}: {}", self.name, dur.as_secs_f64());
         }

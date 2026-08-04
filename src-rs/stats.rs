@@ -16,8 +16,13 @@ limitations under the License.
 
 //! `kati::stats` implements stats collection and reporting about regions of
 //! execution.
+//!
+//! Collection sites used to expand to a `static` apiece, so the number of
+//! process globals grew with the number of call sites. They now name an entry
+//! in a session-owned [`StatsRegistry`], which the macros reach through
+//! whatever [`Context`] is in scope.
 
-use crate::{flags::FLAGS, symtab::symbol_count};
+use crate::session::{Context, Session};
 use parking_lot::Mutex;
 use std::{
     collections::{HashMap, HashSet},
@@ -27,7 +32,36 @@ use std::{
     time::{Duration, Instant},
 };
 
-static ALL_STATS: Mutex<Vec<Arc<Stats>>> = Mutex::new(Vec::new());
+/// Every collection site a session has reached, in the order it first reached
+/// them.
+// [spec:ronin:req:make.no-ambient-state]
+#[derive(Default)]
+pub struct StatsRegistry {
+    all: Mutex<Vec<Arc<Stats>>>,
+}
+
+impl StatsRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The entry named `name`, created on first use. There are a handful of
+    /// distinct names, so a linear scan keeps the report in creation order
+    /// without a second structure to hold it.
+    fn get_or_create(&self, name: &'static str) -> Arc<Stats> {
+        let mut all = self.all.lock();
+        if let Some(found) = all.iter().find(|s| s.name == name) {
+            return found.clone();
+        }
+        let stats = Arc::new(Stats::new(name));
+        all.push(stats.clone());
+        stats
+    }
+
+    fn take_all(&self) -> Vec<Arc<Stats>> {
+        std::mem::take(&mut self.all.lock())
+    }
+}
 
 #[derive(Default, Clone)]
 struct StatsDetails {
@@ -37,7 +71,7 @@ struct StatsDetails {
 
 /// `Stats` represents a single collection site.
 pub struct Stats {
-    name: String,
+    name: &'static str,
     count: Mutex<i64>,
     elapsed: Mutex<Duration>,
     detailed: Mutex<HashMap<OsString, StatsDetails>>,
@@ -45,20 +79,14 @@ pub struct Stats {
 }
 
 impl Stats {
-    /// Create a new `Stats` instance. Normally you would use [`collect_stats!`]
-    /// or [`collect_stats_with_slow_report!`] to call this.
-    #[doc(hidden)]
-    pub fn new(name: &str) -> Arc<Self> {
-        let stats = Arc::new(Self {
-            name: name.to_string(),
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
             elapsed: Mutex::new(Duration::new(0, 0)),
             count: Mutex::new(0),
             detailed: Mutex::new(HashMap::new()),
             interesting: Mutex::new(HashSet::new()),
-        });
-        let mut all_stats = ALL_STATS.lock();
-        all_stats.push(stats.clone());
-        stats
+        }
     }
 
     fn dump_top(&self) {
@@ -104,20 +132,6 @@ impl Stats {
                 name.to_string_lossy()
             );
         }
-    }
-
-    /// The implementation behind [`collect_stats!`]
-    #[doc(hidden)]
-    #[must_use]
-    pub fn start_scope(self: &Arc<Self>) -> impl Drop {
-        ScopedStatsRecorder::new(self)
-    }
-
-    /// The implementation behind [`collect_stats_with_slow_report!`]
-    #[doc(hidden)]
-    #[must_use]
-    pub fn start_scope_with_slow_report(self: &Arc<Self>, msg: &OsStr) -> impl Drop {
-        ScopedStatsRecorderWithSlowReport::new(self, msg)
     }
 
     fn start(&self) -> Instant {
@@ -175,19 +189,53 @@ impl Display for Stats {
     }
 }
 
-struct ScopedStatsRecorder<'a> {
-    st: &'a Stats,
+/// The implementation behind [`collect_stats!`]. Returns `None`, and records
+/// nothing, unless `--kati_stats` is on.
+#[doc(hidden)]
+#[must_use]
+pub fn start_scope(ctx: &impl Context, name: &'static str) -> Option<ScopedStatsRecorder> {
+    if !ctx.flags().enable_stat_logs {
+        return None;
+    }
+    Some(ScopedStatsRecorder::new(ctx.stats().get_or_create(name)))
+}
+
+/// The implementation behind [`collect_stats_with_slow_report!`].
+#[doc(hidden)]
+#[must_use]
+pub fn start_scope_with_slow_report(
+    ctx: &impl Context,
+    name: &'static str,
+    msg: &OsStr,
+) -> Option<ScopedStatsRecorderWithSlowReport> {
+    if !ctx.flags().enable_stat_logs {
+        return None;
+    }
+    Some(ScopedStatsRecorderWithSlowReport::new(
+        ctx.stats().get_or_create(name),
+        msg.to_os_string(),
+    ))
+}
+
+/// Mark the makefile `name` as interesting at the `included makefiles` site.
+pub fn mark_interesting(ctx: &impl Context, site: &'static str, name: OsString) {
+    ctx.stats().get_or_create(site).mark_interesting(name);
+}
+
+#[doc(hidden)]
+pub struct ScopedStatsRecorder {
+    st: Arc<Stats>,
     start: Instant,
 }
 
-impl<'a> ScopedStatsRecorder<'a> {
-    fn new(st: &'a Stats) -> Self {
+impl ScopedStatsRecorder {
+    fn new(st: Arc<Stats>) -> Self {
         let start = st.start();
         Self { st, start }
     }
 }
 
-impl Drop for ScopedStatsRecorder<'_> {
+impl Drop for ScopedStatsRecorder {
     fn drop(&mut self) {
         self.st.end(self.start);
     }
@@ -196,36 +244,32 @@ impl Drop for ScopedStatsRecorder<'_> {
 /// Define and collect statistics about this block of code.
 ///
 /// We'll record both the count and duration of these blocks, and report them
-/// when [`report_all_stats`] is called.
+/// when [`report_all_stats`] is called. The first argument is whatever carries
+/// the session: an `Evaluator`, or the `Session` itself.
 #[macro_export]
 macro_rules! collect_stats {
-    ($name:literal) => {
-        static STATS: std::sync::LazyLock<std::sync::Arc<$crate::stats::Stats>> =
-            std::sync::LazyLock::new(|| $crate::stats::Stats::new($name));
-        let _ssr = if $crate::flags::FLAGS.enable_stat_logs {
-            Some(STATS.start_scope())
-        } else {
-            None
-        };
+    ($ctx:expr, $name:literal) => {
+        let _ssr = $crate::stats::start_scope($ctx, $name);
     };
 }
 
-struct ScopedStatsRecorderWithSlowReport<'a, 'b> {
-    st: &'a Stats,
-    msg: &'b OsStr,
+#[doc(hidden)]
+pub struct ScopedStatsRecorderWithSlowReport {
+    st: Arc<Stats>,
+    msg: OsString,
     start: Instant,
 }
 
-impl<'a, 'b> ScopedStatsRecorderWithSlowReport<'a, 'b> {
-    fn new(st: &'a Stats, msg: &'b OsStr) -> Self {
+impl ScopedStatsRecorderWithSlowReport {
+    fn new(st: Arc<Stats>, msg: OsString) -> Self {
         let start = st.start();
         Self { st, msg, start }
     }
 }
 
-impl Drop for ScopedStatsRecorderWithSlowReport<'_, '_> {
+impl Drop for ScopedStatsRecorderWithSlowReport {
     fn drop(&mut self) {
-        let dur = self.st.end_with_msg(self.start, self.msg);
+        let dur = self.st.end_with_msg(self.start, &self.msg);
         if dur > Duration::from_secs(3) {
             eprintln!(
                 "*kati*: slow {} ({}): {}",
@@ -247,26 +291,25 @@ impl Drop for ScopedStatsRecorderWithSlowReport<'_, '_> {
 /// Any executions over 3 seconds will be logged as they happen.
 #[macro_export]
 macro_rules! collect_stats_with_slow_report {
-    ($name:literal, $msg:expr) => {
-        static STATS: std::sync::LazyLock<std::sync::Arc<$crate::stats::Stats>> =
-            std::sync::LazyLock::new(|| $crate::stats::Stats::new($name));
-        let _ssr = if $crate::flags::FLAGS.enable_stat_logs {
-            Some(STATS.start_scope_with_slow_report($msg))
-        } else {
-            None
-        };
+    ($ctx:expr, $name:literal, $msg:expr) => {
+        let _ssr = $crate::stats::start_scope_with_slow_report($ctx, $name, $msg);
     };
 }
 
 /// Report all the statistics to stderr, if `--enable_stat_log` is enabled.
-pub fn report_all_stats() {
-    let all_stats = std::mem::take(&mut *ALL_STATS.lock());
-    if FLAGS.enable_stat_logs {
+pub fn report_all_stats(session: &Session) {
+    let all_stats = session.stats.take_all();
+    if session.flags.enable_stat_logs {
         for stats in all_stats {
             eprintln!("*kati*: {stats}");
             stats.dump_top();
         }
-        eprintln!("*kati*: {} symbols", symbol_count());
-        eprintln!("*kati*: {} find nodes", crate::find::get_node_count());
+        eprintln!("*kati*: {} symbols", session.symtab.count());
+        eprintln!(
+            "*kati*: {} find nodes",
+            session
+                .find_node_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 }

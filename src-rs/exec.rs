@@ -26,7 +26,6 @@ use crate::{
     error,
     eval::{Evaluator, FrameType},
     fileutil::{RedirectStderr, get_timestamp, run_command},
-    flags::FLAGS,
     log,
     symtab::Symbol,
     warn,
@@ -83,13 +82,13 @@ impl<'a> Executor<'a> {
         needed_by: Option<&[u8]>,
     ) -> Result<ExecStatus> {
         let output = n.lock().output;
-        let output_str = output.as_bytes();
+        let output_str = output.as_bytes(&self.ce.ev.session);
         if let Some(found) = self.done.get(&output) {
             if found == &ExecStatus::Processing {
                 warn!(
                     "Circular {} <- {} dependency dropped.",
                     String::from_utf8_lossy(needed_by.unwrap_or(b"(null)")),
-                    output
+                    output.display(&self.ce.ev.session)
                 )
             }
             return Ok(*found);
@@ -105,25 +104,30 @@ impl<'a> Executor<'a> {
         let output_ts = ExecStatus::Timestamp(output_timestamp);
 
         log!(
-            "ExecNode: {output} for {}",
+            "ExecNode: {} for {}",
+            output.display(&self.ce.ev.session),
             String::from_utf8_lossy(needed_by.unwrap_or(b"(null)"))
         );
 
         if !n.lock().has_rule && output_timestamp.is_none() && !n.lock().is_phony {
             if let Some(needed_by) = needed_by {
                 error!(
-                    "*** No rule to make target '{output}', needed by '{}'.",
+                    "*** No rule to make target '{}', needed by '{}'.",
+                    output.display(&self.ce.ev.session),
                     String::from_utf8_lossy(needed_by)
                 );
             } else {
-                error!("*** No rule to make target '{output}'");
+                error!(
+                    "*** No rule to make target '{}'",
+                    output.display(&self.ce.ev.session)
+                );
             }
         }
 
         let mut latest = ExecStatus::Processing;
         let order_onlys = n.lock().order_onlys.clone();
         for (_, d) in order_onlys {
-            let dep_out = d.lock().output.as_bytes();
+            let dep_out = d.lock().output.as_bytes(&self.ce.ev.session);
             if std::fs::exists(OsStr::from_bytes(&dep_out))? {
                 continue;
             }
@@ -152,7 +156,7 @@ impl<'a> Executor<'a> {
             if command.echo {
                 println!("{}", String::from_utf8_lossy(&command.cmd));
             }
-            if !FLAGS.is_dry_run {
+            if !self.ce.ev.session.flags.is_dry_run {
                 let (status, output) = run_command(
                     &self.shell,
                     self.shellflag,
@@ -164,13 +168,13 @@ impl<'a> Executor<'a> {
                     if command.ignore_error {
                         eprintln!(
                             "[{}] Error {} (ignored)",
-                            command.output,
+                            command.output.display(&self.ce.ev.session),
                             status.code().unwrap_or(1)
                         )
                     } else {
                         error!(
                             "*** [{}] Error {}",
-                            command.output,
+                            command.output.display(&self.ce.ev.session),
                             status.code().unwrap_or(1)
                         );
                     }
@@ -190,7 +194,10 @@ pub fn exec(roots: Vec<NamedDepNode>, ev: &mut Evaluator) -> Result<()> {
     }
     if executor.num_commands == 0 {
         for (sym, _) in roots {
-            println!("kati: Nothing to be done for `{sym}'.")
+            println!(
+                "kati: Nothing to be done for `{}'.",
+                sym.display(&executor.ce.ev.session)
+            )
         }
     }
     Ok(())

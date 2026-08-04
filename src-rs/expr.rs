@@ -21,11 +21,11 @@ use bytes::{BufMut, Bytes, BytesMut};
 use memchr::memchr;
 
 use crate::eval::{Evaluator, FrameType};
-use crate::flags::FLAGS;
 use crate::func::{FuncInfo, get_func_info};
 use crate::loc::Loc;
+use crate::session::Session;
 use crate::strutil::{Pattern, WordWriter, trim_right_space, trim_suffix, word_scanner};
-use crate::symtab::{Symbol, intern};
+use crate::symtab::{Symbol, Symtab};
 use crate::{error_loc, kati_warn_loc, log};
 
 pub trait Evaluable {
@@ -51,7 +51,7 @@ pub trait Evaluable {
     // expansion variable, and return true in that case. Implementations of this
     // function must also not mark variables as used, as that can trigger unwanted
     // warnings. They should use ev->PeekVar().
-    fn is_func(&self) -> bool;
+    fn is_func(&self, names: &Symtab) -> bool;
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -96,7 +96,8 @@ impl Evaluable for Value {
                     let v = v.read();
                     v.used(ev, &sym)?;
                     v.eval(ev, out)?;
-                    v.check_current_referencing_file(&ev.loc, sym)?;
+                    let loc = ev.loc.clone();
+                    v.check_current_referencing_file(&ev.session, &loc, sym)?;
                     ev.var_eval_complete(sym);
                 }
             }
@@ -104,12 +105,13 @@ impl Evaluable for Value {
                 ev.eval_depth += 1;
                 let name = var.eval_to_buf(ev)?;
                 ev.eval_depth -= 1;
-                let sym = intern(name);
+                let sym = ev.session.intern(name);
                 if let Some(v) = ev.lookup_var_for_eval(sym)? {
                     let v = v.read();
                     v.used(ev, &sym)?;
                     v.eval(ev, out)?;
-                    v.check_current_referencing_file(&ev.loc, sym)?;
+                    let loc = ev.loc.clone();
+                    v.check_current_referencing_file(&ev.session, &loc, sym)?;
                     ev.var_eval_complete(sym);
                 }
             }
@@ -121,7 +123,7 @@ impl Evaluable for Value {
             } => {
                 ev.eval_depth += 1;
                 let name = name.eval_to_buf(ev)?;
-                let sym = intern(name);
+                let sym = ev.session.intern(name);
                 let v = ev.lookup_var(sym)?;
                 let pat_str = pat.eval_to_buf(ev)?;
                 let subst = subst.eval_to_buf(ev)?;
@@ -154,16 +156,16 @@ impl Evaluable for Value {
         Ok(())
     }
 
-    fn is_func(&self) -> bool {
+    fn is_func(&self, names: &Symtab) -> bool {
         match self {
             Value::Func { .. } => true,
-            Value::List(_, list) => list.iter().any(|v| v.is_func()),
+            Value::List(_, list) => list.iter().any(|v| v.is_func(names)),
             Value::SymRef(_, sym) => {
                 // This is a heuristic, where say that if a variable has positional
                 // parameters, we think it is likely to be a function. Callers can use
                 // .KATI_SYMBOLS to extract variables and their values, without evaluating
                 // macros that are likely to have side effects.
-                crate::strutil::is_integer(&sym.as_bytes())
+                crate::strutil::is_integer(&sym.as_bytes(names))
             }
             Value::VarRef(_, _) => {
                 // This is the unhandled edge case as described in the Evaluable::is_func
@@ -171,7 +173,7 @@ impl Evaluable for Value {
             }
             Value::VarSubst {
                 name, pat, subst, ..
-            } => name.is_func() || pat.is_func() || subst.is_func(),
+            } => name.is_func(names) || pat.is_func(names) || subst.is_func(names),
             Value::Literal(_, _) => false,
         }
     }
@@ -224,6 +226,7 @@ fn skip_spaces(loc: &mut Loc, s: &[u8], terms: &[u8]) -> usize {
 }
 
 fn parse_func(
+    session: &mut Session,
     loc: &mut Loc,
     fi: &FuncInfo,
     s: Bytes,
@@ -266,6 +269,7 @@ fn parse_func(
 
         let trim_right_space = fi.trim_space || (nargs == 1 && fi.trim_right_space_1st);
         let (n, val) = parse_expr_impl(
+            session,
             loc,
             s.slice(i..),
             Some(&terms),
@@ -277,6 +281,7 @@ fn parse_func(
         i += n;
         if i == s.len() {
             error_loc!(
+                session,
                 Some(&start_loc),
                 "*** unterminated call to function '{}': missing '{}'.",
                 String::from_utf8_lossy(fi.name),
@@ -296,6 +301,7 @@ fn parse_func(
 
     if nargs <= fi.min_arity {
         error_loc!(
+            session,
             Some(&start_loc),
             "*** insufficient number of arguments ({}) to function `{}'.",
             nargs - 1,
@@ -306,7 +312,12 @@ fn parse_func(
     Ok((i, args))
 }
 
-fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<Value>)> {
+fn parse_dollar(
+    session: &mut Session,
+    loc: &mut Loc,
+    s: Bytes,
+    end_paren: bool,
+) -> Result<(usize, Arc<Value>)> {
     assert!(s.len() >= 2);
     assert!(s.starts_with(b"$"));
     assert!(!s.starts_with(b"$$"));
@@ -314,32 +325,38 @@ fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<
     let start_loc = loc.clone();
 
     let Some(cp) = close_paren(s[1]) else {
-        return Ok((
-            2,
-            Arc::new(Value::SymRef(start_loc.clone(), intern(s.slice(1..2)))),
-        ));
+        let sym = session.intern(s.slice(1..2));
+        return Ok((2, Arc::new(Value::SymRef(start_loc.clone(), sym))));
     };
 
     let mut terms = vec![cp, b':', b' '];
     let mut i = 2;
     loop {
-        let (n, vname) =
-            parse_expr_impl(loc, s.slice(i..), Some(&terms), ParseExprOpt::Normal, false)?;
+        let (n, vname) = parse_expr_impl(
+            session,
+            loc,
+            s.slice(i..),
+            Some(&terms),
+            ParseExprOpt::Normal,
+            false,
+        )?;
         i += n;
 
         let t: &[u8] = &s[i..];
         if t.first() == Some(&cp) || (end_paren && t.is_empty() && cp == b')') {
             if let Value::Literal(_, lit) = &*vname {
-                let sym = intern(lit.clone());
-                if FLAGS.enable_kati_warnings
-                    && let Some(found) = sym.to_string().find([' ', '(', '{'])
-                {
-                    kati_warn_loc!(
-                        Some(&start_loc),
-                        "*warning*: variable lookup with '{}': {}",
-                        &sym.to_string()[found..found + 1],
-                        String::from_utf8_lossy(&s)
-                    )
+                let sym = session.intern(lit.clone());
+                if session.flags.enable_kati_warnings {
+                    let name = sym.display(&*session).to_string();
+                    if let Some(found) = name.find([' ', '(', '{']) {
+                        kati_warn_loc!(
+                            session,
+                            Some(&start_loc),
+                            "*warning*: variable lookup with '{}': {}",
+                            &name[found..found + 1],
+                            String::from_utf8_lossy(&s)
+                        )
+                    }
                 }
                 return Ok((i + 1, Arc::new(Value::SymRef(start_loc, sym))));
             }
@@ -350,7 +367,7 @@ fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<
             // ${func ...}
             if let Value::Literal(_, lit) = &*vname {
                 if let Some(fi) = get_func_info(lit) {
-                    let (idx, args) = parse_func(loc, fi, s, i + 1, terms)?;
+                    let (idx, args) = parse_func(session, loc, fi, s, i + 1, terms)?;
                     return Ok((
                         idx,
                         Arc::new(Value::Func {
@@ -361,6 +378,7 @@ fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<
                     ));
                 } else {
                     kati_warn_loc!(
+                        session,
                         Some(&start_loc),
                         "*warning*: unknown make function {lit:?}: {}",
                         String::from_utf8_lossy(&s)
@@ -380,6 +398,7 @@ fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<
             terms.truncate(2);
             terms[1] = b'=';
             let (n, pat) = parse_expr_impl(
+                session,
                 loc,
                 s.slice(i + 1..),
                 Some(&terms),
@@ -406,6 +425,7 @@ fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<
 
             terms.truncate(1);
             let (n, subst) = parse_expr_impl(
+                session,
                 loc,
                 s.slice(i + 1..),
                 Some(&terms),
@@ -428,31 +448,36 @@ fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<
         // for detail.
         if let Some(found) = memchr(cp, &s) {
             kati_warn_loc!(
+                session,
                 Some(&start_loc),
                 "*warning*: unmatched parentheses: {}",
                 String::from_utf8_lossy(&s)
             );
-            return Ok((
-                s.len(),
-                Arc::new(Value::SymRef(start_loc.clone(), intern(s.slice(2..found)))),
-            ));
+            let sym = session.intern(s.slice(2..found));
+            return Ok((s.len(), Arc::new(Value::SymRef(start_loc.clone(), sym))));
         }
 
-        error_loc!(Some(&start_loc), "*** unterminated variable reference.");
+        error_loc!(
+            session,
+            Some(&start_loc),
+            "*** unterminated variable reference."
+        );
     }
 }
 
 pub fn parse_expr_impl(
+    session: &mut Session,
     loc: &mut Loc,
     s: Bytes,
     terms: Option<&[u8]>,
     opt: ParseExprOpt,
     trim_right_sp: bool,
 ) -> Result<(usize, Arc<Value>)> {
-    parse_expr_impl_ext(loc, s, terms, opt, trim_right_sp, false)
+    parse_expr_impl_ext(session, loc, s, terms, opt, trim_right_sp, false)
 }
 
 pub fn parse_expr_impl_ext(
+    session: &mut Session,
     loc: &mut Loc,
     s: Bytes,
     terms: Option<&[u8]>,
@@ -527,7 +552,7 @@ pub fn parse_expr_impl_ext(
                 return Ok((i + 1, Arc::new(Value::List(Some(item_loc), list))));
             }
 
-            let (n, v) = parse_dollar(loc, s.slice(i..), end_paren)?;
+            let (n, v) = parse_dollar(session, loc, s.slice(i..), end_paren)?;
             list.push(v);
             i += n;
             b = i;
@@ -627,8 +652,13 @@ pub fn parse_expr_impl_ext(
     }
 }
 
-pub fn parse_expr(loc: &mut Loc, s: Bytes, opt: ParseExprOpt) -> Result<Arc<Value>> {
-    let (_i, val) = parse_expr_impl(loc, s, None, opt, false)?;
+pub fn parse_expr(
+    session: &mut Session,
+    loc: &mut Loc,
+    s: Bytes,
+    opt: ParseExprOpt,
+) -> Result<Arc<Value>> {
+    let (_i, val) = parse_expr_impl(session, loc, s, None, opt, false)?;
     Ok(val)
 }
 
@@ -638,8 +668,10 @@ mod tests {
 
     #[test]
     fn test_parse_expr() {
+        let mut session = Session::new();
         assert_eq!(
             parse_expr(
+                &mut session,
                 &mut Loc::default(),
                 Bytes::from_static(b"foo"),
                 ParseExprOpt::Normal
@@ -647,22 +679,25 @@ mod tests {
             .unwrap(),
             Arc::new(Value::Literal(None, Bytes::from_static(b"foo")))
         );
+        let foo = session.intern("foo");
         assert_eq!(
             parse_expr(
+                &mut session,
                 &mut Loc::default(),
                 Bytes::from_static(b"$(foo)"),
                 ParseExprOpt::Normal
             )
             .unwrap(),
-            Arc::new(Value::SymRef(Loc::default(), intern("foo")))
+            Arc::new(Value::SymRef(Loc::default(), foo))
         );
     }
 
     #[test]
     fn test_eval_define_simplified() {
+        let mut session = Session::new();
         let s = Bytes::from_static(b"$(eval dst := $$(notdir $$(src)))");
         assert_eq!(
-            parse_expr(&mut Loc::default(), s, ParseExprOpt::Define).unwrap(),
+            parse_expr(&mut session, &mut Loc::default(), s, ParseExprOpt::Define).unwrap(),
             Arc::new(Value::Func {
                 loc: Loc::default(),
                 fi: get_func_info(b"eval").unwrap(),
@@ -682,12 +717,21 @@ mod tests {
 
     #[test]
     fn test_parse_dollar() {
+        let mut session = Session::new();
+        let foo = session.intern("foo");
         assert_eq!(
-            parse_dollar(&mut Loc::default(), Bytes::from_static(b"${foo}bar"), false).unwrap(),
-            (6, Arc::new(Value::SymRef(Loc::default(), intern("foo"))))
+            parse_dollar(
+                &mut session,
+                &mut Loc::default(),
+                Bytes::from_static(b"${foo}bar"),
+                false
+            )
+            .unwrap(),
+            (6, Arc::new(Value::SymRef(Loc::default(), foo)))
         );
         assert_eq!(
             parse_dollar(
+                &mut session,
                 &mut Loc::default(),
                 Bytes::from_static(b"$(info ***   - Re-execute)"),
                 false,
@@ -707,6 +751,7 @@ mod tests {
         );
         assert_eq!(
             parse_dollar(
+                &mut session,
                 &mut Loc::default(),
                 Bytes::from_static(b"$(info ***   - Re-execute envsetup (\". envsetup.sh\"))"),
                 false,
@@ -728,8 +773,11 @@ mod tests {
 
     #[test]
     fn test_call_func() {
+        let mut session = Session::new();
+        let upper = session.intern("upper");
         assert_eq!(
             parse_expr(
+                &mut session,
                 &mut Loc::default(),
                 Bytes::from_static(b"$(call to-lower,$(upper))"),
                 ParseExprOpt::Normal
@@ -740,7 +788,7 @@ mod tests {
                 fi: get_func_info(b"call").unwrap(),
                 args: vec![
                     Arc::new(Value::Literal(None, Bytes::from_static(b"to-lower"))),
-                    Arc::new(Value::SymRef(Loc::default(), intern("upper"))),
+                    Arc::new(Value::SymRef(Loc::default(), upper)),
                 ],
             })
         )
@@ -748,8 +796,12 @@ mod tests {
 
     #[test]
     fn test_subst2() {
+        let mut session = Session::new();
+        let space = session.intern("space");
+        let foo = session.intern("foo");
         assert_eq!(
             parse_expr(
+                &mut session,
                 &mut Loc::default(),
                 Bytes::from_static(b"$(subst $(space),$,,$(foo))"),
                 ParseExprOpt::Normal
@@ -759,13 +811,13 @@ mod tests {
                 loc: Loc::default(),
                 fi: get_func_info(b"subst").unwrap(),
                 args: vec![
-                    Arc::new(Value::SymRef(Loc::default(), intern("space"))),
+                    Arc::new(Value::SymRef(Loc::default(), space)),
                     Arc::new(Value::Literal(None, Bytes::from_static(b"$"))),
                     Arc::new(Value::List(
                         Some(Loc::default()),
                         vec![
                             Arc::new(Value::Literal(None, Bytes::from_static(b","))),
-                            Arc::new(Value::SymRef(Loc::default(), intern("foo"))),
+                            Arc::new(Value::SymRef(Loc::default(), foo)),
                         ]
                     )),
                 ],
@@ -778,9 +830,11 @@ mod tests {
         // ckati does not error on lines like `ifeq (foo,$(BAR)` as parse_expr
         // gets `$(BAR`, but reads off the end of the string view to find the
         // ending `)`.
+        let mut session = Session::new();
         let mut loc = Loc::default();
         assert_eq!(
             parse_expr_impl_ext(
+                &mut session,
                 &mut loc,
                 Bytes::from_static(b"$(BAR"),
                 None,
@@ -792,8 +846,10 @@ mod tests {
             .to_string(),
             "<unknown>:0: *** unterminated variable reference."
         );
+        let bar = session.intern("BAR");
         assert_eq!(
             parse_expr_impl_ext(
+                &mut session,
                 &mut loc,
                 Bytes::from_static(b"$(BAR"),
                 None,
@@ -802,7 +858,7 @@ mod tests {
                 true
             )
             .unwrap(),
-            (6, Arc::new(Value::SymRef(loc, intern("BAR"))))
+            (6, Arc::new(Value::SymRef(loc, bar)))
         );
     }
 }

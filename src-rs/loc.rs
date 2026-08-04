@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Display, sync::LazyLock};
+use std::fmt::Display;
 
-use crate::symtab::{Symbol, intern};
+use crate::symtab::{Interner, Symbol, Symtab};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loc {
@@ -24,18 +24,41 @@ pub struct Loc {
     pub line: i32,
 }
 
-impl Display for Loc {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.filename, self.line)
+impl Loc {
+    /// A borrowing wrapper that renders this location through `names`.
+    ///
+    /// The inherent `Display` this replaces reached for a process-global
+    /// interner to render the filename. Every user-facing diagnostic goes
+    /// through here, so the interner has to be reachable wherever one is
+    /// raised.
+    // [spec:ronin:req:make.no-ambient-state]
+    pub fn display<'a, T: Interner + ?Sized>(&self, names: &'a T) -> LocDisplay<'a> {
+        LocDisplay {
+            symtab: names.symtab(),
+            filename: self.filename,
+            line: self.line,
+        }
     }
 }
 
-static DEFAULT_FILENAME: LazyLock<Symbol> = LazyLock::new(|| intern("<unknown>"));
+pub struct LocDisplay<'a> {
+    symtab: &'a Symtab,
+    filename: Symbol,
+    line: i32,
+}
 
+impl Display for LocDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.filename.display(self.symtab), self.line)
+    }
+}
+
+/// The location of something with no location, whose filename is the
+/// `<unknown>` every interner preloads.
 impl Default for Loc {
     fn default() -> Self {
         Loc {
-            filename: *DEFAULT_FILENAME,
+            filename: Symbol::UNKNOWN_FILENAME,
             line: 0,
         }
     }

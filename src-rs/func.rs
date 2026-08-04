@@ -26,29 +26,23 @@ use std::{
 
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use parking_lot::Mutex;
 
 use crate::{
     collect_stats, collect_stats_with_slow_report, error_loc,
     eval::{Evaluator, ExportAllowed, FrameType},
     expr::{Evaluable, Value},
-    file_cache::add_extra_file_dep,
     fileutil::{RedirectStderr, run_command},
     find::FindCommand,
-    flags::FLAGS,
     kati_warn_loc,
     loc::Loc,
     log,
     parser::parse_buf,
+    session::Session,
     strutil::{
         Pattern, WordWriter, echo_escape, format_for_command_substitution, has_path_prefix,
         normalize_path, trim_left_space, trim_space, word_scanner,
     },
-    symtab::intern,
-    var::{
-        VarOrigin, Variable, set_global_var, set_shell_status_var, with_global_var_bound,
-        with_global_vars_bound,
-    },
+    var::{VarOrigin, Variable},
     warn_loc,
 };
 
@@ -233,7 +227,7 @@ fn filter_out_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut
 
 fn sort_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
     let list = args[0].eval_to_buf(ev)?;
-    collect_stats!("func sort time");
+    collect_stats!(ev, "func sort time");
     let mut toks: Vec<&[u8]> = word_scanner(&list).collect();
     toks.sort();
     let mut ww = WordWriter::new(out);
@@ -256,6 +250,7 @@ fn word_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
     let n_str = args[0].eval_to_buf(ev)?;
     let Ok(mut n) = get_numeric_value_for_func(&n_str) else {
         error_loc!(
+            ev,
             ev.loc.as_ref(),
             "*** non-numeric first argument to `word' function: '{}'.",
             String::from_utf8_lossy(&n_str)
@@ -263,6 +258,7 @@ fn word_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
     };
     if n == 0 {
         error_loc!(
+            ev,
             ev.loc.as_ref(),
             "*** first argument to `word' function must be greater than 0."
         );
@@ -283,6 +279,7 @@ fn wordlist_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) 
     let s_str = args[0].eval_to_buf(ev)?;
     let Ok(si) = get_numeric_value_for_func(&s_str) else {
         error_loc!(
+            ev,
             ev.loc.as_ref(),
             "*** non-numeric first argument to `wordlist' function: '{}'.",
             String::from_utf8_lossy(&s_str)
@@ -290,6 +287,7 @@ fn wordlist_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) 
     };
     if si == 0 {
         error_loc!(
+            ev,
             ev.loc.as_ref(),
             "*** invalid first argument to `wordlist' function: {}`",
             String::from_utf8_lossy(&s_str)
@@ -299,6 +297,7 @@ fn wordlist_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) 
     let e_str = args[1].eval_to_buf(ev)?;
     let Ok(ei) = get_numeric_value_for_func(&e_str) else {
         error_loc!(
+            ev,
             ev.loc.as_ref(),
             "*** non-numeric second argument to `wordlist' function: '{}'.",
             String::from_utf8_lossy(&e_str)
@@ -366,13 +365,13 @@ fn join_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
 
 fn wildcard_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
     let pat = args[0].eval_to_buf(ev)?;
-    collect_stats!("func wildcard time");
+    collect_stats!(ev, "func wildcard time");
     // Note GNU make does not delay the execution of $(wildcard) so we
     // do not need to check avoid_io here.
     let mut ww = WordWriter::new(out);
     for tok in word_scanner(&pat) {
         let tok = pat.slice_ref(tok);
-        let files = crate::fileutil::glob(tok);
+        let files = ev.session.glob(tok);
         if let Ok(files) = files.as_ref() {
             for f in files {
                 ww.write(f);
@@ -517,10 +516,11 @@ fn or_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Res
 
 fn value_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
     let var_name = args[0].eval_to_buf(ev)?;
-    let Some(var) = ev.lookup_var(intern(var_name))? else {
+    let sym = ev.session.intern(var_name);
+    let Some(var) = ev.lookup_var(sym)? else {
         return Ok(());
     };
-    out.put_slice(&var.read().string()?);
+    out.put_slice(&var.read().string(&ev.session)?);
     Ok(())
 }
 
@@ -528,13 +528,15 @@ fn eval_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> 
     let text = args[0].eval_to_buf(ev)?;
     if ev.avoid_io {
         kati_warn_loc!(
+            ev,
             ev.loc.as_ref(),
             "*warning*: $(eval) in a recipe is not recommended: {}",
             String::from_utf8_lossy(&text)
         );
     }
-    let stmts = parse_buf(&text, ev.loc.clone().unwrap_or_default())?;
-    let stmts = stmts.lock();
+    let loc = ev.loc.clone().unwrap_or_default();
+    let stmts = parse_buf(&mut ev.session, &text, loc)?;
+    let stmts = stmts.lock().clone();
     for stmt in stmts.iter() {
         log!("{:?}", stmt);
         stmt.eval(ev)?;
@@ -558,6 +560,7 @@ fn has_no_io_in_shell_script(cmd: &[u8]) -> bool {
 }
 
 fn shell_func_impl(
+    session: &Session,
     shell: &[u8],
     shellflag: &[u8],
     cmd: &Bytes,
@@ -565,14 +568,14 @@ fn shell_func_impl(
 ) -> Result<(i32, Bytes, Option<FindCommand>)> {
     log!("ShellFunc: {:?}", cmd);
 
-    if FLAGS.use_find_emulator
-        && let Some(fc) = crate::find::parse(cmd)?
-        && let Some(out) = crate::find::find(cmd, &fc, loc)?
+    if session.flags.use_find_emulator
+        && let Some(fc) = crate::find::parse(session, cmd)?
+        && let Some(out) = crate::find::find(session, cmd, &fc, loc)?
     {
         return Ok((0, out, Some(fc)));
     }
 
-    collect_stats_with_slow_report!("func shell time", OsStr::from_bytes(cmd));
+    collect_stats_with_slow_report!(session, "func shell time", OsStr::from_bytes(cmd));
     let (status, output) = run_command(shell, shellflag, cmd, RedirectStderr::None)?;
     let output = Bytes::from(format_for_command_substitution(output));
 
@@ -583,15 +586,15 @@ fn shell_func_impl(
     Ok((exit_code, output, None))
 }
 
-fn should_store_command_result(cmd: &[u8]) -> bool {
+fn should_store_command_result(session: &Session, cmd: &[u8]) -> bool {
     // We really just want to ignore this one, or remove BUILD_DATETIME from
     // Android completely
     if cmd == b"date +%s" {
         return false;
     }
 
-    if let Some(pat) = &FLAGS.ignore_dirty_pattern {
-        let nopat = &FLAGS.no_ignore_dirty_pattern;
+    if let Some(pat) = &session.flags.ignore_dirty_pattern {
+        let nopat = &session.flags.no_ignore_dirty_pattern;
         for tok in word_scanner(cmd) {
             if pat.matches(tok) && !nopat.as_ref().map(|p| p.matches(tok)).unwrap_or(false) {
                 return false;
@@ -601,9 +604,6 @@ fn should_store_command_result(cmd: &[u8]) -> bool {
 
     true
 }
-
-pub static COMMAND_RESULTS: LazyLock<Mutex<Vec<CommandResult>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum CommandOp {
@@ -655,6 +655,7 @@ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> 
     if ev.avoid_io && !has_no_io_in_shell_script(&cmd) {
         if ev.eval_depth > 1 {
             error_loc!(
+                ev,
                 ev.loc.as_ref(),
                 "kati doesn't support passing results of $(shell) to other make constructs: {}",
                 String::from_utf8_lossy(&cmd)
@@ -671,10 +672,10 @@ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> 
     let shell = ev.get_shell()?;
     let shellflag = ev.get_shell_flag();
 
-    let (exit_code, output, fc) = shell_func_impl(&shell, shellflag, &cmd, &loc)?;
+    let (exit_code, output, fc) = shell_func_impl(&ev.session, &shell, shellflag, &cmd, &loc)?;
     out.put_slice(&output);
-    if should_store_command_result(&cmd) {
-        COMMAND_RESULTS.lock().push(CommandResult {
+    if should_store_command_result(&ev.session, &cmd) {
+        ev.session.command_results.push(CommandResult {
             op: if fc.is_some() {
                 CommandOp::Find
             } else {
@@ -688,7 +689,7 @@ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> 
             loc,
         })
     }
-    set_shell_status_var(exit_code);
+    ev.session.shell_status = Some(exit_code);
     Ok(())
 }
 
@@ -704,6 +705,7 @@ fn shell_no_rerun_func(
         // instead of run directly by kati. So it already has the benefits of not
         // rerunning every time kati is invoked.
         error_loc!(
+            ev,
             ev.loc.as_ref(),
             "KATI_shell_no_rerun provides no benefit over regular $(shell) inside of a rule."
         );
@@ -713,24 +715,26 @@ fn shell_no_rerun_func(
     let shell = ev.get_shell()?;
     let shellflag = ev.get_shell_flag();
 
-    let (exit_code, output, _) = shell_func_impl(&shell, shellflag, &cmd, &loc)?;
+    let (exit_code, output, _) = shell_func_impl(&ev.session, &shell, shellflag, &cmd, &loc)?;
     out.put_slice(&output);
-    set_shell_status_var(exit_code);
+    ev.session.shell_status = Some(exit_code);
     Ok(())
 }
 
 fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
     let func_name_buf = args[0].eval_to_buf(ev)?;
     let func_name_buf = func_name_buf.slice_ref(trim_space(&func_name_buf));
-    let func_sym = intern(func_name_buf.clone());
+    let func_sym = ev.session.intern(func_name_buf.clone());
     let func = ev.lookup_var(func_sym)?;
     if let Some(func) = &func {
         let func = func.read();
         func.used(ev, &func_sym)?;
-    } else if FLAGS.enable_kati_warnings {
+    } else if ev.session.flags.enable_kati_warnings {
         kati_warn_loc!(
+            ev,
             ev.loc.as_ref(),
-            "*warning*: undefined user function: {func_sym}"
+            "*warning*: undefined user function: {}",
+            func_sym.display(ev)
         );
     }
     let mut av = Vec::with_capacity(args.len() - 1);
@@ -745,7 +749,7 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
     let mut bindings = Vec::new();
     let mut i = 1;
     loop {
-        let tmpvar_name_sym = intern(format!("{i}"));
+        let tmpvar_name_sym = ev.session.intern(format!("{i}"));
         if let Some(a) = av.get(i - 1) {
             bindings.push((tmpvar_name_sym, a.clone()));
         } else {
@@ -767,12 +771,9 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
 
     // The positional arguments stay bound for the whole body and are put back
     // afterwards, including when the body fails.
-    with_global_vars_bound(bindings, || {
-        let _frame = ev.enter(
-            FrameType::Call,
-            func_name_buf,
-            ev.loc.clone().unwrap_or_default(),
-        );
+    ev.with_bounds(bindings, |ev| {
+        let loc = ev.loc.clone().unwrap_or_default();
+        let _frame = ev.enter(FrameType::Call, func_name_buf, loc);
         if let Some(func) = func {
             func.read().eval(ev, out)?;
         }
@@ -785,7 +786,8 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
 }
 
 fn foreach_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
-    let varname = intern(args[0].eval_to_buf(ev)?);
+    let name = args[0].eval_to_buf(ev)?;
+    let varname = ev.session.intern(name);
     let list = args[1].eval_to_buf(ev)?;
     ev.eval_depth -= 1;
     let mut ww = WordWriter::new(out);
@@ -793,7 +795,7 @@ fn foreach_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -
         let tok = list.slice_ref(tok);
         let v = Variable::with_simple_string(tok, VarOrigin::Automatic, None, None);
         ww.maybe_add_space();
-        with_global_var_bound(varname, v, || args[2].eval(ev, ww.out))?;
+        ev.with_bound(varname, v, |ev| args[2].eval(ev, ww.out))?;
     }
     ev.eval_depth += 1;
     Ok(())
@@ -801,7 +803,8 @@ fn foreach_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -
 
 fn origin_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
     let var_name = args[0].eval_to_buf(ev)?;
-    if let Some(var) = ev.lookup_var(intern(var_name))? {
+    let sym = ev.session.intern(var_name);
+    if let Some(var) = ev.lookup_var(sym)? {
         let orig = var.read().origin();
         out.put_slice(crate::var::get_origin_str(orig).as_bytes());
     } else {
@@ -812,7 +815,8 @@ fn origin_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) ->
 
 fn flavor_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
     let var_name = args[0].eval_to_buf(ev)?;
-    if let Some(var) = ev.lookup_var(intern(var_name))? {
+    let sym = ev.session.intern(var_name);
+    if let Some(var) = ev.lookup_var(sym)? {
         out.put_slice(var.read().flavor().as_bytes());
     } else {
         out.put_slice(b"undefined");
@@ -839,14 +843,15 @@ fn warning_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) 
     if ev.avoid_io {
         let mut s = BytesMut::new();
         s.put_slice(b"echo -e \"");
-        s.put_slice(ev.loc.clone().unwrap_or_default().to_string().as_bytes());
+        let loc = ev.loc.clone().unwrap_or_default();
+        s.put_slice(loc.display(&ev.session).to_string().as_bytes());
         s.put_slice(b": ");
         s.put_slice(&echo_escape(&a));
         s.put_slice(b"\" 2>&1");
         ev.delayed_output_commands.push(s.freeze());
         return Ok(());
     }
-    warn_loc!(ev.loc.as_ref(), "{}", String::from_utf8_lossy(&a));
+    warn_loc!(ev, ev.loc.as_ref(), "{}", String::from_utf8_lossy(&a));
     Ok(())
 }
 
@@ -855,14 +860,15 @@ fn error_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) ->
     if ev.avoid_io {
         let mut s = BytesMut::new();
         s.put_slice(b"echo -e \"");
-        s.put_slice(ev.loc.clone().unwrap_or_default().to_string().as_bytes());
+        let loc = ev.loc.clone().unwrap_or_default();
+        s.put_slice(loc.display(&ev.session).to_string().as_bytes());
         s.put_slice(b": *** ");
         s.put_slice(&echo_escape(&a));
         s.put_slice(b".\" 2>&1 && false");
         ev.delayed_output_commands.push(s.freeze());
         return Ok(());
     }
-    error_loc!(ev.loc.as_ref(), "*** {}.", String::from_utf8_lossy(&a));
+    error_loc!(ev, ev.loc.as_ref(), "*** {}.", String::from_utf8_lossy(&a));
 }
 
 fn file_read_func(
@@ -872,15 +878,16 @@ fn file_read_func(
     rerun: bool,
 ) -> Result<()> {
     if !std::fs::exists(filename)? {
-        if should_store_command_result(filename.as_bytes()) {
-            COMMAND_RESULTS.lock().push(CommandResult {
+        if should_store_command_result(&ev.session, filename.as_bytes()) {
+            let loc = ev.loc.clone().unwrap_or_default();
+            ev.session.command_results.push(CommandResult {
                 op: CommandOp::ReadMissing,
                 shell: Bytes::new(),
                 shellflag: Bytes::new(),
                 cmd: Bytes::from(filename.as_bytes().to_vec()),
                 find: None,
                 result: Bytes::new(),
-                loc: ev.loc.clone().unwrap_or_default(),
+                loc,
             })
         }
         return Ok(());
@@ -892,15 +899,16 @@ fn file_read_func(
     }
     let buf = Bytes::from(buf);
 
-    if rerun && should_store_command_result(filename.as_bytes()) {
-        COMMAND_RESULTS.lock().push(CommandResult {
+    if rerun && should_store_command_result(&ev.session, filename.as_bytes()) {
+        let loc = ev.loc.clone().unwrap_or_default();
+        ev.session.command_results.push(CommandResult {
             op: CommandOp::Read,
             shell: Bytes::new(),
             shellflag: Bytes::new(),
             cmd: Bytes::from(filename.as_bytes().to_vec()),
             find: None,
             result: buf.clone(),
-            loc: ev.loc.clone().unwrap_or_default(),
+            loc,
         })
     }
     out.put_slice(&buf);
@@ -924,15 +932,16 @@ fn file_write_func(
         f.write_all(&text)?;
     }
 
-    if rerun && should_store_command_result(filename.as_bytes()) {
-        COMMAND_RESULTS.lock().push(CommandResult {
+    if rerun && should_store_command_result(&ev.session, filename.as_bytes()) {
+        let loc = ev.loc.clone().unwrap_or_default();
+        ev.session.command_results.push(CommandResult {
             op: CommandOp::Write,
             shell: Bytes::new(),
             shellflag: Bytes::new(),
             cmd: Bytes::from(filename.as_bytes().to_vec()),
             find: None,
             result: text,
-            loc: ev.loc.clone().unwrap_or_default(),
+            loc,
         })
     }
 
@@ -947,6 +956,7 @@ fn file_func_impl(
 ) -> Result<()> {
     if ev.avoid_io {
         error_loc!(
+            ev,
             ev.loc.as_ref(),
             "*** $(file ...) is not supported in rules."
         );
@@ -956,16 +966,16 @@ fn file_func_impl(
     let filename = trim_space(&arg);
 
     if filename.is_empty() {
-        error_loc!(ev.loc.as_ref(), "*** Missing filename");
+        error_loc!(ev, ev.loc.as_ref(), "*** Missing filename");
     }
 
     if filename[0] == b'<' {
         let filename = trim_left_space(&filename[1..]);
         if filename.is_empty() {
-            error_loc!(ev.loc.as_ref(), "*** Missing filename");
+            error_loc!(ev, ev.loc.as_ref(), "*** Missing filename");
         }
         if args.len() > 1 {
-            error_loc!(ev.loc.as_ref(), "*** invalid argument");
+            error_loc!(ev, ev.loc.as_ref(), "*** invalid argument");
         }
 
         let filename = <OsStr as OsStrExt>::from_bytes(filename);
@@ -974,7 +984,7 @@ fn file_func_impl(
         let append = filename.starts_with(b">>");
         let filename = trim_left_space(&filename[if append { 2 } else { 1 }..]);
         if filename.is_empty() {
-            error_loc!(ev.loc.as_ref(), "*** Missing filename");
+            error_loc!(ev, ev.loc.as_ref(), "*** Missing filename");
         }
 
         let mut text = BytesMut::new();
@@ -989,6 +999,7 @@ fn file_func_impl(
         file_write_func(ev, filename, append, text.freeze(), rerun)?;
     } else {
         error_loc!(
+            ev,
             ev.loc.as_ref(),
             "*** Invalid file operation: {}.  Stop.",
             String::from_utf8_lossy(filename)
@@ -1019,6 +1030,7 @@ fn deprecated_var_func(
 
     if ev.avoid_io {
         error_loc!(
+            ev,
             ev.loc.as_ref(),
             "*** $(KATI_deprecated_var ...) is not supported in rules."
         );
@@ -1026,13 +1038,14 @@ fn deprecated_var_func(
 
     for var in word_scanner(&vars_str) {
         let var = vars_str.slice_ref(var);
-        let sym = intern(var);
+        let sym = ev.session.intern(var);
         let v = match ev.peek_var(sym) {
             Some(v) => v,
             None => {
-                let v =
-                    Variable::new_simple(VarOrigin::File, Some(ev.current_frame()), ev.loc.clone());
-                set_global_var(sym, v.clone(), false, None)?;
+                let frame = ev.current_frame();
+                let loc = ev.loc.clone();
+                let v = Variable::new_simple(VarOrigin::File, Some(frame), loc);
+                ev.session.set_global_var(sym, v.clone(), false, None)?;
                 v
             }
         };
@@ -1040,13 +1053,17 @@ fn deprecated_var_func(
         let mut v = v.write();
         if v.deprecated.is_some() {
             error_loc!(
+                ev,
                 ev.loc.as_ref(),
-                "*** Cannot call KATI_deprecated_var on already deprecated variable: {sym}."
+                "*** Cannot call KATI_deprecated_var on already deprecated variable: {}.",
+                sym.display(ev)
             );
         } else if v.obsolete() {
             error_loc!(
+                ev,
                 ev.loc.as_ref(),
-                "*** Cannot call KATI_deprecated_var on already obsolete variable: {sym}."
+                "*** Cannot call KATI_deprecated_var on already obsolete variable: {}.",
+                sym.display(ev)
             );
         }
 
@@ -1065,6 +1082,7 @@ fn obsolete_var_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn Buf
 
     if ev.avoid_io {
         error_loc!(
+            ev,
             ev.loc.as_ref(),
             "*** $(KATI_obsolete_var ...) is not supported in rules."
         );
@@ -1072,13 +1090,14 @@ fn obsolete_var_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn Buf
 
     for var in word_scanner(&vars_str) {
         let var = vars_str.slice_ref(var);
-        let sym = intern(var);
+        let sym = ev.session.intern(var);
         let v = match ev.peek_var(sym) {
             Some(v) => v,
             None => {
-                let v =
-                    Variable::new_simple(VarOrigin::File, Some(ev.current_frame()), ev.loc.clone());
-                set_global_var(sym, v.clone(), false, None)?;
+                let frame = ev.current_frame();
+                let loc = ev.loc.clone();
+                let v = Variable::new_simple(VarOrigin::File, Some(frame), loc);
+                ev.session.set_global_var(sym, v.clone(), false, None)?;
                 v
             }
         };
@@ -1086,13 +1105,17 @@ fn obsolete_var_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn Buf
         let mut v = v.write();
         if v.deprecated.is_some() {
             error_loc!(
+                ev,
                 ev.loc.as_ref(),
-                "*** Cannot call KATI_obsolete_var on already deprecated variable: {sym}."
+                "*** Cannot call KATI_obsolete_var on already deprecated variable: {}.",
+                sym.display(ev)
             );
         } else if v.obsolete() {
             error_loc!(
+                ev,
                 ev.loc.as_ref(),
-                "*** Cannot call KATI_obsolete_var on already obsolete variable: {sym}."
+                "*** Cannot call KATI_obsolete_var on already obsolete variable: {}.",
+                sym.display(ev)
             );
         }
 
@@ -1110,6 +1133,7 @@ fn deprecate_export_func(
 
     if ev.avoid_io {
         error_loc!(
+            ev,
             ev.loc.as_ref(),
             "*** $(KATI_deprecate_export) is not supported in rules."
         );
@@ -1117,9 +1141,11 @@ fn deprecate_export_func(
 
     match &ev.export_allowed {
         ExportAllowed::Warning(_) => {
-            error_loc!(ev.loc.as_ref(), "*** Export is already deprecated.")
+            error_loc!(ev, ev.loc.as_ref(), "*** Export is already deprecated.")
         }
-        ExportAllowed::Error(_) => error_loc!(ev.loc.as_ref(), "*** Export is already obsolete."),
+        ExportAllowed::Error(_) => {
+            error_loc!(ev, ev.loc.as_ref(), "*** Export is already obsolete.")
+        }
         ExportAllowed::Allowed => {}
     }
 
@@ -1136,13 +1162,14 @@ fn obsolete_export_func(
 
     if ev.avoid_io {
         error_loc!(
+            ev,
             ev.loc.as_ref(),
             "*** $(KATI_obsolete_export) is not supported in rules."
         );
     }
 
     if matches!(ev.export_allowed, ExportAllowed::Error(_)) {
-        error_loc!(ev.loc.as_ref(), "*** Export is already obsolete.");
+        error_loc!(ev, ev.loc.as_ref(), "*** Export is already obsolete.");
     }
 
     ev.export_allowed = ExportAllowed::Error(msg);
@@ -1169,15 +1196,19 @@ fn variable_location_func(
     out: &mut dyn BufMut,
 ) -> Result<()> {
     let arg = args[0].eval_to_buf(ev)?;
-    let mut ww = WordWriter::new(out);
+    let mut locations = Vec::new();
     for var in word_scanner(&arg) {
         let var = arg.slice_ref(var);
-        let sym = intern(var);
+        let sym = ev.session.intern(var);
         let l = ev
             .peek_var(sym)
             .and_then(|v| v.read().loc().clone())
             .unwrap_or_default();
-        ww.write(l.to_string().as_bytes());
+        locations.push(l.display(&ev.session).to_string());
+    }
+    let mut ww = WordWriter::new(out);
+    for l in locations {
+        ww.write(l.as_bytes());
     }
     Ok(())
 }
@@ -1193,19 +1224,23 @@ fn extra_file_deps_func(
             let fname = <OsStr as OsStrExt>::from_bytes(file);
             if !std::fs::exists(fname)? {
                 error_loc!(
+                    ev,
                     ev.loc.as_ref(),
                     "*** file does not exist: {}",
                     fname.to_string_lossy()
                 );
             }
-            add_extra_file_dep(fname.to_os_string());
+            ev.session
+                .makefiles
+                .add_extra_file_dep(fname.to_os_string());
         }
     }
     Ok(())
 }
 
 fn foreach_sep_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
-    let varname = intern(args[0].eval_to_buf(ev)?);
+    let name = args[0].eval_to_buf(ev)?;
+    let varname = ev.session.intern(name);
     let separator = args[1].eval_to_buf(ev)?;
     let list = args[2].eval_to_buf(ev)?;
     ev.eval_depth -= 1;
@@ -1214,7 +1249,7 @@ fn foreach_sep_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMu
         let tok = list.slice_ref(tok);
         let v = Variable::with_simple_string(tok, VarOrigin::Automatic, None, None);
         ww.maybe_add_separator(&separator);
-        with_global_var_bound(varname, v, || args[3].eval(ev, ww.out))?;
+        ev.with_bound(varname, v, |ev| args[3].eval(ev, ww.out))?;
     }
     ev.eval_depth += 1;
     Ok(())
@@ -1230,10 +1265,15 @@ fn visibility_prefix_func(
 
     for prefix in word_scanner(&args[1].eval_to_buf(ev)?) {
         if prefix.starts_with(b"/") {
-            error_loc!(ev.loc.as_ref(), "Visibility prefix should not start with /");
+            error_loc!(
+                ev,
+                ev.loc.as_ref(),
+                "Visibility prefix should not start with /"
+            );
         }
         if prefix.starts_with(b"../") {
             error_loc!(
+                ev,
                 ev.loc.as_ref(),
                 "Visibility prefix should not start with ../"
             );
@@ -1242,6 +1282,7 @@ fn visibility_prefix_func(
         let normalized_prefix = normalize_path(prefix);
         if prefix != normalized_prefix {
             error_loc!(
+                ev,
                 ev.loc.as_ref(),
                 "Visibility prefix {} is not normalized. Normalized prefix: {}",
                 String::from_utf8_lossy(prefix),
@@ -1253,6 +1294,7 @@ fn visibility_prefix_func(
         for p in &prefixes {
             if has_path_prefix(p.as_bytes(), prefix) {
                 error_loc!(
+                    ev,
                     ev.loc.as_ref(),
                     "Visibility prefix {} is the prefix of another visibility prefix {}",
                     String::from_utf8_lossy(prefix),
@@ -1260,6 +1302,7 @@ fn visibility_prefix_func(
                 );
             } else if has_path_prefix(prefix, p.as_bytes()) {
                 error_loc!(
+                    ev,
                     ev.loc.as_ref(),
                     "Visibility prefix {} is the prefix of another visibility prefix {}",
                     p.to_string_lossy(),
@@ -1271,17 +1314,20 @@ fn visibility_prefix_func(
         prefixes.push(OsStringExt::from_vec(normalized_prefix.to_vec()));
     }
 
-    let sym = intern(arg);
+    let sym = ev.session.intern(arg);
     let v = if let Some(v) = ev.peek_var(sym) {
         v
     } else {
         // If variable is not defined, create an empty variable.
-        let v = Variable::new_simple(VarOrigin::File, Some(ev.current_frame()), ev.loc.clone());
-        set_global_var(sym, v.clone(), false, None)?;
+        let frame = ev.current_frame();
+        let loc = ev.loc.clone();
+        let v = Variable::new_simple(VarOrigin::File, Some(frame), loc);
+        ev.session.set_global_var(sym, v.clone(), false, None)?;
         v
     };
     if !prefixes.is_empty() {
-        v.write().set_visibility_prefix(prefixes, &sym)?;
+        v.write()
+            .set_visibility_prefix(&ev.session, prefixes, &sym)?;
     }
 
     Ok(())
@@ -1290,16 +1336,26 @@ fn visibility_prefix_func(
 fn debug_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> Result<()> {
     let a = args[0].eval_to_buf(ev)?;
     let loc = ev.loc.clone().unwrap_or_default();
-    for tok in word_scanner(&a) {
-        let tok = a.slice_ref(tok);
-        let tok = intern(tok);
+    let toks = word_scanner(&a)
+        .map(|tok| a.slice_ref(tok))
+        .collect::<Vec<_>>();
+    for tok in toks {
+        let tok = ev.session.intern(tok);
         let Some(v) = ev.lookup_var(tok)? else {
-            println!("{loc}: Variable {tok:?} is undefined");
+            println!(
+                "{}: Variable {:?} is undefined",
+                loc.display(&ev.session),
+                tok.display(&ev.session)
+            );
             continue;
         };
         let v = v.read();
         let val = v.eval_to_buf(ev)?;
-        println!("{loc}: Variable {tok:?}={val:?} ({v:?})")
+        println!(
+            "{}: Variable {:?}={val:?} ({v:?})",
+            loc.display(&ev.session),
+            tok.display(&ev.session)
+        )
     }
     Ok(())
 }
@@ -1422,6 +1478,8 @@ const FUNC_INFO: &[FuncInfo] = &[
     func(b"KATI_debug_var", debug_func, 1),
 ];
 
+// no-globals-gate: read-only dispatch table built once from the const array
+// above, permitted by plan/decisions/session-owned-evaluation.md.
 static FUNC_INFO_MAP: LazyLock<HashMap<&'static [u8], &'static FuncInfo>> =
     LazyLock::new(|| FUNC_INFO.iter().map(|f| (f.name, f)).collect());
 
@@ -1432,23 +1490,20 @@ pub fn get_func_info(name: &[u8]) -> Option<&'static FuncInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        expr::{ParseExprOpt, parse_expr},
-        var::peek_global_var,
-    };
+    use crate::expr::{ParseExprOpt, parse_expr};
 
     /// Evaluate a Make expression with a fresh evaluator, returning both the
     /// result and whatever the expression managed to write before failing.
-    fn eval(src: &'static str) -> (Result<()>, Bytes) {
+    fn eval_with(ev: &mut Evaluator, src: &'static str) -> (Result<()>, Bytes) {
         let expr = parse_expr(
+            &mut ev.session,
             &mut Loc::default(),
             Bytes::from_static(src.as_bytes()),
             ParseExprOpt::Normal,
         )
         .unwrap();
-        let mut ev = Evaluator::new();
         let mut out = BytesMut::new();
-        let result = expr.eval(&mut ev, &mut out);
+        let result = expr.eval(ev, &mut out);
         (result, out.freeze())
     }
 
@@ -1456,8 +1511,8 @@ mod tests {
         Variable::with_simple_string(Bytes::from_static(value), VarOrigin::File, None, None)
     }
 
-    fn string_of(var: crate::var::Var) -> String {
-        String::from_utf8(var.read().string().unwrap().into_owned()).unwrap()
+    fn string_of(session: &Session, var: crate::var::Var) -> String {
+        String::from_utf8(var.read().string(session).unwrap().into_owned()).unwrap()
     }
 
     /// A `foreach` body that fails partway must leave the loop variable
@@ -1466,10 +1521,12 @@ mod tests {
     /// and it is the one the error path used to reach only through `Drop`.
     #[test]
     fn test_foreach_restores_unbound_variable_when_body_fails() {
-        let sym = intern("KATI_TEST_FOREACH_UNBOUND");
-        assert!(peek_global_var(sym).is_none());
+        let mut ev = Evaluator::new(Session::new());
+        let sym = ev.session.intern("KATI_TEST_FOREACH_UNBOUND");
+        assert!(ev.session.peek_global_var(sym).is_none());
 
-        let (result, out) = eval(
+        let (result, out) = eval_with(
+            &mut ev,
             "$(foreach KATI_TEST_FOREACH_UNBOUND,a b c,\
              $(if $(filter b,$(KATI_TEST_FOREACH_UNBOUND)),\
              $(error stop),$(KATI_TEST_FOREACH_UNBOUND)))",
@@ -1479,16 +1536,20 @@ mod tests {
         // The first token was written and the third was not: the loop failed
         // partway rather than before it started.
         assert_eq!(out.as_ref(), b"a ");
-        assert!(peek_global_var(sym).is_none());
+        assert!(ev.session.peek_global_var(sym).is_none());
     }
 
     /// The same failure with a binding to go back to must go back to it.
     #[test]
     fn test_foreach_restores_previous_binding_when_body_fails() {
-        let sym = intern("KATI_TEST_FOREACH_BOUND");
-        set_global_var(sym, simple(b"outer"), false, None).unwrap();
+        let mut ev = Evaluator::new(Session::new());
+        let sym = ev.session.intern("KATI_TEST_FOREACH_BOUND");
+        ev.session
+            .set_global_var(sym, simple(b"outer"), false, None)
+            .unwrap();
 
-        let (result, out) = eval(
+        let (result, out) = eval_with(
+            &mut ev,
             "$(foreach KATI_TEST_FOREACH_BOUND,a b c,\
              $(if $(filter b,$(KATI_TEST_FOREACH_BOUND)),\
              $(error stop),$(KATI_TEST_FOREACH_BOUND)))",
@@ -1496,55 +1557,68 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(out.as_ref(), b"a ");
-        assert_eq!(string_of(peek_global_var(sym).unwrap()), "outer");
+        let var = ev.session.peek_global_var(sym).unwrap();
+        assert_eq!(string_of(&ev.session, var), "outer");
     }
 
     /// `foreach_sep` takes the same path with a separator in front of the body.
     #[test]
     fn test_foreach_sep_restores_unbound_variable_when_body_fails() {
-        let sym = intern("KATI_TEST_FOREACH_SEP_UNBOUND");
-        assert!(peek_global_var(sym).is_none());
+        let mut ev = Evaluator::new(Session::new());
+        let sym = ev.session.intern("KATI_TEST_FOREACH_SEP_UNBOUND");
+        assert!(ev.session.peek_global_var(sym).is_none());
 
-        let (result, _) = eval(
+        let (result, _) = eval_with(
+            &mut ev,
             "$(KATI_foreach_sep KATI_TEST_FOREACH_SEP_UNBOUND,:,a b c,\
              $(if $(filter b,$(KATI_TEST_FOREACH_SEP_UNBOUND)),\
              $(error stop),$(KATI_TEST_FOREACH_SEP_UNBOUND)))",
         );
 
         assert!(result.is_err());
-        assert!(peek_global_var(sym).is_none());
+        assert!(ev.session.peek_global_var(sym).is_none());
     }
 
     /// `call` binds every positional argument at once. A body that fails must
     /// leave all of them as it found them.
     #[test]
     fn test_call_restores_positional_arguments_when_body_fails() {
+        let mut ev = Evaluator::new(Session::new());
         let body = b"$(1)$(error stop)";
         let expr = parse_expr(
+            &mut ev.session,
             &mut Loc::default(),
             Bytes::from_static(body),
             ParseExprOpt::Normal,
         )
         .unwrap();
-        set_global_var(
-            intern("KATI_TEST_CALL_FUNC"),
-            Variable::new_recursive(expr, VarOrigin::File, None, None, Bytes::from_static(body)),
-            false,
-            None,
-        )
-        .unwrap();
+        let func = ev.session.intern("KATI_TEST_CALL_FUNC");
+        ev.session
+            .set_global_var(
+                func,
+                Variable::new_recursive(
+                    expr,
+                    VarOrigin::File,
+                    None,
+                    None,
+                    Bytes::from_static(body),
+                ),
+                false,
+                None,
+            )
+            .unwrap();
 
-        let one = intern("1");
-        let two = intern("2");
-        assert!(peek_global_var(one).is_none());
-        assert!(peek_global_var(two).is_none());
+        let one = ev.session.intern("1");
+        let two = ev.session.intern("2");
+        assert!(ev.session.peek_global_var(one).is_none());
+        assert!(ev.session.peek_global_var(two).is_none());
 
-        let (result, out) = eval("$(call KATI_TEST_CALL_FUNC,x,y)");
+        let (result, out) = eval_with(&mut ev, "$(call KATI_TEST_CALL_FUNC,x,y)");
 
         assert!(result.is_err());
         // $1 was bound while the body ran, and the body failed after using it.
         assert_eq!(out.as_ref(), b"x");
-        assert!(peek_global_var(one).is_none());
-        assert!(peek_global_var(two).is_none());
+        assert!(ev.session.peek_global_var(one).is_none());
+        assert!(ev.session.peek_global_var(two).is_none());
     }
 }

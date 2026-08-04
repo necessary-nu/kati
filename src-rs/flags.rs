@@ -18,25 +18,22 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     os::unix::ffi::{OsStrExt, OsStringExt},
-    sync::LazyLock,
     vec::IntoIter,
 };
 
 use crate::{
     strutil::{Pattern, word_scanner},
-    symtab::intern,
+    symtab::Symtab,
 };
 use bytes::Bytes;
-use parking_lot::Mutex;
 
-pub static FLAGS: LazyLock<Flags> = LazyLock::new(|| {
-    if cfg!(test) {
-        Flags::default()
-    } else {
-        Flags::from_args(env::args_os().collect())
-    }
-});
-
+/// Everything the command line says, as a value.
+///
+/// This used to be a `LazyLock` that read `std::env::args_os()` the first time
+/// anything touched it, which made the process command line an input to every
+/// evaluation in it. It is now constructed by [`Flags::from_args`] and owned by
+/// the session.
+// [spec:ronin:req:make.no-ambient-state]
 #[derive(Default)]
 pub struct Flags {
     pub detect_android_echo: bool,
@@ -83,7 +80,7 @@ pub struct Flags {
     pub ignore_dirty_pattern: Option<crate::strutil::Pattern>,
     pub no_ignore_dirty_pattern: Option<crate::strutil::Pattern>,
     pub ignore_optional_include_pattern: Option<crate::strutil::Pattern>,
-    pub makefile: Mutex<Option<OsString>>,
+    pub makefile: Option<OsString>,
     pub ninja_dir: Option<OsString>,
     pub ninja_suffix: OsString,
     pub working_dir: Option<OsString>, // -C <dir>
@@ -121,7 +118,12 @@ fn parse_command_line_option_with_arg(
 }
 
 impl Flags {
-    fn from_args(args: Vec<OsString>) -> Flags {
+    /// The flags implied by `args`, which is a whole `argv` including the
+    /// program name.
+    ///
+    /// `symtab` is here only because command-line targets are interned; the
+    /// flags keep no reference to it.
+    pub fn from_args(args: Vec<OsString>, symtab: &mut Symtab) -> Flags {
         let mut iter = args.into_iter();
         let mut flags = Flags::default();
         flags.subkati_args.push(iter.next().unwrap());
@@ -140,7 +142,7 @@ impl Flags {
             let mut should_propagate = true;
             match arg.as_bytes() {
                 b"-f" => {
-                    *flags.makefile.lock() = iter.next();
+                    flags.makefile = iter.next();
                     should_propagate = false;
                 }
                 b"-c" => flags.is_syntax_check_only = true,
@@ -284,7 +286,7 @@ impl Flags {
                     } else {
                         should_propagate = false;
                         let arg = Bytes::from(arg.as_bytes().to_vec());
-                        flags.targets.push(intern(arg));
+                        flags.targets.push(symtab.intern(arg));
                     }
                 }
             }
@@ -311,13 +313,15 @@ mod tests {
 
     #[test]
     fn test_flags() {
+        let mut symtab = Symtab::new();
         let flags = Flags::from_args(
             vec!["test", "-f", "main.mk"]
                 .into_iter()
                 .map(|s| s.into())
                 .collect(),
+            &mut symtab,
         );
-        assert_eq!(flags.makefile.lock().clone().unwrap(), "main.mk");
+        assert_eq!(flags.makefile.clone().unwrap(), "main.mk");
     }
 
     #[test]

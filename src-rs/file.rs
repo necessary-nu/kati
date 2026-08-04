@@ -20,11 +20,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
-use crate::{
-    parser::parse_file,
-    stmt::Stmt,
-    symtab::{Symbol, intern},
-};
+use crate::{parser::parse_file, session::Session, stmt::Stmt, symtab::Symbol};
 
 pub struct Makefile {
     pub filename: Symbol,
@@ -32,15 +28,15 @@ pub struct Makefile {
 }
 
 impl Makefile {
-    pub fn from_file(filename: &OsStr) -> Result<Option<Arc<Makefile>>> {
+    pub fn from_file(session: &mut Session, filename: &OsStr) -> Result<Option<Arc<Makefile>>> {
         if !std::fs::exists(filename)? {
             return Ok(None);
         }
 
         let buf = Bytes::from(std::fs::read(filename)?);
 
-        let filename = intern(filename.as_bytes().to_vec());
-        let stmts = parse_file(&buf, filename)?;
+        let filename = session.intern(filename.as_bytes().to_vec());
+        let stmts = parse_file(session, &buf, filename)?;
 
         Ok(Some(Arc::new(Makefile { filename, stmts })))
     }

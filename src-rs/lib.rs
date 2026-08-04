@@ -42,6 +42,7 @@ pub mod parser;
 pub mod regen;
 pub mod regen_dump;
 pub mod rule;
+pub mod session;
 pub mod stats;
 pub mod stmt;
 pub mod strutil;
@@ -58,8 +59,8 @@ macro_rules! log {
 
 #[macro_export]
 macro_rules! log_stat {
-    ($fmt:expr $(, $($arg:tt)*)?) => {
-        if $crate::flags::FLAGS.enable_stat_logs {
+    ($ctx:expr, $fmt:expr $(, $($arg:tt)*)?) => {
+        if $crate::session::Context::flags($ctx).enable_stat_logs {
             eprintln!("*kati*: {}", format!($fmt, $($($arg)*)?))
         }
     };
@@ -74,8 +75,8 @@ macro_rules! warn {
 
 #[macro_export]
 macro_rules! kati_warn {
-    ($fmt:expr $(, $($arg:tt)*)?) => {
-        if $crate::flags::FLAGS.enable_kati_warnings {
+    ($ctx:expr, $fmt:expr $(, $($arg:tt)*)?) => {
+        if $crate::session::Context::flags($ctx).enable_kati_warnings {
             eprintln!($fmt, $($($arg)*)?)
         }
     };
@@ -88,26 +89,30 @@ macro_rules! error {
     };
 }
 
+/// Warn about something at a location. The first argument is whatever carries
+/// the session — an `Evaluator` or a `Session` — because rendering the
+/// location needs the interner its filename was interned into.
+// [spec:ronin:req:make.no-ambient-state]
 #[macro_export]
 macro_rules! warn_loc {
-    ($loc:expr, $fmt:expr $(, $($arg:tt)*)?) => {
-        $crate::color_warn_log($loc, format!($fmt, $($($arg)*)?))
+    ($ctx:expr, $loc:expr, $fmt:expr $(, $($arg:tt)*)?) => {
+        $crate::color_warn_log($ctx, $loc, format!($fmt, $($($arg)*)?))
     };
 }
 
 #[macro_export]
 macro_rules! kati_warn_loc {
-    ($loc:expr, $fmt:expr $(, $($arg:tt)*)?) => {
-        if $crate::flags::FLAGS.enable_kati_warnings {
-            $crate::color_warn_log($loc, format!($fmt, $($($arg)*)?))
+    ($ctx:expr, $loc:expr, $fmt:expr $(, $($arg:tt)*)?) => {
+        if $crate::session::Context::flags($ctx).enable_kati_warnings {
+            $crate::color_warn_log($ctx, $loc, format!($fmt, $($($arg)*)?))
         }
     };
 }
 
 #[macro_export]
 macro_rules! error_loc {
-    ($loc:expr, $fmt:expr $(, $($arg:tt)*)?) => {
-        return Err($crate::color_error_log($loc, format!($fmt, $($($arg)*)?)))
+    ($ctx:expr, $loc:expr, $fmt:expr $(, $($arg:tt)*)?) => {
+        return Err($crate::color_error_log($ctx, $loc, format!($fmt, $($($arg)*)?)))
     };
 }
 
@@ -116,12 +121,17 @@ const RESET: &str = "\x1b[0m";
 const MAGENTA: &str = "\x1b[35m";
 const RED: &str = "\x1b[31m";
 
-fn color_error_log(loc: Option<&crate::loc::Loc>, msg: String) -> anyhow::Error {
+fn color_error_log(
+    ctx: &impl crate::session::Context,
+    loc: Option<&crate::loc::Loc>,
+    msg: String,
+) -> anyhow::Error {
     let Some(loc) = loc else {
         return anyhow::format_err!("{msg}");
     };
+    let loc = loc.display(ctx);
 
-    if crate::flags::FLAGS.color_warnings {
+    if ctx.flags().color_warnings {
         let filtered = trim_prefix_str(&msg, "*** ");
 
         anyhow::format_err!("{BOLD}{loc}: {RED}error: {RESET}{BOLD}{filtered}{RESET}")
@@ -130,13 +140,14 @@ fn color_error_log(loc: Option<&crate::loc::Loc>, msg: String) -> anyhow::Error 
     }
 }
 
-fn color_warn_log(loc: Option<&crate::loc::Loc>, msg: String) {
+fn color_warn_log(ctx: &impl crate::session::Context, loc: Option<&crate::loc::Loc>, msg: String) {
     let Some(loc) = loc else {
         eprintln!("{msg}");
         return;
     };
+    let loc = loc.display(ctx);
 
-    if crate::flags::FLAGS.color_warnings {
+    if ctx.flags().color_warnings {
         let mut filtered = trim_prefix_str(&msg, "*warning*: ");
         filtered = trim_prefix_str(filtered, "warning: ");
 

@@ -30,13 +30,14 @@ fn main() -> Result<()> {
         std::process::exit(1);
     };
 
+    let session = kati::session::Session::new();
     let cmd = Bytes::from(cmd.as_bytes().to_vec());
-    let Some(fc) = parse(&cmd)? else {
+    let Some(fc) = parse(&session, &cmd)? else {
         log::error!("Unsupported command: {cmd:?}");
         std::process::exit(1);
     };
 
-    let Some(output) = find(&cmd, &fc, &kati::loc::Loc::default())? else {
+    let Some(output) = find(&session, &cmd, &fc, &kati::loc::Loc::default())? else {
         log::error!("Unable to run command {cmd:?}");
         std::process::exit(1);
     };

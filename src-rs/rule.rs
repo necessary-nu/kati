@@ -23,9 +23,10 @@ use memchr::memchr;
 
 use crate::expr::Value;
 use crate::loc::Loc;
+use crate::session::Session;
 use crate::stmt::{RuleSep, RuleStmt};
 use crate::strutil::{Pattern, trim_leading_curdir, word_scanner};
-use crate::symtab::{Symbol, intern};
+use crate::symtab::Symbol;
 use crate::{error_loc, warn_loc};
 
 #[derive(Clone)]
@@ -58,14 +59,14 @@ impl Rule {
         }
     }
 
-    fn parse_inputs(&mut self, inputs_str: &Bytes) {
+    fn parse_inputs(&mut self, session: &mut Session, inputs_str: &Bytes) {
         let mut is_order_only = false;
         for input in word_scanner(inputs_str) {
             if input == b"|" {
                 is_order_only = true;
                 continue;
             }
-            let input_sym = intern(inputs_str.slice_ref(trim_leading_curdir(input)));
+            let input_sym = session.intern(inputs_str.slice_ref(trim_leading_curdir(input)));
             if is_order_only {
                 self.order_only_inputs.push(input_sym);
             } else {
@@ -76,6 +77,7 @@ impl Rule {
 
     pub fn parse_prerequisites(
         &mut self,
+        session: &mut Session,
         line: &Bytes,
         separator_pos: Option<usize>,
         rule_stmt: &RuleStmt,
@@ -98,13 +100,14 @@ impl Rule {
 
         let Some(separator_pos) = memchr(b':', &prereq_string) else {
             // Simple prerequisites
-            self.parse_inputs(&prereq_string);
+            self.parse_inputs(session, &prereq_string);
             return Ok(());
         };
 
         // Static pattern rule.
         if !self.output_patterns.is_empty() {
             error_loc!(
+                session,
                 Some(&self.loc),
                 "*** mixed implicit and normal rules: deprecated syntax"
             );
@@ -119,30 +122,42 @@ impl Rule {
         let target_prereq = prereq_string.slice(..separator_pos);
         let prereq_patterns = prereq_string.slice(separator_pos + 1..);
 
-        for target_pattern in word_scanner(&target_prereq) {
-            let target_pattern = target_prereq.slice_ref(trim_leading_curdir(target_pattern));
+        let patterns = word_scanner(&target_prereq)
+            .map(|p| target_prereq.slice_ref(trim_leading_curdir(p)))
+            .collect::<Vec<_>>();
+        for target_pattern in patterns {
             let pat = Pattern::new(target_pattern.clone());
-            for target in &self.outputs {
-                if !pat.matches(&target.as_bytes()) {
-                    warn_loc!(
-                        Some(&self.loc),
-                        "target `{target}' doesn't match the target pattern",
-                    );
-                }
+            let unmatched = self
+                .outputs
+                .iter()
+                .filter(|t| !pat.matches(&t.as_bytes(&*session)))
+                .copied()
+                .collect::<Vec<_>>();
+            for target in unmatched {
+                warn_loc!(
+                    session,
+                    Some(&self.loc),
+                    "target `{}' doesn't match the target pattern",
+                    target.display(&*session)
+                );
             }
-            self.output_patterns.push(intern(target_pattern));
+            self.output_patterns.push(session.intern(target_pattern));
         }
 
         if self.output_patterns.is_empty() {
-            error_loc!(Some(&self.loc), "*** missing target pattern.");
+            error_loc!(session, Some(&self.loc), "*** missing target pattern.");
         }
         if self.output_patterns.len() > 1 {
-            error_loc!(Some(&self.loc), "*** multiple target patterns.");
+            error_loc!(session, Some(&self.loc), "*** multiple target patterns.");
         }
-        if !is_pattern_rule(&self.output_patterns.first().unwrap().as_bytes()) {
-            error_loc!(Some(&self.loc), "*** target pattern contains no '%'.");
+        if !is_pattern_rule(&self.output_patterns.first().unwrap().as_bytes(&*session)) {
+            error_loc!(
+                session,
+                Some(&self.loc),
+                "*** target pattern contains no '%'."
+            );
         }
-        self.parse_inputs(&prereq_patterns);
+        self.parse_inputs(session, &prereq_patterns);
         Ok(())
     }
 }

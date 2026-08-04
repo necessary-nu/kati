@@ -26,12 +26,11 @@ use crate::{
     exec::ExecStatus,
     expr::Evaluable,
     fileutil::get_timestamp,
-    flags::FLAGS,
     strutil::{
         Pattern, WordWriter, basename, dirname, find_end_of_line, trim_left_space, word_scanner,
     },
-    symtab::{Symbol, intern},
-    var::{Variable, set_global_var},
+    symtab::Symbol,
+    var::Variable,
 };
 
 pub struct AutoCommandVar {
@@ -89,14 +88,15 @@ impl AutoCommandVar {
     fn eval_impl(&self, ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
         let current_dep_node = self.current_dep_node.lock();
         let current_dep_node = current_dep_node.as_ref().unwrap().lock();
+        let names = &ev.session.symtab;
 
         match &self.typ {
             AutoCommand::At => {
-                out.put_slice(&current_dep_node.output.as_bytes());
+                out.put_slice(&current_dep_node.output.as_bytes(names));
             }
             AutoCommand::Less => {
                 if let Some(ai) = current_dep_node.actual_inputs.first() {
-                    out.put_slice(&ai.as_bytes());
+                    out.put_slice(&ai.as_bytes(names));
                 }
             }
             AutoCommand::Hat => {
@@ -104,26 +104,27 @@ impl AutoCommandVar {
                 let mut ww = WordWriter::new(out);
                 for ai in current_dep_node.actual_inputs.iter() {
                     if seen.insert(*ai) {
-                        ww.write(&ai.as_bytes())
+                        ww.write(&ai.as_bytes(names))
                     }
                 }
             }
             AutoCommand::Plus => {
                 let mut ww = WordWriter::new(out);
                 for ai in current_dep_node.actual_inputs.iter() {
-                    ww.write(&ai.as_bytes())
+                    ww.write(&ai.as_bytes(names))
                 }
             }
             AutoCommand::Star => {
                 if let Some(output_pattern) = &current_dep_node.output_pattern {
-                    let pat = Pattern::new(output_pattern.as_bytes());
-                    out.put_slice(pat.stem(&current_dep_node.output.as_bytes()))
+                    let pat = Pattern::new(output_pattern.as_bytes(names));
+                    out.put_slice(pat.stem(&current_dep_node.output.as_bytes(names)))
                 }
             }
             AutoCommand::Question { found_new_inputs } => {
                 let mut seen: HashSet<Symbol> = HashSet::new();
 
                 if ev.avoid_io {
+                    let mut delayed = None;
                     // Check timestamps using the shell at the start of rule execution
                     // instead.
                     out.put_slice(b"${KATI_NEW_INPUTS}");
@@ -134,23 +135,27 @@ impl AutoCommandVar {
                         ww.write(b"KATI_NEW_INPUTS=$(find");
                         for ai in current_dep_node.actual_inputs.iter() {
                             if seen.insert(*ai) {
-                                ww.write(&ai.as_bytes());
+                                ww.write(&ai.as_bytes(names));
                             }
                         }
                         ww.write(b"$(test -e");
-                        ww.write(&current_dep_node.output.as_bytes());
+                        ww.write(&current_dep_node.output.as_bytes(names));
                         ww.write(b"&& echo -newer");
-                        ww.write(&current_dep_node.output.as_bytes());
+                        ww.write(&current_dep_node.output.as_bytes(names));
                         ww.write(b")) && export KATI_NEW_INPUTS");
-                        ev.delayed_output_commands.push(def.freeze());
+                        delayed = Some(def.freeze());
                         *found_new_inputs.lock() = true;
+                    }
+                    if let Some(def) = delayed {
+                        ev.delayed_output_commands.push(def);
                     }
                 } else {
                     let mut ww = WordWriter::new(out);
-                    let target_age =
-                        ExecStatus::Timestamp(get_timestamp(&current_dep_node.output.as_bytes())?);
+                    let target_age = ExecStatus::Timestamp(get_timestamp(
+                        &current_dep_node.output.as_bytes(names),
+                    )?);
                     for ai in current_dep_node.actual_inputs.iter() {
-                        let ai_str = ai.as_bytes();
+                        let ai_str = ai.as_bytes(names);
                         if seen.insert(*ai)
                             && ExecStatus::Timestamp(get_timestamp(&ai_str)?) > target_age
                         {
@@ -161,9 +166,10 @@ impl AutoCommandVar {
             }
             AutoCommand::NotImplemented => {
                 error_loc!(
+                    ev,
                     ev.loc.as_ref(),
                     "Automatic variable `${}' isn't supported yet",
-                    self.sym
+                    self.sym.display(ev)
                 );
             }
         }
@@ -173,7 +179,7 @@ impl AutoCommandVar {
 
 impl Debug for AutoCommandVar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AutoVar({})", self.sym)
+        write!(f, "AutoVar({:?})", self.sym)
     }
 }
 
@@ -234,7 +240,7 @@ impl<'a> CommandEvaluator<'a> {
     }
 
     fn register_autocommand(&mut self, c: char, a: AutoCommand) -> Result<()> {
-        let sym = intern(c.to_string());
+        let sym = self.ev.session.intern(c.to_string());
         let v = Variable::new_autocommand(
             sym,
             AutoCommandVar {
@@ -244,8 +250,8 @@ impl<'a> CommandEvaluator<'a> {
                 current_dep_node: self.current_dep_node.clone(),
             },
         );
-        set_global_var(sym, v, false, None)?;
-        let sym = intern(format!("{c}D"));
+        self.ev.session.set_global_var(sym, v, false, None)?;
+        let sym = self.ev.session.intern(format!("{c}D"));
         let v = Variable::new_autocommand(
             sym,
             AutoCommandVar {
@@ -255,8 +261,8 @@ impl<'a> CommandEvaluator<'a> {
                 current_dep_node: self.current_dep_node.clone(),
             },
         );
-        set_global_var(sym, v, false, None)?;
-        let sym = intern(format!("{c}F"));
+        self.ev.session.set_global_var(sym, v, false, None)?;
+        let sym = self.ev.session.intern(format!("{c}F"));
         let v = Variable::new_autocommand(
             sym,
             AutoCommandVar {
@@ -266,7 +272,7 @@ impl<'a> CommandEvaluator<'a> {
                 current_dep_node: self.current_dep_node.clone(),
             },
         );
-        set_global_var(sym, v, false, None)?;
+        self.ev.session.set_global_var(sym, v, false, None)?;
         Ok(())
     }
 
@@ -286,7 +292,7 @@ impl<'a> CommandEvaluator<'a> {
             self.ev.loc = v.loc();
             let cmds_buf = v.eval_to_buf(self.ev)?;
             let mut cmds = cmds_buf.clone();
-            let mut global_echo = !FLAGS.is_silent_mode;
+            let mut global_echo = !self.ev.session.flags.is_silent_mode;
             let mut global_ignore_error = false;
             cmds = parse_command_prefixes(cmds, &mut global_echo, &mut global_ignore_error);
             if cmds.is_empty() {

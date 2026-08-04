@@ -30,6 +30,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use memchr::{memchr2, memmem};
 use parking_lot::Mutex;
 
+use crate::error;
 use crate::func::CommandOp;
 use crate::io::{dump_int, dump_string, dump_systemtime, dump_usize, dump_vec_string};
 use crate::strutil::{basename, concat_dir, dirname, strip_ext, strip_ext_vec};
@@ -38,13 +39,11 @@ use crate::{
     dep::{DepNode, NamedDepNode, is_special_target},
     eval::Evaluator,
     expr::Evaluable,
-    flags::FLAGS,
+    flags::Flags,
     strutil::{escape_shell, trim_left_space},
-    symtab::{Symbol, intern},
+    symtab::Symbol,
     timeutil::ScopedTimeReporter,
-    var::USED_ENV_VARS,
 };
-use crate::{error, file_cache};
 
 fn find_command_line_flag(cmd: &[u8], name: &[u8]) -> Option<usize> {
     match memmem::find(cmd, name) {
@@ -179,7 +178,7 @@ impl<'a> NinjaGenerator<'a> {
     }
 
     fn generate(&mut self, nodes: &Vec<NamedDepNode>, orig_args: &[u8]) -> Result<()> {
-        let _ = std::fs::remove_file(Self::get_stamp_temp_filename());
+        let _ = std::fs::remove_file(self.get_stamp_temp_filename());
         self.populate_ninja_nodes(nodes)?;
         self.generate_ninja()?;
         self.generate_shell()?;
@@ -187,12 +186,12 @@ impl<'a> NinjaGenerator<'a> {
         Ok(())
     }
 
-    fn get_stamp_temp_filename() -> OsString {
-        ninja_file(".kati_stamp", ".tmp")
+    fn get_stamp_temp_filename(&self) -> OsString {
+        ninja_file(&self.ce.ev.session.flags, ".kati_stamp", ".tmp")
     }
 
     fn populate_ninja_nodes(&mut self, nodes: &Vec<NamedDepNode>) -> Result<()> {
-        let _tr = ScopedTimeReporter::new("ninja gen (eval)");
+        let _tr = ScopedTimeReporter::new(&self.ce.ev.session, "ninja gen (eval)");
         for (_symbol, depnode) in nodes {
             self.populate_ninja_node(depnode)?;
         }
@@ -214,15 +213,16 @@ impl<'a> NinjaGenerator<'a> {
             has_rule = node.has_rule;
             is_phony = node.is_phony;
         }
+        let output_str = output.as_bytes(&self.ce.ev.session);
         let _frame = self.ce.ev.enter(
             crate::eval::FrameType::Ninja,
-            output.as_bytes(),
+            output_str.clone(),
             loc.unwrap_or_default(),
         );
 
         // A hack to exclude out phony target in Android. If this exists,
         // "ninja -t clean" tries to remove this directory and fails.
-        if FLAGS.detect_android_echo && output.as_bytes().as_ref() == b"out" {
+        if self.ce.ev.session.flags.detect_android_echo && output_str.as_ref() == b"out" {
             return Ok(());
         }
 
@@ -380,6 +380,7 @@ impl<'a> NinjaGenerator<'a> {
     }
 
     fn gen_shell_script(
+        flags: &Flags,
         name: &Bytes,
         commands: &Vec<Command>,
         cmd_buf: &mut BytesMut,
@@ -393,7 +394,7 @@ impl<'a> NinjaGenerator<'a> {
             let needs_subshell = (command_count > 1 || c.ignore_error) && !c.force_no_subshell;
 
             let mut translated = Self::translate_command(inp);
-            if FLAGS.detect_android_echo
+            if flags.detect_android_echo
                 && !got_description
                 && !c.echo
                 && Self::get_description_from_command(&translated, description)
@@ -433,7 +434,7 @@ impl<'a> NinjaGenerator<'a> {
             let depfile = depfile_var.read().eval_to_buf(self.ce.ev)?;
             return Ok(Some(depfile));
         }
-        if !FLAGS.detect_depfiles {
+        if !self.ce.ev.session.flags.detect_depfiles {
             return Ok(None);
         }
 
@@ -462,12 +463,19 @@ impl<'a> NinjaGenerator<'a> {
         let commands = &nn.commands;
 
         let mut rule_name = "phony".to_string();
-        let use_local_pool = FLAGS.remote_num_jobs > 0;
-        if is_special_target(&node.output) {
+        let use_local_pool = self.ce.ev.session.flags.remote_num_jobs > 0;
+        if is_special_target(&self.ce.ev.session, &node.output) {
             return Ok(());
         }
-        if FLAGS.enable_debug {
-            writeln!(out, "# {}", node.loc.clone().unwrap_or_default())?;
+        if self.ce.ev.session.flags.enable_debug {
+            writeln!(
+                out,
+                "# {}",
+                node.loc
+                    .clone()
+                    .unwrap_or_default()
+                    .display(&self.ce.ev.session)
+            )?;
         }
         if !commands.is_empty() {
             rule_name = format!("rule{}", nn.rule_id.unwrap());
@@ -475,8 +483,10 @@ impl<'a> NinjaGenerator<'a> {
 
             let mut description = Bytes::from_static(b"build $out");
             let mut cmd_buf = BytesMut::new();
+            let output_str = node.output.as_bytes(&self.ce.ev.session);
             Self::gen_shell_script(
-                &node.output.as_bytes(),
+                &self.ce.ev.session.flags,
+                &output_str,
                 commands,
                 &mut cmd_buf,
                 &mut description,
@@ -507,7 +517,7 @@ impl<'a> NinjaGenerator<'a> {
             if node.is_restat {
                 writeln!(out, " restat = 1")?;
             }
-            if FLAGS.emit_sandbox_disabled {
+            if self.ce.ev.session.flags.emit_sandbox_disabled {
                 writeln!(out, " sandbox_disabled = true")?;
             }
         }
@@ -534,8 +544,8 @@ impl<'a> NinjaGenerator<'a> {
         r.freeze()
     }
 
-    fn escape_build_target(s: Symbol) -> Bytes {
-        Self::escape_ninja(&s.as_bytes())
+    fn escape_build_target(names: &impl crate::symtab::Interner, s: Symbol) -> Bytes {
+        Self::escape_ninja(&s.as_bytes(names))
     }
 
     fn emit_build(
@@ -546,36 +556,36 @@ impl<'a> NinjaGenerator<'a> {
         use_local_pool: bool,
         out: &mut impl std::io::Write,
     ) -> Result<()> {
-        let target = Self::escape_build_target(node.output);
+        let target = Self::escape_build_target(&self.ce.ev.session, node.output);
         write!(out, "build ")?;
         out.write_all(&target)?;
         if !node.implicit_outputs.is_empty() {
             write!(out, " |")?;
             for output in &node.implicit_outputs {
                 out.write_all(b" ")?;
-                out.write_all(&Self::escape_build_target(*output))?;
+                out.write_all(&Self::escape_build_target(&self.ce.ev.session, *output))?;
             }
         }
         write!(out, ": {rule_name}")?;
-        if node.is_phony && !FLAGS.use_ninja_phony_output {
+        if node.is_phony && !self.ce.ev.session.flags.use_ninja_phony_output {
             write!(out, " _kati_always_build_")?;
         }
         for (s, _) in &node.deps {
             out.write_all(b" ")?;
-            out.write_all(&Self::escape_build_target(*s))?;
+            out.write_all(&Self::escape_build_target(&self.ce.ev.session, *s))?;
         }
         if !node.order_onlys.is_empty() {
             write!(out, " ||")?;
             for (s, _) in &node.order_onlys {
                 out.write_all(b" ")?;
-                out.write_all(&Self::escape_build_target(*s))?;
+                out.write_all(&Self::escape_build_target(&self.ce.ev.session, *s))?;
             }
         }
         if !node.validations.is_empty() {
             write!(out, " |@")?;
             for (s, _) in &node.validations {
                 out.write_all(b" ")?;
-                out.write_all(&Self::escape_build_target(*s))?;
+                out.write_all(&Self::escape_build_target(&self.ce.ev.session, *s))?;
             }
         }
 
@@ -594,14 +604,14 @@ impl<'a> NinjaGenerator<'a> {
                 out.write_all(&pool)?;
                 out.write_all(b"\n")?;
             }
-        } else if !FLAGS.default_pool.is_empty() && rule_name != "phony" {
+        } else if !self.ce.ev.session.flags.default_pool.is_empty() && rule_name != "phony" {
             write!(out, " pool = ")?;
-            out.write_all(FLAGS.default_pool.as_bytes())?;
+            out.write_all(self.ce.ev.session.flags.default_pool.as_bytes())?;
             out.write_all(b"\n")?;
         } else if use_local_pool {
             writeln!(out, " pool = local_pool")?;
         }
-        if node.is_phony && FLAGS.use_ninja_phony_output {
+        if node.is_phony && self.ce.ev.session.flags.use_ninja_phony_output {
             writeln!(out, " phony_output = true")?;
         }
         if let Some(tags_var) = &node.tags_var {
@@ -618,13 +628,13 @@ impl<'a> NinjaGenerator<'a> {
         Ok(())
     }
 
-    fn get_env_script_filename() -> OsString {
-        ninja_file("env", ".sh")
+    fn get_env_script_filename(&self) -> OsString {
+        ninja_file(&self.ce.ev.session.flags, "env", ".sh")
     }
 
     fn generate_ninja(&mut self) -> Result<()> {
-        let _tr = ScopedTimeReporter::new("ninja gen (emit)");
-        let out = std::fs::File::create(get_ninja_filename())?;
+        let _tr = ScopedTimeReporter::new(&self.ce.ev.session, "ninja gen (emit)");
+        let out = std::fs::File::create(get_ninja_filename(&self.ce.ev.session.flags))?;
         let mut out = std::io::BufWriter::new(out);
 
         write!(out, "# Generated by kati unknown\n\n")?;
@@ -632,55 +642,62 @@ impl<'a> NinjaGenerator<'a> {
         if !self.used_envs.is_empty() {
             writeln!(out, "# Environment variables used:")?;
             for (key, value) in &self.used_envs {
-                write!(out, "# {key}=")?;
+                write!(out, "# {}=", key.display(&self.ce.ev.session))?;
                 out.write_all(value.as_bytes())?;
                 out.write_all(b"\n")?;
             }
             writeln!(out)?;
         }
 
-        if !FLAGS.no_ninja_prelude {
-            if let Some(ninja_dir) = &FLAGS.ninja_dir {
+        if !self.ce.ev.session.flags.no_ninja_prelude {
+            if let Some(ninja_dir) = &self.ce.ev.session.flags.ninja_dir {
                 write!(out, "builddir = ")?;
                 out.write_all(ninja_dir.as_bytes())?;
                 out.write_all(b"\n\n")?;
             }
 
-            writeln!(out, "pool local_pool\n depth = {}\n", FLAGS.num_jobs)?;
+            writeln!(
+                out,
+                "pool local_pool\n depth = {}\n",
+                self.ce.ev.session.flags.num_jobs
+            )?;
 
-            if !FLAGS.use_ninja_phony_output {
+            if !self.ce.ev.session.flags.use_ninja_phony_output {
                 writeln!(out, "build _kati_always_build_: phony\n")?;
             }
         }
 
-        if !FLAGS.generate_empty_ninja {
+        if !self.ce.ev.session.flags.generate_empty_ninja {
             for node in std::mem::take(&mut self.nodes) {
                 self.emit_node(&node, &mut out)?;
             }
 
             write!(out, "\ndefault ")?;
-            if FLAGS.targets.is_empty() || FLAGS.gen_all_targets {
+            if self.ce.ev.session.flags.targets.is_empty()
+                || self.ce.ev.session.flags.gen_all_targets
+            {
                 out.write_all(&Self::escape_build_target(
+                    &self.ce.ev.session,
                     self.default_target.lock().as_ref().unwrap().lock().output,
                 ))?;
             } else {
                 let mut empty = true;
-                for s in &FLAGS.targets {
+                for s in self.ce.ev.session.flags.targets.clone() {
                     if !empty {
                         out.write_all(b" ")?;
                     }
-                    out.write_all(&Self::escape_build_target(*s))?;
+                    out.write_all(&Self::escape_build_target(&self.ce.ev.session, s))?;
                     empty = false;
                 }
             }
             out.write_all(b"\n")?;
         }
 
-        let mut used_env_vars = USED_ENV_VARS.lock().clone();
+        let mut used_env_vars = self.ce.ev.session.used_env_vars.clone();
         // PATH changes $(shell).
-        used_env_vars.insert(intern("PATH"));
+        used_env_vars.insert(self.ce.ev.session.intern("PATH"));
         for e in used_env_vars {
-            let k = e.as_bytes();
+            let k = e.as_bytes(&self.ce.ev.session);
             let k = OsStr::from_bytes(&k);
             let val = std::env::var_os(k).unwrap();
             self.used_envs.insert(e, val);
@@ -691,7 +708,7 @@ impl<'a> NinjaGenerator<'a> {
 
     fn generate_shell(&mut self) -> Result<()> {
         {
-            let out = std::fs::File::create(Self::get_env_script_filename())?;
+            let out = std::fs::File::create(self.get_env_script_filename())?;
             let mut out = std::io::BufWriter::new(out);
 
             writeln!(out, "#!/bin/sh")?;
@@ -701,11 +718,11 @@ impl<'a> NinjaGenerator<'a> {
             for (symbol, is_exported) in exports {
                 if is_exported {
                     let val = self.ce.ev.eval_var(symbol)?;
-                    write!(out, "export '{symbol}'='")?;
+                    write!(out, "export '{}'='", symbol.display(&self.ce.ev.session))?;
                     out.write_all(&val)?;
                     writeln!(out, "'")?;
                 } else {
-                    writeln!(out, "unset '{symbol}'")?;
+                    writeln!(out, "unset '{}'", symbol.display(&self.ce.ev.session))?;
                 }
             }
         }
@@ -713,20 +730,20 @@ impl<'a> NinjaGenerator<'a> {
         {
             let mut opts = OpenOptions::new();
             opts.create(true).write(true).mode(0o755);
-            let out = opts.open(get_ninja_shell_script_filename())?;
+            let out = opts.open(get_ninja_shell_script_filename(&self.ce.ev.session.flags))?;
             let mut out = std::io::BufWriter::new(out);
 
             writeln!(out, "#!/bin/sh")?;
             writeln!(out, "# Generated by kati unknown\n")?;
 
             write!(out, ". ")?;
-            out.write_all(Self::get_env_script_filename().as_bytes())?;
+            out.write_all(self.get_env_script_filename().as_bytes())?;
 
             write!(out, "\nexec ninja -f ")?;
-            out.write_all(get_ninja_filename().as_bytes())?;
+            out.write_all(get_ninja_filename(&self.ce.ev.session.flags).as_bytes())?;
             out.write_all(b" ")?;
-            if FLAGS.remote_num_jobs > 0 {
-                write!(out, "-j{} ", FLAGS.remote_num_jobs)?;
+            if self.ce.ev.session.flags.remote_num_jobs > 0 {
+                write!(out, "-j{} ", self.ce.ev.session.flags.remote_num_jobs)?;
             }
             writeln!(out, "\"$@\"")?;
         }
@@ -735,29 +752,30 @@ impl<'a> NinjaGenerator<'a> {
 
     fn generate_stamp(&self, orig_args: &[u8]) -> Result<()> {
         {
-            let out = std::fs::File::create(Self::get_stamp_temp_filename())?;
+            let out = std::fs::File::create(self.get_stamp_temp_filename())?;
             let mut out = std::io::BufWriter::new(out);
 
             dump_systemtime(&mut out, &self.start_time)?;
 
-            let makefiles = file_cache::get_all_filenames();
+            let makefiles = self.ce.ev.session.makefiles.all_filenames();
             dump_usize(&mut out, makefiles.len() + 1)?;
             dump_string(&mut out, self.kati_binary.as_bytes())?;
             for makefile in makefiles {
                 dump_string(&mut out, makefile.as_bytes())?;
             }
 
-            dump_usize(&mut out, Evaluator::used_undefined_vars().len())?;
-            for v in Evaluator::used_undefined_vars() {
-                dump_string(&mut out, &v.as_bytes())?;
+            let undefined = self.ce.ev.used_undefined_vars();
+            dump_usize(&mut out, undefined.len())?;
+            for v in &undefined {
+                dump_string(&mut out, &v.as_bytes(&self.ce.ev.session))?;
             }
             dump_usize(&mut out, self.used_envs.len())?;
             for (key, value) in &self.used_envs {
-                dump_string(&mut out, &key.as_bytes())?;
+                dump_string(&mut out, &key.as_bytes(&self.ce.ev.session))?;
                 dump_string(&mut out, value.as_bytes())?;
             }
 
-            let globs = crate::fileutil::GLOB_CACHE.lock();
+            let globs = self.ce.ev.session.glob_cache.lock();
             let globs: Vec<(&Bytes, &crate::fileutil::GlobResults)> = globs
                 .iter()
                 .filter_map(|(key, files)| {
@@ -774,7 +792,7 @@ impl<'a> NinjaGenerator<'a> {
                 dump_vec_string(&mut out, files)?;
             }
 
-            let crs = crate::func::COMMAND_RESULTS.lock();
+            let crs = &self.ce.ev.session.command_results;
             dump_usize(&mut out, crs.len())?;
             for cr in crs.iter() {
                 dump_int(&mut out, cr.op.as_int())?;
@@ -782,7 +800,7 @@ impl<'a> NinjaGenerator<'a> {
                 dump_string(&mut out, &cr.shellflag)?;
                 dump_string(&mut out, &cr.cmd)?;
                 dump_string(&mut out, &cr.result)?;
-                dump_string(&mut out, &cr.loc.filename.as_bytes())?;
+                dump_string(&mut out, &cr.loc.filename.as_bytes(&self.ce.ev.session))?;
                 dump_int(&mut out, cr.loc.line)?;
 
                 if cr.op == CommandOp::Find {
@@ -811,7 +829,10 @@ impl<'a> NinjaGenerator<'a> {
 
             dump_string(&mut out, orig_args)?;
         }
-        std::fs::rename(Self::get_stamp_temp_filename(), get_ninja_stamp_filename())?;
+        std::fs::rename(
+            self.get_stamp_temp_filename(),
+            get_ninja_stamp_filename(&self.ce.ev.session.flags),
+        )?;
         Ok(())
     }
 }
@@ -822,26 +843,26 @@ impl Drop for NinjaGenerator<'_> {
     }
 }
 
-pub fn get_ninja_filename() -> OsString {
-    ninja_file("build", ".ninja")
+pub fn get_ninja_filename(flags: &Flags) -> OsString {
+    ninja_file(flags, "build", ".ninja")
 }
 
-pub fn get_ninja_shell_script_filename() -> OsString {
-    ninja_file("ninja", ".sh")
+pub fn get_ninja_shell_script_filename(flags: &Flags) -> OsString {
+    ninja_file(flags, "ninja", ".sh")
 }
 
-pub fn get_ninja_stamp_filename() -> OsString {
-    ninja_file(".kati_stamp", "")
+pub fn get_ninja_stamp_filename(flags: &Flags) -> OsString {
+    ninja_file(flags, ".kati_stamp", "")
 }
 
-fn ninja_file(prefix: &str, suffix: &str) -> OsString {
-    let mut r = FLAGS
+fn ninja_file(flags: &Flags, prefix: &str, suffix: &str) -> OsString {
+    let mut r = flags
         .ninja_dir
         .clone()
         .unwrap_or_else(|| OsString::from("."));
     r.push("/");
     r.push(prefix);
-    r.push(&FLAGS.ninja_suffix);
+    r.push(&flags.ninja_suffix);
     r.push(suffix);
     r
 }

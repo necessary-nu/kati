@@ -16,11 +16,11 @@ limitations under the License.
 
 use crate::{
     collect_stats, collect_stats_with_slow_report,
-    fileutil::{glob, run_command},
-    flags::FLAGS,
+    fileutil::run_command,
     func::CommandOp,
     io::{dump_systemtime, load_int, load_string, load_systemtime, load_usize, load_vec_string},
     ninja::{get_ninja_filename, get_ninja_shell_script_filename, get_ninja_stamp_filename},
+    session::Session,
     strutil::format_for_command_substitution,
 };
 use anyhow::Result;
@@ -34,12 +34,13 @@ use std::{
     time::SystemTime,
 };
 
-fn should_ignore_dirty(s: &[u8]) -> bool {
-    let Some(ignore) = &FLAGS.ignore_dirty_pattern else {
+fn should_ignore_dirty(session: &Session, s: &[u8]) -> bool {
+    let Some(ignore) = &session.flags.ignore_dirty_pattern else {
         return false;
     };
     ignore.matches(s)
-        && !FLAGS
+        && !session
+            .flags
             .no_ignore_dirty_pattern
             .as_ref()
             .map(|p| p.matches(s))
@@ -91,22 +92,30 @@ impl StampChecker {
         }
     }
 
-    fn needs_regen(&mut self, start_time: SystemTime, orig_args: &OsStr) -> bool {
-        if Self::is_missing_outputs() {
+    fn needs_regen(
+        &mut self,
+        session: &Session,
+        start_time: SystemTime,
+        orig_args: &OsStr,
+    ) -> bool {
+        if Self::is_missing_outputs(session) {
             return true;
         }
 
-        if self.check_step1(orig_args) {
+        if self.check_step1(session, orig_args) {
             return true;
         }
 
-        if self.check_step2().unwrap_or(true) {
+        if self.check_step2(session).unwrap_or(true) {
             return true;
         }
 
         if !self.needs_regen {
             let mut opts = OpenOptions::new();
-            let Ok(mut fp) = opts.write(true).open(get_ninja_stamp_filename()) else {
+            let Ok(mut fp) = opts
+                .write(true)
+                .open(get_ninja_stamp_filename(&session.flags))
+            else {
                 return true;
             };
             dump_systemtime(&mut fp, &start_time).unwrap();
@@ -114,13 +123,13 @@ impl StampChecker {
         self.needs_regen
     }
 
-    fn is_missing_outputs() -> bool {
-        let f = get_ninja_filename();
+    fn is_missing_outputs(session: &Session) -> bool {
+        let f = get_ninja_filename(&session.flags);
         if !std::fs::exists(&f).is_ok_and(|b| b) {
             eprintln!("{} is missing, regenerating...", f.to_string_lossy());
             return true;
         }
-        let f = get_ninja_shell_script_filename();
+        let f = get_ninja_shell_script_filename(&session.flags);
         if !std::fs::exists(&f).is_ok_and(|b| b) {
             eprintln!("{} is missing, regenerating...", f.to_string_lossy());
             return true;
@@ -128,12 +137,12 @@ impl StampChecker {
         false
     }
 
-    fn check_step1(&mut self, orig_args: &OsStr) -> bool {
-        let stamp_filename = get_ninja_stamp_filename();
+    fn check_step1(&mut self, session: &Session, orig_args: &OsStr) -> bool {
+        let stamp_filename = get_ninja_stamp_filename(&session.flags);
         let fp = match std::fs::File::open(&stamp_filename) {
             Ok(fp) => fp,
             Err(err) => {
-                if FLAGS.regen_debug {
+                if session.flags.regen_debug {
                     println!("{stamp_filename:?}: {err}")
                 }
                 return true;
@@ -144,7 +153,7 @@ impl StampChecker {
 
         let gen_time = load!(load_systemtime(fp));
         self.gen_time = Some(gen_time);
-        if FLAGS.regen_debug {
+        if session.flags.regen_debug {
             println!("Generated time: {:?}", self.gen_time);
         }
 
@@ -152,21 +161,22 @@ impl StampChecker {
         for s in files {
             let ts = std::fs::metadata(&s).and_then(|m| m.modified());
             if ts.as_ref().is_ok_and(|ts| gen_time >= *ts) {
-                if FLAGS.dump_kati_stamp {
+                if session.flags.dump_kati_stamp {
                     println!("file {s:?}: clean ({:?})", ts.unwrap())
                 }
             } else {
-                if FLAGS.regen_ignoring_kati_binary && s == std::env::current_exe().unwrap() {
+                if session.flags.regen_ignoring_kati_binary && s == std::env::current_exe().unwrap()
+                {
                     eprintln!("{s:?} was modified, ignored.");
                     continue;
                 }
-                if should_ignore_dirty(s.as_bytes()) {
-                    if FLAGS.regen_debug {
+                if should_ignore_dirty(session, s.as_bytes()) {
+                    if session.flags.regen_debug {
                         println!("file {s:?}: ignored ({:?})", ts.unwrap());
                     }
                     continue;
                 }
-                if FLAGS.dump_kati_stamp {
+                if session.flags.dump_kati_stamp {
                     println!("file {s:?}: dirty ({:?})", ts.unwrap());
                 } else {
                     eprintln!("{} was modified, regenerating...", s.to_string_lossy());
@@ -178,7 +188,7 @@ impl StampChecker {
         let undefineds = load!(load_vec_string(fp));
         for s in undefineds {
             if let Ok(v) = std::env::var(&s) {
-                if FLAGS.dump_kati_stamp {
+                if session.flags.dump_kati_stamp {
                     println!("env {s:?}: dirty (unset => {v:?})");
                 } else {
                     eprintln!(
@@ -187,7 +197,7 @@ impl StampChecker {
                     );
                 }
                 return true;
-            } else if FLAGS.dump_kati_stamp {
+            } else if session.flags.dump_kati_stamp {
                 println!("env {s:?}: clean (unset)");
             }
         }
@@ -198,7 +208,7 @@ impl StampChecker {
             let val = std::env::var_os(&s).unwrap_or_default();
             let s2 = load!(load_string(fp));
             if val != s2 {
-                if FLAGS.dump_kati_stamp {
+                if session.flags.dump_kati_stamp {
                     println!("env {s:?}: dirty ({s2:?} => {val:?})")
                 } else {
                     eprintln!(
@@ -209,7 +219,7 @@ impl StampChecker {
                     );
                 }
                 return true;
-            } else if FLAGS.dump_kati_stamp {
+            } else if session.flags.dump_kati_stamp {
                 println!("env {s:?}: clean ({val:?})")
             }
         }
@@ -266,22 +276,22 @@ impl StampChecker {
         self.needs_regen
     }
 
-    fn check_glob_result(gr: &GlobResult, err: &mut String) -> bool {
-        collect_stats!("glob time (regen)");
-        let files = glob(gr.pat.clone());
+    fn check_glob_result(session: &Session, gr: &GlobResult, err: &mut String) -> bool {
+        collect_stats!(session, "glob time (regen)");
+        let files = session.glob(gr.pat.clone());
         let needs_regen = if let Ok(files) = files.as_ref() {
             files != &gr.result
         } else {
             true
         };
         if needs_regen {
-            if should_ignore_dirty(&gr.pat) {
-                if FLAGS.dump_kati_stamp {
+            if should_ignore_dirty(session, &gr.pat) {
+                if session.flags.dump_kati_stamp {
                     println!("wildcard {:?}: ignored", gr.pat);
                 }
                 return false;
             }
-            if FLAGS.dump_kati_stamp {
+            if session.flags.dump_kati_stamp {
                 println!("wildcard {:?}: dirty", gr.pat);
             } else {
                 *err = format!(
@@ -289,18 +299,18 @@ impl StampChecker {
                     String::from_utf8_lossy(&gr.pat)
                 );
             }
-        } else if FLAGS.dump_kati_stamp {
+        } else if session.flags.dump_kati_stamp {
             println!("wildcard {:?}: clean", gr.pat);
         }
         needs_regen
     }
 
-    fn should_run_command(sr: &ShellResult, gen_time: SystemTime) -> bool {
+    fn should_run_command(session: &Session, sr: &ShellResult, gen_time: SystemTime) -> bool {
         if sr.op != CommandOp::Find {
             return true;
         }
 
-        collect_stats!("stat time (regen)");
+        collect_stats!(session, "stat time (regen)");
         for dir in &sr.missing_dirs {
             if std::fs::exists(dir).unwrap_or(false) {
                 return true;
@@ -314,7 +324,7 @@ impl StampChecker {
         for dir in &sr.read_dirs {
             // We assume we rarely do a significant change for the top
             // directory which affects the results of find command.
-            if dir.is_empty() || dir == "." || should_ignore_dirty(dir.as_bytes()) {
+            if dir.is_empty() || dir == "." || should_ignore_dirty(session, dir.as_bytes()) {
                 continue;
             }
 
@@ -340,13 +350,14 @@ impl StampChecker {
     }
 
     fn check_shell_result(
+        session: &Session,
         sr: &ShellResult,
         gen_time: SystemTime,
         err: &mut String,
     ) -> Result<bool> {
         if sr.op == CommandOp::ReadMissing {
             if std::fs::exists(&sr.cmd).unwrap_or(false) {
-                if FLAGS.dump_kati_stamp {
+                if session.flags.dump_kati_stamp {
                     println!("file {:?}: dirty", sr.cmd);
                 } else {
                     *err = format!(
@@ -356,7 +367,7 @@ impl StampChecker {
                 }
                 return Ok(true);
             }
-            if FLAGS.dump_kati_stamp {
+            if session.flags.dump_kati_stamp {
                 println!("file {:?}: clean", sr.cmd);
             }
             return Ok(false);
@@ -365,7 +376,7 @@ impl StampChecker {
         if sr.op == CommandOp::Read {
             let ts = std::fs::metadata(&sr.cmd).and_then(|md| md.modified());
             if ts.is_ok_and(|ts| gen_time < ts) {
-                if FLAGS.dump_kati_stamp {
+                if session.flags.dump_kati_stamp {
                     println!("file {:?}: dirty", sr.cmd);
                 } else {
                     *err = format!(
@@ -375,7 +386,7 @@ impl StampChecker {
                 }
                 return Ok(true);
             }
-            if FLAGS.dump_kati_stamp {
+            if session.flags.dump_kati_stamp {
                 println!("file {:?}: clean", sr.cmd);
             }
             return Ok(false);
@@ -389,30 +400,30 @@ impl StampChecker {
             let mut f = opts.open(&sr.cmd)?;
             f.write_all(&sr.result)?;
 
-            if FLAGS.dump_kati_stamp {
+            if session.flags.dump_kati_stamp {
                 println!("file {:?}: clean (write)", sr.cmd);
             }
             return Ok(false);
         }
 
-        if !Self::should_run_command(sr, gen_time) {
-            if FLAGS.regen_debug {
+        if !Self::should_run_command(session, sr, gen_time) {
+            if session.flags.regen_debug {
                 println!("shell {:?}: clean (no rerun)", sr.cmd);
             }
             return Ok(false);
         }
 
         let cmd = Bytes::from(sr.cmd.clone().into_vec());
-        if let Some(fc) = crate::find::parse(&cmd)?
-            && fc.chdir.is_some_and(|d| should_ignore_dirty(&d))
+        if let Some(fc) = crate::find::parse(session, &cmd)?
+            && fc.chdir.is_some_and(|d| should_ignore_dirty(session, &d))
         {
-            if FLAGS.dump_kati_stamp {
+            if session.flags.dump_kati_stamp {
                 println!("shell {:?}: ignored", sr.cmd);
             }
             return Ok(false);
         }
 
-        collect_stats_with_slow_report!("shell time (regen)", &sr.cmd);
+        collect_stats_with_slow_report!(session, "shell time (regen)", &sr.cmd);
         let (_status, output) = run_command(
             sr.shell.as_bytes(),
             sr.shellflag.as_bytes(),
@@ -421,7 +432,7 @@ impl StampChecker {
         )?;
         let output = format_for_command_substitution(output);
         if sr.result != output {
-            if FLAGS.dump_kati_stamp {
+            if session.flags.dump_kati_stamp {
                 println!("shell {:?}: dirty", sr.cmd);
             } else {
                 *err = format!(
@@ -430,20 +441,20 @@ impl StampChecker {
                 );
             }
             return Ok(true);
-        } else if FLAGS.regen_debug {
+        } else if session.flags.regen_debug {
             println!("shell {:?}: clean (rerun)", sr.cmd);
         }
         Ok(false)
     }
 
-    fn check_step2(&mut self) -> Result<bool> {
+    fn check_step2(&mut self, session: &Session) -> Result<bool> {
         let needs_regen: Mutex<Result<bool>> = Mutex::new(Ok(false));
 
         std::thread::scope(|s| {
             s.spawn(|| {
                 let mut err = String::new();
                 for gr in &self.globs {
-                    if Self::check_glob_result(gr, &mut err) {
+                    if Self::check_glob_result(session, gr, &mut err) {
                         let mut needs_regen = needs_regen.lock();
                         if let Ok(false) = *needs_regen {
                             *needs_regen = Ok(true);
@@ -456,7 +467,7 @@ impl StampChecker {
             s.spawn(|| {
                 let mut err = String::new();
                 for sr in &self.commands {
-                    match Self::check_shell_result(sr, self.gen_time.unwrap(), &mut err) {
+                    match Self::check_shell_result(session, sr, self.gen_time.unwrap(), &mut err) {
                         Ok(true) => {
                             let mut needs_regen = needs_regen.lock();
                             if let Ok(false) = *needs_regen {
@@ -482,6 +493,11 @@ impl StampChecker {
     }
 }
 
-pub fn needs_regen(start_time: SystemTime, orig_args: &OsStr) -> bool {
-    StampChecker::new().needs_regen(start_time, orig_args)
+/// Whether the ninja file has to be regenerated.
+///
+/// Takes `&Session` rather than `&mut Session` because the two checks run on
+/// worker threads; everything they touch is either read-only or behind the
+/// session's own lock.
+pub fn needs_regen(session: &Session, start_time: SystemTime, orig_args: &OsStr) -> bool {
+    StampChecker::new().needs_regen(session, start_time, orig_args)
 }

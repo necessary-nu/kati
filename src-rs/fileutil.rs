@@ -21,7 +21,7 @@ use std::{
     ffi::{CStr, CString, OsStr},
     process::{Command, ExitStatus},
     slice,
-    sync::{Arc, LazyLock},
+    sync::Arc,
     time::SystemTime,
 };
 
@@ -111,11 +111,12 @@ pub fn run_command(
 
 pub type GlobResults = Arc<Result<Vec<Bytes>, std::io::Error>>;
 
-pub static GLOB_CACHE: LazyLock<Mutex<HashMap<Bytes, GlobResults>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Glob results memoised for one session. Owned by [`crate::session::Session`].
+// [spec:ronin:req:make.no-ambient-state]
+pub type GlobCache = Mutex<HashMap<Bytes, GlobResults>>;
 
-pub fn glob(pat: Bytes) -> GlobResults {
-    let mut cache = GLOB_CACHE.lock();
+pub fn glob(cache: &GlobCache, pat: Bytes) -> GlobResults {
+    let mut cache = cache.lock();
     if let Some(entry) = cache.get(&pat) {
         return entry.clone();
     }
@@ -178,8 +179,4 @@ pub fn fnmatch(pattern: &CString, string: &[u8], flags: i32) -> bool {
     // SAFETY: This is a relatively simple C func, both CStrings are inputs
     // and only need to last through the function call.
     unsafe { libc::fnmatch(pattern.as_ptr(), string.as_ptr(), flags) == 0 }
-}
-
-pub fn clear_glob_cache() {
-    GLOB_CACHE.lock().clear();
 }

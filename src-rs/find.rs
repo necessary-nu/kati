@@ -19,7 +19,7 @@ use std::{
     ffi::{CString, OsStr, OsString},
     os::unix::{ffi::OsStrExt, fs::FileTypeExt},
     path::PathBuf,
-    sync::{Arc, LazyLock, OnceLock, Weak, atomic::AtomicUsize},
+    sync::{Arc, OnceLock, Weak},
 };
 
 use anyhow::Result;
@@ -31,21 +31,19 @@ use parking_lot::Mutex;
 use crate::{
     collect_stats, error,
     fileutil::fnmatch,
-    flags::FLAGS,
     loc::Loc,
     log,
+    session::Session,
     strutil::{WordWriter, basename, concat_dir, has_word, normalize_path, trim_left_space},
     warn,
 };
 
-static NODE_COUNT: AtomicUsize = AtomicUsize::new(0);
-
 macro_rules! find_warn_loc {
-    ($loc:expr, $fmt:expr $(, $($arg:tt)*)?) => {
-        if FLAGS.werror_find_emulator {
-            crate::error_loc!($loc, $fmt, $($($arg)*)?)
+    ($session:expr, $loc:expr, $fmt:expr $(, $($arg:tt)*)?) => {
+        if $session.flags.werror_find_emulator {
+            crate::error_loc!($session, $loc, $fmt, $($($arg)*)?)
         } else {
-            crate::warn_loc!($loc, $fmt, $($($arg)*)?)
+            crate::warn_loc!($session, $loc, $fmt, $($($arg)*)?)
         }
     };
 }
@@ -209,19 +207,19 @@ impl DirentNode {
         }
         out.push(path.to_vec())
     }
-    fn is_directory(self: &Arc<Self>) -> bool {
-        match self.inner(true) {
+    fn is_directory(self: &Arc<Self>, session: &Session) -> bool {
+        match self.inner(session, true) {
             Some(NodeType::Error {}) => false,
             Some(NodeType::File { .. }) => false,
             Some(NodeType::Dir { .. }) => true,
             Some(NodeType::SymlinkError { .. }) => false,
             Some(NodeType::UnsupportedSymlink {}) => false,
-            Some(NodeType::Symlink { to, .. }) => to.is_directory(),
+            Some(NodeType::Symlink { to, .. }) => to.is_directory(session),
             None => false,
         }
     }
-    fn find_dir(self: &Arc<Self>, d: &[u8]) -> Option<Arc<DirentNode>> {
-        match self.inner(true) {
+    fn find_dir(self: &Arc<Self>, session: &Session, d: &[u8]) -> Option<Arc<DirentNode>> {
+        match self.inner(session, true) {
             Some(NodeType::Dir { parent, children }) => {
                 if d.is_empty() || d == b"." {
                     return Some(self.clone());
@@ -237,11 +235,11 @@ impl DirentNode {
                     (d, &[][..])
                 };
                 if p.is_empty() || p == b"." {
-                    return self.find_dir(rest);
+                    return self.find_dir(session, rest);
                 }
                 if p == b".." {
                     let parent = parent.clone()?.upgrade()?;
-                    return parent.find_dir(rest);
+                    return parent.find_dir(session, rest);
                 }
 
                 let p = OsStr::from_bytes(p);
@@ -250,23 +248,24 @@ impl DirentNode {
                         if idx.is_none() {
                             return Some(child.clone());
                         }
-                        return child.find_dir(rest);
+                        return child.find_dir(session, rest);
                     }
                 }
                 None
             }
-            Some(NodeType::Symlink { to }) => to.find_dir(d),
+            Some(NodeType::Symlink { to }) => to.find_dir(session, d),
             _ => None,
         }
     }
     fn find_nodes(
         self: &Arc<Self>,
+        session: &Session,
         fc: &FindCommand,
         results: &mut Vec<(Vec<u8>, Arc<DirentNode>)>,
         path: &mut Vec<u8>,
         d: &[u8],
     ) -> bool {
-        match self.inner(true) {
+        match self.inner(session, true) {
             Some(NodeType::Dir { parent, children }) => {
                 if !path.is_empty() {
                     path.push(b'/');
@@ -287,7 +286,7 @@ impl DirentNode {
                         results.push((path.clone(), self.clone()));
                         return true;
                     }
-                    return self.find_nodes(fc, results, path, rest);
+                    return self.find_nodes(session, fc, results, path, rest);
                 }
                 if p == b".." {
                     let Some(parent) = parent.clone().and_then(|p| p.upgrade()) else {
@@ -302,7 +301,7 @@ impl DirentNode {
                         results.push((path.clone(), parent));
                         return true;
                     }
-                    return parent.find_nodes(fc, results, path, rest);
+                    return parent.find_nodes(session, fc, results, path, rest);
                 }
 
                 let is_wild = memchr3(b'?', b'*', b'[', p).is_some();
@@ -323,7 +322,7 @@ impl DirentNode {
                         path.extend_from_slice(name);
                         if idx.is_none() {
                             results.push((path.clone(), child.clone()));
-                        } else if !child.find_nodes(fc, results, path, rest) {
+                        } else if !child.find_nodes(session, fc, results, path, rest) {
                             return false;
                         }
                         path.truncate(orig_path_size);
@@ -333,11 +332,11 @@ impl DirentNode {
                 true
             }
             Some(NodeType::Symlink { to }) => {
-                if to.is_directory() {
+                if to.is_directory(session) {
                     let mut v = fc.read_dirs.lock();
                     v.insert(Bytes::from(path.clone()));
                 }
-                to.find_nodes(fc, results, path, d)
+                to.find_nodes(session, fc, results, path, d)
             }
             Some(NodeType::UnsupportedSymlink {}) => {
                 log!("FindEmulator does not support symlink {path:?}");
@@ -348,14 +347,14 @@ impl DirentNode {
     }
     fn run_find(
         self: &Arc<Self>,
-        fc: &FindCommand,
-        loc: &Loc,
+        run: &FindRun<'_>,
         d: i32,
         path: &mut Vec<u8>,
         cur_read_dirs: &Arc<Mutex<HashMap<DirentNodeKey, Vec<u8>>>>,
         out: &mut Vec<Vec<u8>>,
     ) -> Result<bool> {
-        match self.inner(fc.follows_symlink) {
+        let FindRun { session, fc, loc } = *run;
+        match self.inner(session, fc.follows_symlink) {
             Some(NodeType::File { typ }) => {
                 self.print_if_necessary(fc, path, *typ, d, out);
                 Ok(true)
@@ -364,6 +363,7 @@ impl DirentNode {
                 let srdt = ScopedReadDirTracker::new(self, path, cur_read_dirs);
                 if let Some(conflicted) = &srdt.conflicted {
                     find_warn_loc!(
+                        session,
                         Some(loc),
                         "FindEmulator: find: File system loop detected; {:?} is part of the same file system loop as {:?}.",
                         String::from_utf8_lossy(path),
@@ -396,14 +396,14 @@ impl DirentNode {
                     let orig_out_size = out.len();
                     for (_name, c) in children {
                         // We will handle directories later.
-                        if c.is_directory() {
+                        if c.is_directory(session) {
                             continue;
                         }
                         if !path.ends_with(b"/") {
                             path.push(b'/');
                         }
                         path.extend_from_slice(c.base.as_bytes());
-                        if !c.run_find(fc, loc, d + 1, path, cur_read_dirs, out)? {
+                        if !c.run_find(run, d + 1, path, cur_read_dirs, out)? {
                             return Ok(false);
                         }
                         path.truncate(orig_path_size);
@@ -430,14 +430,14 @@ impl DirentNode {
                     }
 
                     for (_name, c) in children {
-                        if !c.is_directory() {
+                        if !c.is_directory(session) {
                             continue;
                         }
                         if !path.ends_with(b"/") {
                             path.push(b'/');
                         }
                         path.extend_from_slice(c.base.as_bytes());
-                        if !c.run_find(fc, loc, d + 1, path, cur_read_dirs, out)? {
+                        if !c.run_find(run, d + 1, path, cur_read_dirs, out)? {
                             return Ok(false);
                         }
                         path.truncate(orig_path_size);
@@ -448,7 +448,7 @@ impl DirentNode {
                             path.push(b'/');
                         }
                         path.extend_from_slice(c.base.as_bytes());
-                        if !c.run_find(fc, loc, d + 1, path, cur_read_dirs, out)? {
+                        if !c.run_find(run, d + 1, path, cur_read_dirs, out)? {
                             return Ok(false);
                         }
                         path.truncate(orig_path_size);
@@ -456,7 +456,7 @@ impl DirentNode {
                 }
                 Ok(true)
             }
-            Some(NodeType::Symlink { to }) => to.run_find(fc, loc, d, path, cur_read_dirs, out),
+            Some(NodeType::Symlink { to }) => to.run_find(run, d, path, cur_read_dirs, out),
             Some(NodeType::SymlinkError { err }) => {
                 if err.kind() == std::io::ErrorKind::NotFound {
                     self.print_if_necessary(fc, path, FileType::Symlink, d, out);
@@ -465,6 +465,7 @@ impl DirentNode {
 
                 if fc.typ != Some(FindCommandType::FindLeaves) {
                     find_warn_loc!(
+                        session,
                         Some(loc),
                         "FindEmulator: find: {:?}: {err}",
                         String::from_utf8_lossy(path),
@@ -488,7 +489,7 @@ impl DirentNode {
         }
     }
 
-    fn inner(self: &Arc<Self>, follows_symlinks: bool) -> Option<&NodeType> {
+    fn inner(self: &Arc<Self>, session: &Session, follows_symlinks: bool) -> Option<&NodeType> {
         if !follows_symlinks {
             if let Some(inner) = self.inner.get() {
                 match inner {
@@ -510,15 +511,20 @@ impl DirentNode {
                 return NodeType::Error {};
             };
             match init_data {
-                NodeTypeInitData::Dir { name, parent } => self.initialize_dir(name, parent),
+                NodeTypeInitData::Dir { name, parent } => {
+                    self.initialize_dir(session, name, parent)
+                }
                 NodeTypeInitData::Symlink { name, parent } => {
-                    Self::initialize_symlink(name, parent)
+                    Self::initialize_symlink(session, name, parent)
                 }
             }
         }))
     }
-    fn initialize_symlink(name: PathBuf, parent: Weak<DirentNode>) -> NodeType {
-        collect_stats!("init find emulator Dirent NodeType::Symlink initialize");
+    fn initialize_symlink(session: &Session, name: PathBuf, parent: Weak<DirentNode>) -> NodeType {
+        collect_stats!(
+            session,
+            "init find emulator Dirent NodeType::Symlink initialize"
+        );
         let dest = match std::fs::read_link(&name) {
             Err(err) => {
                 warn!("readlink failed: {:?}", err);
@@ -543,7 +549,7 @@ impl DirentNode {
             };
         };
 
-        let Some(to) = parent.find_dir(dest.as_os_str().as_bytes()) else {
+        let Some(to) = parent.find_dir(session, dest.as_os_str().as_bytes()) else {
             return NodeType::SymlinkError {
                 err: std::io::Error::from(std::io::ErrorKind::Other),
             };
@@ -553,10 +559,14 @@ impl DirentNode {
 
     fn initialize_dir(
         self: &Arc<Self>,
+        session: &Session,
         name: PathBuf,
         parent: Option<Weak<DirentNode>>,
     ) -> NodeType {
-        collect_stats!("init find emulator Dirent NodeType::Dir initialize");
+        collect_stats!(
+            session,
+            "init find emulator Dirent NodeType::Dir initialize"
+        );
 
         let entries = match std::fs::read_dir(&name) {
             Ok(entries) => entries,
@@ -625,10 +635,22 @@ impl DirentNode {
                 }),
             ))
         }
-        NODE_COUNT.fetch_add(children.len(), std::sync::atomic::Ordering::Relaxed);
+        session
+            .find_node_count
+            .fetch_add(children.len(), std::sync::atomic::Ordering::Relaxed);
 
         NodeType::Dir { parent, children }
     }
+}
+
+/// What stays the same for the whole of one `find` traversal.
+///
+/// Bundled so the recursive walk does not carry three extra parameters through
+/// every frame.
+struct FindRun<'a> {
+    session: &'a Session,
+    fc: &'a FindCommand,
+    loc: &'a Loc,
 }
 
 struct DirentNodeKey(Arc<DirentNode>);
@@ -691,11 +713,13 @@ struct FindCommandParser {
     fc: FindCommand,
     has_if: bool,
     unget_tok: Option<Bytes>,
+    werror_find_emulator: bool,
 }
 
 impl FindCommandParser {
-    fn new(cmd: &Bytes) -> Self {
+    fn new(session: &Session, cmd: &Bytes) -> Self {
         FindCommandParser {
+            werror_find_emulator: session.flags.werror_find_emulator,
             cmd: cmd.clone(),
             cur: cmd.clone(),
             fc: FindCommand::default(),
@@ -1028,7 +1052,7 @@ impl FindCommandParser {
             } else if let Some(dir) = tok.strip_prefix(b"--dir=") {
                 self.fc.finddirs.push(Bytes::from(dir.to_vec()));
             } else if tok.starts_with(b"--") {
-                if FLAGS.werror_find_emulator {
+                if self.werror_find_emulator {
                     error!(
                         "Unknown flag in findleaves.py: {}",
                         String::from_utf8_lossy(&tok)
@@ -1127,7 +1151,7 @@ pub struct FindEmulator {
 }
 
 impl FindEmulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             root: DirentNode::new(),
         }
@@ -1137,8 +1161,13 @@ impl FindEmulator {
         !s.starts_with(b"/") && !s.starts_with(b".repo") && !s.starts_with(b".git")
     }
 
-    fn find_dir(&self, d: &[u8], should_fallback: &mut bool) -> Option<Arc<DirentNode>> {
-        let r = self.root.find_dir(d);
+    fn find_dir(
+        &self,
+        session: &Session,
+        d: &[u8],
+        should_fallback: &mut bool,
+    ) -> Option<Arc<DirentNode>> {
+        let r = self.root.find_dir(session, d);
         if r.is_none() {
             *should_fallback = std::fs::exists(OsStr::from_bytes(d)).unwrap_or(false);
         }
@@ -1147,6 +1176,7 @@ impl FindEmulator {
 
     fn handle_find(
         &self,
+        session: &Session,
         cmd: &Bytes,
         fc: &FindCommand,
         loc: &Loc,
@@ -1165,7 +1195,10 @@ impl FindEmulator {
                 return Ok(false);
             }
             let mut should_fallback = false;
-            if self.find_dir(testdir, &mut should_fallback).is_none() {
+            if self
+                .find_dir(session, testdir, &mut should_fallback)
+                .is_none()
+            {
                 log!("FindEmulator: Test dir ({testdir:?}) not found: {cmd:?}");
                 return Ok(!should_fallback);
             }
@@ -1179,12 +1212,13 @@ impl FindEmulator {
                 log!("FindEmulator: Cannot handle chdir ({chdir:?}): {cmd:?}");
                 return Ok(false);
             }
-            let Some(new_root) = root.find_dir(chdir) else {
+            let Some(new_root) = root.find_dir(session, chdir) else {
                 if std::fs::exists(OsStr::from_bytes(chdir)).unwrap_or(false) {
                     return Ok(false);
                 }
                 if !fc.redirect_to_devnull {
                     find_warn_loc!(
+                        session,
                         Some(loc),
                         "FindEmulator: cd: {}: No such file or directory",
                         String::from_utf8_lossy(chdir)
@@ -1206,7 +1240,7 @@ impl FindEmulator {
 
             let mut findnodestr = Vec::new();
             let mut bases = Vec::new();
-            if !root.find_nodes(fc, &mut bases, &mut findnodestr, finddir) {
+            if !root.find_nodes(session, fc, &mut bases, &mut findnodestr, finddir) {
                 return Ok(false);
             }
             if bases.is_empty() {
@@ -1215,6 +1249,7 @@ impl FindEmulator {
                 }
                 if !fc.redirect_to_devnull {
                     find_warn_loc!(
+                        session,
                         Some(loc),
                         "FindEmulator: find: \"{}\": No such file or directory",
                         String::from_utf8_lossy(&fullpath)
@@ -1228,7 +1263,8 @@ impl FindEmulator {
 
             for (mut path, base) in bases {
                 let cur_read_dirs = Arc::new(Mutex::new(HashMap::new()));
-                if !base.run_find(fc, loc, 0, &mut path, &cur_read_dirs, &mut results)? {
+                let run = FindRun { session, fc, loc };
+                if !base.run_find(&run, 0, &mut path, &cur_read_dirs, &mut results)? {
                     log!(
                         "FindEmulator: RunFind failed: {}",
                         String::from_utf8_lossy(cmd)
@@ -1315,7 +1351,7 @@ impl PartialEq for FindCommand {
 }
 
 impl FindCommand {
-    fn with_cmd(cmd: &Bytes) -> Result<Option<Self>> {
+    fn with_cmd(session: &Session, cmd: &Bytes) -> Result<Option<Self>> {
         if !has_word(cmd, b"find")
             && !has_word(cmd, b"build/tools/findleaves.py")
             && !has_word(cmd, b"build/make/tools/findleaves.py")
@@ -1323,7 +1359,7 @@ impl FindCommand {
             return Ok(None);
         }
 
-        let Some(mut fc) = FindCommandParser::new(cmd).parse()? else {
+        let Some(mut fc) = FindCommandParser::new(session, cmd).parse()? else {
             return Ok(None);
         };
 
@@ -1342,22 +1378,21 @@ impl FindCommand {
     }
 }
 
-pub fn parse(cmd: &Bytes) -> Result<Option<FindCommand>> {
-    FindCommand::with_cmd(cmd)
+pub fn parse(session: &Session, cmd: &Bytes) -> Result<Option<FindCommand>> {
+    FindCommand::with_cmd(session, cmd)
 }
 
-static FIND_EMULATOR: LazyLock<FindEmulator> = LazyLock::new(FindEmulator::new);
-
-pub fn find(cmd: &Bytes, fc: &FindCommand, loc: &Loc) -> Result<Option<Bytes>> {
+/// Run `fc` against the session's find emulator, which is built on first use.
+// [spec:ronin:req:make.no-ambient-state]
+pub fn find(session: &Session, cmd: &Bytes, fc: &FindCommand, loc: &Loc) -> Result<Option<Bytes>> {
     let mut out = BytesMut::new();
-    if !FIND_EMULATOR.handle_find(cmd, fc, loc, &mut out)? {
+    if !session
+        .find_emulator()
+        .handle_find(session, cmd, fc, loc, &mut out)?
+    {
         return Ok(None);
     }
     Ok(Some(out.freeze()))
-}
-
-pub fn get_node_count() -> usize {
-    NODE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -1366,7 +1401,7 @@ mod tests {
 
     #[test]
     fn test_parse_find() {
-        let fc = FindCommand::with_cmd(&Bytes::from_static(b"find ."))
+        let fc = FindCommand::with_cmd(&Session::new(), &Bytes::from_static(b"find ."))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1381,7 +1416,7 @@ mod tests {
 
     #[test]
     fn test_parse_find_follow_symlink() {
-        let fc = FindCommand::with_cmd(&Bytes::from_static(b"find -L ."))
+        let fc = FindCommand::with_cmd(&Session::new(), &Bytes::from_static(b"find -L ."))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1397,7 +1432,7 @@ mod tests {
 
     #[test]
     fn test_parse_find_dirs() {
-        let fc = FindCommand::with_cmd(&Bytes::from_static(b"find top/C bar"))
+        let fc = FindCommand::with_cmd(&Session::new(), &Bytes::from_static(b"find top/C bar"))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1412,7 +1447,7 @@ mod tests {
 
     #[test]
     fn test_parse_cd_find() {
-        let fc = FindCommand::with_cmd(&Bytes::from_static(b"cd top && find C"))
+        let fc = FindCommand::with_cmd(&Session::new(), &Bytes::from_static(b"cd top && find C"))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1428,9 +1463,10 @@ mod tests {
 
     #[test]
     fn test_parse_find_conds() {
-        let fc = FindCommand::with_cmd(&Bytes::from_static(
-            b"find top -type f -name 'a*' -o -name \\*b",
-        ))
+        let fc = FindCommand::with_cmd(
+            &Session::new(),
+            &Bytes::from_static(b"find top -type f -name 'a*' -o -name \\*b"),
+        )
         .unwrap()
         .unwrap();
         assert_eq!(
@@ -1452,9 +1488,10 @@ mod tests {
 
     #[test]
     fn test_parse_find_conds_paren() {
-        let fc = FindCommand::with_cmd(&Bytes::from_static(
-            b"find top -type f -a \\( -name 'a*' -o -name \\*b \\)",
-        ))
+        let fc = FindCommand::with_cmd(
+            &Session::new(),
+            &Bytes::from_static(b"find top -type f -a \\( -name 'a*' -o -name \\*b \\)"),
+        )
         .unwrap()
         .unwrap();
         assert_eq!(
@@ -1476,9 +1513,12 @@ mod tests {
 
     #[test]
     fn test_parse_find_not() {
-        let fc = FindCommand::with_cmd(&Bytes::from_static(b"find top \\! -name 'a*'"))
-            .unwrap()
-            .unwrap();
+        let fc = FindCommand::with_cmd(
+            &Session::new(),
+            &Bytes::from_static(b"find top \\! -name 'a*'"),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             fc,
             FindCommand {
@@ -1492,9 +1532,12 @@ mod tests {
 
     #[test]
     fn test_parse_find_paren() {
-        let fc = FindCommand::with_cmd(&Bytes::from_static(b"find top \\( -name 'a*' \\)"))
-            .unwrap()
-            .unwrap();
+        let fc = FindCommand::with_cmd(
+            &Session::new(),
+            &Bytes::from_static(b"find top \\( -name 'a*' \\)"),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             fc,
             FindCommand {
@@ -1509,12 +1552,17 @@ mod tests {
     #[test]
     fn test_parse_fail() {
         assert_eq!(
-            FindCommand::with_cmd(&Bytes::from_static(b"find top -name a\\*")).unwrap(),
+            FindCommand::with_cmd(&Session::new(), &Bytes::from_static(b"find top -name a\\*"))
+                .unwrap(),
             None
         );
         // * in a chdir is not supported
         assert_eq!(
-            FindCommand::with_cmd(&Bytes::from_static(b"cd top/*/B && find .")).unwrap(),
+            FindCommand::with_cmd(
+                &Session::new(),
+                &Bytes::from_static(b"cd top/*/B && find .")
+            )
+            .unwrap(),
             None
         );
     }
