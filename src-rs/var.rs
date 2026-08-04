@@ -33,7 +33,7 @@ use crate::{
     eval::Frame,
     loc::Loc,
     strutil::{WordWriter, has_path_prefix},
-    symtab::get_symbol_names,
+    symtab::{Symtab, with_symtab},
     warn_loc,
 };
 use crate::{
@@ -388,15 +388,10 @@ impl Evaluable for Variable {
             }
             InnerVar::VariableNames { all, .. } => {
                 let mut ww = WordWriter::new(out);
-                let symbols = get_symbol_names(|var| {
-                    if var.read().obsolete() {
-                        return false;
-                    }
-                    true
-                });
+                let symbols = global_var_names(|var| !var.read().obsolete());
                 for (sym, entry) in symbols {
                     if !*all
-                        && let Some(var) = sym.peek_global_var()
+                        && let Some(var) = peek_global_var(sym)
                         && var.read().is_func()
                     {
                         continue;
@@ -426,6 +421,198 @@ pub fn set_shell_status_var(status: i32) {
 
 pub static USED_ENV_VARS: LazyLock<Mutex<HashSet<Symbol>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Make's global variable scope: the bindings of the outermost scope, keyed by
+/// interned [`Symbol`].
+///
+/// It stores no names, only bindings, so it can be constructed, replaced, or
+/// dropped without disturbing the interner that produced its keys, and
+/// interning a name does not create a binding here.
+// [spec:ronin:req:make.scope-separation]
+pub struct GlobalVars {
+    /// Indexed by [`Symbol::index`]. Sparse: most interned names never become
+    /// global variables.
+    vars: Vec<Option<Var>>,
+}
+
+impl Default for GlobalVars {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GlobalVars {
+    /// An empty scope. No interner is needed to make one.
+    pub fn new() -> Self {
+        Self { vars: Vec::new() }
+    }
+
+    /// A scope carrying the bindings kati defines before any makefile is read.
+    ///
+    /// This is the one place the two halves meet, and only because the builtin
+    /// names have to be interned somewhere: the scope keeps no reference to
+    /// `symtab` afterwards.
+    pub fn with_builtins(symtab: &mut Symtab) -> Self {
+        let mut vars = Self::new();
+        vars.define(
+            symtab.intern(".SHELLSTATUS"),
+            Variable::new_shell_status_var(),
+        );
+        vars.define(
+            symtab.intern(".VARIABLES"),
+            Variable::new_variable_names(b".VARIABLES", true),
+        );
+        vars.define(
+            symtab.intern(".KATI_SYMBOLS"),
+            Variable::new_variable_names(b".KATI_SYMBOLS", false),
+        );
+        vars
+    }
+
+    /// The binding for `sym`, without recording the read.
+    pub fn peek(&self, sym: Symbol) -> Option<Var> {
+        self.vars.get(sym.index())?.clone()
+    }
+
+    /// Bind `sym` unconditionally, returning what it was bound to before.
+    pub fn define(&mut self, sym: Symbol, var: Var) -> Option<Var> {
+        self.replace(sym, Some(var))
+    }
+
+    /// Set or clear the binding for `sym` unconditionally, returning what it
+    /// was bound to before. Bypasses the precedence rules in [`Self::assign`],
+    /// which is what makes it right for save-and-restore.
+    pub fn replace(&mut self, sym: Symbol, var: Option<Var>) -> Option<Var> {
+        let idx = sym.index();
+        if idx >= self.vars.len() {
+            self.vars.resize(idx + 1, None);
+        }
+        std::mem::replace(&mut self.vars[idx], var)
+    }
+
+    /// Assign to `sym` under GNU Make's readonly and origin precedence rules,
+    /// which can decline the assignment silently.
+    pub fn assign(
+        &mut self,
+        sym: Symbol,
+        var: Var,
+        is_override: bool,
+        readonly: Option<&mut bool>,
+    ) -> Result<()> {
+        let idx = sym.index();
+        if idx >= self.vars.len() {
+            self.vars.resize(idx + 1, None);
+        }
+        let entry = self.vars.get_mut(idx).unwrap();
+        if let Some(orig) = entry {
+            if orig.read().readonly {
+                if let Some(readonly) = readonly {
+                    *readonly = true;
+                } else {
+                    error!("*** cannot assign to readonly variable: {sym}");
+                }
+                return Ok(());
+            } else if let Some(readonly) = readonly {
+                *readonly = false;
+            }
+            let origin = orig.read().origin();
+            if !is_override
+                && (origin == VarOrigin::Override || origin == VarOrigin::EnvironmentOverride)
+            {
+                return Ok(());
+            }
+            if origin == VarOrigin::CommandLine && var.read().origin() == VarOrigin::File {
+                return Ok(());
+            }
+            if origin == VarOrigin::Automatic {
+                error!("overriding automatic variable is not implemented yet");
+            }
+        }
+        *entry = Some(var);
+        Ok(())
+    }
+
+    /// Every binding satisfying `filter`, in symbol order.
+    pub fn matching<F: Fn(&Var) -> bool>(&self, filter: F) -> Vec<(Symbol, Var)> {
+        self.vars
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, var)| {
+                let var = var.clone()?;
+                let sym = Symbol::from_index(idx)?;
+                filter(&var).then_some((sym, var))
+            })
+            .collect()
+    }
+}
+
+/// The process-global variable scope.
+///
+/// Temporary: `kati-session-value` moves this into the session. It is a
+/// separate lock from the interner's, so a diagnostic that renders a symbol may
+/// be raised while it is held.
+static GLOBAL_VARS: LazyLock<Mutex<GlobalVars>> =
+    LazyLock::new(|| Mutex::new(with_symtab(GlobalVars::with_builtins)));
+
+/// Read a global variable without recording the read.
+pub fn peek_global_var(sym: Symbol) -> Option<Var> {
+    GLOBAL_VARS.lock().peek(sym)
+}
+
+/// Read a global variable, recording it if it came from the environment.
+pub fn get_global_var(sym: Symbol) -> Option<Var> {
+    let var = GLOBAL_VARS.lock().peek(sym)?;
+    match var.read().origin() {
+        VarOrigin::Environment | VarOrigin::EnvironmentOverride => {
+            USED_ENV_VARS.lock().insert(sym);
+        }
+        _ => {}
+    }
+    Some(var)
+}
+
+/// Assign to a global variable under Make's precedence rules.
+pub fn set_global_var(
+    sym: Symbol,
+    var: Var,
+    is_override: bool,
+    readonly: Option<&mut bool>,
+) -> Result<()> {
+    GLOBAL_VARS.lock().assign(sym, var, is_override, readonly)
+}
+
+/// The names of the global variables satisfying `filter`, in symbol order.
+pub fn global_var_names<F: Fn(&Var) -> bool>(filter: F) -> Vec<(Symbol, Bytes)> {
+    // The scope lock is released before the interner is consulted: these are
+    // two structures with two locks, and nothing takes both.
+    let matched = GLOBAL_VARS.lock().matching(filter);
+    with_symtab(|symtab| {
+        matched
+            .into_iter()
+            .map(|(sym, _)| (sym, symtab.name(sym)))
+            .collect()
+    })
+}
+
+/// Binds a global variable for as long as it is held, then restores whatever
+/// the symbol was bound to before, including nothing.
+pub struct ScopedGlobalVar {
+    sym: Symbol,
+    orig: Option<Var>,
+}
+
+impl ScopedGlobalVar {
+    pub fn new(sym: Symbol, var: Var) -> Result<Self> {
+        let orig = GLOBAL_VARS.lock().replace(sym, Some(var));
+        Ok(Self { sym, orig })
+    }
+}
+
+impl Drop for ScopedGlobalVar {
+    fn drop(&mut self) {
+        GLOBAL_VARS.lock().replace(self.sym, self.orig.take());
+    }
+}
 
 pub struct Vars(pub Mutex<HashMap<Symbol, Var>>);
 
@@ -525,5 +712,81 @@ impl Drop for ScopedVar {
         } else {
             vars.remove(&self.sym);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Interning a name must not create, read, or modify a binding.
+    // [spec:ronin:req:make.scope-separation/test]
+    #[test]
+    fn test_interning_defines_nothing() {
+        let mut symtab = Symtab::new();
+        let scope = GlobalVars::new();
+        let sym = symtab.intern("SOME_VARIABLE");
+        assert!(scope.peek(sym).is_none());
+        assert!(scope.matching(|_| true).is_empty());
+    }
+
+    /// A scope can be replaced wholesale without reinterning its symbols.
+    // [spec:ronin:req:make.scope-separation/test]
+    #[test]
+    fn test_scope_replaced_without_reinterning() {
+        let mut symtab = Symtab::new();
+        let sym = symtab.intern("CFLAGS");
+
+        let mut first = GlobalVars::new();
+        first
+            .assign(
+                sym,
+                Variable::with_simple_string(
+                    Bytes::from_static(b"-O2"),
+                    VarOrigin::File,
+                    None,
+                    None,
+                ),
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            first.peek(sym).unwrap().read().string().unwrap().as_ref(),
+            b"-O2"
+        );
+
+        // A fresh scope over the same interner starts empty, and the symbol
+        // still resolves to its name without being interned again.
+        let second = GlobalVars::new();
+        assert!(second.peek(sym).is_none());
+        assert_eq!(symtab.name(sym), Bytes::from_static(b"CFLAGS"));
+        assert_eq!(symtab.intern("CFLAGS"), sym);
+
+        // The replaced scope is untouched by the new one.
+        assert!(first.peek(sym).is_some());
+    }
+
+    /// The builtins live in the scope, not the interner.
+    #[test]
+    fn test_builtins_are_scope_state() {
+        let mut symtab = Symtab::new();
+        let scope = GlobalVars::with_builtins(&mut symtab);
+        let shell_status = symtab.intern(".SHELLSTATUS");
+        assert!(scope.peek(shell_status).is_some());
+        // Same interner, a scope without builtins: the name interns to the same
+        // handle but has no binding.
+        assert!(GlobalVars::new().peek(shell_status).is_none());
+    }
+
+    #[test]
+    fn test_replace_restores_absence() {
+        let mut symtab = Symtab::new();
+        let sym = symtab.intern("TMP");
+        let mut scope = GlobalVars::new();
+        let var = Variable::new_simple(VarOrigin::Automatic, None, None);
+        assert!(scope.replace(sym, Some(var)).is_none());
+        assert!(scope.replace(sym, None).is_some());
+        assert!(scope.peek(sym).is_none());
     }
 }

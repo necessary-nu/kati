@@ -45,7 +45,7 @@ use kati::eval::FrameType;
 use kati::expr::{Evaluable, Value};
 use kati::loc::Loc;
 use kati::stmt::Stmt;
-use kati::var::{VarOrigin, Variable};
+use kati::var::{VarOrigin, Variable, set_global_var};
 
 use kati::eval::Evaluator;
 use kati::flags::FLAGS;
@@ -132,7 +132,8 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
     let mut makefile_list = BytesMut::new();
     makefile_list.put_u8(b' ');
     makefile_list.put_slice(FLAGS.makefile.lock().clone().unwrap().as_bytes());
-    intern("MAKEFILE_LIST").set_global_var(
+    set_global_var(
+        intern("MAKEFILE_LIST"),
         Variable::with_simple_string(
             makefile_list.freeze(),
             VarOrigin::File,
@@ -145,7 +146,8 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
     for (k, v) in std::env::vars_os() {
         let v = Bytes::from(v.as_bytes().to_vec());
         let val = Arc::new(Value::Literal(None, v.clone()));
-        intern(k.as_bytes().to_vec()).set_global_var(
+        set_global_var(
+            intern(k.as_bytes().to_vec()),
             Variable::new_recursive(
                 val,
                 VarOrigin::Environment,

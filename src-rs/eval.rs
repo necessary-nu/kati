@@ -38,7 +38,7 @@ use crate::stmt::{
 };
 use crate::strutil::{is_space_byte, trim_leading_curdir, trim_right_space, word_scanner};
 use crate::symtab::{ALLOW_RULES_SYM, KATI_READONLY_SYM, MAKEFILE_LIST, SHELL_SYM, Symbol, intern};
-use crate::var::{Var, VarOrigin, Variable, Vars};
+use crate::var::{Var, VarOrigin, Variable, Vars, get_global_var, peek_global_var, set_global_var};
 use crate::{collect_stats_with_slow_report, error_loc, file_cache, log, warn_loc};
 
 pub enum RulesAllowed {
@@ -481,7 +481,7 @@ impl Evaluator {
             let rhs = stmt.rhs.eval_to_buf(self)?;
             for name in word_scanner(&rhs) {
                 let name = intern(rhs.slice_ref(name));
-                let Some(var) = name.get_global_var() else {
+                let Some(var) = get_global_var(name) else {
                     error_loc!(self.loc.as_ref(), "*** unknown variable: {name}");
                 };
                 var.write().readonly = true;
@@ -499,7 +499,7 @@ impl Evaluator {
         )?;
         if needs_assign {
             let mut readonly = false;
-            lhs.set_global_var(var.clone(), is_override, Some(&mut readonly))?;
+            set_global_var(lhs, var.clone(), is_override, Some(&mut readonly))?;
             if readonly {
                 error_loc!(
                     self.loc.as_ref(),
@@ -818,7 +818,8 @@ impl Evaluator {
         if let Some(var_list) = self.lookup_var(*MAKEFILE_LIST)? {
             var_list.write().append_str(&v, self.current_frame())?;
         } else {
-            MAKEFILE_LIST.set_global_var(
+            set_global_var(
+                *MAKEFILE_LIST,
                 Variable::with_simple_string(
                     v,
                     VarOrigin::File,
@@ -938,7 +939,7 @@ impl Evaluator {
     }
 
     pub fn lookup_var_global(&self, name: Symbol) -> Option<Var> {
-        let v = name.get_global_var();
+        let v = get_global_var(name);
         if v.is_none() {
             USED_UNDEFINED_VARS.lock().insert(name);
         }
@@ -1054,7 +1055,7 @@ impl Evaluator {
         }
 
         if result.is_none() {
-            result = name.peek_global_var();
+            result = peek_global_var(name);
         }
 
         result
@@ -1075,7 +1076,7 @@ impl Evaluator {
         if let Some(current_scope) = &self.current_scope {
             current_scope.peek(name)
         } else {
-            name.peek_global_var()
+            peek_global_var(name)
         }
     }
 

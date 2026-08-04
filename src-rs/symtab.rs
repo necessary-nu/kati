@@ -14,6 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Symbol interning.
+//!
+//! This module owns the mapping between byte strings and [`Symbol`] handles and
+//! nothing else. Make's global variable scope, which is keyed by `Symbol`,
+//! lives in [`crate::var::GlobalVars`]; interning a name neither creates nor
+//! reads a variable binding. See `[spec:ronin:req:make.scope-separation]`.
+
 use std::{
     collections::HashMap,
     fmt::{Debug, Display},
@@ -22,15 +29,19 @@ use std::{
     vec,
 };
 
-use crate::{
-    error,
-    var::{Var, VarOrigin, Variable},
-};
-use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
 
 static SYMTAB: LazyLock<Mutex<Symtab>> = LazyLock::new(|| Mutex::new(Symtab::new()));
+
+/// Run `f` with exclusive access to the process-global interner.
+///
+/// Temporary: `kati-session-value` replaces this with an interner reached
+/// through the session. Nothing called from `f` may intern or render a symbol,
+/// because the interner lock is not reentrant.
+pub fn with_symtab<R>(f: impl FnOnce(&mut Symtab) -> R) -> R {
+    f(&mut SYMTAB.lock())
+}
 
 pub static SHELL_SYM: LazyLock<Symbol> = LazyLock::new(|| intern("SHELL"));
 pub static ALLOW_RULES_SYM: LazyLock<Symbol> = LazyLock::new(|| intern(".KATI_ALLOW_RULES"));
@@ -44,190 +55,96 @@ pub struct Symbol(NonZeroUsize);
 
 impl Display for Symbol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let r = SYMTAB.lock();
-        write!(f, "{}", String::from_utf8_lossy(&r.symbols[self.0.get()]))
+        write!(f, "{}", String::from_utf8_lossy(&self.as_bytes()))
     }
 }
 
 impl Debug for Symbol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let r = SYMTAB.lock();
-        write!(f, "{:?}({})", r.symbols[self.0.get()], self.0.get())
+        write!(f, "{:?}({})", self.as_bytes(), self.0.get())
     }
 }
 
 impl Symbol {
     pub fn as_bytes(&self) -> Bytes {
-        let r = SYMTAB.lock();
-        r.symbols[self.0.get()].clone()
+        with_symtab(|symtab| symtab.name(*self))
     }
 
-    pub fn peek_global_var(&self) -> Option<Var> {
-        let r = SYMTAB.lock();
-        r.symbol_data.get(self.0.get())?.clone()
+    /// The interner slot this handle names. Only the interner and the variable
+    /// scope keyed by it have any business looking at this.
+    pub(crate) fn index(self) -> usize {
+        self.0.get()
     }
 
-    pub fn get_global_var(&self) -> Option<Var> {
-        let v = {
-            let r = SYMTAB.lock();
-            r.symbol_data.get(self.0.get())?.clone()?
-        };
-        match v.read().origin() {
-            VarOrigin::Environment | VarOrigin::EnvironmentOverride => {
-                crate::var::USED_ENV_VARS.lock().insert(*self);
-            }
-            _ => {}
-        }
-        Some(v)
-    }
-
-    pub fn set_global_var(
-        &self,
-        var: Var,
-        is_override: bool,
-        readonly: Option<&mut bool>,
-    ) -> Result<()> {
-        let mut r = SYMTAB.lock();
-        r.set_global_var(self, var, is_override, readonly)
+    /// The handle for interner slot `index`, or `None` for the reserved slot 0.
+    pub(crate) fn from_index(index: usize) -> Option<Self> {
+        NonZeroUsize::new(index).map(Self)
     }
 }
 
-pub struct ScopedGlobalVar {
-    sym: Symbol,
-    orig: Option<Var>,
-}
-
-impl ScopedGlobalVar {
-    pub fn new(sym: Symbol, var: Var) -> Result<Self> {
-        let orig = sym.peek_global_var();
-        let mut symtab = SYMTAB.lock();
-        let idx = sym.0.get();
-        if idx >= symtab.symbol_data.len() {
-            symtab.symbol_data.resize(idx + 1, None);
-        }
-        symtab.symbol_data[idx] = Some(var);
-        Ok(Self { sym, orig })
-    }
-}
-
-impl Drop for ScopedGlobalVar {
-    fn drop(&mut self) {
-        let mut r = SYMTAB.lock();
-        let idx = self.sym.0.get();
-        r.symbol_data[idx] = self.orig.clone();
-    }
-}
-
-struct Symtab {
+/// The interner: byte strings to [`Symbol`] handles and back.
+///
+/// It holds no variable bindings. A `Symtab` and a [`crate::var::GlobalVars`]
+/// are constructed, replaced, and dropped independently of each other.
+// [spec:ronin:req:make.scope-separation]
+pub struct Symtab {
     symbols: Vec<Bytes>,
-    symbol_data: Vec<Option<Var>>,
-    symtab: HashMap<Bytes, Symbol>,
+    index: HashMap<Bytes, Symbol>,
+}
+
+impl Default for Symtab {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Symtab {
-    fn new() -> Self {
+    /// An interner preloaded with the 255 single-byte names, which are interned
+    /// at the slot equal to their byte so that `intern` can answer for them
+    /// without consulting the map.
+    pub fn new() -> Self {
         let mut symtab = Self {
             symbols: vec![Bytes::new()],
-            symbol_data: vec![],
-            symtab: HashMap::new(),
+            index: HashMap::new(),
         };
         for i in 1u8..=255 {
             assert!(symtab.symbols.len() == i as usize);
             let name = Bytes::from(vec![i]);
             let sym = Symbol(NonZeroUsize::new(i.into()).unwrap());
             symtab.symbols.push(name.clone());
-            symtab.symtab.insert(name, sym);
+            symtab.index.insert(name, sym);
         }
-
-        let shell_status_sym = symtab.intern(".SHELLSTATUS");
-        symtab
-            .set_global_var(
-                &shell_status_sym,
-                Variable::new_shell_status_var(),
-                false,
-                None,
-            )
-            .unwrap();
-        let variables_sym = symtab.intern(".VARIABLES");
-        symtab
-            .set_global_var(
-                &variables_sym,
-                Variable::new_variable_names(b".VARIABLES", true),
-                false,
-                None,
-            )
-            .unwrap();
-        let symbols_sym = symtab.intern(".KATI_SYMBOLS");
-        symtab
-            .set_global_var(
-                &symbols_sym,
-                Variable::new_variable_names(b".KATI_SYMBOLS", false),
-                false,
-                None,
-            )
-            .unwrap();
-
         symtab
     }
 
-    fn intern<T: Into<Bytes> + AsRef<[u8]>>(&mut self, s: T) -> Symbol {
+    pub fn intern<T: Into<Bytes> + AsRef<[u8]>>(&mut self, s: T) -> Symbol {
         if let [c] = s.as_ref() {
             return Symbol(NonZeroUsize::new(*c as usize).unwrap());
         }
         let s = s.into();
-        if let Some(sym) = self.symtab.get(&s) {
+        if let Some(sym) = self.index.get(&s) {
             return *sym;
         }
         let sym = Symbol(NonZeroUsize::new(self.symbols.len()).unwrap());
         self.symbols.push(s.clone());
-        self.symtab.insert(s, sym);
+        self.index.insert(s, sym);
         sym
     }
 
-    fn set_global_var(
-        &mut self,
-        sym: &Symbol,
-        var: Var,
-        is_override: bool,
-        readonly: Option<&mut bool>,
-    ) -> Result<()> {
-        let idx = sym.0.get();
-        if idx >= self.symbol_data.len() {
-            self.symbol_data.resize(idx + 1, None);
-        }
-        let entry = self.symbol_data.get_mut(idx).unwrap();
-        if let Some(orig) = entry {
-            if orig.read().readonly {
-                if let Some(readonly) = readonly {
-                    *readonly = true;
-                } else {
-                    error!("*** cannot assign to readonly variable: {sym}");
-                }
-                return Ok(());
-            } else if let Some(readonly) = readonly {
-                *readonly = false;
-            }
-            let origin = orig.read().origin();
-            if !is_override
-                && (origin == VarOrigin::Override || origin == VarOrigin::EnvironmentOverride)
-            {
-                return Ok(());
-            }
-            if origin == VarOrigin::CommandLine && var.read().origin() == VarOrigin::File {
-                return Ok(());
-            }
-            if origin == VarOrigin::Automatic {
-                error!("overriding automatic variable is not implemented yet");
-            }
-        }
-        *entry = Some(var);
-        Ok(())
+    /// The bytes `sym` was interned from. Panics if `sym` came from a different
+    /// interner and names a slot this one does not have.
+    pub fn name(&self, sym: Symbol) -> Bytes {
+        self.symbols[sym.0.get()].clone()
+    }
+
+    /// The number of interned names, counting the reserved slot 0.
+    pub fn count(&self) -> usize {
+        self.symbols.len()
     }
 }
 
 pub fn intern<T: Into<Bytes> + AsRef<[u8]>>(s: T) -> Symbol {
-    let mut w = SYMTAB.lock();
-    w.intern(s)
+    with_symtab(|symtab| symtab.intern(s))
 }
 
 pub fn join_symbols(symbols: &[Symbol], sep: &[u8]) -> Bytes {
@@ -244,24 +161,8 @@ pub fn join_symbols(symbols: &[Symbol], sep: &[u8]) -> Bytes {
     r.freeze()
 }
 
-pub fn get_symbol_names<T: Fn(Var) -> bool>(filter: T) -> Vec<(Symbol, Bytes)> {
-    let s = SYMTAB.lock();
-    s.symbols
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, str)| {
-            let var = s.symbol_data.get(idx)?.clone()?;
-            if !filter(var) {
-                return None;
-            }
-            Some((Symbol(NonZeroUsize::new(idx).unwrap()), str.clone()))
-        })
-        .collect::<Vec<_>>()
-}
-
 pub fn symbol_count() -> usize {
-    let s = SYMTAB.lock();
-    s.symbols.len()
+    with_symtab(|symtab| symtab.count())
 }
 
 #[cfg(test)]
@@ -287,5 +188,16 @@ mod tests {
     fn test_single_letter_symbol() {
         let sym = intern("a");
         assert_eq!(sym.0.get(), 'a' as usize);
+    }
+
+    #[test]
+    fn test_symtab_is_independently_constructible() {
+        let mut a = Symtab::new();
+        let mut b = Symtab::new();
+        let foo = a.intern("foo");
+        assert_eq!(a.name(foo), Bytes::from_static(b"foo"));
+        // A private interner is unaffected by every name interned elsewhere.
+        assert_eq!(b.count(), Symtab::new().count());
+        assert_eq!(b.intern("foo"), foo);
     }
 }

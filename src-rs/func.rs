@@ -44,8 +44,8 @@ use crate::{
         Pattern, WordWriter, echo_escape, format_for_command_substitution, has_path_prefix,
         normalize_path, trim_left_space, trim_space, word_scanner,
     },
-    symtab::{ScopedGlobalVar, intern},
-    var::{VarOrigin, Variable, set_shell_status_var},
+    symtab::intern,
+    var::{ScopedGlobalVar, VarOrigin, Variable, set_global_var, set_shell_status_var},
     warn_loc,
 };
 
@@ -1027,7 +1027,7 @@ fn deprecated_var_func(
             None => {
                 let v =
                     Variable::new_simple(VarOrigin::File, Some(ev.current_frame()), ev.loc.clone());
-                sym.set_global_var(v.clone(), false, None)?;
+                set_global_var(sym, v.clone(), false, None)?;
                 v
             }
         };
@@ -1073,7 +1073,7 @@ fn obsolete_var_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn Buf
             None => {
                 let v =
                     Variable::new_simple(VarOrigin::File, Some(ev.current_frame()), ev.loc.clone());
-                sym.set_global_var(v.clone(), false, None)?;
+                set_global_var(sym, v.clone(), false, None)?;
                 v
             }
         };
@@ -1273,7 +1273,7 @@ fn visibility_prefix_func(
     } else {
         // If variable is not defined, create an empty variable.
         let v = Variable::new_simple(VarOrigin::File, Some(ev.current_frame()), ev.loc.clone());
-        sym.set_global_var(v.clone(), false, None)?;
+        set_global_var(sym, v.clone(), false, None)?;
         v
     };
     if !prefixes.is_empty() {
