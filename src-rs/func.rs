@@ -45,7 +45,10 @@ use crate::{
         normalize_path, trim_left_space, trim_space, word_scanner,
     },
     symtab::intern,
-    var::{ScopedGlobalVar, VarOrigin, Variable, set_global_var, set_shell_status_var},
+    var::{
+        VarOrigin, Variable, set_global_var, set_shell_status_var, with_global_var_bound,
+        with_global_vars_bound,
+    },
     warn_loc,
 };
 
@@ -739,12 +742,12 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
             None,
         ));
     }
-    let mut sv = Vec::new();
+    let mut bindings = Vec::new();
     let mut i = 1;
     loop {
         let tmpvar_name_sym = intern(format!("{i}"));
         if let Some(a) = av.get(i - 1) {
-            sv.push(ScopedGlobalVar::new(tmpvar_name_sym, a.clone())?);
+            bindings.push((tmpvar_name_sym, a.clone()));
         } else {
             // We need to blank further automatic vars
             let Some(v) = ev.lookup_var(tmpvar_name_sym)? else {
@@ -755,14 +758,16 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
             }
 
             let v = Variable::new_simple(VarOrigin::Automatic, None, None);
-            sv.push(ScopedGlobalVar::new(tmpvar_name_sym, v)?);
+            bindings.push((tmpvar_name_sym, v));
         }
         i += 1;
     }
 
     ev.eval_depth -= 1;
 
-    {
+    // The positional arguments stay bound for the whole body and are put back
+    // afterwards, including when the body fails.
+    with_global_vars_bound(bindings, || {
         let _frame = ev.enter(
             FrameType::Call,
             func_name_buf,
@@ -771,7 +776,8 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
         if let Some(func) = func {
             func.read().eval(ev, out)?;
         }
-    }
+        Ok(())
+    })?;
 
     ev.eval_depth += 1;
 
@@ -786,9 +792,8 @@ fn foreach_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -
     for tok in word_scanner(&list) {
         let tok = list.slice_ref(tok);
         let v = Variable::with_simple_string(tok, VarOrigin::Automatic, None, None);
-        let _sv = ScopedGlobalVar::new(varname, v)?;
         ww.maybe_add_space();
-        args[2].eval(ev, ww.out)?;
+        with_global_var_bound(varname, v, || args[2].eval(ev, ww.out))?;
     }
     ev.eval_depth += 1;
     Ok(())
@@ -1208,9 +1213,8 @@ fn foreach_sep_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMu
     for tok in word_scanner(&list) {
         let tok = list.slice_ref(tok);
         let v = Variable::with_simple_string(tok, VarOrigin::Automatic, None, None);
-        let _sv = ScopedGlobalVar::new(varname, v)?;
         ww.maybe_add_separator(&separator);
-        args[3].eval(ev, ww.out)?;
+        with_global_var_bound(varname, v, || args[3].eval(ev, ww.out))?;
     }
     ev.eval_depth += 1;
     Ok(())
@@ -1423,4 +1427,124 @@ static FUNC_INFO_MAP: LazyLock<HashMap<&'static [u8], &'static FuncInfo>> =
 
 pub fn get_func_info(name: &[u8]) -> Option<&'static FuncInfo> {
     FUNC_INFO_MAP.get(name).map(|v| &**v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        expr::{ParseExprOpt, parse_expr},
+        var::peek_global_var,
+    };
+
+    /// Evaluate a Make expression with a fresh evaluator, returning both the
+    /// result and whatever the expression managed to write before failing.
+    fn eval(src: &'static str) -> (Result<()>, Bytes) {
+        let expr = parse_expr(
+            &mut Loc::default(),
+            Bytes::from_static(src.as_bytes()),
+            ParseExprOpt::Normal,
+        )
+        .unwrap();
+        let mut ev = Evaluator::new();
+        let mut out = BytesMut::new();
+        let result = expr.eval(&mut ev, &mut out);
+        (result, out.freeze())
+    }
+
+    fn simple(value: &'static [u8]) -> crate::var::Var {
+        Variable::with_simple_string(Bytes::from_static(value), VarOrigin::File, None, None)
+    }
+
+    fn string_of(var: crate::var::Var) -> String {
+        String::from_utf8(var.read().string().unwrap().into_owned()).unwrap()
+    }
+
+    /// A `foreach` body that fails partway must leave the loop variable
+    /// unbound again — not bound to the last token, and not bound to an empty
+    /// value. Restoring an absence is a distinct case from restoring a value,
+    /// and it is the one the error path used to reach only through `Drop`.
+    #[test]
+    fn test_foreach_restores_unbound_variable_when_body_fails() {
+        let sym = intern("KATI_TEST_FOREACH_UNBOUND");
+        assert!(peek_global_var(sym).is_none());
+
+        let (result, out) = eval(
+            "$(foreach KATI_TEST_FOREACH_UNBOUND,a b c,\
+             $(if $(filter b,$(KATI_TEST_FOREACH_UNBOUND)),\
+             $(error stop),$(KATI_TEST_FOREACH_UNBOUND)))",
+        );
+
+        assert!(result.is_err());
+        // The first token was written and the third was not: the loop failed
+        // partway rather than before it started.
+        assert_eq!(out.as_ref(), b"a ");
+        assert!(peek_global_var(sym).is_none());
+    }
+
+    /// The same failure with a binding to go back to must go back to it.
+    #[test]
+    fn test_foreach_restores_previous_binding_when_body_fails() {
+        let sym = intern("KATI_TEST_FOREACH_BOUND");
+        set_global_var(sym, simple(b"outer"), false, None).unwrap();
+
+        let (result, out) = eval(
+            "$(foreach KATI_TEST_FOREACH_BOUND,a b c,\
+             $(if $(filter b,$(KATI_TEST_FOREACH_BOUND)),\
+             $(error stop),$(KATI_TEST_FOREACH_BOUND)))",
+        );
+
+        assert!(result.is_err());
+        assert_eq!(out.as_ref(), b"a ");
+        assert_eq!(string_of(peek_global_var(sym).unwrap()), "outer");
+    }
+
+    /// `foreach_sep` takes the same path with a separator in front of the body.
+    #[test]
+    fn test_foreach_sep_restores_unbound_variable_when_body_fails() {
+        let sym = intern("KATI_TEST_FOREACH_SEP_UNBOUND");
+        assert!(peek_global_var(sym).is_none());
+
+        let (result, _) = eval(
+            "$(KATI_foreach_sep KATI_TEST_FOREACH_SEP_UNBOUND,:,a b c,\
+             $(if $(filter b,$(KATI_TEST_FOREACH_SEP_UNBOUND)),\
+             $(error stop),$(KATI_TEST_FOREACH_SEP_UNBOUND)))",
+        );
+
+        assert!(result.is_err());
+        assert!(peek_global_var(sym).is_none());
+    }
+
+    /// `call` binds every positional argument at once. A body that fails must
+    /// leave all of them as it found them.
+    #[test]
+    fn test_call_restores_positional_arguments_when_body_fails() {
+        let body = b"$(1)$(error stop)";
+        let expr = parse_expr(
+            &mut Loc::default(),
+            Bytes::from_static(body),
+            ParseExprOpt::Normal,
+        )
+        .unwrap();
+        set_global_var(
+            intern("KATI_TEST_CALL_FUNC"),
+            Variable::new_recursive(expr, VarOrigin::File, None, None, Bytes::from_static(body)),
+            false,
+            None,
+        )
+        .unwrap();
+
+        let one = intern("1");
+        let two = intern("2");
+        assert!(peek_global_var(one).is_none());
+        assert!(peek_global_var(two).is_none());
+
+        let (result, out) = eval("$(call KATI_TEST_CALL_FUNC,x,y)");
+
+        assert!(result.is_err());
+        // $1 was bound while the body ran, and the body failed after using it.
+        assert_eq!(out.as_ref(), b"x");
+        assert!(peek_global_var(one).is_none());
+        assert!(peek_global_var(two).is_none());
+    }
 }

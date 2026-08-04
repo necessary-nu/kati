@@ -594,24 +594,56 @@ pub fn global_var_names<F: Fn(&Var) -> bool>(filter: F) -> Vec<(Symbol, Bytes)> 
     })
 }
 
-/// Binds a global variable for as long as it is held, then restores whatever
-/// the symbol was bound to before, including nothing.
-pub struct ScopedGlobalVar {
-    sym: Symbol,
-    orig: Option<Var>,
+/// Bind `sym` to `var` for the duration of `f`, then put back whatever the
+/// symbol was bound to before — including nothing at all.
+///
+/// This is the explicit form of the scope-restoring `Drop` guard it replaces.
+/// The restore runs on the error path as well as the value path, which is the
+/// one thing `Drop` was genuinely buying: Make evaluation propagates errors
+/// straight out of `foreach` and `call`, so a body that fails partway must not
+/// leave an automatic variable bound behind it.
+///
+/// The scope is a parameter of the save and of the restore, never of `f`. `f`
+/// re-enters evaluation and reaches the scope for itself, so nothing that
+/// borrows or locks the scope can be held across it — the lock is not
+/// reentrant, and the borrow would be the evaluator's. That is what rules out
+/// the `globals.with_bound(sym, var, |globals| ...)` shape here. The body is
+/// two [`GlobalVars::replace`] calls around a call, so when the scope becomes
+/// session-owned only the way it is reached has to change.
+///
+/// A panic unwinding out of `f` does not restore, unlike `Drop`. Evaluation
+/// reports every failure it is meant to survive as an `Err`; a panic is a bug,
+/// and the scope it would corrupt does not outlive it.
+pub fn with_global_var_bound<T>(sym: Symbol, var: Var, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let orig = GLOBAL_VARS.lock().replace(sym, Some(var));
+    let result = f();
+    GLOBAL_VARS.lock().replace(sym, orig);
+    result
 }
 
-impl ScopedGlobalVar {
-    pub fn new(sym: Symbol, var: Var) -> Result<Self> {
-        let orig = GLOBAL_VARS.lock().replace(sym, Some(var));
-        Ok(Self { sym, orig })
+/// [`with_global_var_bound`] for several symbols at once: all bound before `f`,
+/// all restored after it, in reverse order so nesting still holds if a symbol
+/// were ever to repeat. `$(call)` needs this — it binds every positional
+/// argument around a single body.
+pub fn with_global_vars_bound<T>(
+    bindings: Vec<(Symbol, Var)>,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let mut saved = Vec::with_capacity(bindings.len());
+    {
+        let mut globals = GLOBAL_VARS.lock();
+        for (sym, var) in bindings {
+            saved.push((sym, globals.replace(sym, Some(var))));
+        }
     }
-}
-
-impl Drop for ScopedGlobalVar {
-    fn drop(&mut self) {
-        GLOBAL_VARS.lock().replace(self.sym, self.orig.take());
+    let result = f();
+    {
+        let mut globals = GLOBAL_VARS.lock();
+        for (sym, orig) in saved.into_iter().rev() {
+            globals.replace(sym, orig);
+        }
     }
+    result
 }
 
 pub struct Vars(pub Mutex<HashMap<Symbol, Var>>);
@@ -788,5 +820,67 @@ mod tests {
         assert!(scope.replace(sym, Some(var)).is_none());
         assert!(scope.replace(sym, None).is_some());
         assert!(scope.peek(sym).is_none());
+    }
+
+    fn automatic(value: &'static [u8]) -> Var {
+        Variable::with_simple_string(Bytes::from_static(value), VarOrigin::Automatic, None, None)
+    }
+
+    fn string_of(var: Var) -> String {
+        String::from_utf8(var.read().string().unwrap().into_owned()).unwrap()
+    }
+
+    /// Restoring the *absence* of a binding is a different case from restoring
+    /// a value, and it is the one a body that fails partway has to get right.
+    #[test]
+    fn test_with_global_var_bound_restores_absence_on_error() {
+        let sym = crate::symtab::intern("KATI_TEST_BOUND_ABSENT");
+        assert!(peek_global_var(sym).is_none());
+
+        let result: Result<()> = with_global_var_bound(sym, automatic(b"inner"), || {
+            assert_eq!(string_of(peek_global_var(sym).unwrap()), "inner");
+            error!("body failed")
+        });
+
+        assert!(result.is_err());
+        assert!(peek_global_var(sym).is_none());
+    }
+
+    /// The same on the error path when there was a binding to go back to.
+    #[test]
+    fn test_with_global_var_bound_restores_previous_on_error() {
+        let sym = crate::symtab::intern("KATI_TEST_BOUND_PREVIOUS");
+        GLOBAL_VARS.lock().replace(sym, Some(automatic(b"outer")));
+
+        let result: Result<()> = with_global_var_bound(sym, automatic(b"inner"), || {
+            assert_eq!(string_of(peek_global_var(sym).unwrap()), "inner");
+            error!("body failed")
+        });
+
+        assert!(result.is_err());
+        assert_eq!(string_of(peek_global_var(sym).unwrap()), "outer");
+    }
+
+    /// Every binding of a group is restored when the body fails, whether it had
+    /// a previous value or none.
+    #[test]
+    fn test_with_global_vars_bound_restores_every_binding_on_error() {
+        let kept = crate::symtab::intern("KATI_TEST_BOUND_MANY_KEPT");
+        let absent = crate::symtab::intern("KATI_TEST_BOUND_MANY_ABSENT");
+        GLOBAL_VARS.lock().replace(kept, Some(automatic(b"outer")));
+        assert!(peek_global_var(absent).is_none());
+
+        let result: Result<()> = with_global_vars_bound(
+            vec![(kept, automatic(b"inner")), (absent, automatic(b"inner"))],
+            || {
+                assert_eq!(string_of(peek_global_var(kept).unwrap()), "inner");
+                assert_eq!(string_of(peek_global_var(absent).unwrap()), "inner");
+                error!("body failed")
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(string_of(peek_global_var(kept).unwrap()), "outer");
+        assert!(peek_global_var(absent).is_none());
     }
 }
