@@ -3,11 +3,11 @@ name = "kati"
 version = "0.1.0"
 edition = "2024"
 default-run = "rkati"
+autobenches = false
 
 [dependencies]
 anyhow = "1.0.98"
 bytes = "1.10.1"
-criterion = { version = "0.5.1", features = ["html_reports"] }
 env_logger = "0.11.8"
 gperftools = { version = "0.2.0", features = ["heap"], optional = true }
 libc = "0.2.172"
@@ -33,6 +33,3 @@ path = "src-rs/bins/find_emulator.rs"
 [lib]
 path = "src-rs/lib.rs"
 
-[[bench]]
-name = "strutil_benchmark"
-harness = false
