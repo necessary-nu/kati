@@ -4,12 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 default-run = "rkati"
-autobenches = false
 
 [dependencies]
 anyhow = "1.0.98"
 bytes = "1.10.1"
-env_logger = "0.11.8"
 gperftools = { version = "0.2.0", features = ["heap"], optional = true }
 libc = "0.2.172"
 log = "0.4.27"
@@ -18,9 +16,21 @@ os_pipe = "1.2.1"
 parking_lot = { version = "0.12.3" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tikv-jemallocator = "0.6.0"
+tikv-jemallocator = { version = "0.6.0", optional = true }
 
 [features]
+default = []
+# jemalloc is the `rkati` binary's allocator and nobody else's. Upstream has it
+# as a plain dependency, so cargo compiles its bundled C sources whenever this
+# package is built at all — including for an embedder that links the library
+# and never installs a global allocator.
+#
+# Off by default rather than on-with-an-opt-out, because an opt-out that has to
+# be remembered is one that eventually gets forgotten: by a new workspace
+# member, a test harness, a CI job. This way the cost lands only on whoever
+# asks for the thing that carries it. `cargo build --features jemalloc` gets
+# the allocator upstream ships with.
+jemalloc = ["dep:tikv-jemallocator"]
 gperf = ["dep:gperftools"]
 
 [[bin]]

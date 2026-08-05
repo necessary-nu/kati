@@ -39,9 +39,14 @@ rust_binary_host {
     name: "rkati",
     defaults: ["rkati_defaults"],
     srcs: ["src-rs/main.rs"],
+    // The allocator is the binary's, and so is the cargo feature that selects
+    // it: the library must not carry jemalloc's bundled C sources for an
+    // embedder that never installs a global allocator. This file already
+    // scoped the dependency to the binary; `Cargo.toml` now agrees, with the
+    // feature off by default, so the binary is where it gets asked for.
+    features: ["jemalloc"],
     rustlibs: [
         "libkati",
-        "libenv_logger",
     ],
     target: {
         linux: {

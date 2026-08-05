@@ -18,7 +18,15 @@ limitations under the License.
 #![allow(missing_docs)]
 // These are the lints enabled by default in Android
 // #![deny(missing_docs)]
-#![deny(warnings)]
+// Upstream also denies `warnings` here. Vendored, that turns every rustc
+// release into a build break for a lint we did not ask for and a downstream
+// `cargo install` cannot suppress, which is a worse failure than the one it
+// prevents. The denial moved to the embedding workspace's release gate, which
+// runs `cargo clippy -p kati --all-targets -- -D warnings`: the same check, at
+// a point where a compiler upgrade fails something a person is running rather
+// than everybody's build. `tests/no_globals.rs` covers the case that made this
+// worth keeping — an unused `static` — and covers it whether or not it is
+// used.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -52,6 +60,7 @@ pub mod flags;
 pub mod func;
 pub mod io;
 pub mod loc;
+pub mod logging;
 pub mod ninja;
 pub mod parser;
 pub mod regen;

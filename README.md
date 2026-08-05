@@ -70,4 +70,11 @@ $ go test --rkati --ninja --all
 ```
 
 The resulting `rkati` binary in `target/*/rkati` is a drop-in replacement for
-`ckati`. Setting `KATI_LOG=trace` at runtime can enable extra debug logging.
+`ckati`. Setting `KATI_LOG=trace` at runtime can enable extra debug logging,
+and a comma-separated `KATI_LOG=warn,kati::find=trace` narrows it to the
+modules named, longest matching prefix winning.
+
+Add `--features jemalloc` for the allocator this used to build with. It is off
+by default because it is the binary's choice and its bundled C sources are
+compiled whenever the feature is on, including for someone linking the library
+who never installs a global allocator.

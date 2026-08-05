@@ -21,10 +21,9 @@ use bytes::Bytes;
 use kati::find::*;
 
 fn main() -> Result<()> {
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Trace)
-        .parse_default_env()
-        .init();
+    // Everything, unless `KATI_LOG` asks for less: this tool exists to show
+    // what the find emulator did with a command.
+    kati::logging::init("KATI_LOG", log::LevelFilter::Trace);
     let Some(cmd) = std::env::args_os().nth(1) else {
         log::error!("Usage: {} <command>", std::env::args().next().unwrap());
         std::process::exit(1);

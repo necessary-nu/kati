@@ -18,7 +18,7 @@ limitations under the License.
 #![allow(missing_docs)]
 // These are the lints enabled by default in Android
 // #![deny(missing_docs)]
-#![deny(warnings)]
+// `#![deny(warnings)]` removed here for the reason given in `lib.rs`.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -45,14 +45,18 @@ use kati::loc::Loc;
 use kati::session::Session;
 use kati::timeutil::ScopedTimeReporter;
 
-#[cfg(all(not(feature = "gperf"), target_os = "linux"))]
+#[cfg(all(feature = "jemalloc", not(feature = "gperf"), target_os = "linux"))]
 use tikv_jemallocator::Jemalloc;
 
 // Use jemalloc for better performance, but gperftools will use tcmalloc for
 // heap debugging.
+//
+// Behind the `jemalloc` feature, which is off by default so that a consumer of
+// the library does not compile the allocator's bundled C sources for a binary
+// it is not building; see the feature's comment in `Cargo.toml`.
 // no-globals-gate: the global allocator, a Ronin-level choice in the binary
 // crate and not evaluation state.
-#[cfg(all(not(feature = "gperf"), target_os = "linux"))]
+#[cfg(all(feature = "jemalloc", not(feature = "gperf"), target_os = "linux"))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
@@ -176,17 +180,7 @@ fn handle_realpath(args: Vec<String>) {
 }
 
 fn main() {
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Warn)
-        .format(|buf, record| {
-            if let (Some(file), Some(line)) = (record.file(), record.line()) {
-                writeln!(buf, "*kati*: {file}:{line}: {}", record.args())
-            } else {
-                writeln!(buf, "*kati*: {}", record.args())
-            }
-        })
-        .parse_env("KATI_LOG")
-        .init();
+    kati::logging::init("KATI_LOG", log::LevelFilter::Warn);
 
     if std::env::args().len() >= 2 {
         let arg = std::env::args().nth(1).unwrap();
