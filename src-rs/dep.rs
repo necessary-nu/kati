@@ -544,7 +544,10 @@ impl<'a> DepBuilder<'a> {
 
     fn build(&mut self, mut targets: Vec<Symbol>) -> Result<Vec<NamedDepNode>> {
         let Some(first_rule) = self.first_rule else {
-            error!("*** No targets.");
+            // GNU Make's own wording, down to the two spaces and the `Stop.`,
+            // because its test suite matches this message exactly to learn what
+            // the program under test is called.
+            error_loc!(self.ev, None, "*** No targets.  Stop.");
         };
 
         if !self.ev.session.flags.gen_all_targets && targets.is_empty() {

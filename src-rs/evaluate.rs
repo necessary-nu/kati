@@ -45,6 +45,21 @@ use crate::symtab::{Symbol, join_symbols};
 use crate::timeutil::ScopedTimeReporter;
 use crate::var::{VarOrigin, Variable};
 
+/// The GNU Make features this evaluator actually has, in `.FEATURES`' spelling.
+///
+/// Each one was established differentially against GNU Make 4.4.1 rather than
+/// copied from its list, and the list is short because most of what GNU Make
+/// reports here is genuinely absent: `second-expansion`, `oneshell` and
+/// `notparallel` are warned about as unsupported at `dep.rs`, `undefine` and
+/// `load` are not directives the parser knows, `shell-export` does not reach
+/// the shell, and `grouped-target` parses but runs the recipe once per target
+/// rather than once for the group.
+///
+/// Build-side features belong to whoever runs the recipes, not to the
+/// evaluator, and arrive through [`Flags::extra_features`].
+pub const EVALUATOR_FEATURES: &[&str] =
+    &["target-specific", "order-only", "else-if", "shortest-stem"];
+
 /// A Makefile that has been read, expanded, and reduced to a graph.
 pub struct Evaluated {
     /// The evaluator the graph was produced by, which still holds the session,
@@ -78,6 +93,22 @@ fn read_bootstrap_makefile(
     // `$(MAKE_VERSION)` for a feature must get the answer the oracle would
     // give, or it takes a branch neither tool would have taken.
     bootstrap.put_slice(b"MAKE_VERSION?=4.4.1\n");
+    // What a Makefile is allowed to assume, and no more. Claiming a feature
+    // that is not there is worse than claiming none: a Makefile branches on
+    // this to decide whether it may use a construct, and GNU Make's test suite
+    // skips a case it names. An honest short list makes a build take the
+    // portable path; a generous one makes it take a path that then misbehaves.
+    // Simple assignment rather than `?=`, because it is a statement about the
+    // program and not a default the makefile may prefer to set.
+    let features = EVALUATOR_FEATURES
+        .iter()
+        .map(|feature| (*feature).to_owned())
+        .chain(session.flags.extra_features.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    bootstrap.put_slice(b".FEATURES := ");
+    bootstrap.put_slice(features.as_bytes());
+    bootstrap.put_u8(b'\n');
     bootstrap.put_slice(b"KATI?=ckati\n");
     // Overwrite $SHELL environment variable.
     bootstrap.put_slice(b"SHELL=/bin/sh\n");

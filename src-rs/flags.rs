@@ -18,6 +18,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     os::unix::ffi::{OsStrExt, OsStringExt},
+    path::Path,
     vec::IntoIter,
 };
 
@@ -103,6 +104,27 @@ pub struct Flags {
 
     pub cpu_profile_path: Option<OsString>,
     pub memory_profile_path: Option<OsString>,
+
+    /// What the program calls itself in a diagnostic that carries no location.
+    ///
+    /// GNU Make leads those with its own name — `make: *** No targets.  Stop.`
+    /// — and at depth with the level too, as `make[1]:`. Its test suite reads
+    /// the name back out of exactly that message and then writes it into every
+    /// expected diagnostic, so a front end that answers this correctly is
+    /// measured under its own name rather than having to claim Make's.
+    ///
+    /// Empty leaves the message unprefixed, which is what kati's own binary has
+    /// always done.
+    pub program_name: String,
+
+    /// Features the front end running the recipes provides, added to
+    /// [`EVALUATOR_FEATURES`](crate::evaluate::EVALUATOR_FEATURES) in
+    /// `.FEATURES`.
+    ///
+    /// The jobserver is the case that needs this: whether a build shares one
+    /// token budget is decided by whoever spawns the recipes, and the evaluator
+    /// never does.
+    pub extra_features: Vec<String>,
 }
 
 fn parse_command_line_option_with_arg(
@@ -134,7 +156,16 @@ impl Flags {
     pub fn from_args(args: Vec<OsString>, symtab: &mut Symtab) -> Flags {
         let mut iter = args.into_iter();
         let mut flags = Flags::default();
-        flags.subkati_args.push(iter.next().unwrap());
+        let program = iter.next().unwrap();
+        // What GNU Make leads a location-less diagnostic with: the name it was
+        // invoked under. kati printed nothing there, which reads as output from
+        // whatever ran it rather than from the tool that failed.
+        flags.program_name = Path::new(&program)
+            .file_name()
+            .unwrap_or(program.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        flags.subkati_args.push(program);
         flags.num_jobs = std::thread::available_parallelism().map_or(1, |p| p.get());
         flags.num_cpus = flags.num_jobs;
 

@@ -151,7 +151,13 @@ fn color_error_log(
     msg: String,
 ) -> anyhow::Error {
     let Some(loc) = loc else {
-        return anyhow::format_err!("{msg}");
+        // With no file and line to lead with, GNU Make leads with its own name.
+        // Empty is kati's own binary, which has never led with anything.
+        let program = &ctx.flags().program_name;
+        if program.is_empty() {
+            return anyhow::format_err!("{msg}");
+        }
+        return anyhow::format_err!("{program}: {msg}");
     };
     let loc = loc.display(ctx);
 
