@@ -72,8 +72,12 @@ fn read_bootstrap_makefile(
         bootstrap.put_slice(b"CXX?=g++\n");
     }
     bootstrap.put_slice(b"AR?=ar\n");
-    // Pretend to be GNU make 4.2.1, for compatibility.
-    bootstrap.put_slice(b"MAKE_VERSION?=4.2.1\n");
+    // The one place a GNU Make version is claimed, because Makefiles branch on
+    // it. It names the version this front end is measured against rather than
+    // the one the vendored Go harness pinned: a Makefile that tests
+    // `$(MAKE_VERSION)` for a feature must get the answer the oracle would
+    // give, or it takes a branch neither tool would have taken.
+    bootstrap.put_slice(b"MAKE_VERSION?=4.4.1\n");
     bootstrap.put_slice(b"KATI?=ckati\n");
     // Overwrite $SHELL environment variable.
     bootstrap.put_slice(b"SHELL=/bin/sh\n");
