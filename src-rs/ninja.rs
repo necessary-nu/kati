@@ -35,15 +35,30 @@ use crate::func::CommandOp;
 use crate::io::{dump_int, dump_string, dump_systemtime, dump_usize, dump_vec_string};
 use crate::strutil::{basename, concat_dir, dirname, strip_ext, strip_ext_vec};
 use crate::{
+    build_sink::{BuildSink, RuleId, SinkCommand, SinkEdge, SinkPool, SinkRule},
     command::{Command, CommandEvaluator},
     dep::{DepNode, NamedDepNode, is_special_target},
     eval::Evaluator,
     expr::Evaluable,
     flags::Flags,
+    loc::Loc,
     strutil::{escape_shell, trim_left_space},
-    symtab::Symbol,
+    symtab::{Interner, Symbol},
     timeutil::ScopedTimeReporter,
 };
+
+/// The pool kati declares for itself, so that `--remote_num_jobs` can let ninja
+/// run wide while the commands kati generated stay capped at `--jobs`.
+const LOCAL_POOL: &[u8] = b"local_pool";
+
+/// The synthetic target every `.PHONY` edge depends on when the manifest cannot
+/// say `phony_output`. Nothing builds it, so ninja considers it dirty forever,
+/// which is how a `.PHONY` target gets Make's always-run behaviour through a
+/// file format that only knows about files.
+///
+/// This exists for the manifest and nowhere else, which is why it is invented
+/// here rather than pushed through [`BuildSink`].
+const ALWAYS_BUILD: &[u8] = b"_kati_always_build_";
 
 fn find_command_line_flag(cmd: &[u8], name: &[u8]) -> Option<usize> {
     match memmem::find(cmd, name) {
@@ -142,26 +157,28 @@ fn get_depfile_from_command(cmd: &mut BytesMut) -> Result<Option<Bytes>> {
 struct NinjaNode {
     node: Arc<Mutex<DepNode>>,
     commands: Vec<Command>,
-    rule_id: Option<usize>,
+    rule_id: Option<RuleId>,
 }
 
 struct NinjaGenerator<'a> {
     ce: CommandEvaluator<'a>,
     done: HashSet<Symbol>,
-    rule_id: usize,
+    rule_id: RuleId,
     shell: Bytes,
     shell_flags: Bytes,
     used_envs: HashMap<Symbol, OsString>,
     kati_binary: OsString,
     start_time: SystemTime,
     nodes: Vec<NinjaNode>,
-    default_target: Mutex<Option<Arc<Mutex<DepNode>>>>,
 }
 
 impl<'a> NinjaGenerator<'a> {
     fn new(ce: CommandEvaluator<'a>, start_time: SystemTime) -> Result<Self> {
-        let shell = Self::escape_ninja(&ce.ev.get_shell()?);
-        let shell_flags = Self::escape_ninja(&Bytes::from_static(ce.ev.get_shell_flag()));
+        // Unescaped: whether these need escaping is a question about the
+        // destination, so the answer belongs to whatever is on the far side of
+        // the sink.
+        let shell = ce.ev.get_shell()?;
+        let shell_flags = Bytes::from_static(ce.ev.get_shell_flag());
         ce.ev.avoid_io = true;
         Ok(Self {
             ce,
@@ -173,7 +190,6 @@ impl<'a> NinjaGenerator<'a> {
             kati_binary: OsString::from(std::env::current_exe().unwrap()),
             start_time,
             nodes: Vec::new(),
-            default_target: Mutex::new(None),
         })
     }
 
@@ -444,188 +460,147 @@ impl<'a> NinjaGenerator<'a> {
         result
     }
 
-    fn emit_depfile(
-        &mut self,
-        node: &DepNode,
-        cmd_buf: &mut BytesMut,
-        out: &mut impl std::io::Write,
-    ) -> Result<()> {
-        if let Some(depfile) = self.get_depfile(node, cmd_buf)? {
-            write!(out, " depfile = ")?;
-            out.write_all(&depfile)?;
-            writeln!(out, "\n deps = gcc")?;
+    /// Which pool this node's edge belongs in.
+    ///
+    /// `.KATI_NINJA_POOL` wins, and names `none` to opt out of the fallbacks.
+    /// Failing that `--default_pool` applies to anything that runs a command,
+    /// and failing that `--remote_num_jobs` puts every edge in kati's own pool
+    /// so that a wide ninja does not run wide locally.
+    fn resolve_pool(&mut self, node: &DepNode, has_rule: bool) -> Result<Option<Bytes>> {
+        let named = if let Some(ninja_pool_var) = &node.ninja_pool_var {
+            Some(ninja_pool_var.read().eval_to_buf(self.ce.ev)?)
+        } else {
+            None
+        };
+        if let Some(named) = named.filter(|pool| !pool.is_empty()) {
+            return Ok(if named.as_ref() == b"none" {
+                None
+            } else {
+                Some(named)
+            });
         }
-        Ok(())
+        let flags = &self.ce.ev.session.flags;
+        if !flags.default_pool.is_empty() && has_rule {
+            return Ok(Some(Bytes::copy_from_slice(flags.default_pool.as_bytes())));
+        }
+        if flags.remote_num_jobs > 0 {
+            return Ok(Some(Bytes::from_static(LOCAL_POOL)));
+        }
+        Ok(None)
     }
 
-    fn emit_node(&mut self, nn: &NinjaNode, out: &mut impl std::io::Write) -> Result<()> {
+    /// Hand one dependency node to the sink as at most one rule and one edge.
+    ///
+    /// Returns the node's output if it is the default target, which is decided
+    /// here rather than in the sink because it is a fact about the Makefile.
+    fn sink_node(&mut self, nn: &NinjaNode, sink: &mut dyn BuildSink) -> Result<Option<Symbol>> {
         let node = nn.node.lock();
-        let commands = &nn.commands;
-
-        let mut rule_name = "phony".to_string();
-        let use_local_pool = self.ce.ev.session.flags.remote_num_jobs > 0;
         if is_special_target(&self.ce.ev.session, &node.output) {
-            return Ok(());
+            return Ok(None);
         }
-        if self.ce.ev.session.flags.enable_debug {
-            writeln!(
-                out,
-                "# {}",
-                node.loc
-                    .clone()
-                    .unwrap_or_default()
-                    .display(&self.ce.ev.session)
-            )?;
-        }
-        if !commands.is_empty() {
-            rule_name = format!("rule{}", nn.rule_id.unwrap());
-            writeln!(out, "rule {rule_name}")?;
 
+        let rule_id = if nn.commands.is_empty() {
+            None
+        } else {
+            let id = nn.rule_id.unwrap();
             let mut description = Bytes::from_static(b"build $out");
             let mut cmd_buf = BytesMut::new();
             let output_str = node.output.as_bytes(&self.ce.ev.session);
             Self::gen_shell_script(
                 &self.ce.ev.session.flags,
                 &output_str,
-                commands,
+                &nn.commands,
                 &mut cmd_buf,
                 &mut description,
             );
-            out.write_all(b" description = ")?;
-            out.write_all(&description)?;
-            out.write_all(b"\n")?;
-            self.emit_depfile(&node, &mut cmd_buf, out)?;
+            // Extracting the depfile can rewrite the command, so it has to
+            // happen before the command is measured or handed over.
+            let depfile = self.get_depfile(&node, &mut cmd_buf)?;
 
             // It seems Linux is OK with ~130kB and Mac's limit is ~250kB.
             // TODO: Find this number automatically.
-            if cmd_buf.len() > 100 * 1000 {
-                writeln!(out, " rspfile = $out.rsp")?;
-                write!(out, " rspfile_content = ")?;
-                out.write_all(&cmd_buf)?;
-                write!(out, "\n command = ")?;
-                out.write_all(&self.shell)?;
-                writeln!(out, " $out.rsp")?;
-            } else {
-                out.write_all(b" command = ")?;
-                out.write_all(&self.shell)?;
-                out.write_all(b" ")?;
-                out.write_all(&self.shell_flags)?;
-                out.write_all(b" \"")?;
-                out.write_all(&escape_shell(&cmd_buf.freeze()))?;
-                writeln!(out, "\"")?;
-            }
-            if node.is_restat {
-                writeln!(out, " restat = 1")?;
-            }
-            if self.ce.ev.session.flags.emit_sandbox_disabled {
-                writeln!(out, " sandbox_disabled = true")?;
-            }
-        }
+            let too_long_for_argv = cmd_buf.len() > 100 * 1000;
+            let script = cmd_buf.freeze();
+            sink.declare_rule(
+                &self.ce.ev.session,
+                &SinkRule {
+                    id,
+                    shell: &self.shell,
+                    shell_flags: &self.shell_flags,
+                    command: if too_long_for_argv {
+                        SinkCommand::ResponseFile(&script)
+                    } else {
+                        SinkCommand::Inline(&script)
+                    },
+                    description: &description,
+                    depfile: depfile.as_deref(),
+                    restat: node.is_restat,
+                    sandbox_disabled: self.ce.ev.session.flags.emit_sandbox_disabled,
+                    loc: node.loc.as_ref(),
+                },
+            )?;
+            Some(id)
+        };
 
-        self.emit_build(nn, &node, rule_name, use_local_pool, out)
-    }
-
-    fn escape_ninja(s: &Bytes) -> Bytes {
-        let extras = s.iter().filter(|c| b"$: ".contains(c)).count();
-        if extras == 0 {
-            return s.clone();
-        }
-        let mut r = BytesMut::with_capacity(s.len() + extras);
-        for c in s {
-            let c = *c;
-            match c {
-                b'$' | b':' | b' ' => {
-                    r.put_u8(b'$');
-                    r.put_u8(c);
-                }
-                _ => r.put_u8(c),
-            }
-        }
-        r.freeze()
-    }
-
-    fn escape_build_target(names: &impl crate::symtab::Interner, s: Symbol) -> Bytes {
-        Self::escape_ninja(&s.as_bytes(names))
-    }
-
-    fn emit_build(
-        &mut self,
-        nn: &NinjaNode,
-        node: &DepNode,
-        rule_name: String,
-        use_local_pool: bool,
-        out: &mut impl std::io::Write,
-    ) -> Result<()> {
-        let target = Self::escape_build_target(&self.ce.ev.session, node.output);
-        write!(out, "build ")?;
-        out.write_all(&target)?;
-        if !node.implicit_outputs.is_empty() {
-            write!(out, " |")?;
-            for output in &node.implicit_outputs {
-                out.write_all(b" ")?;
-                out.write_all(&Self::escape_build_target(&self.ce.ev.session, *output))?;
-            }
-        }
-        write!(out, ": {rule_name}")?;
-        if node.is_phony && !self.ce.ev.session.flags.use_ninja_phony_output {
-            write!(out, " _kati_always_build_")?;
-        }
-        for (s, _) in &node.deps {
-            out.write_all(b" ")?;
-            out.write_all(&Self::escape_build_target(&self.ce.ev.session, *s))?;
-        }
-        if !node.order_onlys.is_empty() {
-            write!(out, " ||")?;
-            for (s, _) in &node.order_onlys {
-                out.write_all(b" ")?;
-                out.write_all(&Self::escape_build_target(&self.ce.ev.session, *s))?;
-            }
-        }
-        if !node.validations.is_empty() {
-            write!(out, " |@")?;
-            for (s, _) in &node.validations {
-                out.write_all(b" ")?;
-                out.write_all(&Self::escape_build_target(&self.ce.ev.session, *s))?;
-            }
-        }
-
-        writeln!(out)?;
-
-        let pool = if let Some(ninja_pool_var) = &node.ninja_pool_var {
-            Some(ninja_pool_var.read().eval_to_buf(self.ce.ev)?)
+        let pool = self.resolve_pool(&node, rule_id.is_some())?;
+        let tags = if let Some(tags_var) = &node.tags_var {
+            let tags = tags_var.read().eval_to_buf(self.ce.ev)?;
+            if tags.is_empty() { None } else { Some(tags) }
         } else {
             None
         };
 
-        if pool.as_ref().is_some_and(|pool| !pool.is_empty()) {
-            let pool = pool.unwrap();
-            if pool.as_ref() != b"none" {
-                write!(out, " pool = ")?;
-                out.write_all(&pool)?;
-                out.write_all(b"\n")?;
+        // The sink is given the names, not the nodes behind them: an edge
+        // refers to its inputs, it does not own them.
+        let symbols = |deps: &[NamedDepNode]| deps.iter().map(|(s, _)| *s).collect::<Vec<_>>();
+        let inputs = symbols(&node.deps);
+        let order_only_inputs = symbols(&node.order_onlys);
+        let validations = symbols(&node.validations);
+
+        sink.declare_edge(
+            &self.ce.ev.session,
+            &SinkEdge {
+                rule: rule_id,
+                output: node.output,
+                implicit_outputs: &node.implicit_outputs,
+                inputs: &inputs,
+                order_only_inputs: &order_only_inputs,
+                validations: &validations,
+                always_dirty: node.is_phony,
+                pool: pool.as_deref(),
+                tags: tags.as_deref(),
+                loc: node.loc.as_ref(),
+            },
+        )?;
+
+        Ok(node.is_default_target.then_some(node.output))
+    }
+
+    /// Drive a sink through the whole graph.
+    fn emit(&mut self, sink: &mut dyn BuildSink) -> Result<()> {
+        sink.start(&[SinkPool {
+            name: LOCAL_POOL,
+            depth: self.ce.ev.session.flags.num_jobs,
+        }])?;
+
+        if !self.ce.ev.session.flags.generate_empty_ninja {
+            let mut default_target = None;
+            for node in std::mem::take(&mut self.nodes) {
+                if let Some(output) = self.sink_node(&node, sink)? {
+                    default_target = Some(output);
+                }
             }
-        } else if !self.ce.ev.session.flags.default_pool.is_empty() && rule_name != "phony" {
-            write!(out, " pool = ")?;
-            out.write_all(self.ce.ev.session.flags.default_pool.as_bytes())?;
-            out.write_all(b"\n")?;
-        } else if use_local_pool {
-            writeln!(out, " pool = local_pool")?;
+
+            let flags = &self.ce.ev.session.flags;
+            let targets = if flags.targets.is_empty() || flags.gen_all_targets {
+                vec![default_target.unwrap()]
+            } else {
+                flags.targets.clone()
+            };
+            sink.set_default_targets(&self.ce.ev.session, &targets)?;
         }
-        if node.is_phony && self.ce.ev.session.flags.use_ninja_phony_output {
-            writeln!(out, " phony_output = true")?;
-        }
-        if let Some(tags_var) = &node.tags_var {
-            let tags = tags_var.read().eval_to_buf(self.ce.ev)?;
-            if !tags.is_empty() {
-                write!(out, " tags = ")?;
-                out.write_all(&tags)?;
-                writeln!(out)?;
-            }
-        }
-        if node.is_default_target {
-            *self.default_target.lock() = Some(nn.node.clone());
-        }
-        Ok(())
+
+        sink.finish()
     }
 
     fn get_env_script_filename(&self) -> OsString {
@@ -635,64 +610,17 @@ impl<'a> NinjaGenerator<'a> {
     fn generate_ninja(&mut self) -> Result<()> {
         let _tr = ScopedTimeReporter::new(&self.ce.ev.session, "ninja gen (emit)");
         let out = std::fs::File::create(get_ninja_filename(&self.ce.ev.session.flags))?;
-        let mut out = std::io::BufWriter::new(out);
+        let options = NinjaWriterOptions::from_flags(&self.ce.ev.session.flags);
+        let mut sink = NinjaWriter::new(std::io::BufWriter::new(out), options);
+        self.emit(&mut sink)?;
 
-        write!(out, "# Generated by kati unknown\n\n")?;
-
-        if !self.used_envs.is_empty() {
-            writeln!(out, "# Environment variables used:")?;
-            for (key, value) in &self.used_envs {
-                write!(out, "# {}=", key.display(&self.ce.ev.session))?;
-                out.write_all(value.as_bytes())?;
-                out.write_all(b"\n")?;
-            }
-            writeln!(out)?;
-        }
-
-        if !self.ce.ev.session.flags.no_ninja_prelude {
-            if let Some(ninja_dir) = &self.ce.ev.session.flags.ninja_dir {
-                write!(out, "builddir = ")?;
-                out.write_all(ninja_dir.as_bytes())?;
-                out.write_all(b"\n\n")?;
-            }
-
-            writeln!(
-                out,
-                "pool local_pool\n depth = {}\n",
-                self.ce.ev.session.flags.num_jobs
-            )?;
-
-            if !self.ce.ev.session.flags.use_ninja_phony_output {
-                writeln!(out, "build _kati_always_build_: phony\n")?;
-            }
-        }
-
-        if !self.ce.ev.session.flags.generate_empty_ninja {
-            for node in std::mem::take(&mut self.nodes) {
-                self.emit_node(&node, &mut out)?;
-            }
-
-            write!(out, "\ndefault ")?;
-            if self.ce.ev.session.flags.targets.is_empty()
-                || self.ce.ev.session.flags.gen_all_targets
-            {
-                out.write_all(&Self::escape_build_target(
-                    &self.ce.ev.session,
-                    self.default_target.lock().as_ref().unwrap().lock().output,
-                ))?;
-            } else {
-                let mut empty = true;
-                for s in self.ce.ev.session.flags.targets.clone() {
-                    if !empty {
-                        out.write_all(b" ")?;
-                    }
-                    out.write_all(&Self::escape_build_target(&self.ce.ev.session, s))?;
-                    empty = false;
-                }
-            }
-            out.write_all(b"\n")?;
-        }
-
+        // Collected after the manifest is written, for the stamp file that
+        // decides whether a regeneration is needed. Upstream also writes these
+        // into the manifest as a comment, from this same map, but does so
+        // before filling it, so that comment has never once been emitted; both
+        // C++ kati and this port have the same ordering. The block is not
+        // reproduced in NinjaWriter, since feeding it would mean putting a
+        // parameter on BuildSink for something unreachable.
         let mut used_env_vars = self.ce.ev.session.used_env_vars.clone();
         // PATH changes $(shell).
         used_env_vars.insert(self.ce.ev.session.intern("PATH"));
@@ -843,6 +771,231 @@ impl Drop for NinjaGenerator<'_> {
     }
 }
 
+/// Escape a name for a `build.ninja`, where `$`, `:` and space would otherwise
+/// be syntax.
+fn escape_ninja(s: &[u8]) -> Bytes {
+    let extras = s.iter().filter(|c| b"$: ".contains(c)).count();
+    if extras == 0 {
+        return Bytes::copy_from_slice(s);
+    }
+    let mut r = BytesMut::with_capacity(s.len() + extras);
+    for c in s {
+        let c = *c;
+        match c {
+            b'$' | b':' | b' ' => {
+                r.put_u8(b'$');
+                r.put_u8(c);
+            }
+            _ => r.put_u8(c),
+        }
+    }
+    r.freeze()
+}
+
+fn escape_build_target(names: &dyn Interner, s: Symbol) -> Bytes {
+    escape_ninja(&s.as_bytes(&names))
+}
+
+/// The flags that are about the manifest rather than about the build graph.
+///
+/// Pulling them out is what lets [`NinjaWriter`] own its own configuration
+/// instead of borrowing the evaluator that is busy producing edges, and it
+/// makes the list of purely-serialization options explicit: there are four.
+pub struct NinjaWriterOptions {
+    /// `-d`: annotate each stanza with the Makefile line it came from.
+    pub locations: bool,
+    /// The inverse of `--no_ninja_prelude`: write the `builddir`, pool and
+    /// always-build declarations a standalone manifest needs. When it is off
+    /// the caller is expected to supply them itself.
+    pub prelude: bool,
+    /// `--ninja_dir`: where ninja should keep its own state.
+    pub builddir: Option<OsString>,
+    /// `--use_ninja_phony_output`: Android's ninja fork can be told a target is
+    /// not a file, which is a direct way to say what [`ALWAYS_BUILD`] otherwise
+    /// has to fake.
+    pub phony_output: bool,
+}
+
+impl NinjaWriterOptions {
+    pub fn from_flags(flags: &Flags) -> Self {
+        Self {
+            locations: flags.enable_debug,
+            prelude: !flags.no_ninja_prelude,
+            builddir: flags.ninja_dir.clone(),
+            phony_output: flags.use_ninja_phony_output,
+        }
+    }
+}
+
+/// The [`BuildSink`] that writes `build.ninja`.
+///
+/// Everything here is about the file format: escaping, the synthetic
+/// always-build target, the prelude, and the spelling of each binding. Nothing
+/// here decides anything about the build.
+pub struct NinjaWriter<W: std::io::Write> {
+    out: W,
+    options: NinjaWriterOptions,
+}
+
+impl<W: std::io::Write> NinjaWriter<W> {
+    pub fn new(out: W, options: NinjaWriterOptions) -> Self {
+        Self { out, options }
+    }
+
+    fn write_location(&mut self, names: &dyn Interner, loc: Option<&Loc>) -> Result<()> {
+        if self.options.locations {
+            let loc = loc.cloned().unwrap_or_default();
+            writeln!(self.out, "# {}", loc.display(names))?;
+        }
+        Ok(())
+    }
+
+    fn write_targets(&mut self, names: &dyn Interner, targets: &[Symbol]) -> Result<()> {
+        for target in targets {
+            self.out.write_all(b" ")?;
+            self.out.write_all(&escape_build_target(names, *target))?;
+        }
+        Ok(())
+    }
+}
+
+impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
+    fn start(&mut self, pools: &[SinkPool<'_>]) -> Result<()> {
+        write!(self.out, "# Generated by kati unknown\n\n")?;
+
+        if self.options.prelude {
+            if let Some(builddir) = &self.options.builddir {
+                write!(self.out, "builddir = ")?;
+                self.out.write_all(builddir.as_bytes())?;
+                self.out.write_all(b"\n\n")?;
+            }
+
+            for pool in pools {
+                self.out.write_all(b"pool ")?;
+                self.out.write_all(pool.name)?;
+                writeln!(self.out, "\n depth = {}\n", pool.depth)?;
+            }
+
+            if !self.options.phony_output {
+                self.out.write_all(b"build ")?;
+                self.out.write_all(ALWAYS_BUILD)?;
+                writeln!(self.out, ": phony\n")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn declare_rule(&mut self, names: &dyn Interner, rule: &SinkRule<'_>) -> Result<()> {
+        self.write_location(names, rule.loc)?;
+        writeln!(self.out, "rule rule{}", rule.id)?;
+
+        self.out.write_all(b" description = ")?;
+        self.out.write_all(rule.description)?;
+        self.out.write_all(b"\n")?;
+
+        if let Some(depfile) = rule.depfile {
+            write!(self.out, " depfile = ")?;
+            self.out.write_all(depfile)?;
+            writeln!(self.out, "\n deps = gcc")?;
+        }
+
+        match rule.command {
+            SinkCommand::ResponseFile(script) => {
+                writeln!(self.out, " rspfile = $out.rsp")?;
+                write!(self.out, " rspfile_content = ")?;
+                self.out.write_all(script)?;
+                write!(self.out, "\n command = ")?;
+                self.out.write_all(&escape_ninja(rule.shell))?;
+                writeln!(self.out, " $out.rsp")?;
+            }
+            SinkCommand::Inline(script) => {
+                self.out.write_all(b" command = ")?;
+                self.out.write_all(&escape_ninja(rule.shell))?;
+                self.out.write_all(b" ")?;
+                self.out.write_all(&escape_ninja(rule.shell_flags))?;
+                self.out.write_all(b" \"")?;
+                self.out
+                    .write_all(&escape_shell(&Bytes::copy_from_slice(script)))?;
+                writeln!(self.out, "\"")?;
+            }
+        }
+
+        if rule.restat {
+            writeln!(self.out, " restat = 1")?;
+        }
+        if rule.sandbox_disabled {
+            writeln!(self.out, " sandbox_disabled = true")?;
+        }
+        Ok(())
+    }
+
+    fn declare_edge(&mut self, names: &dyn Interner, edge: &SinkEdge<'_>) -> Result<()> {
+        // A node with a rule already had its location printed above the rule.
+        if edge.rule.is_none() {
+            self.write_location(names, edge.loc)?;
+        }
+
+        write!(self.out, "build ")?;
+        self.out
+            .write_all(&escape_build_target(names, edge.output))?;
+        if !edge.implicit_outputs.is_empty() {
+            write!(self.out, " |")?;
+            self.write_targets(names, edge.implicit_outputs)?;
+        }
+
+        match edge.rule {
+            Some(id) => write!(self.out, ": rule{id}")?,
+            None => write!(self.out, ": phony")?,
+        }
+
+        // A .PHONY target has to look dirty to a tool that only compares file
+        // timestamps. Depending on a target nothing ever builds is how the
+        // manifest arranges that; it is not something the graph knows about.
+        if edge.always_dirty && !self.options.phony_output {
+            self.out.write_all(b" ")?;
+            self.out.write_all(ALWAYS_BUILD)?;
+        }
+
+        self.write_targets(names, edge.inputs)?;
+        if !edge.order_only_inputs.is_empty() {
+            write!(self.out, " ||")?;
+            self.write_targets(names, edge.order_only_inputs)?;
+        }
+        if !edge.validations.is_empty() {
+            write!(self.out, " |@")?;
+            self.write_targets(names, edge.validations)?;
+        }
+        writeln!(self.out)?;
+
+        if let Some(pool) = edge.pool {
+            write!(self.out, " pool = ")?;
+            self.out.write_all(pool)?;
+            self.out.write_all(b"\n")?;
+        }
+        if edge.always_dirty && self.options.phony_output {
+            writeln!(self.out, " phony_output = true")?;
+        }
+        if let Some(tags) = edge.tags {
+            write!(self.out, " tags = ")?;
+            self.out.write_all(tags)?;
+            writeln!(self.out)?;
+        }
+        Ok(())
+    }
+
+    fn set_default_targets(&mut self, names: &dyn Interner, targets: &[Symbol]) -> Result<()> {
+        write!(self.out, "\ndefault")?;
+        self.write_targets(names, targets)?;
+        self.out.write_all(b"\n")?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.out.flush()?;
+        Ok(())
+    }
+}
+
 pub fn get_ninja_filename(flags: &Flags) -> OsString {
     ninja_file(flags, "build", ".ninja")
 }
@@ -881,6 +1034,83 @@ pub fn generate_ninja(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::symtab::Symtab;
+
+    /// Drive a writer over one always-dirty edge whose names need escaping.
+    fn write_phony_edge(phony_output: bool) -> String {
+        let mut names = Symtab::new();
+        let output = names.intern(&b"out:put"[..]);
+        let input = names.intern(&b"in$put"[..]);
+        let mut writer = NinjaWriter::new(
+            Vec::new(),
+            NinjaWriterOptions {
+                locations: false,
+                prelude: true,
+                builddir: None,
+                phony_output,
+            },
+        );
+        writer
+            .start(&[SinkPool {
+                name: LOCAL_POOL,
+                depth: 4,
+            }])
+            .unwrap();
+        writer
+            .declare_edge(
+                &names,
+                &SinkEdge {
+                    rule: None,
+                    output,
+                    implicit_outputs: &[],
+                    inputs: &[input],
+                    order_only_inputs: &[],
+                    validations: &[],
+                    always_dirty: true,
+                    pool: None,
+                    tags: None,
+                    loc: None,
+                },
+            )
+            .unwrap();
+        writer.set_default_targets(&names, &[output]).unwrap();
+        writer.finish().unwrap();
+        String::from_utf8(writer.out).unwrap()
+    }
+
+    /// The synthetic always-build target is the writer's invention, not
+    /// something the front end pushed through the sink: the same edge, said
+    /// the same way, produces it or `phony_output` depending only on how the
+    /// writer was configured.
+    #[test]
+    fn test_writer_owns_the_always_dirty_mechanism() {
+        let synthetic = write_phony_edge(false);
+        assert!(
+            synthetic.contains("build _kati_always_build_: phony\n"),
+            "{synthetic}"
+        );
+        assert!(
+            synthetic.contains("build out$:put: phony _kati_always_build_ in$$put\n"),
+            "{synthetic}"
+        );
+        assert!(!synthetic.contains("phony_output"), "{synthetic}");
+
+        let declared = write_phony_edge(true);
+        assert!(!declared.contains("_kati_always_build_"), "{declared}");
+        assert!(
+            declared.contains("build out$:put: phony in$$put\n phony_output = true\n"),
+            "{declared}"
+        );
+    }
+
+    /// Escaping happens on the way out and nowhere earlier, so the same
+    /// unescaped symbol is escaped consistently everywhere it appears.
+    #[test]
+    fn test_writer_escapes_every_name_it_writes() {
+        let out = write_phony_edge(false);
+        assert!(out.contains("\ndefault out$:put\n"), "{out}");
+        assert!(!out.contains("out:put"), "{out}");
+    }
 
     fn get_desc(cmd: &'static [u8]) -> Option<String> {
         let mut description = Bytes::new();

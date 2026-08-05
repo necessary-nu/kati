@@ -24,6 +24,7 @@ limitations under the License.
 
 use strutil::trim_prefix_str;
 
+pub mod build_sink;
 pub mod command;
 pub mod dep;
 pub mod eval;
