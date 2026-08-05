@@ -55,6 +55,14 @@ pub struct Flags {
     pub regen_ignoring_kati_binary: bool,
     pub use_find_emulator: bool,
     pub color_warnings: bool,
+    /// GNU Make's `-i`: every recipe line is run for its effect and not for its
+    /// status, which is the `-` prefix applied to all of them at once.
+    pub ignore_errors: bool,
+    /// GNU Make's `-e`: a variable that came from the environment outranks the
+    /// makefile's own assignment to it, which is the difference between
+    /// [`VarOrigin::Environment`](crate::var::VarOrigin::Environment) and
+    /// [`VarOrigin::EnvironmentOverride`](crate::var::VarOrigin::EnvironmentOverride).
+    pub environment_overrides: bool,
     pub no_builtin_rules: bool,
     pub no_ninja_prelude: bool,
     pub use_ninja_phony_output: bool,

@@ -126,6 +126,14 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
         false,
         None,
     )?;
+    // Where an environment variable sits in Make's precedence order is the
+    // whole of `-e`: normally the makefile's own assignment wins, and under
+    // `-e` the environment does, which is what an overriding origin says.
+    let origin = if ev.session.flags.environment_overrides {
+        VarOrigin::EnvironmentOverride
+    } else {
+        VarOrigin::Environment
+    };
     for (k, v) in std::env::vars_os() {
         let v = Bytes::from(v.as_bytes().to_vec());
         let val = Arc::new(Value::Literal(None, v.clone()));
@@ -133,7 +141,7 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
         let sym = ev.session.intern(k.as_bytes().to_vec());
         ev.session.set_global_var(
             sym,
-            Variable::new_recursive(val, VarOrigin::Environment, Some(frame), None, v),
+            Variable::new_recursive(val, origin, Some(frame), None, v),
             false,
             None,
         )?;

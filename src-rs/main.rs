@@ -149,6 +149,23 @@ fn find_first_makefile(session: &mut Session) {
     }
 }
 
+/// Bracket a `-C` run with the directory it moved to, as GNU Make does.
+///
+/// GNU Make turns its `-w` on whenever `-C` moved it, because the relative
+/// paths a recipe is about to print stop resolving against the caller's
+/// directory; `-s` withdraws that. Every error parser that inherited the
+/// convention reads the pair, so the wording, the quoting and the flush are
+/// GNU Make's: without the flush a redirected run would order the line against
+/// the recipe output that has already gone out.
+fn announce_directory(verb: &str) {
+    let Ok(directory) = std::env::current_dir() else {
+        return;
+    };
+    let mut stdout = stdout();
+    let _ = writeln!(stdout, "kati: {verb} directory '{}'", directory.display());
+    let _ = stdout.flush();
+}
+
 fn handle_realpath(args: Vec<String>) {
     for arg in args {
         if let Ok(path) = std::fs::canonicalize(&arg) {
@@ -217,12 +234,19 @@ fn main() {
         eprintln!("*** {}: {}", working_dir.to_string_lossy(), e);
         std::process::exit(1);
     }
+    let announcing = session.flags.working_dir.is_some() && !session.flags.is_silent_mode;
+    if announcing {
+        announce_directory("Entering");
+    }
     let orig_args = std::env::args_os()
         .collect::<Vec<OsString>>()
         .join(OsStr::new(" "));
     find_first_makefile(&mut session);
     if session.flags.makefile.is_none() {
         eprintln!("*** No targets specified and no makefile found.");
+        if announcing {
+            announce_directory("Leaving");
+        }
         std::process::exit(1);
     }
     let gperf_cpu = session.flags.cpu_profile_path.is_some();
@@ -237,6 +261,9 @@ fn main() {
             1
         }
     };
+    if announcing {
+        announce_directory("Leaving");
+    }
     #[cfg(feature = "gperf")]
     {
         if gperf_cpu {

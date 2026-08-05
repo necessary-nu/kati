@@ -543,12 +543,18 @@ impl GlobalVars {
                 *readonly = false;
             }
             let origin = orig.read().origin();
+            let assigning = var.read().origin();
+            // `-e` lifts the environment above the makefile and no higher: a
+            // command-line assignment still outranks it, as it outranks
+            // everything an `override` directive did not write.
             if !is_override
-                && (origin == VarOrigin::Override || origin == VarOrigin::EnvironmentOverride)
+                && (origin == VarOrigin::Override
+                    || (origin == VarOrigin::EnvironmentOverride
+                        && assigning != VarOrigin::CommandLine))
             {
                 return Ok(());
             }
-            if origin == VarOrigin::CommandLine && var.read().origin() == VarOrigin::File {
+            if origin == VarOrigin::CommandLine && assigning == VarOrigin::File {
                 return Ok(());
             }
             if origin == VarOrigin::Automatic {

@@ -293,7 +293,9 @@ impl<'a> CommandEvaluator<'a> {
             let cmds_buf = v.eval_to_buf(self.ev)?;
             let mut cmds = cmds_buf.clone();
             let mut global_echo = !self.ev.session.flags.is_silent_mode;
-            let mut global_ignore_error = false;
+            // `-i` is the `-` prefix asked for once instead of per line, so it
+            // starts each recipe where a leading `-` would have left it.
+            let mut global_ignore_error = self.ev.session.flags.ignore_errors;
             cmds = parse_command_prefixes(cmds, &mut global_echo, &mut global_ignore_error);
             if cmds.is_empty() {
                 continue;
