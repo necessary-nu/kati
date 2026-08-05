@@ -824,11 +824,26 @@ fn flavor_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) ->
     Ok(())
 }
 
+/// How output deferred to a command spells itself.
+///
+/// `$(info)` and its siblings print immediately when evaluation can do IO. When
+/// it cannot — the manifest writer and the graph sink both evaluate with IO
+/// withheld — the text becomes a command instead, and that command has to
+/// survive being written on one line, dequoted by the shell, and then unescaped
+/// back to what the makefile said. `echo_escape` over-escapes for exactly that
+/// round trip.
+///
+/// Upstream spells it `echo -e`, in both the C++ original and this port. That
+/// is a bashism: `/bin/sh` is dash on a Debian system, its `echo` has no `-e`,
+/// and the flag is printed as part of the output. `printf` with `%b` interprets
+/// the same escapes, is specified by POSIX, and needs no flag.
+const DEFERRED_OUTPUT: &[u8] = b"printf '%b\\n' \"";
+
 fn info_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> Result<()> {
     let a = args[0].eval_to_buf(ev)?;
     if ev.avoid_io {
         let mut s = BytesMut::new();
-        s.put_slice(b"echo -e \"");
+        s.put_slice(DEFERRED_OUTPUT);
         s.put_slice(&echo_escape(&a));
         s.put_u8(b'"');
         ev.delayed_output_commands.push(s.freeze());
@@ -842,7 +857,7 @@ fn warning_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) 
     let a = args[0].eval_to_buf(ev)?;
     if ev.avoid_io {
         let mut s = BytesMut::new();
-        s.put_slice(b"echo -e \"");
+        s.put_slice(DEFERRED_OUTPUT);
         let loc = ev.loc.clone().unwrap_or_default();
         s.put_slice(loc.display(&ev.session).to_string().as_bytes());
         s.put_slice(b": ");
@@ -859,7 +874,7 @@ fn error_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) ->
     let a = args[0].eval_to_buf(ev)?;
     if ev.avoid_io {
         let mut s = BytesMut::new();
-        s.put_slice(b"echo -e \"");
+        s.put_slice(DEFERRED_OUTPUT);
         let loc = ev.loc.clone().unwrap_or_default();
         s.put_slice(loc.display(&ev.session).to_string().as_bytes());
         s.put_slice(b": *** ");
