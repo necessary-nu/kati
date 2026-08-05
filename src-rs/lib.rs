@@ -24,10 +24,24 @@ limitations under the License.
 
 use strutil::trim_prefix_str;
 
+/// The error type every fallible entry point here returns.
+///
+/// Re-exported because an out-of-crate [`build_sink::BuildSink`] has to name it
+/// to implement the trait, and an embedder that depends on its own copy of the
+/// crate gets a different type with the same name.
+pub use anyhow;
+/// The byte string this crate hands out for every name and command.
+///
+/// Re-exported for the same reason as [`anyhow`]: it is in the signature of
+/// [`symtab::Symbol::as_bytes`] and [`strutil::escape_shell`], so an embedder
+/// cannot avoid naming it.
+pub use bytes;
+
 pub mod build_sink;
 pub mod command;
 pub mod dep;
 pub mod eval;
+pub mod evaluate;
 pub mod exec;
 pub mod expr;
 pub mod file;

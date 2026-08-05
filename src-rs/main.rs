@@ -25,30 +25,24 @@ limitations under the License.
 use std::ffi::{OsStr, OsString};
 use std::io::{Write, stdout};
 use std::os::unix::ffi::OsStrExt;
-use std::sync::Arc;
 
-use anyhow::{Result, bail};
-use bytes::{BufMut, Bytes, BytesMut};
-use parking_lot::Mutex;
+use anyhow::Result;
+use bytes::Bytes;
 
 #[cfg(feature = "gperf")]
 use gperftools::{HEAP_PROFILER, PROFILER};
 
-use kati::dep::{NamedDepNode, make_dep};
+use kati::evaluate::{Evaluated, evaluate};
 use kati::log;
 use kati::ninja::generate_ninja;
 use kati::regen::needs_regen;
 use kati::regen_dump::stamp_dump_main;
 
 use kati::eval::FrameType;
-use kati::expr::{Evaluable, Value};
+use kati::expr::Evaluable;
 use kati::loc::Loc;
-use kati::stmt::Stmt;
-use kati::var::{VarOrigin, Variable};
 
-use kati::eval::Evaluator;
 use kati::session::Session;
-use kati::symtab::{Symbol, join_symbols};
 use kati::timeutil::ScopedTimeReporter;
 
 #[cfg(all(not(feature = "gperf"), target_os = "linux"))]
@@ -62,58 +56,8 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-fn read_bootstrap_makefile(
-    session: &mut Session,
-    targets: &[Symbol],
-) -> Result<Arc<Mutex<Vec<Stmt>>>> {
-    let mut bootstrap = BytesMut::new();
-    bootstrap.put_slice(b"CC?=cc\n");
-    if cfg!(target_os = "macos") {
-        bootstrap.put_slice(b"CXX?=c++\n");
-    } else {
-        bootstrap.put_slice(b"CXX?=g++\n");
-    }
-    bootstrap.put_slice(b"AR?=ar\n");
-    // Pretend to be GNU make 4.2.1, for compatibility.
-    bootstrap.put_slice(b"MAKE_VERSION?=4.2.1\n");
-    bootstrap.put_slice(b"KATI?=ckati\n");
-    // Overwrite $SHELL environment variable.
-    bootstrap.put_slice(b"SHELL=/bin/sh\n");
-    // TODO: Add more builtin vars.
-
-    if !session.flags.no_builtin_rules {
-        // http://www.gnu.org/software/make/manual/make.html#Catalogue-of-Rules
-        // The document above is actually not correct. See default.c:
-        // http://git.savannah.gnu.org/cgit/make.git/tree/default.c?id=4.1
-        bootstrap.put_slice(b".c.o:\n");
-        bootstrap.put_slice(b"\t$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c -o $@ $<\n");
-        bootstrap.put_slice(b".cc.o:\n");
-        bootstrap.put_slice(b"\t$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c -o $@ $<\n");
-        // TODO: Add more builtin rules.
-    }
-    if session.flags.generate_ninja {
-        bootstrap.put_slice(format!("MAKE?=make -j{}\n", session.flags.num_jobs.max(1)).as_bytes());
-    } else {
-        bootstrap.put_slice(b"MAKE?=");
-        bootstrap.put_slice(session.flags.subkati_args.join(OsStr::new(" ")).as_bytes());
-        bootstrap.put_u8(b'\n');
-    }
-    bootstrap.put_slice(b"MAKECMDGOALS?=");
-    bootstrap.put(join_symbols(&*session, targets, b" "));
-    bootstrap.put_u8(b'\n');
-
-    bootstrap.put_slice(b"CURDIR:=");
-    bootstrap.put_slice(std::env::current_dir()?.as_os_str().as_bytes());
-    bootstrap.put_u8(b'\n');
-
-    let filename = session.intern("*bootstrap*");
-    kati::parser::parse_buf(session, &bootstrap.freeze(), Loc { filename, line: 0 })
-}
-
 fn run(session: Session, orig_args: OsString) -> Result<i32> {
     let start_time = std::time::SystemTime::now();
-    let targets = session.flags.targets.clone();
-    let cl_vars = session.flags.cl_vars.clone();
 
     if session.flags.generate_ninja && (session.flags.regen || session.flags.dump_kati_stamp) {
         let _tr = ScopedTimeReporter::new(&session, "regen_check_time");
@@ -128,104 +72,7 @@ fn run(session: Session, orig_args: OsString) -> Result<i32> {
         session.clear_glob_cache();
     }
 
-    let mut ev = Evaluator::new(session);
-    ev.start()?;
-    let mut makefile_list = BytesMut::new();
-    makefile_list.put_u8(b' ');
-    makefile_list.put_slice(ev.session.flags.makefile.clone().unwrap().as_bytes());
-    let frame = ev.current_frame();
-    let loc = ev.loc.clone();
-    let makefile_list_sym = ev.session.intern("MAKEFILE_LIST");
-    ev.session.set_global_var(
-        makefile_list_sym,
-        Variable::with_simple_string(makefile_list.freeze(), VarOrigin::File, Some(frame), loc),
-        false,
-        None,
-    )?;
-    for (k, v) in std::env::vars_os() {
-        let v = Bytes::from(v.as_bytes().to_vec());
-        let val = Arc::new(Value::Literal(None, v.clone()));
-        let frame = ev.current_frame();
-        let sym = ev.session.intern(k.as_bytes().to_vec());
-        ev.session.set_global_var(
-            sym,
-            Variable::new_recursive(val, VarOrigin::Environment, Some(frame), None, v),
-            false,
-            None,
-        )?;
-    }
-
-    let bootstrap_asts = read_bootstrap_makefile(&mut ev.session, &targets)?;
-
-    {
-        let _frame = ev.enter(
-            FrameType::Phase,
-            Bytes::from_static(b"*bootstrap*"),
-            Loc::default(),
-        );
-        ev.in_bootstrap();
-        let stmts = bootstrap_asts.lock().clone();
-        for stmt in stmts {
-            log!("{stmt:?}");
-            stmt.eval(&mut ev)?;
-        }
-    }
-
-    {
-        let _frame = ev.enter(
-            FrameType::Phase,
-            Bytes::from_static(b"*command line*"),
-            Loc::default(),
-        );
-        ev.in_command_line();
-        for l in &cl_vars {
-            let filename = ev.session.intern("*bootstrap*");
-            let asts = kati::parser::parse_buf(&mut ev.session, l, Loc { filename, line: 0 })?;
-            let asts = asts.lock().clone();
-            assert!(asts.len() == 1);
-            asts[0].eval(&mut ev)?;
-        }
-    }
-    ev.in_toplevel_makefile();
-
-    {
-        let _eval_frame = ev.enter(
-            FrameType::Phase,
-            Bytes::from_static(b"*parse*"),
-            Loc::default(),
-        );
-        let _tr = ScopedTimeReporter::new(&ev.session, "eval time");
-
-        let makefile = ev.session.flags.makefile.clone().unwrap();
-        let _file_frame = ev.enter(
-            FrameType::Parse,
-            Bytes::from(makefile.as_bytes().to_vec()),
-            Loc::default(),
-        );
-        let Some(mk) = ev.session.get_makefile(&makefile)? else {
-            bail!("makefile not found")
-        };
-        let stmts = mk.stmts.lock().clone();
-        for stmt in stmts {
-            log!("{stmt:?}");
-            stmt.eval(&mut ev)?;
-        }
-    }
-
-    if let Some(filename) = ev.session.flags.dump_include_graph.clone() {
-        ev.dump_include_json(&filename)?;
-    }
-
-    let nodes: Vec<NamedDepNode>;
-    {
-        let _frame = ev.enter(
-            FrameType::Phase,
-            Bytes::from_static(b"*dependency analysis*"),
-            Loc::default(),
-        );
-        let _tr = ScopedTimeReporter::new(&ev.session, "make dep time");
-        nodes = make_dep(&mut ev, targets.to_owned())?;
-    }
+    let Evaluated { mut ev, nodes } = evaluate(session)?;
 
     if ev.session.flags.is_syntax_check_only {
         return Ok(0);

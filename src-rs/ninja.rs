@@ -185,13 +185,11 @@ struct NinjaGenerator<'a> {
     shell: Bytes,
     shell_flags: Bytes,
     used_envs: HashMap<Symbol, OsString>,
-    kati_binary: OsString,
-    start_time: SystemTime,
     nodes: Vec<NinjaNode>,
 }
 
 impl<'a> NinjaGenerator<'a> {
-    fn new(ce: CommandEvaluator<'a>, start_time: SystemTime) -> Result<Self> {
+    fn new(ce: CommandEvaluator<'a>) -> Result<Self> {
         // Unescaped: whether these need escaping is a question about the
         // destination, so the answer belongs to whatever is on the far side of
         // the sink.
@@ -205,18 +203,21 @@ impl<'a> NinjaGenerator<'a> {
             shell,
             shell_flags,
             used_envs: HashMap::new(),
-            kati_binary: OsString::from(std::env::current_exe().unwrap()),
-            start_time,
             nodes: Vec::new(),
         })
     }
 
-    fn generate(&mut self, nodes: &Vec<NamedDepNode>, orig_args: &[u8]) -> Result<()> {
+    fn generate(
+        &mut self,
+        nodes: &Vec<NamedDepNode>,
+        orig_args: &[u8],
+        start_time: SystemTime,
+    ) -> Result<()> {
         let _ = std::fs::remove_file(self.get_stamp_temp_filename());
         self.populate_ninja_nodes(nodes)?;
         self.generate_ninja()?;
         self.generate_shell()?;
-        self.generate_stamp(orig_args)?;
+        self.generate_stamp(orig_args, start_time)?;
         Ok(())
     }
 
@@ -712,16 +713,17 @@ impl<'a> NinjaGenerator<'a> {
         Ok(())
     }
 
-    fn generate_stamp(&self, orig_args: &[u8]) -> Result<()> {
+    fn generate_stamp(&self, orig_args: &[u8], start_time: SystemTime) -> Result<()> {
         {
             let out = std::fs::File::create(self.get_stamp_temp_filename())?;
             let mut out = std::io::BufWriter::new(out);
 
-            dump_systemtime(&mut out, &self.start_time)?;
+            dump_systemtime(&mut out, &start_time)?;
 
+            let kati_binary = std::env::current_exe()?;
             let makefiles = self.ce.ev.session.makefiles.all_filenames();
             dump_usize(&mut out, makefiles.len() + 1)?;
-            dump_string(&mut out, self.kati_binary.as_bytes())?;
+            dump_string(&mut out, kati_binary.as_os_str().as_bytes())?;
             for makefile in makefiles {
                 dump_string(&mut out, makefile.as_bytes())?;
             }
@@ -1099,9 +1101,28 @@ pub fn generate_ninja(
     orig_args: &[u8],
     start_time: SystemTime,
 ) -> Result<()> {
-    let mut ng = NinjaGenerator::new(CommandEvaluator::new(ev)?, start_time)?;
-    ng.generate(nodes, orig_args)?;
+    let mut ng = NinjaGenerator::new(CommandEvaluator::new(ev)?)?;
+    ng.generate(nodes, orig_args, start_time)?;
     Ok(())
+}
+
+/// Hand the graph `nodes` describes to `sink`, and write nothing.
+///
+/// [`generate_ninja`] is this with [`NinjaWriter`] already chosen, plus the
+/// three files that only a manifest needs: the environment script, the wrapper
+/// that runs ninja under it, and the stamp a regeneration check reads. A front
+/// end that consumes the graph in memory wants none of those, so this is the
+/// whole of what it needs — the same walk, the same commands, the same edges,
+/// with the destination left to the caller.
+// [spec:ronin:req:make.graph-direct]
+pub fn emit_build(
+    nodes: &Vec<NamedDepNode>,
+    ev: &mut Evaluator,
+    sink: &mut dyn BuildSink,
+) -> Result<()> {
+    let mut ng = NinjaGenerator::new(CommandEvaluator::new(ev)?)?;
+    ng.populate_ninja_nodes(nodes)?;
+    ng.emit(sink)
 }
 
 #[cfg(test)]
