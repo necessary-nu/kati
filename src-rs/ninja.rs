@@ -60,6 +60,24 @@ const LOCAL_POOL: &[u8] = b"local_pool";
 /// here rather than pushed through [`BuildSink`].
 const ALWAYS_BUILD: &[u8] = b"_kati_always_build_";
 
+/// What a rule prints while it runs when the Makefile did not say.
+///
+/// This is a ninja *expression*, not a string: `$out` is evaluated per edge, so
+/// the same three rules cannot be pushed through [`BuildSink`] as a
+/// description. Nothing outside a manifest could evaluate it, and expanding it
+/// here would put a path where the manifest wants the reference. So the front
+/// end sends `None` and each sink says "no description" in its own terms.
+const DEFAULT_DESCRIPTION: &str = "build $out";
+
+/// Where a script too long for an argument list is written.
+///
+/// Also a ninja expression, and also the writer's alone: it is one file per
+/// edge because `$out` is, and it exists because a manifest can only pass a
+/// command as a string. A sink holding the script in memory needs no file, so
+/// [`SinkCommand::ResponseFile`] says only that the script is too long to be an
+/// argument, and leaves where it lands to whoever has to land it.
+const RESPONSE_FILE: &str = "$out.rsp";
+
 fn find_command_line_flag(cmd: &[u8], name: &[u8]) -> Option<usize> {
     match memmem::find(cmd, name) {
         Some(0) => None,
@@ -280,6 +298,16 @@ impl<'a> NinjaGenerator<'a> {
         Ok(())
     }
 
+    /// Turn one Make recipe line into the command line a shell should receive.
+    ///
+    /// Make's own syntax is already gone by the time this runs — the evaluator
+    /// has expanded the variables, so a `$` still here is a `$$` the Makefile
+    /// wrote and therefore a `$` the shell is meant to see. What is left to
+    /// remove is shell-level: comments, the backslash-newline continuations
+    /// Make allows inside a recipe, and trailing separators.
+    ///
+    /// Nothing here is about Ninja. The result is the command, and whoever
+    /// writes it into a file escapes it for that file.
     fn translate_command(inp: Bytes) -> Bytes {
         let mut cmd_buf = BytesMut::new();
         let mut prev_backslash = false;
@@ -309,7 +337,6 @@ impl<'a> NinjaGenerator<'a> {
                     }
                     cmd_buf.put_u8(c);
                 }
-                b'$' => cmd_buf.put_slice(b"$$"),
                 b'\n' => {
                     if prev_backslash {
                         cmd_buf.truncate(cmd_buf.len() - 1);
@@ -358,10 +385,13 @@ impl<'a> NinjaGenerator<'a> {
         cmd == dirname(name)
     }
 
-    fn get_description_from_command(cmd: &Bytes, out: &mut Bytes) -> bool {
-        let Some(cmd) = cmd.strip_prefix(b"echo ") else {
-            return false;
-        };
+    /// The text a lone `echo` was going to print, which is a better thing to
+    /// show while the command runs than the command itself.
+    ///
+    /// This is a literal string, not a format: it is what the Makefile said,
+    /// with the shell quoting taken off.
+    fn get_description_from_command(cmd: &Bytes) -> Option<Bytes> {
+        let cmd = cmd.strip_prefix(b"echo ")?;
 
         let mut prev_backslash = false;
         let mut quote = None;
@@ -385,24 +415,29 @@ impl<'a> NinjaGenerator<'a> {
             } else {
                 match c {
                     b'\'' | b'"' | b'`' => quote = Some(c),
-                    b'<' | b'>' | b'&' | b'|' | b';' => return false,
+                    b'<' | b'>' | b'&' | b'|' | b';' => return None,
                     _ => out_buf.put_u8(c),
                 }
             }
         }
 
-        *out = out_buf.freeze();
-        true
+        Some(out_buf.freeze())
     }
 
+    /// Assemble the recipe into one shell script, and say what to print while
+    /// it runs if the recipe itself said so.
+    ///
+    /// `description` is left `None` when the Makefile did not say, rather than
+    /// filled with a default: what a build prints when nobody chose is a
+    /// question for whatever consumes the graph, and the manifest writer
+    /// answers it in Ninja's own terms, which are not available here.
     fn gen_shell_script(
         flags: &Flags,
         name: &Bytes,
         commands: &Vec<Command>,
         cmd_buf: &mut BytesMut,
-        description: &mut Bytes,
+        description: &mut Option<Bytes>,
     ) {
-        let mut got_description = false;
         let mut command_count = commands.len();
         for c in commands {
             let inp = c.cmd.slice_ref(c.cmd.trim_ascii_start());
@@ -410,12 +445,11 @@ impl<'a> NinjaGenerator<'a> {
             let needs_subshell = (command_count > 1 || c.ignore_error) && !c.force_no_subshell;
 
             let mut translated = Self::translate_command(inp);
-            if flags.detect_android_echo
-                && !got_description
-                && !c.echo
-                && Self::get_description_from_command(&translated, description)
-            {
-                got_description = true;
+            let echoed = (flags.detect_android_echo && description.is_none() && !c.echo)
+                .then(|| Self::get_description_from_command(&translated))
+                .flatten();
+            if let Some(echoed) = echoed {
+                *description = Some(echoed);
                 translated.clear();
             } else if Self::is_output_mkdir(name, &translated) && !c.echo && cmd_buf.is_empty() {
                 translated.clear();
@@ -503,7 +537,7 @@ impl<'a> NinjaGenerator<'a> {
             None
         } else {
             let id = nn.rule_id.unwrap();
-            let mut description = Bytes::from_static(b"build $out");
+            let mut description = None;
             let mut cmd_buf = BytesMut::new();
             let output_str = node.output.as_bytes(&self.ce.ev.session);
             Self::gen_shell_script(
@@ -532,7 +566,7 @@ impl<'a> NinjaGenerator<'a> {
                     } else {
                         SinkCommand::Inline(&script)
                     },
-                    description: &description,
+                    description: description.as_deref(),
                     depfile: depfile.as_deref(),
                     restat: node.is_restat,
                     sandbox_disabled: self.ce.ev.session.flags.emit_sandbox_disabled,
@@ -796,6 +830,32 @@ fn escape_build_target(names: &dyn Interner, s: Symbol) -> Bytes {
     escape_ninja(&s.as_bytes(&names))
 }
 
+/// Escape a value for the right-hand side of a `build.ninja` binding, where
+/// `$` is the only character that is syntax.
+///
+/// A name in a `build` line needs [`escape_ninja`] instead, because there the
+/// `:` and the space that separate names are syntax too. Here they are not, and
+/// a command is mostly made of them.
+///
+/// Everything the front end hands the writer as *data* goes through this: the
+/// command, the response-file content, the description, the depfile. Ninja
+/// reverses it when it evaluates the binding, so what the build finally sees is
+/// exactly the bytes that crossed the sink.
+fn escape_ninja_value(s: &[u8]) -> Bytes {
+    let extras = s.iter().filter(|c| **c == b'$').count();
+    if extras == 0 {
+        return Bytes::copy_from_slice(s);
+    }
+    let mut r = BytesMut::with_capacity(s.len() + extras);
+    for c in s {
+        if *c == b'$' {
+            r.put_u8(b'$');
+        }
+        r.put_u8(*c);
+    }
+    r.freeze()
+}
+
 /// The flags that are about the manifest rather than about the build graph.
 ///
 /// Pulling them out is what lets [`NinjaWriter`] own its own configuration
@@ -890,24 +950,35 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
         writeln!(self.out, "rule rule{}", rule.id)?;
 
         self.out.write_all(b" description = ")?;
-        self.out.write_all(rule.description)?;
+        match rule.description {
+            Some(description) => self.out.write_all(&escape_ninja_value(description))?,
+            None => self.out.write_all(DEFAULT_DESCRIPTION.as_bytes())?,
+        }
         self.out.write_all(b"\n")?;
 
         if let Some(depfile) = rule.depfile {
             write!(self.out, " depfile = ")?;
-            self.out.write_all(depfile)?;
+            self.out.write_all(&escape_ninja_value(depfile))?;
             writeln!(self.out, "\n deps = gcc")?;
         }
 
         match rule.command {
+            // The script is the file, so the only layer between these bytes
+            // and the shell is ninja's own.
             SinkCommand::ResponseFile(script) => {
-                writeln!(self.out, " rspfile = $out.rsp")?;
+                writeln!(self.out, " rspfile = {RESPONSE_FILE}")?;
                 write!(self.out, " rspfile_content = ")?;
-                self.out.write_all(script)?;
+                self.out.write_all(&escape_ninja_value(script))?;
                 write!(self.out, "\n command = ")?;
                 self.out.write_all(&escape_ninja(rule.shell))?;
-                writeln!(self.out, " $out.rsp")?;
+                writeln!(self.out, " {RESPONSE_FILE}")?;
             }
+            // Two layers, and they have to be applied in this order. The
+            // script becomes an argument of a shell ninja itself starts, so
+            // first it is escaped for that shell; then the whole binding is
+            // escaped for ninja, which unescapes it before the shell ever sees
+            // it. A `$` the Makefile meant for the shell is therefore written
+            // `\$$`: `\$` once ninja is done, `$` once the shell is.
             SinkCommand::Inline(script) => {
                 self.out.write_all(b" command = ")?;
                 self.out.write_all(&escape_ninja(rule.shell))?;
@@ -915,7 +986,9 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
                 self.out.write_all(&escape_ninja(rule.shell_flags))?;
                 self.out.write_all(b" \"")?;
                 self.out
-                    .write_all(&escape_shell(&Bytes::copy_from_slice(script)))?;
+                    .write_all(&escape_ninja_value(&escape_shell(&Bytes::copy_from_slice(
+                        script,
+                    ))))?;
                 writeln!(self.out, "\"")?;
             }
         }
@@ -1113,13 +1186,8 @@ mod tests {
     }
 
     fn get_desc(cmd: &'static [u8]) -> Option<String> {
-        let mut description = Bytes::new();
-        if NinjaGenerator::get_description_from_command(&Bytes::from_static(cmd), &mut description)
-        {
-            Some(String::from_utf8_lossy(description.as_ref()).to_string())
-        } else {
-            None
-        }
+        NinjaGenerator::get_description_from_command(&Bytes::from_static(cmd))
+            .map(|d| String::from_utf8_lossy(d.as_ref()).to_string())
     }
 
     #[test]
@@ -1140,6 +1208,170 @@ mod tests {
         assert_eq!(
             NinjaGenerator::translate_command(Bytes::from_static(b"echo Hello")),
             Bytes::from_static(b"echo Hello")
+        );
+        // Make's own escape is long gone by here, so a `$` is the shell's and
+        // translation leaves it alone.
+        assert_eq!(
+            NinjaGenerator::translate_command(Bytes::from_static(b"echo $PATH")),
+            Bytes::from_static(b"echo $PATH")
+        );
+    }
+
+    /// The script `sink_node` would hand to a sink for a one-line recipe whose
+    /// Make expansion is `cmd`.
+    fn script_for(cmd: &'static [u8]) -> Bytes {
+        let mut names = Symtab::new();
+        let output = names.intern(&b"out"[..]);
+        let commands = vec![Command {
+            output,
+            cmd: Bytes::from_static(cmd),
+            echo: true,
+            ignore_error: false,
+            force_no_subshell: false,
+        }];
+        let mut cmd_buf = BytesMut::new();
+        let mut description = None;
+        NinjaGenerator::gen_shell_script(
+            &Flags::default(),
+            &Bytes::from_static(b"out"),
+            &commands,
+            &mut cmd_buf,
+            &mut description,
+        );
+        assert_eq!(description, None, "no Makefile echo, so no description");
+        cmd_buf.freeze()
+    }
+
+    /// The manifest stanza a writer produces for one rule.
+    fn declare_rule_for(command: SinkCommand<'_>, description: Option<&[u8]>) -> String {
+        let names = Symtab::new();
+        let mut writer = NinjaWriter::new(
+            Vec::new(),
+            NinjaWriterOptions {
+                locations: false,
+                prelude: false,
+                builddir: None,
+                phony_output: false,
+            },
+        );
+        writer
+            .declare_rule(
+                &names,
+                &SinkRule {
+                    id: 0,
+                    shell: b"/bin/sh",
+                    shell_flags: b"-c",
+                    command,
+                    description,
+                    depfile: None,
+                    restat: false,
+                    sandbox_disabled: false,
+                    loc: None,
+                },
+            )
+            .unwrap();
+        String::from_utf8(writer.out).unwrap()
+    }
+
+    fn binding(manifest: &str, name: &str) -> String {
+        let prefix = format!(" {name} = ");
+        manifest
+            .lines()
+            .find_map(|l| l.strip_prefix(prefix.as_str()))
+            .unwrap_or_else(|| panic!("no {name} in {manifest}"))
+            .to_string()
+    }
+
+    /// What ninja makes of a binding's value, which is what the build actually
+    /// runs. Panics on a `$` it cannot account for, since that is the shape the
+    /// escaping exists to avoid: an unescaped `$` in a manifest is a variable
+    /// reference, and expands to nothing.
+    fn ninja_unescape(value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut rest = value;
+        while let Some((c, tail)) = rest.split_first() {
+            rest = tail;
+            if *c != b'$' {
+                out.push(*c);
+                continue;
+            }
+            match rest.split_first() {
+                Some((c @ (b'$' | b':' | b' '), tail)) => {
+                    out.push(*c);
+                    rest = tail;
+                }
+                other => panic!("unescaped $ before {other:?} in {value:?}"),
+            }
+        }
+        out
+    }
+
+    /// What a shell makes of the inside of a `"..."` argument.
+    fn shell_unquote(quoted: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut rest = quoted;
+        while let Some((c, tail)) = rest.split_first() {
+            rest = tail;
+            match (c, rest.first()) {
+                (b'\\', Some(next @ (b'"' | b'$' | b'\\' | b'`'))) => {
+                    out.push(*next);
+                    rest = &rest[1..];
+                }
+                _ => out.push(*c),
+            }
+        }
+        out
+    }
+
+    /// What crosses the sink is what the *shell* is meant to receive, not what
+    /// a manifest is meant to contain.
+    ///
+    /// A manifest cannot tell the two apart: ninja unescapes on the way in, so
+    /// a command that was escaped one time too many still reaches the shell
+    /// correctly through `build.ninja`, and only a sink that writes the bytes
+    /// straight into a graph sees the difference. This pins the boundary from
+    /// both sides — the bytes are the shell's, and every escape between them
+    /// and the file undoes exactly.
+    #[test]
+    fn test_command_crosses_the_sink_as_a_shell_wants_it() {
+        // What Make's evaluator produces for a recipe line reading
+        // `echo $$PATH`: Make's escape is already gone, and the shell is meant
+        // to expand PATH.
+        let script = script_for(b"echo $PATH");
+        assert_eq!(script, Bytes::from_static(b"echo $PATH"));
+
+        // Inline: escaped for the shell ninja starts, then for ninja itself.
+        let manifest = declare_rule_for(SinkCommand::Inline(&script), None);
+        let evaluated = ninja_unescape(binding(&manifest, "command").as_bytes());
+        assert_eq!(evaluated, b"/bin/sh -c \"echo \\$PATH\"");
+        let quoted = evaluated
+            .strip_prefix(b"/bin/sh -c \"")
+            .and_then(|v| v.strip_suffix(b"\""))
+            .unwrap();
+        assert_eq!(shell_unquote(quoted), script);
+
+        // A response file is read by the shell directly, so ninja's is the
+        // only escape between the two.
+        let manifest = declare_rule_for(SinkCommand::ResponseFile(&script), None);
+        assert_eq!(
+            ninja_unescape(binding(&manifest, "rspfile_content").as_bytes()),
+            script
+        );
+        assert_eq!(binding(&manifest, "rspfile"), RESPONSE_FILE);
+    }
+
+    /// A description the Makefile chose is text and gets escaped; the default
+    /// is a ninja expression the writer owns and must not be.
+    #[test]
+    fn test_writer_owns_the_default_description() {
+        let manifest = declare_rule_for(SinkCommand::Inline(b"true"), None);
+        assert_eq!(binding(&manifest, "description"), DEFAULT_DESCRIPTION);
+
+        let manifest = declare_rule_for(SinkCommand::Inline(b"true"), Some(b"making $PATH"));
+        assert_eq!(binding(&manifest, "description"), "making $$PATH");
+        assert_eq!(
+            ninja_unescape(binding(&manifest, "description").as_bytes()),
+            b"making $PATH"
         );
     }
 

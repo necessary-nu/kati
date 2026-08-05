@@ -448,6 +448,15 @@ pub fn echo_escape(s: &[u8]) -> Bytes {
     buf.freeze()
 }
 
+/// Escape a command so it survives being written inside `"..."` and handed to a
+/// shell.
+///
+/// The four characters that keep a meaning inside double quotes are the four
+/// that get a backslash, and that is the whole rule. In particular a `$` is one
+/// character here, not two: this function is about the shell and knows nothing
+/// about any format the result may later be written into. A caller that has to
+/// put the escaped command in a `build.ninja` escapes it again on the way out —
+/// see `NinjaWriter::declare_rule`, where the two escapes compose in that order.
 pub fn escape_shell(s: &Bytes) -> Bytes {
     let delimiters = b"\"$\\`";
     let mut prev = 0;
@@ -459,13 +468,8 @@ pub fn escape_shell(s: &Bytes) -> Bytes {
     let mut r = BytesMut::new();
     while i < s.len() {
         r.put_slice(&s[prev..i]);
-        let c = s[i];
         r.put_u8(b'\\');
-        if s[i..].starts_with(b"$$") {
-            r.put_u8(b'$');
-            i += 1;
-        }
-        r.put_u8(c);
+        r.put_u8(s[i]);
         i += 1;
         prev = i;
         i += skip_until(&s[i..], delimiters);
@@ -503,6 +507,27 @@ mod test {
 
         let ss = word_scanner(b" a  b").collect::<Vec<&[u8]>>();
         assert_eq!(ss, vec![b"a", b"b"]);
+    }
+
+    /// Escaping for a shell is about the shell and about nothing else.
+    ///
+    /// A `$$` used to be special here: it was left as one escaped pair,
+    /// because kati's only caller handed it commands that had already been
+    /// escaped for a `build.ninja`, where every `$` is written twice. That made
+    /// this function wrong for its other caller and wrong for anything that is
+    /// not a manifest, so the doubling now happens on the way into the file
+    /// instead. `$$` is the shell's own PID and is escaped like any other two
+    /// dollars.
+    #[test]
+    fn test_escape_shell() {
+        let esc = |s: &'static [u8]| escape_shell(&Bytes::from_static(s));
+        assert_eq!(esc(b"foo"), Bytes::from_static(b"foo"));
+        assert_eq!(
+            esc(b"foo$`\\baz\"bar"),
+            Bytes::from_static(b"foo\\$\\`\\\\baz\\\"bar")
+        );
+        assert_eq!(esc(b"echo $PATH"), Bytes::from_static(b"echo \\$PATH"));
+        assert_eq!(esc(b"echo $$x"), Bytes::from_static(b"echo \\$\\$x"));
     }
 
     #[test]

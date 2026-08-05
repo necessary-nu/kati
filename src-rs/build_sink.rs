@@ -31,6 +31,20 @@ limitations under the License.
 //!   unescaped one, as a [`Symbol`] or as raw bytes, and escaping happens
 //!   inside the writer.
 //!
+//!   Commands are the case where this is easy to get wrong, because a command
+//!   with the wrong escaping still round-trips through a manifest: ninja
+//!   unescapes on the way in, so a doubled `$` reaches the shell as one either
+//!   way, and only a sink that skips the unescaping sees the difference. The
+//!   rule is the same as for paths, and it decides which: what crosses here is
+//!   what the *shell* should receive.
+//!
+//! * **Ninja expressions.** A manifest can say `$out` and have it mean a
+//!   different path per edge. That is a property of the format, not of the
+//!   build, so nothing shaped like it crosses this trait — the writer keeps
+//!   both of the ones kati relies on, the default description and the
+//!   response-file path, and a sink that cannot evaluate them never receives
+//!   them.
+//!
 //! * **`_kati_always_build_`.** A `.PHONY` target names no file, so nothing can
 //!   ever decide it is up to date. In a manifest kati expresses that by giving
 //!   the edge a synthetic input that is itself always dirty. That is one way to
@@ -67,9 +81,12 @@ pub struct SinkPool<'a> {
 pub enum SinkCommand<'a> {
     /// `<shell> <shell_flags> "<script>"`.
     Inline(&'a [u8]),
-    /// The script does not fit in an argument list. It is written to a file
-    /// next to the output and the shell is given that file to run, with no
-    /// flags: `<shell> <rspfile>`.
+    /// The script does not fit in an argument list, so it has to reach the
+    /// shell as a file instead: `<shell> <script file>`, with no flags.
+    ///
+    /// Which file is not said here. A sink that runs the script itself may not
+    /// need one at all, and the manifest writer names it in the only terms a
+    /// manifest has.
     ResponseFile(&'a [u8]),
 }
 
@@ -88,11 +105,17 @@ pub struct SinkRule<'a> {
     /// The flags that make the shell take a script as an argument, unescaped.
     /// Unused by [`SinkCommand::ResponseFile`].
     pub shell_flags: &'a [u8],
-    /// The assembled shell script. Already through `translate_command`, so
-    /// still carries Make's `$` handling; see the note on that function.
+    /// The assembled shell script, as the shell should receive it. A `$` here
+    /// is a `$` the shell will act on, never an escape belonging to some
+    /// destination format.
     pub command: SinkCommand<'a>,
-    /// What to print while the command runs.
-    pub description: &'a [u8],
+    /// What to print while the command runs, if the Makefile said — literal
+    /// text, with the shell quoting already off.
+    ///
+    /// `None` is not "print nothing": it is nobody having chosen, which leaves
+    /// the choice to the sink. The manifest writer picks a ninja expression
+    /// that names the outputs.
+    pub description: Option<&'a [u8]>,
     /// A file the command writes its discovered dependencies to, in the format
     /// `cc -MD` produces. kati never emits any other format.
     pub depfile: Option<&'a [u8]>,
