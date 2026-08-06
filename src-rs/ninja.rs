@@ -37,7 +37,7 @@ use crate::strutil::{basename, concat_dir, dirname, strip_ext, strip_ext_vec};
 use crate::{
     build_sink::{BuildSink, RuleId, SinkCommand, SinkEdge, SinkPool, SinkRule},
     command::{Command, CommandEvaluator},
-    dep::{DepNode, NamedDepNode, is_special_target},
+    dep::{DepNode, NamedDepNode, is_buildable_target},
     eval::Evaluator,
     expr::Evaluable,
     flags::Flags,
@@ -530,7 +530,7 @@ impl<'a> NinjaGenerator<'a> {
     /// here rather than in the sink because it is a fact about the Makefile.
     fn sink_node(&mut self, nn: &NinjaNode, sink: &mut dyn BuildSink) -> Result<Option<Symbol>> {
         let node = nn.node.lock();
-        if is_special_target(&self.ce.ev.session, &node.output) {
+        if !is_buildable_target(&self.ce.ev.session, &node.output) {
             return Ok(None);
         }
 

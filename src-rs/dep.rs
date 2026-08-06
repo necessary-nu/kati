@@ -527,20 +527,7 @@ impl<'a> DepBuilder<'a> {
             }
         }
 
-        let unsupported_builtin_targets = vec![
-            ".DEFAULT",
-            ".PRECIOUS",
-            ".INTERMEDIATE",
-            ".SECONDARY",
-            ".SECONDEXPANSION",
-            ".IGNORE",
-            ".LOW_RESOLUTION_TIME",
-            ".SILENT",
-            ".EXPORT_ALL_VARIABLES",
-            ".NOTPARALLEL",
-            ".ONESHELL",
-        ];
-        for p in unsupported_builtin_targets {
+        for p in UNSUPPORTED_BUILTIN_TARGETS.iter().copied() {
             let sym = self.ev.session.intern(p);
             if let Some((_, loc)) = self.get_rule_inputs(sym) {
                 warn_loc!(self.ev, Some(&loc), "kati doesn't support {p}");
@@ -1410,9 +1397,64 @@ pub fn make_dep(ev: &mut Evaluator, targets: Vec<Symbol>) -> Result<Vec<NamedDep
     db.build(targets)
 }
 
+/// Whether the name has the shape Make reserves for itself.
+///
+/// This answers a question about spelling, not about meaning, and it is
+/// deliberately wider than the set of names that actually mean something: it
+/// decides which rule may become the default goal, and GNU Make's rule there is
+/// the leading dot rather than a list. Nothing that puts nodes into a build
+/// graph should ask this — a Makefile is free to write `.1:` and expect `.1`
+/// built. Ask [`is_directive_target`] instead.
 pub fn is_special_target(names: &impl Interner, output: &Symbol) -> bool {
     let s = output.as_bytes(names);
     s.starts_with(b".") && !s[1..].starts_with(b".")
+}
+
+/// The special targets whose whole handling is [`DepBuilder::handle_special_targets`]
+/// reading them.
+const CONSUMED_BUILTIN_TARGETS: &[&str] = &[".PHONY", ".SUFFIXES", ".KATI_RESTAT"];
+
+/// The special targets kati declines. Declining consumes them just as
+/// thoroughly, so for the purpose of building they belong with the others.
+const UNSUPPORTED_BUILTIN_TARGETS: &[&str] = &[
+    ".DEFAULT",
+    ".PRECIOUS",
+    ".INTERMEDIATE",
+    ".SECONDARY",
+    ".SECONDEXPANSION",
+    ".IGNORE",
+    ".LOW_RESOLUTION_TIME",
+    ".SILENT",
+    ".EXPORT_ALL_VARIABLES",
+    ".NOTPARALLEL",
+    ".ONESHELL",
+];
+
+/// Whether this target addresses Make itself rather than naming something to
+/// build, and has therefore already been read for whatever it had to say.
+///
+/// A closed list, because being a directive is not a property of the name's
+/// shape: `.1` and `.WAIT` look exactly like `.PHONY` and are not it.
+pub fn is_directive_target(names: &impl Interner, output: &Symbol) -> bool {
+    let s = output.as_bytes(names);
+    CONSUMED_BUILTIN_TARGETS
+        .iter()
+        .chain(UNSUPPORTED_BUILTIN_TARGETS)
+        .any(|name| name.as_bytes() == &s[..])
+}
+
+/// Whether this node names something to build, as opposed to something the
+/// Makefile said to the evaluator and that the evaluator has already answered.
+///
+/// The suffix rules are here rather than under [`is_directive_target`] because
+/// they are not directives: `.c.o` names a rule for making any `.o` from any
+/// `.c`, and GNU Make will additionally build a file of that name if a Makefile
+/// asks for one. We do not, and refusing is what we have always done — but the
+/// refusal has to stay explicit, because the alternative is worse than being
+/// wrong. Emitted as an ordinary node, `.c.o` is claimed by the built-in
+/// `%.o: %.c` rule with an empty stem and runs `cc -c -o .c.o` against no input.
+pub fn is_buildable_target(names: &impl Interner, output: &Symbol) -> bool {
+    !is_directive_target(names, output) && !is_suffix_rule(names, output)
 }
 
 #[cfg(test)]
@@ -1430,5 +1472,29 @@ mod tests {
         assert!(!is_suffix_rule(&session, &foo));
         assert!(!is_suffix_rule(&session, &dotco));
         assert!(!is_suffix_rule(&session, &cob));
+    }
+
+    #[test]
+    fn a_dot_named_target_is_something_to_build() {
+        let mut session = Session::new();
+        // The names GNU Make's own test suite builds and we used to discard:
+        // an empty static-pattern stem leaves `.1`, and `.WAIT` is written by
+        // Makefiles that declare it themselves for the benefit of older makes.
+        for name in [".1", ".WAIT", ".x", "foo", ".."] {
+            let sym = session.intern(name);
+            assert!(
+                is_buildable_target(&session, &sym),
+                "{name} should be built"
+            );
+        }
+        // The directives are answered by the evaluator and never reach a sink,
+        // and a suffix rule is a rule rather than a file.
+        for name in [".PHONY", ".SUFFIXES", ".KATI_RESTAT", ".ONESHELL", ".c.o"] {
+            let sym = session.intern(name);
+            assert!(
+                !is_buildable_target(&session, &sym),
+                "{name} should not be built"
+            );
+        }
     }
 }
