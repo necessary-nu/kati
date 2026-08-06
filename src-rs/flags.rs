@@ -133,6 +133,10 @@ pub struct Flags {
     /// `.EXPORT_ALL_VARIABLES`: every variable the Makefile defined reaches the
     /// recipe's environment without being named.
     pub export_all_variables: bool,
+
+    /// `-R`: no `CC`, `CXX` or `AR` unless the Makefile says so itself. What
+    /// Make defines about itself stays, which is why this is not `-r`.
+    pub no_builtin_variables: bool,
 }
 
 fn parse_command_line_option_with_arg(

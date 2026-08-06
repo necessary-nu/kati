@@ -80,13 +80,17 @@ fn read_bootstrap_makefile(
     targets: &[Symbol],
 ) -> Result<Arc<Mutex<Vec<Stmt>>>> {
     let mut bootstrap = BytesMut::new();
-    bootstrap.put_slice(b"CC?=cc\n");
-    if cfg!(target_os = "macos") {
-        bootstrap.put_slice(b"CXX?=c++\n");
-    } else {
-        bootstrap.put_slice(b"CXX?=g++\n");
+    // The tool defaults, and the only part `-R` withholds. Everything below is
+    // Make describing itself, which it goes on doing.
+    if !session.flags.no_builtin_variables {
+        bootstrap.put_slice(b"CC?=cc\n");
+        if cfg!(target_os = "macos") {
+            bootstrap.put_slice(b"CXX?=c++\n");
+        } else {
+            bootstrap.put_slice(b"CXX?=g++\n");
+        }
+        bootstrap.put_slice(b"AR?=ar\n");
     }
-    bootstrap.put_slice(b"AR?=ar\n");
     // The one place a GNU Make version is claimed, because Makefiles branch on
     // it. It names the version this front end is measured against rather than
     // the one the vendored Go harness pinned: a Makefile that tests
