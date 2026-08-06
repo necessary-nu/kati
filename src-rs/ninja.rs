@@ -437,6 +437,7 @@ impl<'a> NinjaGenerator<'a> {
         name: &Bytes,
         commands: &Vec<Command>,
         cmd_buf: &mut BytesMut,
+        dry_buf: &mut BytesMut,
         description: &mut Option<Bytes>,
     ) {
         let mut command_count = commands.len();
@@ -460,22 +461,26 @@ impl<'a> NinjaGenerator<'a> {
                 continue;
             }
 
-            if !cmd_buf.is_empty() {
-                cmd_buf.put_slice(b" && ");
-            }
-
+            let mut fragment = BytesMut::new();
             if needs_subshell {
-                cmd_buf.put_u8(b'(');
+                fragment.put_u8(b'(');
             }
-
-            cmd_buf.put_slice(&translated);
-
+            fragment.put_slice(&translated);
             if c.ignore_error {
-                cmd_buf.put_slice(b" ; true");
+                fragment.put_slice(b" ; true");
+            }
+            if needs_subshell {
+                fragment.put_slice(b" )");
             }
 
-            if needs_subshell {
-                cmd_buf.put_slice(b" )");
+            for buf in [Some(&mut *cmd_buf), c.always_run.then_some(&mut *dry_buf)]
+                .into_iter()
+                .flatten()
+            {
+                if !buf.is_empty() {
+                    buf.put_slice(b" && ");
+                }
+                buf.put_slice(&fragment);
             }
         }
     }
@@ -540,12 +545,14 @@ impl<'a> NinjaGenerator<'a> {
             let id = nn.rule_id.unwrap();
             let mut description = None;
             let mut cmd_buf = BytesMut::new();
+            let mut dry_buf = BytesMut::new();
             let output_str = node.output.as_bytes(&self.ce.ev.session);
             Self::gen_shell_script(
                 &self.ce.ev.session.flags,
                 &output_str,
                 &nn.commands,
                 &mut cmd_buf,
+                &mut dry_buf,
                 &mut description,
             );
             // Extracting the depfile can rewrite the command, so it has to
@@ -556,6 +563,7 @@ impl<'a> NinjaGenerator<'a> {
             // TODO: Find this number automatically.
             let too_long_for_argv = cmd_buf.len() > 100 * 1000;
             let script = cmd_buf.freeze();
+            let dry_run_script = dry_buf.freeze();
             sink.declare_rule(
                 &self.ce.ev.session,
                 &SinkRule {
@@ -567,6 +575,7 @@ impl<'a> NinjaGenerator<'a> {
                     } else {
                         SinkCommand::Inline(&script)
                     },
+                    dry_run_command: &dry_run_script,
                     description: description.as_deref(),
                     depfile: depfile.as_deref(),
                     restat: node.is_restat,
@@ -1249,17 +1258,21 @@ mod tests {
             echo: true,
             ignore_error: false,
             force_no_subshell: false,
+            always_run: false,
         }];
         let mut cmd_buf = BytesMut::new();
+        let mut dry_buf = BytesMut::new();
         let mut description = None;
         NinjaGenerator::gen_shell_script(
             &Flags::default(),
             &Bytes::from_static(b"out"),
             &commands,
             &mut cmd_buf,
+            &mut dry_buf,
             &mut description,
         );
         assert_eq!(description, None, "no Makefile echo, so no description");
+        assert!(dry_buf.is_empty(), "no + prefix, so nothing runs under -n");
         cmd_buf.freeze()
     }
 
@@ -1283,6 +1296,9 @@ mod tests {
                     shell: b"/bin/sh",
                     shell_flags: b"-c",
                     command,
+                    // Ninja's -n runs nothing, so the manifest writer has no
+                    // use for the subset Make would still run.
+                    dry_run_command: b"",
                     description,
                     depfile: None,
                     restat: false,

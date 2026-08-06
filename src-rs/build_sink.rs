@@ -109,6 +109,11 @@ pub struct SinkRule<'a> {
     /// is a `$` the shell will act on, never an escape belonging to some
     /// destination format.
     pub command: SinkCommand<'a>,
+    /// The subset of the recipe Make runs even when told not to run anything:
+    /// the lines the Makefile prefixed `+`. Assembled the same way as
+    /// [`SinkRule::command`] and empty when there are none. The manifest writer
+    /// ignores it — Ninja's `-n` runs nothing at all.
+    pub dry_run_command: &'a [u8],
     /// What to print while the command runs, if the Makefile said — literal
     /// text, with the shell quoting already off.
     ///

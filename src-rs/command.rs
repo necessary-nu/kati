@@ -199,9 +199,16 @@ pub struct Command {
     pub echo: bool,
     pub ignore_error: bool,
     pub force_no_subshell: bool,
+    /// The `+` prefix: run this line even when the run is only pretending.
+    pub always_run: bool,
 }
 
-fn parse_command_prefixes(cmds: Bytes, echo: &mut bool, ignore_error: &mut bool) -> Bytes {
+fn parse_command_prefixes(
+    cmds: Bytes,
+    echo: &mut bool,
+    ignore_error: &mut bool,
+    always_run: &mut bool,
+) -> Bytes {
     let mut s = trim_left_space(&cmds);
     while !s.is_empty() {
         match s[0] {
@@ -212,7 +219,7 @@ fn parse_command_prefixes(cmds: Bytes, echo: &mut bool, ignore_error: &mut bool)
                 *ignore_error = true;
             }
             b'+' => {
-                // ignore recursion marker
+                *always_run = true;
             }
             _ => {
                 break;
@@ -323,7 +330,13 @@ impl<'a> CommandEvaluator<'a> {
             // `-i` is the `-` prefix asked for once instead of per line, so it
             // starts each recipe where a leading `-` would have left it.
             let mut global_ignore_error = self.ev.session.flags.ignore_errors;
-            cmds = parse_command_prefixes(cmds, &mut global_echo, &mut global_ignore_error);
+            let mut global_always_run = false;
+            cmds = parse_command_prefixes(
+                cmds,
+                &mut global_echo,
+                &mut global_ignore_error,
+                &mut global_always_run,
+            );
             if cmds.is_empty() {
                 continue;
             }
@@ -334,7 +347,8 @@ impl<'a> CommandEvaluator<'a> {
 
                 let mut echo = global_echo;
                 let mut ignore_error = global_ignore_error;
-                cmd = parse_command_prefixes(cmd, &mut echo, &mut ignore_error);
+                let mut always_run = global_always_run;
+                cmd = parse_command_prefixes(cmd, &mut echo, &mut ignore_error, &mut always_run);
 
                 if !cmd.is_empty() {
                     result.push(Command {
@@ -343,6 +357,7 @@ impl<'a> CommandEvaluator<'a> {
                         echo,
                         ignore_error,
                         force_no_subshell: false,
+                        always_run,
                     })
                 }
             }
@@ -358,6 +373,7 @@ impl<'a> CommandEvaluator<'a> {
                     echo: false,
                     ignore_error: false,
                     force_no_subshell: true,
+                    always_run: false,
                 })
             }
             // Prepend |output_commands|.
