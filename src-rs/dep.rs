@@ -557,17 +557,22 @@ impl<'a> DepBuilder<'a> {
                 .filter(|rule| !rule.cmds.is_empty())
                 .cloned();
         }
+        // In order, because `.SUFFIXES:` clears the list and a later one adds
+        // to what is left. Merging them first loses the clear.
         let suffixes = self.ev.session.intern(".SUFFIXES");
-        if let Some((targets, loc)) = self.get_rule_inputs(suffixes) {
-            if targets.is_empty() {
+        if let Some(merger) = self.rules.get(&suffixes).cloned() {
+            let mut declared: Vec<Symbol> = Vec::new();
+            for rule in &merger.lock().rules {
+                if rule.inputs.is_empty() {
+                    declared.clear();
+                } else {
+                    declared.extend(rule.inputs.iter().copied());
+                }
+            }
+            if declared.is_empty() {
                 self.suffix_rules.clear();
             } else {
-                let program = self.ev.session.flags.program_name.clone();
-                warn_loc!(
-                    self.ev,
-                    Some(&loc),
-                    "{program} doesn't support .SUFFIXES with prerequisites"
-                );
+                self.keep_only_declared_suffix_rules(&declared);
             }
         }
 
@@ -578,6 +583,27 @@ impl<'a> DepBuilder<'a> {
                 warn_loc!(self.ev, Some(&loc), "{program} doesn't support {p}");
             }
         }
+    }
+
+    /// A `.x.y:` rule is a suffix rule only while both `.x` and `.y` are on the
+    /// list, so a Makefile that clears the list and declares its own decides
+    /// which rules survive.
+    fn keep_only_declared_suffix_rules(&mut self, declared: &[Symbol]) {
+        let declared = declared
+            .iter()
+            .map(|s| {
+                let name = s.as_bytes(&self.ev.session);
+                name.slice(usize::from(name.starts_with(b"."))..)
+            })
+            .collect::<HashSet<_>>();
+        let names = &self.ev.session;
+        self.suffix_rules.retain(|output_suffix, rules| {
+            if !declared.contains(output_suffix) {
+                return false;
+            }
+            rules.retain(|rule| declared.contains(&rule.inputs[0].as_bytes(names)));
+            !rules.is_empty()
+        });
     }
 
     fn build(&mut self, mut targets: Vec<Symbol>) -> Result<Vec<NamedDepNode>> {

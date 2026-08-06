@@ -118,6 +118,7 @@ fn read_bootstrap_makefile(
         // http://www.gnu.org/software/make/manual/make.html#Catalogue-of-Rules
         // The document above is actually not correct. See default.c:
         // http://git.savannah.gnu.org/cgit/make.git/tree/default.c?id=4.1
+        bootstrap.put_slice(b".SUFFIXES: .o .c .cc\n");
         bootstrap.put_slice(b".c.o:\n");
         bootstrap.put_slice(b"\t$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c -o $@ $<\n");
         bootstrap.put_slice(b".cc.o:\n");
