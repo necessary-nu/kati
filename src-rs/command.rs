@@ -46,6 +46,7 @@ enum AutoCommand {
     Less,
     Hat,
     Plus,
+    Bar,
     Star,
     Question { found_new_inputs: Arc<Mutex<bool>> },
     NotImplemented,
@@ -112,6 +113,15 @@ impl AutoCommandVar {
                 let mut ww = WordWriter::new(out);
                 for ai in current_dep_node.actual_inputs.iter() {
                     ww.write(&ai.as_bytes(names))
+                }
+            }
+            AutoCommand::Bar => {
+                let mut seen = HashSet::new();
+                let mut ww = WordWriter::new(out);
+                for oi in current_dep_node.actual_order_only_inputs.iter() {
+                    if seen.insert(*oi) {
+                        ww.write(&oi.as_bytes(names))
+                    }
                 }
             }
             AutoCommand::Star => {
@@ -234,9 +244,26 @@ impl<'a> CommandEvaluator<'a> {
         ret.register_autocommand('*', AutoCommand::Star)?;
         ret.register_autocommand('?', AutoCommand::Question { found_new_inputs })?;
         // TODO: Implement them.
+        ret.register_bare_autocommand('|', AutoCommand::Bar)?;
         ret.register_autocommand('%', AutoCommand::NotImplemented)?;
-        ret.register_autocommand('|', AutoCommand::NotImplemented)?;
         Ok(ret)
+    }
+
+    /// `$|` has no D or F form: GNU Make reads `$(|D)` as an ordinary variable
+    /// nobody defined and expands it to nothing.
+    fn register_bare_autocommand(&mut self, c: char, a: AutoCommand) -> Result<()> {
+        let sym = self.ev.session.intern(c.to_string());
+        let v = Variable::new_autocommand(
+            sym,
+            AutoCommandVar {
+                typ: a,
+                sym,
+                variant: AutoCommandVariant::None,
+                current_dep_node: self.current_dep_node.clone(),
+            },
+        );
+        self.ev.session.set_global_var(sym, v, false, None)?;
+        Ok(())
     }
 
     fn register_autocommand(&mut self, c: char, a: AutoCommand) -> Result<()> {
