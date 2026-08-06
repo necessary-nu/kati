@@ -43,6 +43,16 @@ use crate::{
 
 pub type NamedDepNode = (Symbol, Arc<Mutex<DepNode>>);
 
+/// How many intermediate files the implicit rule search will invent in a row.
+///
+/// GNU Make has no such limit and does not need one: its chains terminate
+/// because the rule set is finite and because the stem does not grow. A pair of
+/// rules like `%.a: %.b.a` and `%.b.a: %.a` grows it, and the cycle guard
+/// cannot see that as a cycle because every name it visits is new. Six is well
+/// past anything a Makefile does on purpose — the deepest in GNU Make's own
+/// suite is three.
+const MAX_IMPLICIT_CHAIN: usize = 6;
+
 #[derive(Debug)]
 pub struct DepNode {
     pub output: Symbol,
@@ -437,6 +447,10 @@ struct DepBuilder<'a> {
     cur_rule_vars: Option<Arc<Vars>>,
 
     implicit_rules: RuleTrie,
+    /// The targets the recursive half of the implicit rule search is currently
+    /// asking about, so that a Makefile whose rules refer to each other is
+    /// refused rather than followed round.
+    chaining: HashSet<Symbol>,
     suffix_rules: SuffixRuleMap,
 
     first_rule: Option<Symbol>,
@@ -475,6 +489,7 @@ impl<'a> DepBuilder<'a> {
             cur_rule_vars: None,
 
             implicit_rules: RuleTrie::new(),
+            chaining: HashSet::new(),
             suffix_rules: HashMap::new(),
 
             first_rule: None,
@@ -892,6 +907,7 @@ impl<'a> DepBuilder<'a> {
         rule: &Rule,
         output: Symbol,
         n: Arc<Mutex<DepNode>>,
+        chaining: bool,
     ) -> Option<Arc<Rule>> {
         let output_str = output.as_bytes(&self.ev.session);
         let mut matched = None;
@@ -902,7 +918,7 @@ impl<'a> DepBuilder<'a> {
                 for input in &rule.inputs {
                     let buf = pat.append_subst(&output_str, &input.as_bytes(&self.ev.session));
                     let sym = self.ev.session.intern(buf);
-                    if !self.exists(sym) {
+                    if !self.exists(sym) && !(chaining && self.can_be_made_implicitly(sym, 0)) {
                         ok = false;
                         break;
                     }
@@ -950,6 +966,100 @@ impl<'a> DepBuilder<'a> {
         Some(found)
     }
 
+    /// Whether an implicit rule could make this, if one were asked to.
+    ///
+    /// This is the recursive half of GNU Make's implicit rule search — step 6,
+    /// the one it reaches by trying harder. Step 5 asks whether every
+    /// prerequisite already exists, and when no rule can answer yes, Make asks
+    /// the weaker question instead: could the prerequisite itself be made? A
+    /// prerequisite that could be is an intermediate file, and being willing to
+    /// invent one is the whole of what `%.x: %.o` beside `%.o: %.f` means when
+    /// only the `.f` is on disk.
+    ///
+    /// Nothing is built or recorded here. Answering yes is enough, because
+    /// build_plan will descend into the prerequisite on its own and the search
+    /// there will succeed for the ordinary reason — one level down, the file it
+    /// needs does exist.
+    ///
+    /// Two things keep it finite. Match-anything rules are skipped unless they
+    /// are terminal, which is Make's own restriction and the reason `%: %.o`
+    /// does not offer to make anything out of anything. And the depth is
+    /// capped, which is not Make's: Make leans on its rule set being finite and
+    /// on stems not growing, and a Makefile pairing `%.a: %.b` with `%.b: %.a`
+    /// should be refused rather than followed forever.
+    fn can_be_made_implicitly(&mut self, output: Symbol, depth: usize) -> bool {
+        if depth >= MAX_IMPLICIT_CHAIN || !self.chaining.insert(output) {
+            return false;
+        }
+        let answer = self.implicit_chain_exists(output, depth);
+        self.chaining.remove(&output);
+        answer
+    }
+
+    fn implicit_chain_exists(&mut self, output: Symbol, depth: usize) -> bool {
+        let output_str = output.as_bytes(&self.ev.session);
+        for rule in self
+            .implicit_rules
+            .get(&output_str)
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+        {
+            // A rule with no recipe cannot make anything, and a non-terminal
+            // match-anything rule is not allowed to try. Both are Make's, and
+            // both are checked here rather than in the caller because only the
+            // recursive pass is entitled to skip a rule for the second reason.
+            if rule.cmds.is_empty() || (!rule.is_double_colon && self.matches_anything(&rule)) {
+                continue;
+            }
+            for output_pattern in rule.output_patterns.clone() {
+                let pat = Pattern::new(output_pattern.as_bytes(&self.ev.session));
+                if !pat.matches(&output_str) {
+                    continue;
+                }
+                let inputs = rule
+                    .inputs
+                    .iter()
+                    .map(|input| {
+                        let buf = pat.append_subst(&output_str, &input.as_bytes(&self.ev.session));
+                        self.ev.session.intern(buf)
+                    })
+                    .collect::<Vec<_>>();
+                if inputs
+                    .into_iter()
+                    .all(|i| self.exists(i) || self.can_be_made_implicitly(i, depth + 1))
+                {
+                    return true;
+                }
+            }
+        }
+
+        let Some(suffix) = get_ext(&output_str) else {
+            return false;
+        };
+        if !suffix.starts_with(b".") {
+            return false;
+        }
+        let Some(found) = self.suffix_rules.get(&suffix[1..]).cloned() else {
+            return false;
+        };
+        for irule in &found {
+            let input = replace_suffix(&mut self.ev.session, output, &irule.inputs[0]);
+            if self.exists(input) || self.can_be_made_implicitly(input, depth + 1) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the rule offers to make any target at all, which is what makes
+    /// it dangerous to follow in a chain.
+    fn matches_anything(&self, rule: &Rule) -> bool {
+        rule.output_patterns
+            .iter()
+            .any(|p| p.as_bytes(&self.ev.session).as_ref() == b"%")
+    }
+
     fn pick_rule(&mut self, output: Symbol, n: &Arc<Mutex<DepNode>>) -> Option<PickedRuleInfo> {
         let rule_merger = self.lookup_rule_merger(output);
         let vars = self.lookup_rule_vars(output);
@@ -967,89 +1077,15 @@ impl<'a> DepBuilder<'a> {
             });
         }
 
-        let irules = self.implicit_rules.get(&output.as_bytes(&self.ev.session));
-        for rule in irules.into_iter().rev() {
-            let Some(pattern_rule) = self.can_pick_implicit_rule(&rule, output, n.clone()) else {
-                continue;
-            };
-            if rule_merger.is_some() {
-                return Some(PickedRuleInfo {
-                    merger: rule_merger,
-                    pattern_rule: Some(pattern_rule),
-                    vars,
-                });
+        // Steps 5 and 6 of the search, over the same list of rules, asked a
+        // weaker question the second time. The first pass has to finish before
+        // the second begins: a rule whose prerequisites are already on disk
+        // beats one whose prerequisites would have to be invented, however far
+        // down the list it appears.
+        for chaining in [false, true] {
+            if let Some(picked) = self.pick_pattern_rule(output, n, &rule_merger, &vars, chaining) {
+                return Some(picked);
             }
-            assert!(pattern_rule.output_patterns.len() == 1);
-            let vars = self.merge_implicit_rule_vars(pattern_rule.output_patterns[0], vars);
-            return Some(PickedRuleInfo {
-                merger: None,
-                pattern_rule: Some(pattern_rule),
-                vars,
-            });
-        }
-
-        let output_str = output.as_bytes(&self.ev.session);
-        let Some(output_suffix) = get_ext(&output_str) else {
-            if rule_merger.is_some() {
-                return Some(PickedRuleInfo {
-                    merger: rule_merger,
-                    pattern_rule: None,
-                    vars,
-                });
-            } else {
-                return None;
-            }
-        };
-        if !output_suffix.starts_with(b".") {
-            if rule_merger.is_some() {
-                return Some(PickedRuleInfo {
-                    merger: rule_merger,
-                    pattern_rule: None,
-                    vars,
-                });
-            } else {
-                return None;
-            }
-        }
-        let output_suffix = &output_suffix[1..];
-
-        let Some(found) = self.suffix_rules.get(output_suffix) else {
-            if rule_merger.is_some() {
-                return Some(PickedRuleInfo {
-                    merger: rule_merger,
-                    pattern_rule: None,
-                    vars,
-                });
-            } else {
-                return None;
-            }
-        };
-
-        let found = found.clone();
-        for irule in &found {
-            assert!(irule.inputs.len() == 1);
-            let input = replace_suffix(&mut self.ev.session, output, &irule.inputs[0]);
-            if !self.exists(input) {
-                continue;
-            }
-
-            if rule_merger.is_some() {
-                return Some(PickedRuleInfo {
-                    merger: rule_merger,
-                    pattern_rule: Some(irule.clone()),
-                    vars,
-                });
-            }
-            let mut vars = vars;
-            if vars.is_some() {
-                assert!(irule.outputs.len() == 1);
-                vars = self.merge_implicit_rule_vars(irule.outputs[0], vars);
-            }
-            return Some(PickedRuleInfo {
-                merger: rule_merger,
-                pattern_rule: Some(irule.clone()),
-                vars,
-            });
         }
 
         if rule_merger.is_some() {
@@ -1061,6 +1097,72 @@ impl<'a> DepBuilder<'a> {
         } else {
             None
         }
+    }
+
+    fn pick_pattern_rule(
+        &mut self,
+        output: Symbol,
+        n: &Arc<Mutex<DepNode>>,
+        rule_merger: &Option<Arc<Mutex<RuleMerger>>>,
+        vars: &Option<Arc<Vars>>,
+        chaining: bool,
+    ) -> Option<PickedRuleInfo> {
+        let irules = self.implicit_rules.get(&output.as_bytes(&self.ev.session));
+        for rule in irules.into_iter().rev() {
+            let Some(pattern_rule) =
+                self.can_pick_implicit_rule(&rule, output, n.clone(), chaining)
+            else {
+                continue;
+            };
+            if rule_merger.is_some() {
+                return Some(PickedRuleInfo {
+                    merger: rule_merger.clone(),
+                    pattern_rule: Some(pattern_rule),
+                    vars: vars.clone(),
+                });
+            }
+            assert!(pattern_rule.output_patterns.len() == 1);
+            let vars = self.merge_implicit_rule_vars(pattern_rule.output_patterns[0], vars.clone());
+            return Some(PickedRuleInfo {
+                merger: None,
+                pattern_rule: Some(pattern_rule),
+                vars,
+            });
+        }
+
+        let output_str = output.as_bytes(&self.ev.session);
+        let output_suffix = get_ext(&output_str)?;
+        if !output_suffix.starts_with(b".") {
+            return None;
+        }
+        let found = self.suffix_rules.get(&output_suffix[1..]).cloned()?;
+
+        for irule in &found {
+            assert!(irule.inputs.len() == 1);
+            let input = replace_suffix(&mut self.ev.session, output, &irule.inputs[0]);
+            if !self.exists(input) && !(chaining && self.can_be_made_implicitly(input, 0)) {
+                continue;
+            }
+
+            if rule_merger.is_some() {
+                return Some(PickedRuleInfo {
+                    merger: rule_merger.clone(),
+                    pattern_rule: Some(irule.clone()),
+                    vars: vars.clone(),
+                });
+            }
+            let mut vars = vars.clone();
+            if vars.is_some() {
+                assert!(irule.outputs.len() == 1);
+                vars = self.merge_implicit_rule_vars(irule.outputs[0], vars);
+            }
+            return Some(PickedRuleInfo {
+                merger: rule_merger.clone(),
+                pattern_rule: Some(irule.clone()),
+                vars,
+            });
+        }
+        None
     }
 
     fn build_plan(
@@ -1121,7 +1223,23 @@ impl<'a> DepBuilder<'a> {
         );
 
         if let Some(vars) = &picked_rule_info.vars {
-            for (name, var) in vars.0.lock().iter() {
+            // Sorted, because the order these are applied in is observable and
+            // a HashMap's is not. `a: BLAH := bar` beside `a: COMMAND += $(BLAH)`
+            // answers `bar` or `foo` depending on which is reached first, and
+            // with Rust's per-process hash seed that is a different answer on
+            // different runs of the same Makefile.
+            //
+            // By name, which is not Make's order — Make applies them as they
+            // were written. This buys reproducibility and nothing else, and the
+            // Makefile that depends on the order is still owed the real thing.
+            let mut targeted = vars
+                .0
+                .lock()
+                .iter()
+                .map(|(name, var)| (*name, var.clone()))
+                .collect::<Vec<_>>();
+            targeted.sort_by_cached_key(|(name, _)| name.as_bytes(&self.ev.session));
+            for (name, var) in &targeted {
                 let mut new_var = var.clone();
                 match var.read().assign_op {
                     Some(AssignOp::PlusEq) => {
