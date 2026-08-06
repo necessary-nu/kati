@@ -94,6 +94,14 @@ pub struct Session {
     /// The exit status of the last `$(shell)`, which is what `.SHELLSTATUS`
     /// reads.
     pub shell_status: Option<i32>,
+    /// Where to look for a prerequisite that is not in the current directory,
+    /// in the order the `vpath` directives declared it.
+    ///
+    /// A list rather than a map because order is the semantics: the first
+    /// pattern that matches a name decides which directories are searched, and
+    /// a later directive for the same pattern extends it rather than replacing
+    /// it.
+    pub vpaths: Vec<(crate::strutil::Pattern, Vec<Bytes>)>,
 }
 
 impl Default for Session {
@@ -133,6 +141,7 @@ impl Session {
             used_env_vars: HashSet::new(),
             used_undefined_vars: HashSet::new(),
             shell_status: None,
+            vpaths: Vec::new(),
         }
     }
 

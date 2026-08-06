@@ -359,3 +359,43 @@ impl ExportStmt {
         })
     }
 }
+
+/// A `vpath` directive, which says where to look for a prerequisite that is not
+/// in the current directory.
+///
+/// The line is kept unexpanded and evaluated when the statement runs, like every
+/// other directive here: a `vpath` can name its directories through a variable,
+/// and which directories those are depends on when the line is reached.
+pub struct VpathStmt {
+    loc: Loc,
+    orig: Bytes,
+    pub expr: Arc<Value>,
+}
+
+impl Statement for VpathStmt {
+    fn loc(&self) -> Loc {
+        self.loc.clone()
+    }
+    fn orig(&self) -> Bytes {
+        self.orig.clone()
+    }
+    fn eval(&self, ev: &mut Evaluator) -> Result<()> {
+        ev.eval_vpath(self)
+    }
+}
+
+impl Debug for VpathStmt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VpathStmt({:?}, loc={:?})", self.expr, self.loc)
+    }
+}
+
+impl VpathStmt {
+    pub fn new(loc: Loc, expr: Arc<Value>) -> Arc<VpathStmt> {
+        Arc::new(VpathStmt {
+            loc,
+            orig: Bytes::new(),
+            expr,
+        })
+    }
+}

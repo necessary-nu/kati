@@ -444,6 +444,8 @@ struct DepBuilder<'a> {
     phony: HashSet<Symbol>,
     restat: HashSet<Symbol>,
     depfile_var_name: Symbol,
+    /// `VPATH`, the variable form of the directory search.
+    vpath_var_name: Symbol,
     implicit_outputs_var_name: Symbol,
     ninja_pool_var_name: Symbol,
     validations_var_name: Symbol,
@@ -461,6 +463,7 @@ impl<'a> DepBuilder<'a> {
     fn new(ev: &'a mut Evaluator) -> Result<Self> {
         let rule_vars = std::mem::take(&mut ev.rule_vars);
         let depfile_var_name = ev.session.intern(".KATI_DEPFILE");
+        let vpath_var_name = ev.session.intern("VPATH");
         let implicit_outputs_var_name = ev.session.intern(".KATI_IMPLICIT_OUTPUTS");
         let ninja_pool_var_name = ev.session.intern(".KATI_NINJA_POOL");
         let validations_var_name = ev.session.intern(".KATI_VALIDATIONS");
@@ -479,6 +482,7 @@ impl<'a> DepBuilder<'a> {
             phony: HashSet::new(),
             restat: HashSet::new(),
             depfile_var_name,
+            vpath_var_name,
             implicit_outputs_var_name,
             ninja_pool_var_name,
             validations_var_name,
@@ -601,6 +605,122 @@ impl<'a> DepBuilder<'a> {
             || self.phony.contains(&target)
             || std::fs::exists(OsStr::from_bytes(&target.as_bytes(&self.ev.session)))
                 .is_ok_and(|v| v)
+            || self.vpath_of(target).is_some()
+    }
+
+    /// Replace each prerequisite with where the directory search found it.
+    ///
+    /// The rewrite has to happen to the node's inputs rather than only at the
+    /// point of asking whether a file exists, because the inputs are what `$<`
+    /// and `$^` expand to and what the recipe is therefore handed. A search
+    /// that found the file and then passed on the name as written would build
+    /// with a path that is not there.
+    ///
+    /// A prerequisite with a rule of its own is left alone: it is going to be
+    /// built here, so where an older copy of it might be lying is not a
+    /// question worth asking.
+    fn resolve_vpaths(&mut self, n: &Arc<Mutex<DepNode>>) {
+        if self.ev.session.vpaths.is_empty() && self.vpath_variable().is_empty() {
+            return;
+        }
+        let (inputs, order_only) = {
+            let n = n.lock();
+            (n.actual_inputs.clone(), n.actual_order_only_inputs.clone())
+        };
+        let inputs = self.at_vpaths(inputs);
+        let order_only = self.at_vpaths(order_only);
+        let mut n = n.lock();
+        n.actual_inputs = inputs;
+        n.actual_order_only_inputs = order_only;
+    }
+
+    /// Each prerequisite, moved to where the search found it.
+    ///
+    /// Resolved first and interned after, because finding the file needs the
+    /// session to read and naming the result needs it to write.
+    fn at_vpaths(&mut self, inputs: Vec<Symbol>) -> Vec<Symbol> {
+        let mut resolved = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            match self.at_vpath(input) {
+                Some(found) => resolved.push(self.ev.session.intern(found)),
+                None => resolved.push(input),
+            }
+        }
+        resolved
+    }
+
+    /// Where one prerequisite was found, if it had to be looked for.
+    ///
+    /// A prerequisite with a rule of its own is left alone: it is going to be
+    /// built here, so where an older copy of it might be lying is not a
+    /// question worth asking.
+    fn at_vpath(&self, input: Symbol) -> Option<Bytes> {
+        if self.rules.contains_key(&input) || self.phony.contains(&input) {
+            return None;
+        }
+        let name = input.as_bytes(&self.ev.session);
+        if std::fs::exists(OsStr::from_bytes(&name)).is_ok_and(|found| found) {
+            return None;
+        }
+        self.vpath_of(input)
+    }
+
+    /// Where a prerequisite actually is, when it is not where it was named.
+    ///
+    /// GNU Make's directory search. A name with a rule, or one that names a
+    /// file in the current directory, is already resolved and is left alone —
+    /// the search is what happens when neither is true. The first `vpath`
+    /// pattern that matches decides which directories are looked in; a name no
+    /// pattern matches falls back to `VPATH`, which is a variable rather than a
+    /// directive and so is read here rather than recorded.
+    fn vpath_of(&self, target: Symbol) -> Option<Bytes> {
+        let name = target.as_bytes(&self.ev.session);
+        if name.is_empty() || self.ev.session.vpaths.is_empty() && self.vpath_variable().is_empty()
+        {
+            return None;
+        }
+        let matched = self
+            .ev
+            .session
+            .vpaths
+            .iter()
+            .filter(|(pattern, _)| pattern.matches(&name))
+            .flat_map(|(_, directories)| directories.iter().cloned())
+            .collect::<Vec<_>>();
+        let directories = if matched.is_empty() {
+            self.vpath_variable()
+        } else {
+            matched
+        };
+        for directory in directories {
+            let mut candidate = BytesMut::from(directory.as_ref());
+            if !candidate.ends_with(b"/") {
+                candidate.put_u8(b'/');
+            }
+            candidate.put_slice(&name);
+            let candidate = candidate.freeze();
+            if std::fs::exists(OsStr::from_bytes(&candidate)).is_ok_and(|found| found) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// The directories `VPATH` names, separated by colons or by whitespace.
+    fn vpath_variable(&self) -> Vec<Bytes> {
+        let Some(var) = self.ev.session.peek_global_var(self.vpath_var_name) else {
+            return Vec::new();
+        };
+        let read = var.read();
+        let Ok(value) = read.string(&self.ev.session) else {
+            return Vec::new();
+        };
+        let value = Bytes::copy_from_slice(value.as_ref());
+        crate::strutil::word_scanner(&value)
+            .flat_map(|word| word.split(|byte| *byte == b':'))
+            .filter(|directory| !directory.is_empty())
+            .map(|directory| value.slice_ref(directory))
+            .collect()
     }
 
     fn get_rule_inputs(&self, s: Symbol) -> Option<(Vec<Symbol>, Loc)> {
@@ -1004,6 +1124,7 @@ impl<'a> DepBuilder<'a> {
                 &picked_rule_info.pattern_rule,
                 &n,
             );
+        self.resolve_vpaths(&n);
 
         let mut sv = Vec::new();
         let frame = self.ev.enter(

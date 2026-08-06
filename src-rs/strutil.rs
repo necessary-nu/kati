@@ -128,6 +128,12 @@ impl Pattern {
         }
     }
 
+    /// The pattern as it was written, so two can be compared for being the
+    /// same pattern rather than for matching the same names.
+    pub fn as_bytes(&self) -> &Bytes {
+        &self.pat
+    }
+
     pub fn matches(&self, str: &[u8]) -> bool {
         if let Some(percent_index) = self.percent_index {
             return self.match_impl(str, percent_index);

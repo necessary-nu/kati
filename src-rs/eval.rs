@@ -36,9 +36,9 @@ use crate::session::{Context, Session};
 use crate::stats::StatsRegistry;
 use crate::stmt::{
     AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt, IncludeStmt, RuleSep, RuleStmt,
-    Statement,
+    Statement, VpathStmt,
 };
-use crate::strutil::{is_space_byte, trim_leading_curdir, trim_right_space, word_scanner};
+use crate::strutil::{Pattern, is_space_byte, trim_leading_curdir, trim_right_space, word_scanner};
 use crate::symtab::{Interner, Symbol, Symtab};
 use crate::var::{Var, VarOrigin, Variable, Vars};
 use crate::{collect_stats_with_slow_report, error_loc, log, warn_loc};
@@ -963,6 +963,53 @@ impl Evaluator {
             }
         }
 
+        Ok(())
+    }
+
+    /// Record where to look for prerequisites a `vpath` directive covers.
+    ///
+    /// Three forms, told apart by how many words the line expands to. No words
+    /// clears every search path; one word clears the paths for that pattern
+    /// alone; two or more give a pattern and the directories to search for it.
+    ///
+    /// A repeated pattern extends rather than replaces, which is GNU Make's
+    /// rule and the reason the paths are a list keyed by pattern rather than a
+    /// map: `vpath %.c foo` then `vpath %.c bar` searches foo before bar.
+    pub fn eval_vpath(&mut self, stmt: &VpathStmt) -> Result<()> {
+        self.loc = Some(stmt.loc());
+        self.in_rule = false;
+
+        let line = stmt.expr.eval_to_buf(self)?;
+        let mut words = word_scanner(&line);
+        let Some(pattern) = words.next() else {
+            self.session.vpaths.clear();
+            return Ok(());
+        };
+        let pattern = line.slice_ref(pattern);
+        // Directories are separated by whitespace or by colons, and GNU Make
+        // accepts both in one directive.
+        let directories = words
+            .flat_map(|word| word.split(|byte| *byte == b':'))
+            .filter(|directory| !directory.is_empty())
+            .map(|directory| line.slice_ref(directory))
+            .collect::<Vec<_>>();
+        if directories.is_empty() {
+            self.session
+                .vpaths
+                .retain(|(existing, _)| existing.as_bytes() != &pattern);
+            return Ok(());
+        }
+        let pattern = Pattern::new(pattern);
+        if let Some((_, existing)) = self
+            .session
+            .vpaths
+            .iter_mut()
+            .find(|(candidate, _)| candidate.as_bytes() == pattern.as_bytes())
+        {
+            existing.extend(directories);
+        } else {
+            self.session.vpaths.push((pattern, directories));
+        }
         Ok(())
     }
 

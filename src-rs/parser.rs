@@ -28,7 +28,7 @@ use crate::{
     session::Session,
     stmt::{
         AssignDirective, AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt,
-        IncludeStmt, RuleSep, RuleStmt, Stmt,
+        IncludeStmt, RuleSep, RuleStmt, Stmt, VpathStmt,
     },
     strutil::{
         find_end_of_line, find_outside_paren, trim_left_space, trim_right_space, trim_space,
@@ -665,6 +665,20 @@ impl<'a> Parser<'a> {
         self.create_export(line, false)
     }
 
+    /// `vpath pattern dirs`, `vpath pattern`, or bare `vpath`.
+    ///
+    /// Which of the three it is cannot be decided here: the line is expanded
+    /// when the statement runs, and a single variable can supply the pattern,
+    /// the directories, or both. So the whole of it is carried across and the
+    /// evaluator counts words.
+    fn parse_vpath(&mut self, line: Bytes) -> Result<()> {
+        let loc = self.loc.clone();
+        let mut mutable_loc = loc.clone();
+        let expr = parse_expr(self.session, &mut mutable_loc, line, ParseExprOpt::Normal)?;
+        self.out_stmts.lock().push(VpathStmt::new(loc, expr));
+        Ok(())
+    }
+
     fn check_if_stack(&self, keyword: &'static str) -> Result<()> {
         if self.if_stack.is_empty() {
             error_loc!(
@@ -709,6 +723,7 @@ impl<'a> Parser<'a> {
             b"override" => self.parse_override(rest)?,
             b"export" => self.parse_export(rest)?,
             b"unexport" => self.parse_unexport(&rest)?,
+            b"vpath" => self.parse_vpath(rest)?,
             _ => return Ok(false),
         }
         Ok(true)
