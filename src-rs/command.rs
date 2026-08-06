@@ -319,6 +319,7 @@ impl<'a> CommandEvaluator<'a> {
             self.ev.current_scope = node.rule_vars.clone();
             node_cmds = node.cmds.clone();
         }
+        let node_ignores_errors = n.lock().is_ignore_error;
         self.ev.is_evaluating_command = true;
         *self.current_dep_node.lock() = Some(n.clone());
         *self.found_new_inputs.lock() = false;
@@ -329,7 +330,8 @@ impl<'a> CommandEvaluator<'a> {
             let mut global_echo = !self.ev.session.flags.is_silent_mode;
             // `-i` is the `-` prefix asked for once instead of per line, so it
             // starts each recipe where a leading `-` would have left it.
-            let mut global_ignore_error = self.ev.session.flags.ignore_errors;
+            let mut global_ignore_error =
+                self.ev.session.flags.ignore_errors || node_ignores_errors;
             let mut global_always_run = false;
             cmds = parse_command_prefixes(
                 cmds,

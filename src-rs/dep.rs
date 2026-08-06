@@ -58,6 +58,8 @@ pub struct DepNode {
     pub is_default_target: bool,
     pub is_phony: bool,
     pub is_restat: bool,
+    /// `.IGNORE` named this target: a failing recipe line is not a failure.
+    pub is_ignore_error: bool,
     pub implicit_outputs: Vec<Symbol>,
     pub actual_inputs: Vec<Symbol>,
     pub actual_order_only_inputs: Vec<Symbol>,
@@ -71,7 +73,12 @@ pub struct DepNode {
 }
 
 impl DepNode {
-    fn new(output: Symbol, is_phony: bool, is_restat: bool) -> Arc<Mutex<Self>> {
+    fn new(
+        output: Symbol,
+        is_phony: bool,
+        is_restat: bool,
+        is_ignore_error: bool,
+    ) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
             output,
             cmds: Vec::new(),
@@ -82,6 +89,7 @@ impl DepNode {
             is_default_target: false,
             is_phony,
             is_restat,
+            is_ignore_error,
             implicit_outputs: Vec::new(),
             actual_inputs: Vec::new(),
             actual_order_only_inputs: Vec::new(),
@@ -454,6 +462,9 @@ struct DepBuilder<'a> {
     done: HashMap<Symbol, Arc<Mutex<DepNode>>>,
     phony: HashSet<Symbol>,
     restat: HashSet<Symbol>,
+    /// The targets `.IGNORE` named. Empty when it named none, which is the
+    /// form that means every target and sets the flag instead.
+    ignore_errors: HashSet<Symbol>,
     depfile_var_name: Symbol,
     /// `VPATH`, the variable form of the directory search.
     vpath_var_name: Symbol,
@@ -497,6 +508,7 @@ impl<'a> DepBuilder<'a> {
             done: HashMap::new(),
             phony: HashSet::new(),
             restat: HashSet::new(),
+            ignore_errors: HashSet::new(),
             depfile_var_name,
             vpath_var_name,
             implicit_outputs_var_name,
@@ -528,6 +540,16 @@ impl<'a> DepBuilder<'a> {
         if let Some((targets, _)) = self.get_rule_inputs(restat) {
             for t in targets {
                 self.restat.insert(t);
+            }
+        }
+        // Bare `.IGNORE:` is `-i` asked for by the Makefile; with prerequisites
+        // it is the same thing for those targets alone.
+        let ignore = self.ev.session.intern(".IGNORE");
+        if let Some((targets, _)) = self.get_rule_inputs(ignore) {
+            if targets.is_empty() {
+                self.ev.session.flags.ignore_errors = true;
+            } else {
+                self.ignore_errors.extend(targets);
             }
         }
         // The bare `.WAIT:` form is what Makefiles write for older makes, so it
@@ -1347,6 +1369,7 @@ impl<'a> DepBuilder<'a> {
             output,
             self.phony.contains(&output),
             self.restat.contains(&output),
+            self.ignore_errors.contains(&output),
         );
         self.done.insert(output, n.clone());
 
@@ -1709,7 +1732,6 @@ const CONSUMED_BUILTIN_TARGETS: &[&str] = &[
 const UNSUPPORTED_BUILTIN_TARGETS: &[&str] = &[
     ".INTERMEDIATE",
     ".SECONDARY",
-    ".IGNORE",
     ".EXPORT_ALL_VARIABLES",
     ".NOTPARALLEL",
     ".ONESHELL",
