@@ -667,6 +667,54 @@ impl<'a> DepBuilder<'a> {
         n.actual_order_only_inputs = order_only;
     }
 
+    /// The second half of `.SECONDEXPANSION`: expand what the first expansion
+    /// left, now that `$@` has a value, and read the result as prerequisites.
+    fn expand_prerequisites_again(
+        &mut self,
+        n: &Arc<Mutex<DepNode>>,
+        output: Symbol,
+        text: &Bytes,
+    ) -> Result<()> {
+        let at = self.ev.session.intern("@");
+        let value = Variable::with_simple_string(
+            output.as_bytes(&self.ev.session),
+            crate::var::VarOrigin::Automatic,
+            None,
+            None,
+        );
+        let scope = self.cur_rule_vars.clone().unwrap_or_default();
+        let expanded = {
+            let _bound = ScopedVar::new(scope, at, value);
+            let mut loc = self.ev.loc.clone().unwrap_or_default();
+            let expr = crate::expr::parse_expr(
+                &mut self.ev.session,
+                &mut loc,
+                text.clone(),
+                crate::expr::ParseExprOpt::Normal,
+            )?;
+            expr.eval_to_buf(self.ev)?
+        };
+
+        let mut node = n.lock();
+        let mut order_only = false;
+        for word in word_scanner(&expanded) {
+            if word == b"|" {
+                order_only = true;
+                continue;
+            }
+            let sym = self
+                .ev
+                .session
+                .intern(expanded.slice_ref(trim_leading_curdir(word)));
+            if order_only {
+                node.actual_order_only_inputs.push(sym);
+            } else {
+                node.actual_inputs.push(sym);
+            }
+        }
+        Ok(())
+    }
+
     /// `.WAIT` names no file, so it goes before build_plan descends and never
     /// reaches the graph or an automatic variable. What it separated is
     /// recorded for [`DepBuilder::apply_wait_barriers`].
@@ -1293,6 +1341,18 @@ impl<'a> DepBuilder<'a> {
         }
         let output_str = output.as_bytes(&self.ev.session);
 
+        let deferred = picked_rule_info
+            .merger
+            .as_ref()
+            .map(|merger| {
+                merger
+                    .lock()
+                    .rules
+                    .iter()
+                    .filter_map(|rule| rule.deferred_prerequisites.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         picked_rule_info
             .merger
             .unwrap_or_else(RuleMerger::new)
@@ -1303,6 +1363,9 @@ impl<'a> DepBuilder<'a> {
                 &picked_rule_info.pattern_rule,
                 &n,
             );
+        for text in deferred {
+            self.expand_prerequisites_again(&n, output, &text)?;
+        }
         self.resolve_vpaths(&n);
         self.take_out_waits(&n);
 
@@ -1608,13 +1671,18 @@ pub fn is_special_target(names: &impl Interner, output: &Symbol) -> bool {
     s.starts_with(b".") && !s[1..].starts_with(b".")
 }
 
-const CONSUMED_BUILTIN_TARGETS: &[&str] =
-    &[".PHONY", ".SUFFIXES", ".KATI_RESTAT", ".WAIT", ".DEFAULT"];
+const CONSUMED_BUILTIN_TARGETS: &[&str] = &[
+    ".PHONY",
+    ".SUFFIXES",
+    ".KATI_RESTAT",
+    ".WAIT",
+    ".DEFAULT",
+    ".SECONDEXPANSION",
+];
 
 const UNSUPPORTED_BUILTIN_TARGETS: &[&str] = &[
     ".INTERMEDIATE",
     ".SECONDARY",
-    ".SECONDEXPANSION",
     ".IGNORE",
     ".EXPORT_ALL_VARIABLES",
     ".NOTPARALLEL",

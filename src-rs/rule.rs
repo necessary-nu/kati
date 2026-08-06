@@ -38,6 +38,11 @@ pub struct Rule {
     pub validations: Vec<Symbol>,
     pub is_double_colon: bool,
     pub is_suffix_rule: bool,
+    /// Set when `.SECONDEXPANSION` was declared before this rule was read.
+    pub expand_again: bool,
+    /// The prerequisite text as the first expansion left it, kept unparsed for
+    /// the second one.
+    pub deferred_prerequisites: Option<Bytes>,
     pub cmds: Vec<Arc<Value>>,
     pub loc: Loc,
     pub cmd_loc: Option<Loc>,
@@ -53,6 +58,8 @@ impl Rule {
             validations: Vec::new(),
             is_double_colon,
             is_suffix_rule: false,
+            expand_again: false,
+            deferred_prerequisites: None,
             cmds: Vec::new(),
             loc,
             cmd_loc: None,
@@ -100,7 +107,15 @@ impl Rule {
 
         let Some(separator_pos) = memchr(b':', &prereq_string) else {
             // Simple prerequisites
-            self.parse_inputs(session, &prereq_string);
+            // Explicit rules only. A pattern rule is chosen by matching its
+            // prerequisites against the filesystem, so deferring them leaves it
+            // matching anything and building the wrong thing — worse than the
+            // refusal it gives today.
+            if self.expand_again && self.output_patterns.is_empty() {
+                self.deferred_prerequisites = Some(prereq_string);
+            } else {
+                self.parse_inputs(session, &prereq_string);
+            }
             return Ok(());
         };
 

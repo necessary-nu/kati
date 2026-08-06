@@ -259,6 +259,10 @@ pub struct Evaluator {
     symbols_for_eval: HashSet<Symbol>,
 
     in_rule: bool,
+    /// Whether `.SECONDEXPANSION` has been read yet. It applies only to rules
+    /// below the declaration, so this is a position in the file rather than a
+    /// property of the Makefile.
+    second_expansion: bool,
     pub current_scope: Option<Arc<Vars>>,
 
     pub loc: Option<Loc>,
@@ -322,6 +326,7 @@ impl Evaluator {
             symbols_for_eval: HashSet::new(),
 
             in_rule: false,
+            second_expansion: false,
             current_scope: None,
 
             loc: None,
@@ -750,7 +755,16 @@ impl Evaluator {
             error_loc!(self, self.loc.as_ref(), "*** empty variable name.");
         }
 
+        if !is_pattern_rule
+            && targets
+                .iter()
+                .any(|t| t.as_bytes(&self.session).as_ref() == b".SECONDEXPANSION")
+        {
+            self.second_expansion = true;
+        }
+
         let mut rule = Rule::new(self.loc.clone().unwrap(), is_double_colon);
+        rule.expand_again = self.second_expansion;
         if is_pattern_rule {
             rule.output_patterns = targets;
         } else {
