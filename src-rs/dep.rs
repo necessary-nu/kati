@@ -446,6 +446,8 @@ struct DepBuilder<'a> {
     wait_sym: Symbol,
     /// Each prerequisite that followed a `.WAIT`, with what preceded it.
     wait_barriers: Vec<(Symbol, Vec<Symbol>)>,
+    /// The recipe `.DEFAULT` offers for a target with no rule of its own.
+    default_rule: Option<Arc<Rule>>,
     suffix_rules: SuffixRuleMap,
 
     first_rule: Option<Symbol>,
@@ -488,6 +490,7 @@ impl<'a> DepBuilder<'a> {
             chaining: HashSet::new(),
             wait_sym,
             wait_barriers: Vec::new(),
+            default_rule: None,
             suffix_rules: HashMap::new(),
 
             first_rule: None,
@@ -543,6 +546,16 @@ impl<'a> DepBuilder<'a> {
                     warn_loc!(self.ev, Some(&rule.loc), ".WAIT should not have commands");
                 }
             }
+        }
+        // The last one wins, and a `.DEFAULT:` with no recipe cancels it.
+        let default = self.ev.session.intern(".DEFAULT");
+        if let Some(merger) = self.rules.get(&default).cloned() {
+            self.default_rule = merger
+                .lock()
+                .rules
+                .last()
+                .filter(|rule| !rule.cmds.is_empty())
+                .cloned();
         }
         let suffixes = self.ev.session.intern(".SUFFIXES");
         if let Some((targets, loc)) = self.get_rule_inputs(suffixes) {
@@ -1160,14 +1173,20 @@ impl<'a> DepBuilder<'a> {
         }
 
         if rule_merger.is_some() {
-            Some(PickedRuleInfo {
+            return Some(PickedRuleInfo {
                 merger: rule_merger,
                 pattern_rule: None,
                 vars,
-            })
-        } else {
-            None
+            });
         }
+        // Make's step 7, and the last thing it tries. Only for a target with no
+        // rule at all that is not already there.
+        let default_rule = self.default_rule.clone().filter(|_| !self.exists(output));
+        default_rule.map(|rule| PickedRuleInfo {
+            merger: None,
+            pattern_rule: Some(rule),
+            vars,
+        })
     }
 
     fn pick_pattern_rule(
@@ -1589,10 +1608,10 @@ pub fn is_special_target(names: &impl Interner, output: &Symbol) -> bool {
     s.starts_with(b".") && !s[1..].starts_with(b".")
 }
 
-const CONSUMED_BUILTIN_TARGETS: &[&str] = &[".PHONY", ".SUFFIXES", ".KATI_RESTAT", ".WAIT"];
+const CONSUMED_BUILTIN_TARGETS: &[&str] =
+    &[".PHONY", ".SUFFIXES", ".KATI_RESTAT", ".WAIT", ".DEFAULT"];
 
 const UNSUPPORTED_BUILTIN_TARGETS: &[&str] = &[
-    ".DEFAULT",
     ".INTERMEDIATE",
     ".SECONDARY",
     ".SECONDEXPANSION",
