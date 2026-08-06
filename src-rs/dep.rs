@@ -451,6 +451,12 @@ struct DepBuilder<'a> {
     /// asking about, so that a Makefile whose rules refer to each other is
     /// refused rather than followed round.
     chaining: HashSet<Symbol>,
+    wait_sym: Symbol,
+    /// Each prerequisite that followed a `.WAIT`, with everything that came
+    /// before the `.WAIT` it followed. Collected while the marker is taken out
+    /// and acted on once the whole graph is known, because whether the ordering
+    /// can be expressed at all depends on who else wants the prerequisite.
+    wait_barriers: Vec<(Symbol, Vec<Symbol>)>,
     suffix_rules: SuffixRuleMap,
 
     first_rule: Option<Symbol>,
@@ -482,6 +488,7 @@ impl<'a> DepBuilder<'a> {
         let ninja_pool_var_name = ev.session.intern(".KATI_NINJA_POOL");
         let validations_var_name = ev.session.intern(".KATI_VALIDATIONS");
         let tags_var_name = ev.session.intern(".KATI_TAGS");
+        let wait_sym = ev.session.intern(".WAIT");
         let mut ret = Self {
             ev,
             rules: HashMap::new(),
@@ -490,6 +497,8 @@ impl<'a> DepBuilder<'a> {
 
             implicit_rules: RuleTrie::new(),
             chaining: HashSet::new(),
+            wait_sym,
+            wait_barriers: Vec::new(),
             suffix_rules: HashMap::new(),
 
             first_rule: None,
@@ -527,6 +536,25 @@ impl<'a> DepBuilder<'a> {
         if let Some((targets, _)) = self.get_rule_inputs(restat) {
             for t in targets {
                 self.restat.insert(t);
+            }
+        }
+        // `.WAIT:` is written by Makefiles that want to keep working on a make
+        // too old to know the marker, so the bare form is not worth a word. A
+        // `.WAIT` carrying prerequisites or a recipe is a Makefile expecting it
+        // to be a target, which it never is.
+        if let Some(merger) = self.rules.get(&self.wait_sym).cloned() {
+            let merger = merger.lock();
+            for rule in &merger.rules {
+                if !rule.inputs.is_empty() || !rule.order_only_inputs.is_empty() {
+                    warn_loc!(
+                        self.ev,
+                        Some(&rule.loc),
+                        ".WAIT should not have prerequisites"
+                    );
+                }
+                if !rule.cmds.is_empty() {
+                    warn_loc!(self.ev, Some(&rule.loc), ".WAIT should not have commands");
+                }
             }
         }
         let suffixes = self.ev.session.intern(".SUFFIXES");
@@ -599,6 +627,7 @@ impl<'a> DepBuilder<'a> {
             self.ev.current_scope = None;
             self.cur_rule_vars = None;
         }
+        self.apply_wait_barriers();
         Ok(nodes)
     }
 
@@ -634,6 +663,109 @@ impl<'a> DepBuilder<'a> {
         let mut n = n.lock();
         n.actual_inputs = inputs;
         n.actual_order_only_inputs = order_only;
+    }
+
+    /// Take `.WAIT` out of a node's prerequisites, remembering what it split.
+    ///
+    /// `.WAIT` names no file and must not reach the graph, an automatic
+    /// variable or a diagnostic: GNU Make's suite checks that `$^` on
+    /// `all: .WAIT pre1 .WAIT pre2` is `pre1 pre2` and nothing else. Taking it
+    /// out here rather than later means no node is ever made for it, so
+    /// build_plan does not descend into a marker.
+    ///
+    /// What it separated is recorded rather than applied, because whether the
+    /// ordering can be expressed depends on the rest of the graph. See
+    /// [`DepBuilder::apply_wait_barriers`].
+    fn take_out_waits(&mut self, n: &Arc<Mutex<DepNode>>) {
+        let mut node = n.lock();
+        if !node.actual_inputs.contains(&self.wait_sym)
+            && !node.actual_order_only_inputs.contains(&self.wait_sym)
+        {
+            return;
+        }
+        let (inputs, barriers) = self.without_waits(std::mem::take(&mut node.actual_inputs));
+        node.actual_inputs = inputs;
+        self.wait_barriers.extend(barriers);
+        let (order_only, barriers) =
+            self.without_waits(std::mem::take(&mut node.actual_order_only_inputs));
+        node.actual_order_only_inputs = order_only;
+        self.wait_barriers.extend(barriers);
+    }
+
+    /// The prerequisites without the markers, and what each marker separated.
+    fn without_waits(&self, inputs: Vec<Symbol>) -> (Vec<Symbol>, Vec<(Symbol, Vec<Symbol>)>) {
+        let mut kept = Vec::with_capacity(inputs.len());
+        let mut earlier: Vec<Symbol> = Vec::new();
+        let mut barriers = Vec::new();
+        for input in inputs {
+            if input == self.wait_sym {
+                // Everything so far, not only the group just ended: `.WAIT`
+                // waits for all of the prerequisites on its left, not for the
+                // ones since the previous `.WAIT`.
+                earlier.clone_from(&kept);
+                continue;
+            }
+            if !earlier.is_empty() {
+                barriers.push((input, earlier.clone()));
+            }
+            kept.push(input);
+        }
+        (kept, barriers)
+    }
+
+    /// Turn the `.WAIT` markers into ordering, where the graph can hold it.
+    ///
+    /// GNU Make's `.WAIT` orders one rule's prerequisite list as that rule is
+    /// walked, and its own tests pin the consequence: in `one: pre1 .WAIT pre2`
+    /// beside `two: pre2 pre1`, pre2 still runs early because `two` asked for it
+    /// with no barrier in the way. Upstream says so in the suite — "these same
+    /// two targets might be run in a different order if they appear as
+    /// prerequisites of another target ... it's much simpler to implement than
+    /// creating an actual edge in the DAG to represent .WAIT".
+    ///
+    /// Ronin has only the DAG. An edge is therefore added exactly when it
+    /// cannot say something Make would not: where the later prerequisite has a
+    /// single consumer, no other walk can start it early and the two readings
+    /// agree. Where it has several, Make's answer is that the other consumer
+    /// wins, and adding the edge would order what Make leaves free — which on
+    /// upstream's own case deadlocks two recipes that rendezvous through files.
+    ///
+    /// So this orders less than Make in the shared case and exactly as much in
+    /// every other. Ordering less is what already happened before any of this.
+    fn apply_wait_barriers(&mut self) {
+        if self.wait_barriers.is_empty() {
+            return;
+        }
+        let mut consumers: HashMap<Symbol, usize> = HashMap::new();
+        for node in self.done.values() {
+            let node = node.lock();
+            for input in node
+                .actual_inputs
+                .iter()
+                .chain(node.actual_order_only_inputs.iter())
+            {
+                *consumers.entry(*input).or_default() += 1;
+            }
+        }
+        for (later, earlier) in std::mem::take(&mut self.wait_barriers) {
+            if consumers.get(&later).copied() != Some(1) {
+                continue;
+            }
+            let Some(node) = self.done.get(&later).cloned() else {
+                continue;
+            };
+            for before in earlier {
+                let Some(dep) = self.done.get(&before).cloned() else {
+                    continue;
+                };
+                let mut node = node.lock();
+                if node.actual_order_only_inputs.contains(&before) {
+                    continue;
+                }
+                node.actual_order_only_inputs.push(before);
+                node.order_onlys.push((before, dep));
+            }
+        }
     }
 
     /// Each prerequisite, moved to where the search found it.
@@ -1214,6 +1346,7 @@ impl<'a> DepBuilder<'a> {
                 &n,
             );
         self.resolve_vpaths(&n);
+        self.take_out_waits(&n);
 
         let mut sv = Vec::new();
         let frame = self.ev.enter(
@@ -1530,7 +1663,7 @@ pub fn is_special_target(names: &impl Interner, output: &Symbol) -> bool {
 
 /// The special targets whose whole handling is [`DepBuilder::handle_special_targets`]
 /// reading them.
-const CONSUMED_BUILTIN_TARGETS: &[&str] = &[".PHONY", ".SUFFIXES", ".KATI_RESTAT"];
+const CONSUMED_BUILTIN_TARGETS: &[&str] = &[".PHONY", ".SUFFIXES", ".KATI_RESTAT", ".WAIT"];
 
 /// The special targets kati declines. Declining consumes them just as
 /// thoroughly, so for the purpose of building they belong with the others.
@@ -1595,10 +1728,9 @@ mod tests {
     #[test]
     fn a_dot_named_target_is_something_to_build() {
         let mut session = Session::new();
-        // The names GNU Make's own test suite builds and we used to discard:
-        // an empty static-pattern stem leaves `.1`, and `.WAIT` is written by
-        // Makefiles that declare it themselves for the benefit of older makes.
-        for name in [".1", ".WAIT", ".x", "foo", ".."] {
+        // The names GNU Make's own test suite builds and we used to discard.
+        // An empty static-pattern stem leaves `.1`.
+        for name in [".1", ".x", "foo", ".."] {
             let sym = session.intern(name);
             assert!(
                 is_buildable_target(&session, &sym),
@@ -1606,8 +1738,16 @@ mod tests {
             );
         }
         // The directives are answered by the evaluator and never reach a sink,
-        // and a suffix rule is a rule rather than a file.
-        for name in [".PHONY", ".SUFFIXES", ".KATI_RESTAT", ".ONESHELL", ".c.o"] {
+        // and a suffix rule is a rule rather than a file. `.WAIT` is a marker
+        // between prerequisites that is taken out before any of this.
+        for name in [
+            ".PHONY",
+            ".SUFFIXES",
+            ".KATI_RESTAT",
+            ".ONESHELL",
+            ".WAIT",
+            ".c.o",
+        ] {
             let sym = session.intern(name);
             assert!(
                 !is_buildable_target(&session, &sym),
