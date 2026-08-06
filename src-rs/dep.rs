@@ -1440,6 +1440,12 @@ impl<'a> DepBuilder<'a> {
                 .map(|(name, var)| (*name, var.clone()))
                 .collect::<Vec<_>>();
             targeted.sort_by_cached_key(|(name, _)| name.as_bytes(&self.ev.session));
+            // `+=` last, and its right-hand side expanded once every other
+            // target-specific variable is in scope. `all: A += $(Z)` beside
+            // `all: Z = changed` appends `changed`, not whatever Z was outside
+            // the rule, and expanding while the scope is half built reads the
+            // outer one.
+            targeted.sort_by_key(|(_, var)| var.read().assign_op == Some(AssignOp::PlusEq));
             for (name, var) in &targeted {
                 let mut new_var = var.clone();
                 match var.read().assign_op {
