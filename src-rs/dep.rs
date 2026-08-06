@@ -43,14 +43,8 @@ use crate::{
 
 pub type NamedDepNode = (Symbol, Arc<Mutex<DepNode>>);
 
-/// How many intermediate files the implicit rule search will invent in a row.
-///
-/// GNU Make has no such limit and does not need one: its chains terminate
-/// because the rule set is finite and because the stem does not grow. A pair of
-/// rules like `%.a: %.b.a` and `%.b.a: %.a` grows it, and the cycle guard
-/// cannot see that as a cycle because every name it visits is new. Six is well
-/// past anything a Makefile does on purpose — the deepest in GNU Make's own
-/// suite is three.
+/// The cycle guard cannot catch `%.a: %.b.a` against `%.b.a: %.a`, where every
+/// name visited is new. The deepest chain in GNU Make's suite is three.
 const MAX_IMPLICIT_CHAIN: usize = 6;
 
 #[derive(Debug)]
@@ -447,15 +441,10 @@ struct DepBuilder<'a> {
     cur_rule_vars: Option<Arc<Vars>>,
 
     implicit_rules: RuleTrie,
-    /// The targets the recursive half of the implicit rule search is currently
-    /// asking about, so that a Makefile whose rules refer to each other is
-    /// refused rather than followed round.
+    /// Cycle guard for the recursive implicit rule search.
     chaining: HashSet<Symbol>,
     wait_sym: Symbol,
-    /// Each prerequisite that followed a `.WAIT`, with everything that came
-    /// before the `.WAIT` it followed. Collected while the marker is taken out
-    /// and acted on once the whole graph is known, because whether the ordering
-    /// can be expressed at all depends on who else wants the prerequisite.
+    /// Each prerequisite that followed a `.WAIT`, with what preceded it.
     wait_barriers: Vec<(Symbol, Vec<Symbol>)>,
     suffix_rules: SuffixRuleMap,
 
@@ -538,10 +527,8 @@ impl<'a> DepBuilder<'a> {
                 self.restat.insert(t);
             }
         }
-        // `.WAIT:` is written by Makefiles that want to keep working on a make
-        // too old to know the marker, so the bare form is not worth a word. A
-        // `.WAIT` carrying prerequisites or a recipe is a Makefile expecting it
-        // to be a target, which it never is.
+        // The bare `.WAIT:` form is what Makefiles write for older makes, so it
+        // is not worth a word.
         if let Some(merger) = self.rules.get(&self.wait_sym).cloned() {
             let merger = merger.lock();
             for rule in &merger.rules {
@@ -562,10 +549,11 @@ impl<'a> DepBuilder<'a> {
             if targets.is_empty() {
                 self.suffix_rules.clear();
             } else {
+                let program = self.ev.session.flags.program_name.clone();
                 warn_loc!(
                     self.ev,
                     Some(&loc),
-                    "kati doesn't support .SUFFIXES with prerequisites"
+                    "{program} doesn't support .SUFFIXES with prerequisites"
                 );
             }
         }
@@ -573,7 +561,8 @@ impl<'a> DepBuilder<'a> {
         for p in UNSUPPORTED_BUILTIN_TARGETS.iter().copied() {
             let sym = self.ev.session.intern(p);
             if let Some((_, loc)) = self.get_rule_inputs(sym) {
-                warn_loc!(self.ev, Some(&loc), "kati doesn't support {p}");
+                let program = self.ev.session.flags.program_name.clone();
+                warn_loc!(self.ev, Some(&loc), "{program} doesn't support {p}");
             }
         }
     }
@@ -665,17 +654,9 @@ impl<'a> DepBuilder<'a> {
         n.actual_order_only_inputs = order_only;
     }
 
-    /// Take `.WAIT` out of a node's prerequisites, remembering what it split.
-    ///
-    /// `.WAIT` names no file and must not reach the graph, an automatic
-    /// variable or a diagnostic: GNU Make's suite checks that `$^` on
-    /// `all: .WAIT pre1 .WAIT pre2` is `pre1 pre2` and nothing else. Taking it
-    /// out here rather than later means no node is ever made for it, so
-    /// build_plan does not descend into a marker.
-    ///
-    /// What it separated is recorded rather than applied, because whether the
-    /// ordering can be expressed depends on the rest of the graph. See
-    /// [`DepBuilder::apply_wait_barriers`].
+    /// `.WAIT` names no file, so it goes before build_plan descends and never
+    /// reaches the graph or an automatic variable. What it separated is
+    /// recorded for [`DepBuilder::apply_wait_barriers`].
     fn take_out_waits(&mut self, n: &Arc<Mutex<DepNode>>) {
         let mut node = n.lock();
         if !node.actual_inputs.contains(&self.wait_sym)
@@ -692,16 +673,13 @@ impl<'a> DepBuilder<'a> {
         self.wait_barriers.extend(barriers);
     }
 
-    /// The prerequisites without the markers, and what each marker separated.
     fn without_waits(&self, inputs: Vec<Symbol>) -> (Vec<Symbol>, Vec<(Symbol, Vec<Symbol>)>) {
         let mut kept = Vec::with_capacity(inputs.len());
         let mut earlier: Vec<Symbol> = Vec::new();
         let mut barriers = Vec::new();
         for input in inputs {
             if input == self.wait_sym {
-                // Everything so far, not only the group just ended: `.WAIT`
-                // waits for all of the prerequisites on its left, not for the
-                // ones since the previous `.WAIT`.
+                // Everything to the left, not only the group just ended.
                 earlier.clone_from(&kept);
                 continue;
             }
@@ -713,25 +691,10 @@ impl<'a> DepBuilder<'a> {
         (kept, barriers)
     }
 
-    /// Turn the `.WAIT` markers into ordering, where the graph can hold it.
-    ///
-    /// GNU Make's `.WAIT` orders one rule's prerequisite list as that rule is
-    /// walked, and its own tests pin the consequence: in `one: pre1 .WAIT pre2`
-    /// beside `two: pre2 pre1`, pre2 still runs early because `two` asked for it
-    /// with no barrier in the way. Upstream says so in the suite — "these same
-    /// two targets might be run in a different order if they appear as
-    /// prerequisites of another target ... it's much simpler to implement than
-    /// creating an actual edge in the DAG to represent .WAIT".
-    ///
-    /// Ronin has only the DAG. An edge is therefore added exactly when it
-    /// cannot say something Make would not: where the later prerequisite has a
-    /// single consumer, no other walk can start it early and the two readings
-    /// agree. Where it has several, Make's answer is that the other consumer
-    /// wins, and adding the edge would order what Make leaves free — which on
-    /// upstream's own case deadlocks two recipes that rendezvous through files.
-    ///
-    /// So this orders less than Make in the shared case and exactly as much in
-    /// every other. Ordering less is what already happened before any of this.
+    /// Make orders one rule's prerequisite list as it walks it, so a shared
+    /// prerequisite is still free to run early for another rule's sake. An edge
+    /// is added only where the later prerequisite has one consumer and the two
+    /// readings agree; adding it otherwise deadlocks GNU Make's own test.
     fn apply_wait_barriers(&mut self) {
         if self.wait_barriers.is_empty() {
             return;
@@ -1098,27 +1061,9 @@ impl<'a> DepBuilder<'a> {
         Some(found)
     }
 
-    /// Whether an implicit rule could make this, if one were asked to.
-    ///
-    /// This is the recursive half of GNU Make's implicit rule search — step 6,
-    /// the one it reaches by trying harder. Step 5 asks whether every
-    /// prerequisite already exists, and when no rule can answer yes, Make asks
-    /// the weaker question instead: could the prerequisite itself be made? A
-    /// prerequisite that could be is an intermediate file, and being willing to
-    /// invent one is the whole of what `%.x: %.o` beside `%.o: %.f` means when
-    /// only the `.f` is on disk.
-    ///
-    /// Nothing is built or recorded here. Answering yes is enough, because
-    /// build_plan will descend into the prerequisite on its own and the search
-    /// there will succeed for the ordinary reason — one level down, the file it
-    /// needs does exist.
-    ///
-    /// Two things keep it finite. Match-anything rules are skipped unless they
-    /// are terminal, which is Make's own restriction and the reason `%: %.o`
-    /// does not offer to make anything out of anything. And the depth is
-    /// capped, which is not Make's: Make leans on its rule set being finite and
-    /// on stems not growing, and a Makefile pairing `%.a: %.b` with `%.b: %.a`
-    /// should be refused rather than followed forever.
+    /// Step 6 of GNU Make's implicit rule search: whether an implicit rule could
+    /// make this. Nothing is built here — build_plan descends into the
+    /// prerequisite anyway, and the search one level down succeeds normally.
     fn can_be_made_implicitly(&mut self, output: Symbol, depth: usize) -> bool {
         if depth >= MAX_IMPLICIT_CHAIN || !self.chaining.insert(output) {
             return false;
@@ -1137,10 +1082,8 @@ impl<'a> DepBuilder<'a> {
             .rev()
             .collect::<Vec<_>>()
         {
-            // A rule with no recipe cannot make anything, and a non-terminal
-            // match-anything rule is not allowed to try. Both are Make's, and
-            // both are checked here rather than in the caller because only the
-            // recursive pass is entitled to skip a rule for the second reason.
+            // Make's step 6a: a non-terminal match-anything rule is not allowed
+            // to make an intermediate.
             if rule.cmds.is_empty() || (!rule.is_double_colon && self.matches_anything(&rule)) {
                 continue;
             }
@@ -1184,8 +1127,6 @@ impl<'a> DepBuilder<'a> {
         false
     }
 
-    /// Whether the rule offers to make any target at all, which is what makes
-    /// it dangerous to follow in a chain.
     fn matches_anything(&self, rule: &Rule) -> bool {
         rule.output_patterns
             .iter()
@@ -1209,11 +1150,9 @@ impl<'a> DepBuilder<'a> {
             });
         }
 
-        // Steps 5 and 6 of the search, over the same list of rules, asked a
-        // weaker question the second time. The first pass has to finish before
-        // the second begins: a rule whose prerequisites are already on disk
-        // beats one whose prerequisites would have to be invented, however far
-        // down the list it appears.
+        // Steps 5 then 6, over the same rules. The first pass must finish
+        // first: a rule whose prerequisites exist beats one whose would have to
+        // be invented, however far down the list it is.
         for chaining in [false, true] {
             if let Some(picked) = self.pick_pattern_rule(output, n, &rule_merger, &vars, chaining) {
                 return Some(picked);
@@ -1356,15 +1295,9 @@ impl<'a> DepBuilder<'a> {
         );
 
         if let Some(vars) = &picked_rule_info.vars {
-            // Sorted, because the order these are applied in is observable and
-            // a HashMap's is not. `a: BLAH := bar` beside `a: COMMAND += $(BLAH)`
-            // answers `bar` or `foo` depending on which is reached first, and
-            // with Rust's per-process hash seed that is a different answer on
-            // different runs of the same Makefile.
-            //
-            // By name, which is not Make's order — Make applies them as they
-            // were written. This buys reproducibility and nothing else, and the
-            // Makefile that depends on the order is still owed the real thing.
+            // Sorted because the order is observable and a HashMap's varies per
+            // process. By name, not Make's order, which is as written — this
+            // buys reproducibility only.
             let mut targeted = vars
                 .0
                 .lock()
@@ -1648,62 +1581,46 @@ pub fn make_dep(ev: &mut Evaluator, targets: Vec<Symbol>) -> Result<Vec<NamedDep
     db.build(targets)
 }
 
-/// Whether the name has the shape Make reserves for itself.
-///
-/// This answers a question about spelling, not about meaning, and it is
-/// deliberately wider than the set of names that actually mean something: it
-/// decides which rule may become the default goal, and GNU Make's rule there is
-/// the leading dot rather than a list. Nothing that puts nodes into a build
-/// graph should ask this — a Makefile is free to write `.1:` and expect `.1`
-/// built. Ask [`is_directive_target`] instead.
+/// Whether the name has the shape Make reserves: the rule for choosing a
+/// default goal, and wider than the names that mean anything. To decide whether
+/// something belongs in the graph, ask [`is_buildable_target`].
 pub fn is_special_target(names: &impl Interner, output: &Symbol) -> bool {
     let s = output.as_bytes(names);
     s.starts_with(b".") && !s[1..].starts_with(b".")
 }
 
-/// The special targets whose whole handling is [`DepBuilder::handle_special_targets`]
-/// reading them.
 const CONSUMED_BUILTIN_TARGETS: &[&str] = &[".PHONY", ".SUFFIXES", ".KATI_RESTAT", ".WAIT"];
 
-/// The special targets kati declines. Declining consumes them just as
-/// thoroughly, so for the purpose of building they belong with the others.
 const UNSUPPORTED_BUILTIN_TARGETS: &[&str] = &[
     ".DEFAULT",
-    ".PRECIOUS",
     ".INTERMEDIATE",
     ".SECONDARY",
     ".SECONDEXPANSION",
     ".IGNORE",
-    ".LOW_RESOLUTION_TIME",
-    ".SILENT",
     ".EXPORT_ALL_VARIABLES",
     ".NOTPARALLEL",
     ".ONESHELL",
 ];
 
-/// Whether this target addresses Make itself rather than naming something to
-/// build, and has therefore already been read for whatever it had to say.
-///
+/// Special targets asking for what already happens: we never echo a recipe,
+/// never delete a target whose recipe failed, and 4.x ignores the last two.
+const ACCEPTED_BUILTIN_TARGETS: &[&str] =
+    &[".SILENT", ".PRECIOUS", ".LOW_RESOLUTION_TIME", ".POSIX"];
+
 /// A closed list, because being a directive is not a property of the name's
-/// shape: `.1` and `.WAIT` look exactly like `.PHONY` and are not it.
+/// shape: `.1` looks exactly like `.PHONY` and is an ordinary target.
 pub fn is_directive_target(names: &impl Interner, output: &Symbol) -> bool {
     let s = output.as_bytes(names);
     CONSUMED_BUILTIN_TARGETS
         .iter()
         .chain(UNSUPPORTED_BUILTIN_TARGETS)
+        .chain(ACCEPTED_BUILTIN_TARGETS)
         .any(|name| name.as_bytes() == &s[..])
 }
 
-/// Whether this node names something to build, as opposed to something the
-/// Makefile said to the evaluator and that the evaluator has already answered.
-///
-/// The suffix rules are here rather than under [`is_directive_target`] because
-/// they are not directives: `.c.o` names a rule for making any `.o` from any
-/// `.c`, and GNU Make will additionally build a file of that name if a Makefile
-/// asks for one. We do not, and refusing is what we have always done — but the
-/// refusal has to stay explicit, because the alternative is worse than being
-/// wrong. Emitted as an ordinary node, `.c.o` is claimed by the built-in
-/// `%.o: %.c` rule with an empty stem and runs `cc -c -o .c.o` against no input.
+/// Suffix rules are excluded deliberately. Emitted as an ordinary node, `.c.o`
+/// is claimed by the built-in `%.o: %.c` with an empty stem and runs
+/// `cc -c -o .c.o` against no input, which is worse than refusing it.
 pub fn is_buildable_target(names: &impl Interner, output: &Symbol) -> bool {
     !is_directive_target(names, output) && !is_suffix_rule(names, output)
 }
@@ -1728,8 +1645,7 @@ mod tests {
     #[test]
     fn a_dot_named_target_is_something_to_build() {
         let mut session = Session::new();
-        // The names GNU Make's own test suite builds and we used to discard.
-        // An empty static-pattern stem leaves `.1`.
+        // An empty static-pattern stem leaves `.1`, which Make builds.
         for name in [".1", ".x", "foo", ".."] {
             let sym = session.intern(name);
             assert!(
@@ -1737,9 +1653,6 @@ mod tests {
                 "{name} should be built"
             );
         }
-        // The directives are answered by the evaluator and never reach a sink,
-        // and a suffix rule is a rule rather than a file. `.WAIT` is a marker
-        // between prerequisites that is taken out before any of this.
         for name in [
             ".PHONY",
             ".SUFFIXES",

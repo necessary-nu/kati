@@ -654,10 +654,11 @@ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> 
     let cmd = args[0].eval_to_buf(ev)?;
     if ev.avoid_io && !has_no_io_in_shell_script(&cmd) {
         if ev.eval_depth > 1 {
+            let program = ev.session.flags.program_name.clone();
             error_loc!(
                 ev,
                 ev.loc.as_ref(),
-                "kati doesn't support passing results of $(shell) to other make constructs: {}",
+                "{program} doesn't support passing results of $(shell) to other make constructs: {}",
                 String::from_utf8_lossy(&cmd)
             );
         }
