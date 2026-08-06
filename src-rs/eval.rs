@@ -916,6 +916,29 @@ impl Evaluator {
         Ok(())
     }
 
+    /// Where `-I` found the file, or the name as written.
+    ///
+    /// Only when the working directory does not have it: GNU Make searches the
+    /// path after failing, not instead of looking.
+    fn at_include_dirs(&self, pat: Bytes) -> Bytes {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::path::Path;
+
+        if self.session.flags.include_dirs.is_empty()
+            || pat.starts_with(b"/")
+            || Path::new(OsStr::from_bytes(&pat)).exists()
+        {
+            return pat;
+        }
+        for dir in &self.session.flags.include_dirs {
+            let candidate = dir.join(OsStr::from_bytes(&pat));
+            if candidate.exists() {
+                return Bytes::from(candidate.into_os_string().into_vec());
+            }
+        }
+        pat
+    }
+
     pub fn eval_include(&mut self, stmt: &IncludeStmt) -> Result<()> {
         self.loc = Some(stmt.loc());
         self.in_rule = false;
@@ -923,6 +946,7 @@ impl Evaluator {
         let pats = stmt.expr.eval_to_buf(self)?;
         for pat in word_scanner(&pats) {
             let pat = pats.slice_ref(pat);
+            let pat = self.at_include_dirs(pat);
             let files = self.session.glob(pat.clone());
 
             if stmt.should_exist {

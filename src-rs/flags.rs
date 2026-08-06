@@ -18,7 +18,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     os::unix::ffi::{OsStrExt, OsStringExt},
-    path::Path,
+    path::{Path, PathBuf},
     vec::IntoIter,
 };
 
@@ -125,6 +125,10 @@ pub struct Flags {
     /// token budget is decided by whoever spawns the recipes, and the evaluator
     /// never does.
     pub extra_features: Vec<String>,
+
+    /// Where `-I` says to look for an `include` the working directory does not
+    /// have, in the order given.
+    pub include_dirs: Vec<PathBuf>,
 }
 
 fn parse_command_line_option_with_arg(
