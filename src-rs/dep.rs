@@ -26,7 +26,7 @@ use std::{
 };
 
 use crate::{
-    error, error_loc,
+    error_loc,
     eval::{Evaluator, FrameType},
     expr::{Evaluable, Value},
     loc::Loc,
@@ -249,7 +249,9 @@ impl RuleMerger {
         {
             let merger = merger.lock();
             if merger.primary_rule.is_none() {
-                error!(
+                error_loc!(
+                    ctx,
+                    None,
                     "*** implicit output `{}' on phony target `{}'",
                     output.display(ctx),
                     p.display(ctx)
@@ -544,10 +546,10 @@ impl<'a> DepBuilder<'a> {
 
     fn build(&mut self, mut targets: Vec<Symbol>) -> Result<Vec<NamedDepNode>> {
         let Some(first_rule) = self.first_rule else {
-            // GNU Make's own wording, down to the two spaces and the `Stop.`,
-            // because its test suite matches this message exactly to learn what
-            // the program under test is called.
-            error_loc!(self.ev, None, "*** No targets.  Stop.");
+            // GNU Make's own wording, because its test suite matches this
+            // message exactly to learn what the program under test is called.
+            // The name and the `Stop.` are added on the way out.
+            error_loc!(self.ev, None, "*** No targets.");
         };
 
         if !self.ev.session.flags.gen_all_targets && targets.is_empty() {

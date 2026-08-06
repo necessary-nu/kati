@@ -179,6 +179,9 @@ fn handle_realpath(args: Vec<String>) {
     }
 }
 
+/// What GNU Make exits with when it abandons a build instead of finishing one.
+const ABANDONED: i32 = 2;
+
 fn main() {
     kati::logging::init("KATI_LOG", log::LevelFilter::Warn);
 
@@ -225,8 +228,12 @@ fn main() {
     if let Some(working_dir) = &session.flags.working_dir
         && let Err(e) = std::env::set_current_dir(working_dir)
     {
-        eprintln!("*** {}: {}", working_dir.to_string_lossy(), e);
-        std::process::exit(1);
+        eprintln!(
+            "{}*** {}: {e}  Stop.",
+            kati::diagnostic_prefix(&session),
+            working_dir.to_string_lossy()
+        );
+        std::process::exit(ABANDONED);
     }
     let announcing = session.flags.working_dir.is_some() && !session.flags.is_silent_mode;
     if announcing {
@@ -237,11 +244,14 @@ fn main() {
         .join(OsStr::new(" "));
     find_first_makefile(&mut session);
     if session.flags.makefile.is_none() {
-        eprintln!("*** No targets specified and no makefile found.");
+        eprintln!(
+            "{}*** No targets specified and no makefile found.  Stop.",
+            kati::diagnostic_prefix(&session)
+        );
         if announcing {
             announce_directory("Leaving");
         }
-        std::process::exit(1);
+        std::process::exit(ABANDONED);
     }
     let gperf_cpu = session.flags.cpu_profile_path.is_some();
     let gperf_mem = session.flags.memory_profile_path.is_some();
@@ -252,7 +262,10 @@ fn main() {
             for cause in err.chain() {
                 eprintln!("{cause}");
             }
-            1
+            // GNU Make exits 2 when it abandons a build rather than finishing
+            // one, and scripts branch on the difference: 1 is the answer `-q`
+            // gives to a question, not the way a run fails.
+            ABANDONED
         }
     };
     if announcing {

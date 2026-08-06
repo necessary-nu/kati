@@ -844,7 +844,9 @@ mod tests {
             )
             .unwrap_err()
             .to_string(),
-            "<unknown>:0: *** unterminated variable reference."
+            // GNU Make ends the diagnostic it dies on with `Stop.`, wherever it
+            // was raised, and this is one it dies on.
+            "<unknown>:0: *** unterminated variable reference.  Stop."
         );
         let bar = session.intern("BAR");
         assert_eq!(

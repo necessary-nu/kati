@@ -140,16 +140,39 @@ macro_rules! error_loc {
     };
 }
 
+/// How GNU Make ends the diagnostic it dies on: two spaces, then `Stop.`.
+const STOP: &str = "  Stop.";
+
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 const MAGENTA: &str = "\x1b[35m";
 const RED: &str = "\x1b[31m";
+
+/// What a diagnostic with no makefile location opens with, colon and space
+/// included, or nothing when no name was set.
+///
+/// Most callers get this from [`color_error_log`] without asking. This is for
+/// the one that cannot: GNU Make's recipe-failure line takes the name like
+/// every other diagnostic, but it is not a fatal it dies on, so it must not
+/// pick up the `Stop.` that goes with one.
+pub fn diagnostic_prefix(ctx: &impl crate::session::Context) -> String {
+    let program = &ctx.flags().program_name;
+    if program.is_empty() {
+        return String::new();
+    }
+    format!("{program}: ")
+}
 
 fn color_error_log(
     ctx: &impl crate::session::Context,
     loc: Option<&crate::loc::Loc>,
     msg: String,
 ) -> anyhow::Error {
+    // Everything raised through here is a fatal one, and GNU Make ends one the
+    // same way whether or not it has a place to point at: the message, two
+    // spaces, `Stop.`. The exception is its recipe-failure line, which is not a
+    // fatal it dies on and so is raised without coming through here.
+    let msg = format!("{msg}{STOP}");
     let Some(loc) = loc else {
         // With no file and line to lead with, GNU Make leads with its own name.
         // Empty is kati's own binary, which has never led with anything.

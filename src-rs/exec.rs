@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use crate::{
     command::CommandEvaluator,
     dep::{DepNode, NamedDepNode},
-    error,
+    error, error_loc,
     eval::{Evaluator, FrameType},
     fileutil::{RedirectStderr, get_timestamp, run_command},
     log,
@@ -111,14 +111,20 @@ impl<'a> Executor<'a> {
 
         if !n.lock().has_rule && output_timestamp.is_none() && !n.lock().is_phony {
             if let Some(needed_by) = needed_by {
-                error!(
+                error_loc!(
+                    &self.ce.ev.session,
+                    None,
                     "*** No rule to make target '{}', needed by '{}'.",
                     output.display(&self.ce.ev.session),
                     String::from_utf8_lossy(needed_by)
                 );
             } else {
-                error!(
-                    "*** No rule to make target '{}'",
+                // GNU Make ends the sentence here too; kati left the period off
+                // only in this one of the pair.
+                error_loc!(
+                    &self.ce.ev.session,
+                    None,
+                    "*** No rule to make target '{}'.",
                     output.display(&self.ce.ev.session)
                 );
             }
@@ -173,7 +179,8 @@ impl<'a> Executor<'a> {
                         )
                     } else {
                         error!(
-                            "*** [{}] Error {}",
+                            "{}*** [{}] Error {}",
+                            crate::diagnostic_prefix(&self.ce.ev.session),
                             command.output.display(&self.ce.ev.session),
                             status.code().unwrap_or(1)
                         );
