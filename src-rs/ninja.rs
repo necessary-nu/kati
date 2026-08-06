@@ -35,7 +35,7 @@ use crate::func::CommandOp;
 use crate::io::{dump_int, dump_string, dump_systemtime, dump_usize, dump_vec_string};
 use crate::strutil::{basename, concat_dir, dirname, strip_ext, strip_ext_vec};
 use crate::{
-    build_sink::{BuildSink, RuleId, SinkCommand, SinkEdge, SinkPool, SinkRule},
+    build_sink::{BuildSink, RuleId, SinkCommand, SinkEdge, SinkPool, SinkRecipeLine, SinkRule},
     command::{Command, CommandEvaluator},
     dep::{DepNode, NamedDepNode, is_special_target},
     eval::Evaluator,
@@ -438,10 +438,16 @@ impl<'a> NinjaGenerator<'a> {
         commands: &Vec<Command>,
         cmd_buf: &mut BytesMut,
         description: &mut Option<Bytes>,
+        recipe: &mut Vec<(Bytes, bool)>,
     ) {
         let mut command_count = commands.len();
         for c in commands {
             let inp = c.cmd.slice_ref(c.cmd.trim_ascii_start());
+            // Before any of the rewriting below, because what Make echoes is
+            // the recipe line the Makefile wrote once its variables are
+            // expanded — not what kati went on to make of it. A line dropped
+            // here is still a line Make would have printed.
+            recipe.push((inp.clone(), c.echo));
 
             let needs_subshell = (command_count > 1 || c.ignore_error) && !c.force_no_subshell;
 
@@ -540,6 +546,7 @@ impl<'a> NinjaGenerator<'a> {
             let id = nn.rule_id.unwrap();
             let mut description = None;
             let mut cmd_buf = BytesMut::new();
+            let mut recipe = Vec::new();
             let output_str = node.output.as_bytes(&self.ce.ev.session);
             Self::gen_shell_script(
                 &self.ce.ev.session.flags,
@@ -547,7 +554,15 @@ impl<'a> NinjaGenerator<'a> {
                 &nn.commands,
                 &mut cmd_buf,
                 &mut description,
+                &mut recipe,
             );
+            let recipe = recipe
+                .iter()
+                .map(|(text, echoed)| SinkRecipeLine {
+                    text,
+                    echoed: *echoed,
+                })
+                .collect::<Vec<_>>();
             // Extracting the depfile can rewrite the command, so it has to
             // happen before the command is measured or handed over.
             let depfile = self.get_depfile(&node, &mut cmd_buf)?;
@@ -567,6 +582,7 @@ impl<'a> NinjaGenerator<'a> {
                     } else {
                         SinkCommand::Inline(&script)
                     },
+                    recipe: &recipe,
                     description: description.as_deref(),
                     depfile: depfile.as_deref(),
                     restat: node.is_restat,
@@ -1252,14 +1268,19 @@ mod tests {
         }];
         let mut cmd_buf = BytesMut::new();
         let mut description = None;
+        let mut recipe = Vec::new();
         NinjaGenerator::gen_shell_script(
             &Flags::default(),
             &Bytes::from_static(b"out"),
             &commands,
             &mut cmd_buf,
             &mut description,
+            &mut recipe,
         );
         assert_eq!(description, None, "no Makefile echo, so no description");
+        // The recipe is kept alongside the script rather than consumed by it:
+        // one line in, one line out, and the echo flag it arrived with.
+        assert_eq!(recipe, vec![(Bytes::from_static(cmd), true)]);
         cmd_buf.freeze()
     }
 
@@ -1283,6 +1304,9 @@ mod tests {
                     shell: b"/bin/sh",
                     shell_flags: b"-c",
                     command,
+                    // The manifest writer has no use for the recipe: a Ninja
+                    // rule has one command and no lines within it.
+                    recipe: &[],
                     description,
                     depfile: None,
                     restat: false,

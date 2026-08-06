@@ -90,6 +90,23 @@ pub enum SinkCommand<'a> {
     ResponseFile(&'a [u8]),
 }
 
+/// One line of a Makefile recipe, as Make itself would treat it.
+///
+/// A recipe is a sequence of lines and Make keeps them as one: it echoes each
+/// before running it, and a line beginning `@` is run without being echoed.
+/// [`SinkRule::command`] has already lost that — it is the whole recipe joined
+/// into a single script, because that is the only shape a Ninja rule has. A
+/// sink that runs recipes itself rather than writing a manifest needs the lines
+/// back, and there is nowhere to recover them from downstream.
+pub struct SinkRecipeLine<'a> {
+    /// The line as the shell will receive it, after variable expansion, with
+    /// the `@`, `-` and `+` prefixes already read off and removed.
+    pub text: &'a [u8],
+    /// Whether Make would print this line before running it. False is the `@`
+    /// prefix, which is the only thing that silences one line rather than all.
+    pub echoed: bool,
+}
+
 /// The half of a Make dependency node that Ninja binds to a `rule`.
 ///
 /// A `DepNode` is one thing, but Ninja splits what it carries across two
@@ -109,6 +126,12 @@ pub struct SinkRule<'a> {
     /// is a `$` the shell will act on, never an escape belonging to some
     /// destination format.
     pub command: SinkCommand<'a>,
+    /// The recipe the command was assembled from, line by line.
+    ///
+    /// Only a sink that runs recipes itself has any use for this; the manifest
+    /// writer ignores it, because a Ninja rule has one command and no notion of
+    /// a line within it.
+    pub recipe: &'a [SinkRecipeLine<'a>],
     /// What to print while the command runs, if the Makefile said — literal
     /// text, with the shell quoting already off.
     ///
