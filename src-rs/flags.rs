@@ -129,6 +129,10 @@ pub struct Flags {
     /// Where `-I` says to look for an `include` the working directory does not
     /// have, in the order given.
     pub include_dirs: Vec<PathBuf>,
+
+    /// `.EXPORT_ALL_VARIABLES`: every variable the Makefile defined reaches the
+    /// recipe's environment without being named.
+    pub export_all_variables: bool,
 }
 
 fn parse_command_line_option_with_arg(
