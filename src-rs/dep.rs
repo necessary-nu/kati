@@ -544,6 +544,10 @@ impl<'a> DepBuilder<'a> {
         }
         // Bare `.IGNORE:` is `-i` asked for by the Makefile; with prerequisites
         // it is the same thing for those targets alone.
+        let one_shell = self.ev.session.intern(".ONESHELL");
+        if self.get_rule_inputs(one_shell).is_some() {
+            self.ev.session.flags.one_shell = true;
+        }
         let export_all = self.ev.session.intern(".EXPORT_ALL_VARIABLES");
         if self.get_rule_inputs(export_all).is_some() {
             self.ev.session.flags.export_all_variables = true;
@@ -1739,10 +1743,10 @@ const CONSUMED_BUILTIN_TARGETS: &[&str] = &[
     ".SECONDEXPANSION",
     ".IGNORE",
     ".EXPORT_ALL_VARIABLES",
+    ".ONESHELL",
 ];
 
-const UNSUPPORTED_BUILTIN_TARGETS: &[&str] =
-    &[".INTERMEDIATE", ".SECONDARY", ".NOTPARALLEL", ".ONESHELL"];
+const UNSUPPORTED_BUILTIN_TARGETS: &[&str] = &[".INTERMEDIATE", ".SECONDARY", ".NOTPARALLEL"];
 
 /// Special targets asking for what already happens: we never echo a recipe,
 /// never delete a target whose recipe failed, and 4.x ignores the last two.

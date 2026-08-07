@@ -137,6 +137,10 @@ pub struct Flags {
     /// `-R`: no `CC`, `CXX` or `AR` unless the Makefile says so itself. What
     /// Make defines about itself stays, which is why this is not `-r`.
     pub no_builtin_variables: bool,
+
+    /// `.ONESHELL`: the whole recipe is one script rather than a line at a
+    /// time, so a `cd` carries and a failing line does not stop the rest.
+    pub one_shell: bool,
 }
 
 fn parse_command_line_option_with_arg(

@@ -444,7 +444,11 @@ impl<'a> NinjaGenerator<'a> {
         for c in commands {
             let inp = c.cmd.slice_ref(c.cmd.trim_ascii_start());
 
-            let needs_subshell = (command_count > 1 || c.ignore_error) && !c.force_no_subshell;
+            // Under `.ONESHELL` the recipe is one script: no subshell to
+            // confine a `cd`, and the lines are separated rather than chained,
+            // so a failing one does not stop the rest.
+            let needs_subshell =
+                !flags.one_shell && (command_count > 1 || c.ignore_error) && !c.force_no_subshell;
 
             let mut translated = Self::translate_command(inp);
             let echoed = (flags.detect_android_echo && description.is_none() && !c.echo)
@@ -466,7 +470,7 @@ impl<'a> NinjaGenerator<'a> {
                 fragment.put_u8(b'(');
             }
             fragment.put_slice(&translated);
-            if c.ignore_error {
+            if c.ignore_error && !flags.one_shell {
                 fragment.put_slice(b" ; true");
             }
             if needs_subshell {
@@ -478,7 +482,7 @@ impl<'a> NinjaGenerator<'a> {
                 .flatten()
             {
                 if !buf.is_empty() {
-                    buf.put_slice(b" && ");
+                    buf.put_slice(if flags.one_shell { b"\n" } else { b" && " });
                 }
                 buf.put_slice(&fragment);
             }
