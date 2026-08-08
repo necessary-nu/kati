@@ -31,7 +31,7 @@ use crate::{
     expr::{Evaluable, Value},
     loc::Loc,
     log,
-    rule::{Rule, split_order_only},
+    rule::{Rule, glob_word, split_order_only},
     session::{Context, Session},
     stmt::AssignOp,
     strutil::{Pattern, WordWriter, get_ext, strip_ext, trim_leading_curdir, word_scanner},
@@ -992,11 +992,8 @@ impl<'a> DepBuilder<'a> {
         let mut order_only_inputs = Vec::new();
         for (text, into) in [(before, &mut inputs), (after, &mut order_only_inputs)] {
             for word in word_scanner(&text) {
-                let sym = self
-                    .ev
-                    .session
-                    .intern(text.slice_ref(trim_leading_curdir(word)));
-                into.push(sym);
+                let word = text.slice_ref(trim_leading_curdir(word));
+                glob_word(&mut self.ev.session, word, into);
             }
         }
         Ok((inputs, order_only_inputs))
