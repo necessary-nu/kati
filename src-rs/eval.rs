@@ -30,7 +30,7 @@ use crate::expr::Evaluable;
 use crate::expr::Value;
 use crate::flags::Flags;
 use crate::loc::Loc;
-use crate::parser::{parse_assign_statement, parse_buf_no_stats};
+use crate::parser::{parse_assign_statement, parse_buf_no_stats, take_assign_modifiers};
 use crate::rule::{Rule, is_pattern_rule};
 use crate::session::{Context, Session};
 use crate::stats::StatsRegistry;
@@ -553,6 +553,14 @@ impl Evaluator {
         }
 
         let is_override = stmt.directive.map(|v| v.is_override).unwrap_or(false);
+        // GNU Make redefines a global rather than replacing it, and nothing
+        // clears `private`: once a name is private here, every later assignment
+        // to it is too. A target-specific one is settled per assignment.
+        let is_private = stmt.directive.is_some_and(|v| v.is_private)
+            || self
+                .session
+                .peek_global_var(lhs)
+                .is_some_and(|var| var.read().is_private);
         let (var, needs_assign) = self.eval_rhs(
             lhs,
             stmt.rhs.clone(),
@@ -574,6 +582,9 @@ impl Evaluator {
             }
         }
 
+        if is_private {
+            var.write().is_private = true;
+        }
         if stmt.is_final {
             var.write().readonly = true
         }
@@ -653,7 +664,8 @@ impl Evaluator {
         separator_pos: usize,
     ) -> Result<()> {
         let assign = parse_assign_statement(after_targets, separator_pos);
-        let var_sym = self.session.intern(after_targets.slice_ref(assign.lhs));
+        let (name, is_private) = take_assign_modifiers(assign.lhs);
+        let var_sym = self.session.intern(after_targets.slice_ref(name));
         let is_final = stmt.sep == RuleSep::FinalEq;
         for target in targets {
             let scope = self
@@ -714,6 +726,9 @@ impl Evaluator {
                             var_sym.display(self)
                         );
                     }
+                }
+                if is_private {
+                    rhs_var.write().is_private = true;
                 }
                 if is_final {
                     rhs_var.write().readonly = true;
@@ -1243,6 +1258,12 @@ impl Evaluator {
 
         if result.is_none() {
             result = self.lookup_var_global(name);
+            // A rule's scope reaches the global one through a parent, which is
+            // the boundary `private` refuses to cross: from inside a rule the
+            // variable is not there at all, so `$(origin)` says undefined.
+            if self.current_scope.is_some() {
+                result = result.filter(|var| !var.read().is_private);
+            }
         }
 
         self.trace_variable_lookup("lookup", &name, &result)?;

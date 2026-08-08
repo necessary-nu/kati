@@ -51,6 +51,9 @@ pub enum AssignOp {
 pub struct AssignDirective {
     pub is_override: bool,
     pub export: bool,
+    /// `private`: the variable is defined, and withheld from every scope that
+    /// reaches this one through a parent.
+    pub is_private: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
