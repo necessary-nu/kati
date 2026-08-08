@@ -141,6 +141,10 @@ pub struct Flags {
     /// `.ONESHELL`: the whole recipe is one script rather than a line at a
     /// time, so a `cd` carries and a failing line does not stop the rest.
     pub one_shell: bool,
+
+    /// `.NOTPARALLEL` with no prerequisites: this makefile's own targets run
+    /// one at a time. What it hands a sub-make is untouched.
+    pub not_parallel: bool,
 }
 
 fn parse_command_line_option_with_arg(

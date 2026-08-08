@@ -544,6 +544,14 @@ impl<'a> DepBuilder<'a> {
         }
         // Bare `.IGNORE:` is `-i` asked for by the Makefile; with prerequisites
         // it is the same thing for those targets alone.
+        // Only the bare form. With prerequisites it says something narrower
+        // that has not been established against GNU Make.
+        let not_parallel = self.ev.session.intern(".NOTPARALLEL");
+        if let Some((targets, _)) = self.get_rule_inputs(not_parallel)
+            && targets.is_empty()
+        {
+            self.ev.session.flags.not_parallel = true;
+        }
         let one_shell = self.ev.session.intern(".ONESHELL");
         if self.get_rule_inputs(one_shell).is_some() {
             self.ev.session.flags.one_shell = true;
@@ -1744,9 +1752,10 @@ const CONSUMED_BUILTIN_TARGETS: &[&str] = &[
     ".IGNORE",
     ".EXPORT_ALL_VARIABLES",
     ".ONESHELL",
+    ".NOTPARALLEL",
 ];
 
-const UNSUPPORTED_BUILTIN_TARGETS: &[&str] = &[".INTERMEDIATE", ".SECONDARY", ".NOTPARALLEL"];
+const UNSUPPORTED_BUILTIN_TARGETS: &[&str] = &[".INTERMEDIATE", ".SECONDARY"];
 
 /// Special targets asking for what already happens: we never echo a recipe,
 /// never delete a target whose recipe failed, and 4.x ignores the last two.
