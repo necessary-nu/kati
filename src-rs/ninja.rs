@@ -432,6 +432,9 @@ impl<'a> NinjaGenerator<'a> {
     /// filled with a default: what a build prints when nobody chose is a
     /// question for whatever consumes the graph, and the manifest writer
     /// answers it in Ninja's own terms, which are not available here.
+    ///
+    /// Returns whether the script's own status can be read as an ignored
+    /// error, which is [`SinkRule::ignore_errors`].
     fn gen_shell_script(
         flags: &Flags,
         name: &Bytes,
@@ -439,7 +442,19 @@ impl<'a> NinjaGenerator<'a> {
         cmd_buf: &mut BytesMut,
         dry_buf: &mut BytesMut,
         description: &mut Option<Bytes>,
-    ) {
+    ) -> bool {
+        // A nonzero status is certainly an ignored failure only when every line
+        // ignores errors: otherwise it may be the `&&` chain stopping at a line
+        // whose failure counts. Read over every command rather than the ones
+        // that survive the loop, so dropping one can only make this stricter.
+        let wholly_ignored = !commands.is_empty() && commands.iter().all(|c| c.ignore_error);
+        // Ignored lines are chained rather than conjoined, so the next line runs
+        // whatever the last one left and the last line's status is the script's.
+        let separator: &[u8] = match (flags.one_shell, wholly_ignored) {
+            (true, _) => b"\n",
+            (false, true) => b" ; ",
+            (false, false) => b" && ",
+        };
         let mut command_count = commands.len();
         for c in commands {
             let inp = c.cmd.slice_ref(c.cmd.trim_ascii_start());
@@ -465,16 +480,26 @@ impl<'a> NinjaGenerator<'a> {
                 continue;
             }
 
+            // An ignored line the script cannot speak for has to lose its
+            // status here, because a later line needs the one channel out. The
+            // subshell goes inside the group, so `exit` reaches the `true`
+            // instead of leaving before it, and the group keeps the `&&` chain
+            // able to stop at a line whose failure counts.
+            let mute = c.ignore_error && !flags.one_shell && !wholly_ignored;
+
             let mut fragment = BytesMut::new();
+            if mute {
+                fragment.put_slice(b"{ ");
+            }
             if needs_subshell {
                 fragment.put_u8(b'(');
             }
             fragment.put_slice(&translated);
-            if c.ignore_error && !flags.one_shell {
-                fragment.put_slice(b" ; true");
-            }
             if needs_subshell {
                 fragment.put_slice(b" )");
+            }
+            if mute {
+                fragment.put_slice(b" ; true ; }");
             }
 
             for buf in [Some(&mut *cmd_buf), c.always_run.then_some(&mut *dry_buf)]
@@ -482,11 +507,14 @@ impl<'a> NinjaGenerator<'a> {
                 .flatten()
             {
                 if !buf.is_empty() {
-                    buf.put_slice(if flags.one_shell { b"\n" } else { b" && " });
+                    buf.put_slice(separator);
                 }
                 buf.put_slice(&fragment);
             }
         }
+        // A script with nothing left in it has no status to read, and a whole
+        // recipe can be absorbed: a lone `mkdir -p` of the output's directory.
+        wholly_ignored && !cmd_buf.is_empty()
     }
 
     fn get_depfile(&mut self, node: &DepNode, cmd_buf: &mut BytesMut) -> Result<Option<Bytes>> {
@@ -551,7 +579,7 @@ impl<'a> NinjaGenerator<'a> {
             let mut cmd_buf = BytesMut::new();
             let mut dry_buf = BytesMut::new();
             let output_str = node.output.as_bytes(&self.ce.ev.session);
-            Self::gen_shell_script(
+            let ignore_errors = Self::gen_shell_script(
                 &self.ce.ev.session.flags,
                 &output_str,
                 &nn.commands,
@@ -583,6 +611,7 @@ impl<'a> NinjaGenerator<'a> {
                     description: description.as_deref(),
                     depfile: depfile.as_deref(),
                     restat: node.is_restat,
+                    ignore_errors,
                     sandbox_disabled: self.ce.ev.session.flags.emit_sandbox_disabled,
                     loc: node.loc.as_ref(),
                 },
@@ -979,7 +1008,22 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
             writeln!(self.out, "\n deps = gcc")?;
         }
 
-        match rule.command {
+        // Nothing in a manifest says an edge is allowed to fail, so the writer
+        // is the one that answers for it: the script goes in a subshell, which
+        // contains an `exit`, and the status is discarded outside it.
+        let muted = rule.ignore_errors.then(|| {
+            let script = match rule.command {
+                SinkCommand::ResponseFile(script) | SinkCommand::Inline(script) => script,
+            };
+            [b"( ".as_slice(), script, b" ) ; true"].concat()
+        });
+        let command = match (&muted, &rule.command) {
+            (Some(muted), SinkCommand::ResponseFile(_)) => SinkCommand::ResponseFile(muted),
+            (Some(muted), SinkCommand::Inline(_)) => SinkCommand::Inline(muted),
+            (None, command) => *command,
+        };
+
+        match command {
             // The script is the file, so the only layer between these bytes
             // and the shell is ninja's own.
             SinkCommand::ResponseFile(script) => {
@@ -1255,23 +1299,26 @@ mod tests {
         );
     }
 
-    /// The script `sink_node` would hand to a sink for a one-line recipe whose
-    /// Make expansion is `cmd`.
-    fn script_for(cmd: &'static [u8]) -> Bytes {
+    /// The script and the ignore-errors flag `sink_node` would hand to a sink
+    /// for a recipe whose lines are `(expansion, whether errors are ignored)`.
+    fn recipe_script(lines: &[(&'static [u8], bool)]) -> (Bytes, bool) {
         let mut names = Symtab::new();
         let output = names.intern(&b"out"[..]);
-        let commands = vec![Command {
-            output,
-            cmd: Bytes::from_static(cmd),
-            echo: true,
-            ignore_error: false,
-            force_no_subshell: false,
-            always_run: false,
-        }];
+        let commands = lines
+            .iter()
+            .map(|(cmd, ignore_error)| Command {
+                output,
+                cmd: Bytes::from_static(cmd),
+                echo: true,
+                ignore_error: *ignore_error,
+                force_no_subshell: false,
+                always_run: false,
+            })
+            .collect();
         let mut cmd_buf = BytesMut::new();
         let mut dry_buf = BytesMut::new();
         let mut description = None;
-        NinjaGenerator::gen_shell_script(
+        let ignore_errors = NinjaGenerator::gen_shell_script(
             &Flags::default(),
             &Bytes::from_static(b"out"),
             &commands,
@@ -1281,11 +1328,24 @@ mod tests {
         );
         assert_eq!(description, None, "no Makefile echo, so no description");
         assert!(dry_buf.is_empty(), "no + prefix, so nothing runs under -n");
-        cmd_buf.freeze()
+        (cmd_buf.freeze(), ignore_errors)
+    }
+
+    /// The script for a one-line recipe whose errors are nobody's to ignore.
+    fn script_for(cmd: &'static [u8]) -> Bytes {
+        recipe_script(&[(cmd, false)]).0
     }
 
     /// The manifest stanza a writer produces for one rule.
     fn declare_rule_for(command: SinkCommand<'_>, description: Option<&[u8]>) -> String {
+        declare_rule_of(command, description, false)
+    }
+
+    fn declare_rule_of(
+        command: SinkCommand<'_>,
+        description: Option<&[u8]>,
+        ignore_errors: bool,
+    ) -> String {
         let names = Symtab::new();
         let mut writer = NinjaWriter::new(
             Vec::new(),
@@ -1310,6 +1370,7 @@ mod tests {
                     description,
                     depfile: None,
                     restat: false,
+                    ignore_errors,
                     sandbox_disabled: false,
                     loc: None,
                 },
@@ -1417,6 +1478,54 @@ mod tests {
         assert_eq!(
             ninja_unescape(binding(&manifest, "description").as_bytes()),
             b"making $PATH"
+        );
+    }
+
+    /// `exit` leaves a subshell before anything after it inside runs, so the
+    /// status is dropped outside the subshell or it is not dropped at all.
+    #[test]
+    fn an_ignored_line_lets_the_rest_of_the_recipe_run_even_past_exit() {
+        let (script, ignore_errors) = recipe_script(&[(b"exit 1", true), (b"echo ok", false)]);
+        assert_eq!(
+            script,
+            Bytes::from_static(b"{ (exit 1 ) ; true ; } && (echo ok )")
+        );
+        assert!(!ignore_errors, "only one of the two lines ignores errors");
+    }
+
+    /// The group is what keeps the muting local: a bare `; true` would swallow
+    /// the chain's own break as well as the line it was written for.
+    #[test]
+    fn a_line_whose_failure_counts_still_stops_a_recipe_that_ignores_another() {
+        let (script, ignore_errors) = recipe_script(&[(b"false", false), (b"exit 3", true)]);
+        assert_eq!(
+            script,
+            Bytes::from_static(b"(false ) && { (exit 3 ) ; true ; }")
+        );
+        assert!(!ignore_errors);
+    }
+
+    /// Nothing here can fail in a way that counts, so the status is left alone
+    /// and the sink is told it may read a nonzero one as an ignored error.
+    #[test]
+    fn a_wholly_ignored_recipe_keeps_the_status_it_ends_on() {
+        let (script, ignore_errors) = recipe_script(&[(b"false", true), (b"exit 3", true)]);
+        assert_eq!(script, Bytes::from_static(b"(false ) ; (exit 3 )"));
+        assert!(ignore_errors);
+    }
+
+    /// A manifest cannot say an edge is allowed to fail, so the writer says it
+    /// in the only place it can.
+    #[test]
+    fn the_manifest_writer_discards_an_ignored_status_itself() {
+        let manifest = declare_rule_of(SinkCommand::Inline(b"( false )"), None, true);
+        let evaluated = ninja_unescape(binding(&manifest, "command").as_bytes());
+        assert_eq!(evaluated, b"/bin/sh -c \"( ( false ) ) ; true\"");
+
+        let manifest = declare_rule_of(SinkCommand::ResponseFile(b"( false )"), None, true);
+        assert_eq!(
+            ninja_unescape(binding(&manifest, "rspfile_content").as_bytes()),
+            b"( ( false ) ) ; true"
         );
     }
 

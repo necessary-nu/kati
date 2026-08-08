@@ -78,6 +78,7 @@ pub struct SinkPool<'a> {
 /// The split is not cosmetic: a command too long to pass as an argument is
 /// invoked differently, as the shell reading a script file rather than as the
 /// shell given `-c` and a string.
+#[derive(Clone, Copy)]
 pub enum SinkCommand<'a> {
     /// `<shell> <shell_flags> "<script>"`.
     Inline(&'a [u8]),
@@ -127,6 +128,14 @@ pub struct SinkRule<'a> {
     /// The command may leave its output unchanged, so downstream edges should
     /// re-check rather than assume they are dirty.
     pub restat: bool,
+    /// A nonzero status from this command is an error Make was told to ignore:
+    /// the `-` recipe prefix on every line, `-i`, or `.IGNORE`.
+    ///
+    /// The script keeps the status rather than throwing it away, so a sink that
+    /// runs the build can say what it was and carry on — which is the whole of
+    /// GNU Make's `Error N (ignored)`. Ninja has no notion of an edge allowed
+    /// to fail, so the manifest writer answers for it instead.
+    pub ignore_errors: bool,
     /// Android's ninja fork runs this command outside its sandbox.
     pub sandbox_disabled: bool,
     /// The line of the Makefile this came from.
