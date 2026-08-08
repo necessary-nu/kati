@@ -193,6 +193,7 @@ impl Debug for AutoCommandVar {
     }
 }
 
+#[derive(Clone)]
 pub struct Command {
     pub output: Symbol,
     pub cmd: Bytes,

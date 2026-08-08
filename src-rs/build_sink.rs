@@ -91,6 +91,14 @@ pub enum SinkCommand<'a> {
     ResponseFile(&'a [u8]),
 }
 
+/// One recursive command extracted from a recipe for semantic graph inclusion.
+pub struct SinkSubninja<'a> {
+    /// The expanded command line selecting the child Make compilation.
+    pub command: &'a [u8],
+    /// The value produced by the `MAKE` reference in command position.
+    pub make: &'a [u8],
+}
+
 /// The half of a Make dependency node that Ninja binds to a `rule`.
 ///
 /// A `DepNode` is one thing, but Ninja splits what it carries across two
@@ -110,16 +118,23 @@ pub struct SinkRule<'a> {
     /// is a `$` the shell will act on, never an escape belonging to some
     /// destination format.
     pub command: SinkCommand<'a>,
-    /// The whole recipe is one recursive `$(MAKE)` invocation.
-    ///
-    /// A graph sink can compile this as semantic subninja inclusion rather
-    /// than handing a nested Make process to its executor.
+    /// Recursive `$(MAKE)` invocations extracted from the recipe in their
+    /// written order. A graph sink compiles these as semantic subninjas rather
+    /// than handing nested Make processes to its executor.
     // [spec:ronin:req:make.recursive-invocation+1]
-    pub recursive_make: Option<&'a [u8]>,
+    pub subninjas: &'a [SinkSubninja<'a>],
     /// At least one line in the recipe is a recursive `$(MAKE)` invocation.
-    /// This differs from [`Self::recursive_make`] for a mixed recipe whose
-    /// other shell effects need an explicit graph representation too.
+    /// This can be true while [`Self::subninjas`] is empty when a multi-line
+    /// `.ONESHELL` recipe or one shell line cannot be safely split into static
+    /// units.
     pub contains_recursive: bool,
+    /// The non-recursive recipe lines, assembled after extracting subninjas.
+    /// A graph sink runs this parent action after the child graphs.
+    pub residual_command: Option<SinkCommand<'a>>,
+    /// The `+` subset of [`Self::residual_command`].
+    pub residual_dry_run_command: &'a [u8],
+    /// Whether every residual line ignores failure.
+    pub residual_ignore_errors: bool,
     /// The subset of the recipe Make runs even when told not to run anything:
     /// the lines the Makefile prefixed `+`. Assembled the same way as
     /// [`SinkRule::command`] and empty when there are none. The manifest writer

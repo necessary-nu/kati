@@ -438,7 +438,7 @@ impl<'a> NinjaGenerator<'a> {
     fn gen_shell_script(
         flags: &Flags,
         name: &Bytes,
-        commands: &Vec<Command>,
+        commands: &[Command],
         cmd_buf: &mut BytesMut,
         dry_buf: &mut BytesMut,
         description: &mut Option<Bytes>,
@@ -596,6 +596,84 @@ impl<'a> NinjaGenerator<'a> {
             let too_long_for_argv = cmd_buf.len() > 100 * 1000;
             let script = cmd_buf.freeze();
             let dry_run_script = dry_buf.freeze();
+            let contains_recursive = nn
+                .commands
+                .iter()
+                .any(|command| !command.recursive_make.is_empty());
+            // Splitting is all-or-nothing. A sink must never receive a
+            // plausible-looking prefix while another recursive line remains
+            // hidden in the discarded executor script. A multi-line
+            // `.ONESHELL` recipe shares shell state across lines, and more
+            // than one MAKE reference on a line does not identify one static
+            // child compilation.
+            let composable_subninjas = contains_recursive
+                && (!self.ce.ev.session.flags.one_shell || nn.commands.len() == 1)
+                && nn
+                    .commands
+                    .iter()
+                    .filter(|command| !command.recursive_make.is_empty())
+                    .all(|command| command.recursive_make.len() == 1);
+            let subninja_storage = if composable_subninjas {
+                nn.commands
+                    .iter()
+                    .filter_map(|command| {
+                        let [make] = command.recursive_make.as_slice() else {
+                            return None;
+                        };
+                        Some((
+                            Self::translate_command(
+                                command.cmd.slice_ref(command.cmd.trim_ascii_start()),
+                            ),
+                            make.clone(),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let subninjas = subninja_storage
+                .iter()
+                .map(|(command, make)| crate::build_sink::SinkSubninja { command, make })
+                .collect::<Vec<_>>();
+            let residual_commands = if composable_subninjas {
+                nn.commands
+                    .iter()
+                    .filter(|command| command.recursive_make.is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let mut residual_buf = BytesMut::new();
+            let mut residual_dry_buf = BytesMut::new();
+            let mut residual_description = None;
+            let residual_ignore_errors = Self::gen_shell_script(
+                &self.ce.ev.session.flags,
+                &output_str,
+                &residual_commands,
+                &mut residual_buf,
+                &mut residual_dry_buf,
+                &mut residual_description,
+            );
+            // Automatic depfile detection appends the copy to kati's manifest
+            // command. The direct graph runs the residual command instead, so
+            // it needs the identical transformation and must name the same
+            // discovered file.
+            if composable_subninjas
+                && !residual_buf.is_empty()
+                && node.depfile_var.is_none()
+                && self.ce.ev.session.flags.detect_depfiles
+            {
+                let residual_depfile = get_depfile_from_command(&mut residual_buf)?;
+                if residual_depfile != depfile {
+                    return Err(anyhow::anyhow!(
+                        "recursive recipe residual selected a different depfile"
+                    ));
+                }
+            }
+            let residual_too_long = residual_buf.len() > 100 * 1000;
+            let residual_script = residual_buf.freeze();
+            let residual_dry_run_script = residual_dry_buf.freeze();
             sink.declare_rule(
                 &self.ce.ev.session,
                 &SinkRule {
@@ -607,13 +685,17 @@ impl<'a> NinjaGenerator<'a> {
                     } else {
                         SinkCommand::Inline(&script)
                     },
-                    recursive_make: (nn.commands.len() == 1
-                        && nn.commands[0].recursive_make.len() == 1)
-                        .then(|| nn.commands[0].recursive_make[0].as_ref()),
-                    contains_recursive: nn
-                        .commands
-                        .iter()
-                        .any(|command| !command.recursive_make.is_empty()),
+                    subninjas: &subninjas,
+                    contains_recursive,
+                    residual_command: (!residual_script.is_empty()).then_some(
+                        if residual_too_long {
+                            SinkCommand::ResponseFile(&residual_script)
+                        } else {
+                            SinkCommand::Inline(&residual_script)
+                        },
+                    ),
+                    residual_dry_run_command: &residual_dry_run_script,
+                    residual_ignore_errors,
                     dry_run_command: &dry_run_script,
                     description: description.as_deref(),
                     depfile: depfile.as_deref(),
@@ -1311,7 +1393,7 @@ mod tests {
     fn recipe_script(lines: &[(&'static [u8], bool)]) -> (Bytes, bool) {
         let mut names = Symtab::new();
         let output = names.intern(&b"out"[..]);
-        let commands = lines
+        let commands: Vec<Command> = lines
             .iter()
             .map(|(cmd, ignore_error)| Command {
                 output,
@@ -1372,8 +1454,11 @@ mod tests {
                     shell: b"/bin/sh",
                     shell_flags: b"-c",
                     command,
-                    recursive_make: None,
+                    subninjas: &[],
                     contains_recursive: false,
+                    residual_command: None,
+                    residual_dry_run_command: b"",
+                    residual_ignore_errors: false,
                     // Ninja's -n runs nothing, so the manifest writer has no
                     // use for the subset Make would still run.
                     dry_run_command: b"",
