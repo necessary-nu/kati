@@ -31,7 +31,7 @@ use crate::{
     expr::{Evaluable, Value},
     loc::Loc,
     log,
-    rule::{Rule, split_order_only},
+    rule::{Rule, glob_word, split_order_only},
     session::{Context, Session},
     stmt::AssignOp,
     strutil::{Pattern, WordWriter, get_ext, strip_ext, trim_leading_curdir, word_scanner},
@@ -801,14 +801,16 @@ impl<'a> DepBuilder<'a> {
     }
 
     fn build(&mut self, mut targets: Vec<Symbol>) -> Result<Vec<NamedDepNode>> {
-        let Some(first_rule) = self.first_rule else {
+        if !self.ev.session.flags.gen_all_targets && targets.is_empty() {
+            // Only a build with nothing to aim at has no targets. A goal was
+            // named, so a makefile holding nothing but pattern rules has one.
+            //
             // GNU Make's own wording, because its test suite matches this
             // message exactly to learn what the program under test is called.
             // The name and the `Stop.` are added on the way out.
-            error_loc!(self.ev, None, "*** No targets.");
-        };
-
-        if !self.ev.session.flags.gen_all_targets && targets.is_empty() {
+            let Some(first_rule) = self.first_rule else {
+                error_loc!(self.ev, None, "*** No targets.");
+            };
             targets.push(first_rule);
         }
         if self.ev.session.flags.gen_all_targets {
@@ -992,11 +994,8 @@ impl<'a> DepBuilder<'a> {
         let mut order_only_inputs = Vec::new();
         for (text, into) in [(before, &mut inputs), (after, &mut order_only_inputs)] {
             for word in word_scanner(&text) {
-                let sym = self
-                    .ev
-                    .session
-                    .intern(text.slice_ref(trim_leading_curdir(word)));
-                into.push(sym);
+                let word = text.slice_ref(trim_leading_curdir(word));
+                glob_word(&mut self.ev.session, word, into);
             }
         }
         Ok((inputs, order_only_inputs))
@@ -1465,7 +1464,9 @@ impl<'a> DepBuilder<'a> {
             rule.order_only_inputs = order_only_inputs;
         }
         if rule.output_patterns.len() > 1 {
-            // We should mark all other output patterns as used.
+            // A pattern rule with several target patterns is one recipe that
+            // makes all of them, so the rest are this node's outputs and not
+            // merely names it has already been asked about.
             let pat = Pattern::new(matched.as_bytes(&self.ev.session));
             for output_pattern in rule.output_patterns.clone() {
                 if output_pattern == matched {
@@ -1474,6 +1475,7 @@ impl<'a> DepBuilder<'a> {
                 let buf = pat.append_subst(&output_str, &output_pattern.as_bytes(&self.ev.session));
                 let sym = self.ev.session.intern(buf);
                 self.done.insert(sym, n.clone());
+                n.lock().implicit_outputs.push(sym);
             }
             rule.output_patterns.clear();
             rule.output_patterns.push(matched);

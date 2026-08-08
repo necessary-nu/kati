@@ -31,7 +31,7 @@ use crate::expr::Value;
 use crate::flags::Flags;
 use crate::loc::Loc;
 use crate::parser::{parse_assign_statement, parse_buf_no_stats};
-use crate::rule::{Rule, is_pattern_rule};
+use crate::rule::{Rule, glob_word, is_pattern_rule};
 use crate::session::{Context, Session};
 use crate::stats::StatsRegistry;
 use crate::stmt::{
@@ -599,8 +599,11 @@ impl Evaluator {
         let mut targets: Vec<Symbol> = Vec::new();
         for word in word_scanner(&targets_string) {
             let target = targets_string.slice_ref(trim_leading_curdir(word));
-            targets.push(session.intern(target.clone()));
-            if is_pattern_rule(&target) {
+            glob_word(session, target, &mut targets);
+        }
+        // The `%` is read off what the glob left, as GNU Make does.
+        for target in &targets {
+            if is_pattern_rule(&target.as_bytes(&*session)) {
                 pattern_rule_count += 1;
             }
         }

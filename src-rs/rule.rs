@@ -71,12 +71,12 @@ impl Rule {
     fn parse_inputs(&mut self, session: &mut Session, inputs_str: &Bytes) {
         let (inputs, order_only) = split_order_only(inputs_str);
         for input in word_scanner(&inputs) {
-            let sym = session.intern(inputs.slice_ref(trim_leading_curdir(input)));
-            self.inputs.push(sym);
+            let word = inputs.slice_ref(trim_leading_curdir(input));
+            glob_word(session, word, &mut self.inputs);
         }
         for input in word_scanner(&order_only) {
-            let sym = session.intern(order_only.slice_ref(trim_leading_curdir(input)));
-            self.order_only_inputs.push(sym);
+            let word = order_only.slice_ref(trim_leading_curdir(input));
+            glob_word(session, word, &mut self.order_only_inputs);
         }
     }
 
@@ -209,4 +209,25 @@ pub fn split_order_only(inputs: &Bytes) -> (Bytes, Bytes) {
 
 pub fn is_pattern_rule(target: &[u8]) -> bool {
     memchr(b'%', target).is_some()
+}
+
+/// Match one word of a target or prerequisite list against the filesystem, as
+/// GNU Make does for any name holding `?`, `*` or `[`. A name matching nothing
+/// is kept as it was written, which is how `%` survives to make a pattern rule
+/// and how a refusal still names what the makefile asked for.
+pub fn glob_word(session: &mut Session, word: Bytes, into: &mut Vec<Symbol>) {
+    if !word.iter().any(|c| matches!(c, b'?' | b'*' | b'[')) {
+        into.push(session.intern(word));
+        return;
+    }
+    let matched = session.glob(word.clone());
+    match matched.as_ref() {
+        Ok(paths) if !paths.is_empty() => {
+            for path in paths {
+                let sym = session.intern(path.clone());
+                into.push(sym);
+            }
+        }
+        _ => into.push(session.intern(word)),
+    }
 }
