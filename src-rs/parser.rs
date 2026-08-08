@@ -28,7 +28,7 @@ use crate::{
     session::Session,
     stmt::{
         AssignDirective, AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt,
-        IncludeStmt, RuleSep, RuleStmt, Stmt, VpathStmt,
+        IncludeStmt, RuleSep, RuleStmt, Stmt, UndefineStmt, VpathStmt,
     },
     strutil::{
         find_end_of_line, find_outside_paren, trim_left_space, trim_right_space, trim_space,
@@ -36,6 +36,9 @@ use crate::{
     symtab::Symbol,
     warn_loc,
 };
+
+/// What introduces a recipe line before `.RECIPEPREFIX` says otherwise.
+const RECIPE_PREFIX_DEFAULT: u8 = b'\t';
 
 struct IfState {
     stmt: Arc<IfStmt>,
@@ -69,6 +72,9 @@ struct Parser<'a> {
     num_if_nest: i32,
     if_stack: Vec<IfState>,
 
+    /// What introduces a recipe line, from `.RECIPEPREFIX`.
+    cmd_prefix: u8,
+
     loc: Loc,
     fixed_lineno: bool,
 }
@@ -100,6 +106,8 @@ impl<'a> Parser<'a> {
 
             num_if_nest: 0,
             if_stack: Vec::new(),
+
+            cmd_prefix: RECIPE_PREFIX_DEFAULT,
 
             loc,
             fixed_lineno,
@@ -160,7 +168,7 @@ impl<'a> Parser<'a> {
 
         self.current_directive = None;
 
-        if line.starts_with(b"\t") && self.after_rule {
+        if line.first() == Some(&self.cmd_prefix) && self.after_rule {
             let loc = self.loc.clone();
             let mut mutable_loc = self.loc.clone();
             let expr = parse_expr(
@@ -195,10 +203,12 @@ impl<'a> Parser<'a> {
         let s = &line[sep..];
         if s.starts_with(b";") {
             return self.parse_rule(line, None);
-        } else if s.starts_with(b"=") {
+        } else if s.starts_with(b"=") || s[1..].starts_with(b"=") {
+            let sep = if s.starts_with(b"=") { sep } else { sep + 1 };
+            if sep != 0 && !is_variable_name(parse_assign_statement(&line, sep).lhs) {
+                return self.parse_rule(line, None);
+            }
             return self.parse_assign(line, sep);
-        } else if s[1..].starts_with(b"=") {
-            return self.parse_assign(line, sep + 1);
         } else if s.starts_with(b":") {
             return self.parse_rule(line, Some(sep));
         }
@@ -223,7 +233,7 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
 
-        if orig_line.starts_with(b"\t") {
+        if orig_line.first() == Some(&self.cmd_prefix) {
             error_loc!(
                 &*self.session,
                 Some(&self.loc),
@@ -286,6 +296,7 @@ impl<'a> Parser<'a> {
             );
         }
         let mut assign = parse_assign_statement(&line, separator_pos);
+        self.note_recipe_prefix(&assign);
 
         // If rhs starts with '$=', this is 'final assignment',
         // e.g., a combination of the assignment and
@@ -324,6 +335,30 @@ impl<'a> Parser<'a> {
             is_final,
         ));
         Ok(())
+    }
+
+    /// Read `.RECIPEPREFIX` where it is written.
+    ///
+    /// GNU Make applies it as it reads, so a rule below the assignment is
+    /// introduced by the new character and one above it is not. Parsing here
+    /// runs ahead of evaluation, which costs three narrowings, each of them a
+    /// refusal rather than a wrong build: a conditional's branches are both
+    /// parsed and only one runs, so an assignment inside one is not read; a
+    /// simply expanded value holding a `$` cannot be expanded yet; and the
+    /// prefix does not reach an included file, which is parsed when the
+    /// `include` runs. A recursive value is taken verbatim, which is what GNU
+    /// Make stores and therefore what it reads the first character of.
+    fn note_recipe_prefix(&mut self, assign: &ParsedAssign) {
+        if !self.if_stack.is_empty() || assign.lhs != b".RECIPEPREFIX" {
+            return;
+        }
+        let value = trim_left_space(Parser::remove_comment(assign.rhs));
+        match assign.op {
+            AssignOp::Eq => {}
+            AssignOp::ColonEq if memchr(b'$', value).is_none() => {}
+            _ => return,
+        }
+        self.cmd_prefix = value.first().copied().unwrap_or(RECIPE_PREFIX_DEFAULT);
     }
 
     fn parse_include(&mut self, line: Bytes, directive: &[u8]) -> Result<()> {
@@ -679,6 +714,19 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// `undefine name`, whose name is expanded when the statement runs.
+    fn parse_undefine(&mut self, line: Bytes) -> Result<()> {
+        let loc = self.loc.clone();
+        let mut mutable_loc = loc.clone();
+        let expr = parse_expr(self.session, &mut mutable_loc, line, ParseExprOpt::Normal)?;
+        let is_override = self.current_directive.is_some_and(|d| d.is_override);
+        self.out_stmts
+            .lock()
+            .push(UndefineStmt::new(loc, expr, is_override));
+        self.after_rule = false;
+        Ok(())
+    }
+
     fn check_if_stack(&self, keyword: &'static str) -> Result<()> {
         if self.if_stack.is_empty() {
             error_loc!(
@@ -723,6 +771,7 @@ impl<'a> Parser<'a> {
             b"override" => self.parse_override(rest)?,
             b"export" => self.parse_export(rest)?,
             b"unexport" => self.parse_unexport(&rest)?,
+            b"undefine" if !starts_assignment(&rest) => self.parse_undefine(rest)?,
             b"vpath" => self.parse_vpath(rest)?,
             _ => return Ok(false),
         }
@@ -751,6 +800,7 @@ impl<'a> Parser<'a> {
             b"define" => self.parse_define(rest)?,
             b"override" => self.parse_override(rest)?,
             b"export" => self.parse_export(rest)?,
+            b"undefine" if !starts_assignment(&rest) => self.parse_undefine(rest)?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -792,6 +842,34 @@ fn parse_buf_no_stats_impl(
     Ok(stmts)
 }
 
+/// Whether an assignment operator comes first, which makes the word before it a
+/// variable name rather than a directive: `undefine = x` defines `undefine`.
+fn starts_assignment(rest: &[u8]) -> bool {
+    [b"=".as_slice(), b":=", b"::=", b":::=", b"+=", b"?=", b"!="]
+        .iter()
+        .any(|op| rest.starts_with(op))
+}
+
+/// Whether `name` names a variable.
+///
+/// GNU Make requires one word: the assignment operator may be separated from
+/// the name by blanks, but a blank anywhere else means the line is not an
+/// assignment at all and is read as a rule, which then has no separator. Blanks
+/// inside a `$(...)` reference do not divide the name, since the reference is
+/// one token however it expands.
+fn is_variable_name(name: &[u8]) -> bool {
+    let mut depth = 0usize;
+    for byte in name {
+        match byte {
+            b'(' | b'{' => depth += 1,
+            b')' | b'}' => depth = depth.saturating_sub(1),
+            b' ' | b'\t' if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
 pub struct ParsedAssign<'a> {
     pub lhs: &'a [u8],
     pub rhs: &'a [u8],
@@ -810,6 +888,9 @@ pub fn parse_assign_statement(line: &[u8], sep: usize) -> ParsedAssign<'_> {
     } else if lhs.ends_with(b"?") {
         lhs = &lhs[..lhs.len() - 1];
         op = AssignOp::QuestionEq;
+    } else if lhs.ends_with(b"!") {
+        lhs = &lhs[..lhs.len() - 1];
+        op = AssignOp::ShellEq;
     }
     lhs = trim_space(lhs);
     let rhs = trim_left_space(&line[line.len().min(sep + 1)..]);
@@ -830,5 +911,17 @@ mod tests {
             Parser::get_directive(&Bytes::from_static(b"endif")),
             Bytes::from_static(b"endif")
         );
+    }
+
+    /// A name is one word once the operator is off it, and a `$(...)` reference
+    /// is one word however many spaces it holds.
+    #[test]
+    fn a_variable_name_is_one_word() {
+        for name in [b"x".as_slice(), b"$(a b)", b"a$(b c)d", b"$X"] {
+            assert!(is_variable_name(name), "{}", String::from_utf8_lossy(name));
+        }
+        for name in [b"x y".as_slice(), b"x $X", b"x $(a b)", b"a\\ b"] {
+            assert!(!is_variable_name(name), "{}", String::from_utf8_lossy(name));
+        }
     }
 }

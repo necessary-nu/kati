@@ -565,6 +565,43 @@ impl GlobalVars {
         Ok(())
     }
 
+    /// Remove the binding for `sym`, if the `undefine` outranks what defined it.
+    ///
+    /// A makefile's `undefine` reaches the environment and its own assignments
+    /// and stops there; `override undefine` reaches what the command line and
+    /// `override` set as well. An automatic variable is out of reach of both.
+    pub fn undefine(
+        &mut self,
+        names: &impl Interner,
+        sym: Symbol,
+        is_override: bool,
+    ) -> Result<()> {
+        let Some(var) = self.peek(sym) else {
+            return Ok(());
+        };
+        let (readonly, origin) = {
+            let var = var.read();
+            (var.readonly, var.origin())
+        };
+        if readonly {
+            error!(
+                "*** cannot undefine readonly variable: {}",
+                sym.display(names)
+            );
+        }
+        let outranks = match origin {
+            VarOrigin::Automatic => false,
+            VarOrigin::EnvironmentOverride | VarOrigin::CommandLine | VarOrigin::Override => {
+                is_override
+            }
+            _ => true,
+        };
+        if outranks {
+            self.replace(sym, None);
+        }
+        Ok(())
+    }
+
     /// Every binding satisfying `filter`, in symbol order.
     pub fn matching<F: Fn(&Var) -> bool>(&self, filter: F) -> Vec<(Symbol, Var)> {
         self.vars
