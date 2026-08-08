@@ -60,6 +60,13 @@ pub struct DepNode {
     pub is_restat: bool,
     /// `.IGNORE` named this target: a failing recipe line is not a failure.
     pub is_ignore_error: bool,
+    /// This file's absence is no reason to remake what reads it: the implicit
+    /// rule search invented the name to complete a chain, or `.INTERMEDIATE`
+    /// or `.SECONDARY` said so.
+    pub is_intermediate: bool,
+    /// The build deletes this file once it has finished with it, which every
+    /// intermediate but a `.SECONDARY` one and a goal is.
+    pub is_disposable: bool,
     pub implicit_outputs: Vec<Symbol>,
     pub actual_inputs: Vec<Symbol>,
     pub actual_order_only_inputs: Vec<Symbol>,
@@ -78,6 +85,8 @@ impl DepNode {
         is_phony: bool,
         is_restat: bool,
         is_ignore_error: bool,
+        is_intermediate: bool,
+        is_disposable: bool,
     ) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
             output,
@@ -90,6 +99,8 @@ impl DepNode {
             is_phony,
             is_restat,
             is_ignore_error,
+            is_intermediate,
+            is_disposable,
             implicit_outputs: Vec::new(),
             actual_inputs: Vec::new(),
             actual_order_only_inputs: Vec::new(),
@@ -483,6 +494,26 @@ struct DepBuilder<'a> {
     expanded: HashMap<(usize, Symbol), (Vec<Symbol>, Vec<Symbol>)>,
     /// Cycle guard for the recursive implicit rule search.
     chaining: HashSet<Symbol>,
+    /// Names the search invented to complete a chain, which the Makefile
+    /// therefore never says.
+    intermediates: HashSet<Symbol>,
+    /// What `.INTERMEDIATE` and `.SECONDARY` named outright, which outranks
+    /// every reason a name might have not to be intermediate.
+    declared_intermediate: HashSet<Symbol>,
+    /// The targets `.SECONDARY` named, which are intermediate without the
+    /// deletion. Empty when it named none, which is the form that means every
+    /// target and sets `all_secondary` instead.
+    secondary: HashSet<Symbol>,
+    all_secondary: bool,
+    /// What `.NOTINTERMEDIATE` named, by name and by pattern, and whether it
+    /// named nothing at all — which is every target.
+    not_intermediate: HashSet<Symbol>,
+    not_intermediate_patterns: Vec<Symbol>,
+    no_intermediates: bool,
+    /// Every name an explicit rule writes down as a prerequisite. A name the
+    /// Makefile says is not intermediate however the search reached it, and a
+    /// pattern is not a name.
+    mentioned: HashSet<Symbol>,
     wait_sym: Symbol,
     /// Each prerequisite that followed a `.WAIT`, with what preceded it.
     wait_barriers: Vec<(Symbol, Vec<Symbol>)>,
@@ -532,6 +563,14 @@ impl<'a> DepBuilder<'a> {
             implicit_rules: RuleTrie::new(),
             expanded: HashMap::new(),
             chaining: HashSet::new(),
+            intermediates: HashSet::new(),
+            declared_intermediate: HashSet::new(),
+            secondary: HashSet::new(),
+            all_secondary: false,
+            not_intermediate: HashSet::new(),
+            not_intermediate_patterns: Vec::new(),
+            no_intermediates: false,
+            mentioned: HashSet::new(),
             wait_sym,
             wait_barriers: Vec::new(),
             default_rule: None,
@@ -593,6 +632,7 @@ impl<'a> DepBuilder<'a> {
         if self.get_rule_inputs(export_all)?.is_some() {
             self.ev.session.flags.export_all_variables = true;
         }
+        self.handle_intermediate_targets()?;
         let ignore = self.ev.session.intern(".IGNORE");
         if let Some((targets, _)) = self.get_rule_inputs(ignore)? {
             if targets.is_empty() {
@@ -650,14 +690,93 @@ impl<'a> DepBuilder<'a> {
             }
         }
 
-        for p in UNSUPPORTED_BUILTIN_TARGETS.iter().copied() {
-            let sym = self.ev.session.intern(p);
-            if let Some((_, loc)) = self.get_rule_inputs(sym)? {
-                let program = self.ev.session.flags.program_name.clone();
-                warn_loc!(self.ev, Some(&loc), "{program} doesn't support {p}");
+        Ok(())
+    }
+
+    /// Read the three targets that argue over which files are intermediate.
+    ///
+    /// In GNU Make's order, which is the order they veto each other in:
+    /// `.NOTINTERMEDIATE` first, so the other two can refuse a name it already
+    /// took, and last the one pair that cannot both mean everything.
+    fn handle_intermediate_targets(&mut self) -> Result<()> {
+        let not_intermediate = self.ev.session.intern(".NOTINTERMEDIATE");
+        if let Some((targets, _)) = self.get_rule_inputs(not_intermediate)? {
+            if targets.is_empty() {
+                self.no_intermediates = true;
+            }
+            for t in targets {
+                if t.as_bytes(&self.ev.session).contains(&b'%') {
+                    self.not_intermediate_patterns.push(t);
+                } else {
+                    self.not_intermediate.insert(t);
+                }
+            }
+        }
+        let intermediate = self.ev.session.intern(".INTERMEDIATE");
+        if let Some((targets, _)) = self.get_rule_inputs(intermediate)? {
+            // Naming none would mean every target, and a build whose every
+            // target may be skipped builds nothing. GNU Make ignores it.
+            for t in targets {
+                if self.not_intermediate.contains(&t) {
+                    error_loc!(
+                        self.ev,
+                        None,
+                        "*** {} cannot be both .NOTINTERMEDIATE and .INTERMEDIATE.",
+                        t.display(self.ev)
+                    );
+                }
+                self.declared_intermediate.insert(t);
+            }
+        }
+        let secondary = self.ev.session.intern(".SECONDARY");
+        if let Some((targets, _)) = self.get_rule_inputs(secondary)? {
+            if targets.is_empty() {
+                if self.no_intermediates {
+                    error_loc!(
+                        self.ev,
+                        None,
+                        "*** .NOTINTERMEDIATE and .SECONDARY are mutually exclusive."
+                    );
+                }
+                self.all_secondary = true;
+            }
+            for t in targets {
+                if self.not_intermediate.contains(&t) {
+                    error_loc!(
+                        self.ev,
+                        None,
+                        "*** {} cannot be both .NOTINTERMEDIATE and .SECONDARY.",
+                        t.display(self.ev)
+                    );
+                }
+                self.declared_intermediate.insert(t);
+                self.secondary.insert(t);
             }
         }
         Ok(())
+    }
+
+    /// Whether a file's absence is no reason to remake what reads it.
+    ///
+    /// `.INTERMEDIATE` and `.SECONDARY` win outright: a name either of them
+    /// says is intermediate however else it was reached, which is what makes
+    /// them worth writing beside a `.NOTINTERMEDIATE` pattern.
+    fn treat_as_intermediate(&self, output: Symbol) -> bool {
+        if self.declared_intermediate.contains(&output) {
+            return true;
+        }
+        if self.no_intermediates || self.not_intermediate.contains(&output) {
+            return false;
+        }
+        let name = output.as_bytes(&self.ev.session);
+        if self
+            .not_intermediate_patterns
+            .iter()
+            .any(|p| Pattern::new(p.as_bytes(&self.ev.session)).matches(&name))
+        {
+            return false;
+        }
+        self.all_secondary || self.intermediates.contains(&output)
     }
 
     /// A `.x.y:` rule is a suffix rule only while both `.x` and `.y` are on the
@@ -726,6 +845,14 @@ impl<'a> DepBuilder<'a> {
             self.cur_rule_vars = Some(v.clone());
             self.ev.current_scope = Some(v.clone());
             let n = self.build_plan(target, None)?;
+            // A goal is asked for, so it is built and it is kept: GNU Make
+            // reaches one directly rather than through the rule that wanted it,
+            // and never deletes what the command line named.
+            {
+                let mut n = n.lock();
+                n.is_intermediate = false;
+                n.is_disposable = false;
+            }
             nodes.push((target, n));
             self.ev.current_scope = None;
             self.cur_rule_vars = None;
@@ -1176,6 +1303,11 @@ impl<'a> DepBuilder<'a> {
     }
 
     fn populate_explicit_rule(&mut self, rule: Arc<Rule>) -> Result<()> {
+        for input in rule.inputs.iter().chain(&rule.order_only_inputs) {
+            if !input.as_bytes(&self.ev.session).contains(&b'%') {
+                self.mentioned.insert(*input);
+            }
+        }
         for output in &rule.outputs {
             if self.first_rule.is_none() && !is_special_target(&self.ev.session, output) {
                 self.first_rule = Some(*output);
@@ -1284,27 +1416,38 @@ impl<'a> DepBuilder<'a> {
             let pat = Pattern::new(output_pattern.as_bytes(&self.ev.session));
             if pat.matches(&output_str) {
                 let deferred = self.expanded_pattern_inputs(rule, output, &pat, &output_str)?;
-                let inputs = match &deferred {
-                    Some((inputs, _)) => inputs.clone(),
+                let inputs: Vec<(Symbol, bool)> = match &deferred {
+                    // A deferred list is one string until it is expanded, so
+                    // which word the `%` was in is no longer knowable.
+                    Some((inputs, _)) => inputs.iter().map(|input| (*input, false)).collect(),
                     None => rule
                         .inputs
                         .iter()
                         .map(|input| {
-                            let buf =
-                                pat.append_subst(&output_str, &input.as_bytes(&self.ev.session));
-                            self.ev.session.intern(buf)
+                            let text = input.as_bytes(&self.ev.session);
+                            let from_pattern = text.contains(&b'%');
+                            let buf = pat.append_subst(&output_str, &text);
+                            (self.ev.session.intern(buf), from_pattern)
                         })
                         .collect(),
                 };
                 let mut ok = true;
-                for sym in inputs {
-                    if !self.exists(sym) && !(chaining && self.can_be_made_implicitly(sym, 0)?) {
+                let mut invented = Vec::new();
+                for (sym, from_pattern) in inputs {
+                    if self.exists(sym) {
+                        continue;
+                    }
+                    if !(chaining && self.can_be_made_implicitly(sym, 0)?) {
                         ok = false;
                         break;
+                    }
+                    if from_pattern && !self.mentioned.contains(&sym) {
+                        invented.push(sym);
                     }
                 }
 
                 if ok {
+                    self.intermediates.extend(invented);
                     matched = Some(*output_pattern);
                     expanded = deferred;
                     break;
@@ -1528,8 +1671,13 @@ impl<'a> DepBuilder<'a> {
         for irule in &found {
             assert!(irule.inputs.len() == 1);
             let input = replace_suffix(&mut self.ev.session, output, &irule.inputs[0]);
-            if !self.exists(input) && !(chaining && self.can_be_made_implicitly(input, 0)?) {
-                continue;
+            if !self.exists(input) {
+                if !(chaining && self.can_be_made_implicitly(input, 0)?) {
+                    continue;
+                }
+                if !self.mentioned.contains(&input) {
+                    self.intermediates.insert(input);
+                }
             }
 
             if rule_merger.is_some() {
@@ -1567,11 +1715,14 @@ impl<'a> DepBuilder<'a> {
             return Ok(found.clone());
         }
 
+        let is_intermediate = self.treat_as_intermediate(output);
         let n = DepNode::new(
             output,
             self.phony.contains(&output),
             self.restat.contains(&output),
             self.ignore_errors.contains(&output),
+            is_intermediate,
+            is_intermediate && !self.all_secondary && !self.secondary.contains(&output),
         );
         self.done.insert(output, n.clone());
 
@@ -1963,9 +2114,10 @@ const CONSUMED_BUILTIN_TARGETS: &[&str] = &[
     ".EXPORT_ALL_VARIABLES",
     ".ONESHELL",
     ".NOTPARALLEL",
+    ".INTERMEDIATE",
+    ".SECONDARY",
+    ".NOTINTERMEDIATE",
 ];
-
-const UNSUPPORTED_BUILTIN_TARGETS: &[&str] = &[".INTERMEDIATE", ".SECONDARY"];
 
 /// Special targets asking for what already happens: we never echo a recipe,
 /// never delete a target whose recipe failed, and 4.x ignores the last two.
@@ -1978,7 +2130,6 @@ pub fn is_directive_target(names: &impl Interner, output: &Symbol) -> bool {
     let s = output.as_bytes(names);
     CONSUMED_BUILTIN_TARGETS
         .iter()
-        .chain(UNSUPPORTED_BUILTIN_TARGETS)
         .chain(ACCEPTED_BUILTIN_TARGETS)
         .any(|name| name.as_bytes() == &s[..])
 }
