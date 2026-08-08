@@ -160,6 +160,17 @@ pub struct SinkEdge<'a> {
     /// `phony_output` or wires in a synthetic always-dirty input; a sink that
     /// builds a graph directly should do neither.
     pub always_dirty: bool,
+    /// The output's absence is no reason to remake what reads it: the implicit
+    /// rule search invented the name to complete a chain, or `.INTERMEDIATE` or
+    /// `.SECONDARY` said so.
+    ///
+    /// Nothing in a manifest says this — Ninja has no notion of a file the
+    /// build is allowed to skip — so the writer ignores it and a sink that runs
+    /// the build is the one that answers for it.
+    pub intermediate: bool,
+    /// The build should delete this output once it has finished with it, which
+    /// is every intermediate but a `.SECONDARY` one and a goal.
+    pub disposable: bool,
     /// The pool that limits how many edges like this run at once, unescaped.
     pub pool: Option<&'a [u8]>,
     /// Opaque per-edge metadata from `.KATI_TAGS`, for consumers of the graph
