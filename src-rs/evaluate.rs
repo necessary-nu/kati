@@ -170,7 +170,12 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
     } else {
         VarOrigin::Environment
     };
-    for (k, v) in std::env::vars_os() {
+    let environment = ev
+        .session
+        .invocation_environment
+        .clone()
+        .unwrap_or_else(|| std::env::vars_os().collect());
+    for (k, v) in environment {
         let v = Bytes::from(v.as_bytes().to_vec());
         let val = Arc::new(Value::Literal(None, v.clone()));
         let frame = ev.current_frame();

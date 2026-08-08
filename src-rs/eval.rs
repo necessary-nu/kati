@@ -293,6 +293,13 @@ pub struct Evaluator {
     pub profiled_files: Vec<OsString>,
 
     pub is_evaluating_command: bool,
+    /// Whether expanding the current recipe referenced `MAKE`.
+    ///
+    /// GNU Make treats that reference as recursive intent even when it arrived
+    /// through another recursively-expanded variable. A graph sink needs the
+    /// same semantic fact before the expanded text becomes an opaque shell
+    /// script.
+    pub expanded_make_in_command: Vec<Bytes>,
 }
 
 impl Default for Evaluator {
@@ -356,6 +363,7 @@ impl Evaluator {
             profiled_files: Vec::new(),
 
             is_evaluating_command: false,
+            expanded_make_in_command: Vec::new(),
         }
     }
 

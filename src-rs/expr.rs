@@ -92,10 +92,18 @@ impl Evaluable for Value {
             }
             Value::SymRef(_, sym) => {
                 let sym = *sym;
+                let is_make =
+                    ev.is_evaluating_command && sym.as_bytes(&ev.session).as_ref() == b"MAKE";
                 if let Some(v) = ev.lookup_var_for_eval(sym)? {
                     let v = v.read();
                     v.used(ev, &sym)?;
-                    v.eval(ev, out)?;
+                    if is_make {
+                        let expanded = v.eval_to_buf(ev)?;
+                        out.put_slice(&expanded);
+                        ev.expanded_make_in_command.push(expanded);
+                    } else {
+                        v.eval(ev, out)?;
+                    }
                     let loc = ev.loc.clone();
                     v.check_current_referencing_file(&ev.session, &loc, sym)?;
                     ev.var_eval_complete(sym);
@@ -106,10 +114,18 @@ impl Evaluable for Value {
                 let name = var.eval_to_buf(ev)?;
                 ev.eval_depth -= 1;
                 let sym = ev.session.intern(name);
+                let is_make =
+                    ev.is_evaluating_command && sym.as_bytes(&ev.session).as_ref() == b"MAKE";
                 if let Some(v) = ev.lookup_var_for_eval(sym)? {
                     let v = v.read();
                     v.used(ev, &sym)?;
-                    v.eval(ev, out)?;
+                    if is_make {
+                        let expanded = v.eval_to_buf(ev)?;
+                        out.put_slice(&expanded);
+                        ev.expanded_make_in_command.push(expanded);
+                    } else {
+                        v.eval(ev, out)?;
+                    }
                     let loc = ev.loc.clone();
                     v.check_current_referencing_file(&ev.session, &loc, sym)?;
                     ev.var_eval_complete(sym);

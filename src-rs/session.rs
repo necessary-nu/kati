@@ -63,6 +63,14 @@ pub trait Context: Interner {
 pub struct Session {
     /// The parsed command line. A value, not a read of the process arguments.
     pub flags: Flags,
+    /// The environment this invocation imports, when its caller is another
+    /// compiler session rather than the ambient process.
+    ///
+    /// `None` preserves the standalone API: evaluation snapshots the process
+    /// environment. A semantic submake supplies `Some` so its parent exports
+    /// reach Make evaluation without launching another process or mutating the
+    /// compiler's own environment.
+    pub invocation_environment: Option<Vec<(OsString, OsString)>>,
     /// Byte strings to [`Symbol`] handles and back.
     pub symtab: Symtab,
     /// Make's outermost variable scope, keyed by interned symbol.
@@ -130,6 +138,7 @@ impl Session {
     fn from_parts(flags: Flags, symtab: Symtab) -> Self {
         Self {
             flags,
+            invocation_environment: None,
             symtab,
             globals: GlobalVars::with_builtins(),
             stats: StatsRegistry::new(),

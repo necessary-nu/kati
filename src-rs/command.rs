@@ -201,6 +201,40 @@ pub struct Command {
     pub force_no_subshell: bool,
     /// The `+` prefix: run this line even when the run is only pretending.
     pub always_run: bool,
+    /// Values produced by `MAKE` references while expanding this recipe line.
+    pub recursive_make: Vec<Bytes>,
+}
+
+/// Whether one expanded `MAKE` value occupies the command position of a
+/// recipe line rather than merely being printed or passed as data.
+fn invokes_make(command: &[u8], make: &[u8]) -> bool {
+    fn starts_with_word(command: &[u8], word: &[u8]) -> bool {
+        command.starts_with(word)
+            && command
+                .get(word.len())
+                .is_none_or(|next| next.is_ascii_whitespace())
+    }
+
+    let mut command = command.trim_ascii_start();
+    if starts_with_word(command, b"exec") {
+        command = command[b"exec".len()..].trim_ascii_start();
+    }
+    if starts_with_word(command, make) {
+        return true;
+    }
+
+    let Some(and) = command.windows(2).position(|bytes| bytes == b"&&") else {
+        return false;
+    };
+    let before = command[..and].trim_ascii();
+    let mut after = command[and + 2..].trim_ascii_start();
+    if !starts_with_word(before, b"cd") {
+        return false;
+    }
+    if starts_with_word(after, b"exec") {
+        after = after[b"exec".len()..].trim_ascii_start();
+    }
+    starts_with_word(after, make)
 }
 
 fn parse_command_prefixes(
@@ -310,6 +344,7 @@ impl<'a> CommandEvaluator<'a> {
         Ok(())
     }
 
+    // [spec:ronin:req:make.recursive-invocation+1]
     pub fn eval(&mut self, n: &Arc<Mutex<DepNode>>) -> Result<Vec<Command>> {
         let mut result: Vec<Command> = Vec::new();
         let node_cmds;
@@ -325,7 +360,9 @@ impl<'a> CommandEvaluator<'a> {
         *self.found_new_inputs.lock() = false;
         for v in node_cmds {
             self.ev.loc = v.loc();
+            self.ev.expanded_make_in_command.clear();
             let cmds_buf = v.eval_to_buf(self.ev)?;
+            let recursive_make = self.ev.expanded_make_in_command.clone();
             let mut cmds = cmds_buf.clone();
             let mut global_echo = !self.ev.session.flags.is_silent_mode;
             // `-i` is the `-` prefix asked for once instead of per line, so it
@@ -353,6 +390,11 @@ impl<'a> CommandEvaluator<'a> {
                 cmd = parse_command_prefixes(cmd, &mut echo, &mut ignore_error, &mut always_run);
 
                 if !cmd.is_empty() {
+                    let recursive_make = recursive_make
+                        .iter()
+                        .filter(|make| invokes_make(&cmd, make))
+                        .cloned()
+                        .collect();
                     result.push(Command {
                         output: n.lock().output,
                         cmd,
@@ -360,6 +402,7 @@ impl<'a> CommandEvaluator<'a> {
                         ignore_error,
                         force_no_subshell: false,
                         always_run,
+                        recursive_make,
                     })
                 }
             }
@@ -376,6 +419,7 @@ impl<'a> CommandEvaluator<'a> {
                     ignore_error: false,
                     force_no_subshell: true,
                     always_run: false,
+                    recursive_make: Vec::new(),
                 })
             }
             // Prepend |output_commands|.
@@ -388,5 +432,21 @@ impl<'a> CommandEvaluator<'a> {
         self.ev.is_evaluating_command = false;
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::invokes_make;
+
+    #[test]
+    fn make_must_occupy_the_invoked_command_position() {
+        assert!(invokes_make(b"make -f Child.mk", b"make"));
+        assert!(invokes_make(b"exec ./make child", b"./make"));
+        assert!(invokes_make(b"cd sub && make child", b"make"));
+        assert!(invokes_make(b"cd 'sub dir' && exec make child", b"make"));
+        assert!(!invokes_make(b"printf '%s' make", b"make"));
+        assert!(!invokes_make(b"echo make && true", b"make"));
+        assert!(!invokes_make(b"make-believe child", b"make"));
     }
 }

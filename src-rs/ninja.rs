@@ -607,6 +607,13 @@ impl<'a> NinjaGenerator<'a> {
                     } else {
                         SinkCommand::Inline(&script)
                     },
+                    recursive_make: (nn.commands.len() == 1
+                        && nn.commands[0].recursive_make.len() == 1)
+                        .then(|| nn.commands[0].recursive_make[0].as_ref()),
+                    contains_recursive: nn
+                        .commands
+                        .iter()
+                        .any(|command| !command.recursive_make.is_empty()),
                     dry_run_command: &dry_run_script,
                     description: description.as_deref(),
                     depfile: depfile.as_deref(),
@@ -1313,6 +1320,7 @@ mod tests {
                 ignore_error: *ignore_error,
                 force_no_subshell: false,
                 always_run: false,
+                recursive_make: Vec::new(),
             })
             .collect();
         let mut cmd_buf = BytesMut::new();
@@ -1364,6 +1372,8 @@ mod tests {
                     shell: b"/bin/sh",
                     shell_flags: b"-c",
                     command,
+                    recursive_make: None,
+                    contains_recursive: false,
                     // Ninja's -n runs nothing, so the manifest writer has no
                     // use for the subset Make would still run.
                     dry_run_command: b"",

@@ -110,6 +110,16 @@ pub struct SinkRule<'a> {
     /// is a `$` the shell will act on, never an escape belonging to some
     /// destination format.
     pub command: SinkCommand<'a>,
+    /// The whole recipe is one recursive `$(MAKE)` invocation.
+    ///
+    /// A graph sink can compile this as semantic subninja inclusion rather
+    /// than handing a nested Make process to its executor.
+    // [spec:ronin:req:make.recursive-invocation+1]
+    pub recursive_make: Option<&'a [u8]>,
+    /// At least one line in the recipe is a recursive `$(MAKE)` invocation.
+    /// This differs from [`Self::recursive_make`] for a mixed recipe whose
+    /// other shell effects need an explicit graph representation too.
+    pub contains_recursive: bool,
     /// The subset of the recipe Make runs even when told not to run anything:
     /// the lines the Makefile prefixed `+`. Assembled the same way as
     /// [`SinkRule::command`] and empty when there are none. The manifest writer
