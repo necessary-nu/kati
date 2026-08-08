@@ -1798,6 +1798,7 @@ impl<'a> DepBuilder<'a> {
         self.take_out_waits(&n);
 
         let mut sv = Vec::new();
+        let mut private_sv = Vec::new();
         let frame = self.ev.enter(
             FrameType::Dependency,
             output_str.clone(),
@@ -1822,6 +1823,9 @@ impl<'a> DepBuilder<'a> {
             // outer one.
             targeted.sort_by_key(|(_, var)| var.read().assign_op == Some(AssignOp::PlusEq));
             for (name, var) in &targeted {
+                // Off the declaration rather than the value: `+=` resolves to a
+                // fresh simple variable and would leave the keyword behind.
+                let is_private = var.read().is_private;
                 let mut new_var = var.clone();
                 match var.read().assign_op {
                     Some(AssignOp::PlusEq) => {
@@ -1855,14 +1859,22 @@ impl<'a> DepBuilder<'a> {
                 } else if *name == self.tags_var_name {
                     n.lock().tags_var = Some(new_var);
                 } else {
-                    sv.push(ScopedVar::new(
-                        self.cur_rule_vars.clone().unwrap(),
-                        *name,
-                        new_var,
-                    ));
+                    let scoped =
+                        ScopedVar::new(self.cur_rule_vars.clone().unwrap(), *name, new_var);
+                    if is_private { &mut private_sv } else { &mut sv }.push(scoped);
                 }
             }
         }
+
+        // A `private` target-specific variable belongs to this target's own
+        // recipe and to no prerequisite's, so the scope is read here, with it in
+        // it, and it leaves before the prerequisites are planned.
+        let scope = self.cur_rule_vars.as_ref().map(|vars| {
+            let v = Vars::new();
+            v.merge_from(vars);
+            Arc::new(v)
+        });
+        drop(private_sv);
 
         if self.ev.session.flags.warn_phony_looks_real
             && n.lock().is_phony
@@ -2078,13 +2090,7 @@ impl<'a> DepBuilder<'a> {
             let mut n = n.lock();
             n.has_rule = true;
             n.is_default_target = self.first_rule == Some(output);
-            if let Some(cur_rule_vars) = &self.cur_rule_vars {
-                let v = Vars::new();
-                v.merge_from(cur_rule_vars);
-                n.rule_vars = Some(Arc::new(v));
-            } else {
-                n.rule_vars = None
-            }
+            n.rule_vars = scope;
         }
 
         Ok(n)

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::{Buf, Bytes};
-use memchr::{memchr, memchr3};
+use memchr::{memchr, memchr2, memchr3};
 use parking_lot::Mutex;
 
 use crate::{
@@ -685,6 +685,21 @@ impl<'a> Parser<'a> {
         self.parse_rule_or_assign(line)
     }
 
+    /// `private`, which defines the variable and withholds it from every scope
+    /// that reaches this one through a parent.
+    fn parse_private(&mut self, line: Bytes) -> Result<()> {
+        let mut current_directive = self.current_directive.unwrap_or_default();
+        current_directive.is_private = true;
+        self.current_directive = Some(current_directive);
+        if self.handle_assign_directive(&line)? {
+            return Ok(());
+        }
+        if self.is_in_export() {
+            self.create_export(&line, true)?;
+        }
+        self.parse_rule_or_assign(line)
+    }
+
     fn parse_export(&mut self, line: Bytes) -> Result<()> {
         let mut current_directive = self.current_directive.unwrap_or_default();
         current_directive.export = true;
@@ -768,8 +783,9 @@ impl<'a> Parser<'a> {
             b"ifeq" | b"ifneq" => self.parse_ifeq(rest, directive)?,
             b"else" => self.parse_else(rest)?,
             b"endif" => self.parse_endif(rest)?,
-            b"override" => self.parse_override(rest)?,
-            b"export" => self.parse_export(rest)?,
+            b"override" if !starts_assignment(&rest) => self.parse_override(rest)?,
+            b"export" if !starts_assignment(&rest) => self.parse_export(rest)?,
+            b"private" if !starts_assignment(&rest) => self.parse_private(rest)?,
             b"unexport" => self.parse_unexport(&rest)?,
             b"undefine" if !starts_assignment(&rest) => self.parse_undefine(rest)?,
             b"vpath" => self.parse_vpath(rest)?,
@@ -798,8 +814,9 @@ impl<'a> Parser<'a> {
         ))));
         match directive {
             b"define" => self.parse_define(rest)?,
-            b"override" => self.parse_override(rest)?,
-            b"export" => self.parse_export(rest)?,
+            b"override" if !starts_assignment(&rest) => self.parse_override(rest)?,
+            b"export" if !starts_assignment(&rest) => self.parse_export(rest)?,
+            b"private" if !starts_assignment(&rest) => self.parse_private(rest)?,
             b"undefine" if !starts_assignment(&rest) => self.parse_undefine(rest)?,
             _ => return Ok(false),
         }
@@ -870,6 +887,28 @@ fn is_variable_name(name: &[u8]) -> bool {
     true
 }
 
+/// Take the modifier keywords a target-specific assignment may carry in front
+/// of its variable name, in any order and any number, and answer whether
+/// `private` was among them.
+///
+/// The last word is the name however it is spelled, so `a: private = 1` assigns
+/// to `private` rather than declaring one. `export`, `unexport` and `override`
+/// are keywords in this position too and are taken off the name; what they mean
+/// for a target-specific variable is not this.
+pub fn take_assign_modifiers(name: &[u8]) -> (&[u8], bool) {
+    let mut name = name;
+    let mut is_private = false;
+    while let Some(end) = memchr2(b' ', b'\t', name) {
+        match &name[..end] {
+            b"private" => is_private = true,
+            b"export" | b"unexport" | b"override" => {}
+            _ => break,
+        }
+        name = trim_left_space(&name[end..]);
+    }
+    (name, is_private)
+}
+
 pub struct ParsedAssign<'a> {
     pub lhs: &'a [u8],
     pub rhs: &'a [u8],
@@ -911,6 +950,23 @@ mod tests {
             Parser::get_directive(&Bytes::from_static(b"endif")),
             Bytes::from_static(b"endif")
         );
+    }
+
+    /// A target-specific assignment carries its modifiers in any order, and the
+    /// word left over is the name however it is spelled.
+    #[test]
+    fn modifiers_come_off_a_target_specific_name() {
+        for (line, name, is_private) in [
+            (b"F".as_slice(), b"F".as_slice(), false),
+            (b"private F", b"F", true),
+            (b"export override private _X", b"_X", true),
+            (b"private override B", b"B", true),
+            (b"override X", b"X", false),
+            (b"private", b"private", false),
+            (b"X Y", b"X Y", false),
+        ] {
+            assert_eq!(take_assign_modifiers(line), (name, is_private));
+        }
     }
 
     /// A name is one word once the operator is off it, and a `$(...)` reference
