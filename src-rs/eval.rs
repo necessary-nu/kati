@@ -23,7 +23,7 @@ use std::sync::{Arc, Weak};
 
 use anyhow::Result;
 use bytes::{Buf, Bytes};
-use memchr::{memchr, memchr2};
+use memchr::memchr;
 use parking_lot::Mutex;
 
 use crate::expr::Evaluable;
@@ -38,7 +38,9 @@ use crate::stmt::{
     AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt, IncludeStmt, RuleSep, RuleStmt,
     Statement, VpathStmt,
 };
-use crate::strutil::{Pattern, is_space_byte, trim_leading_curdir, trim_right_space, word_scanner};
+use crate::strutil::{
+    Pattern, find_outside_paren, is_space_byte, trim_leading_curdir, trim_right_space, word_scanner,
+};
 use crate::symtab::{Interner, Symbol, Symtab};
 use crate::var::{Var, VarOrigin, Variable, Vars};
 use crate::{collect_stats_with_slow_report, error_loc, log, warn_loc};
@@ -730,7 +732,9 @@ impl Evaluator {
         // It is an assignment when either after_targets contains an assignment token
         // or separator is an assignment token, but only if there is no ';' before the
         // first assignment token.
-        let mut separator_pos = memchr2(b'=', b';', &after_targets);
+        // Outside parentheses: the first expansion turns `$$(info a=b)` into
+        // `$(info a=b)`, and the `=` in a function's arguments is not one.
+        let mut separator_pos = find_outside_paren(&after_targets, b"=;");
         let separator = if let Some(separator_pos) = separator_pos {
             Some(after_targets[separator_pos])
         } else if stmt.sep == RuleSep::Eq || stmt.sep == RuleSep::FinalEq {

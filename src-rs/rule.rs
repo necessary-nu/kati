@@ -41,7 +41,9 @@ pub struct Rule {
     /// Set when `.SECONDEXPANSION` was declared before this rule was read.
     pub expand_again: bool,
     /// The prerequisite text as the first expansion left it, kept unparsed for
-    /// the second one.
+    /// the second one. Only a list that still has a `$` in it: everything else
+    /// would expand to itself, and holding it back would hide it from the
+    /// automatic variables a later list reads.
     pub deferred_prerequisites: Option<Bytes>,
     pub cmds: Vec<Arc<Value>>,
     pub loc: Loc,
@@ -67,18 +69,14 @@ impl Rule {
     }
 
     fn parse_inputs(&mut self, session: &mut Session, inputs_str: &Bytes) {
-        let mut is_order_only = false;
-        for input in word_scanner(inputs_str) {
-            if input == b"|" {
-                is_order_only = true;
-                continue;
-            }
-            let input_sym = session.intern(inputs_str.slice_ref(trim_leading_curdir(input)));
-            if is_order_only {
-                self.order_only_inputs.push(input_sym);
-            } else {
-                self.inputs.push(input_sym);
-            }
+        let (inputs, order_only) = split_order_only(inputs_str);
+        for input in word_scanner(&inputs) {
+            let sym = session.intern(inputs.slice_ref(trim_leading_curdir(input)));
+            self.inputs.push(sym);
+        }
+        for input in word_scanner(&order_only) {
+            let sym = session.intern(order_only.slice_ref(trim_leading_curdir(input)));
+            self.order_only_inputs.push(sym);
         }
     }
 
@@ -107,11 +105,7 @@ impl Rule {
 
         let Some(separator_pos) = memchr(b':', &prereq_string) else {
             // Simple prerequisites
-            // Explicit rules only. A pattern rule is chosen by matching its
-            // prerequisites against the filesystem, so deferring them leaves it
-            // matching anything and building the wrong thing — worse than the
-            // refusal it gives today.
-            if self.expand_again && self.output_patterns.is_empty() {
+            if self.expand_again && memchr(b'$', &prereq_string).is_some() {
                 self.deferred_prerequisites = Some(prereq_string);
             } else {
                 self.parse_inputs(session, &prereq_string);
@@ -172,7 +166,11 @@ impl Rule {
                 "*** target pattern contains no '%'."
             );
         }
-        self.parse_inputs(session, &prereq_patterns);
+        if self.expand_again && memchr(b'$', &prereq_patterns).is_some() {
+            self.deferred_prerequisites = Some(prereq_patterns);
+        } else {
+            self.parse_inputs(session, &prereq_patterns);
+        }
         Ok(())
     }
 }
@@ -196,6 +194,16 @@ impl Debug for Rule {
             write!(f, " cmds={:?}", self.cmds)?;
         }
         Ok(())
+    }
+}
+
+/// Split a prerequisite list at the first `|`, which ends the word it falls in
+/// rather than needing space around it. After it there is no second list, so a
+/// later `|` is an ordinary character.
+pub fn split_order_only(inputs: &Bytes) -> (Bytes, Bytes) {
+    match memchr(b'|', inputs) {
+        Some(i) => (inputs.slice(..i), inputs.slice(i + 1..)),
+        None => (inputs.clone(), Bytes::new()),
     }
 }
 

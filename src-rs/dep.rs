@@ -31,10 +31,10 @@ use crate::{
     expr::{Evaluable, Value},
     loc::Loc,
     log,
-    rule::Rule,
+    rule::{Rule, split_order_only},
     session::{Context, Session},
     stmt::AssignOp,
-    strutil::{Pattern, get_ext, strip_ext, trim_leading_curdir, word_scanner},
+    strutil::{Pattern, WordWriter, get_ext, strip_ext, trim_leading_curdir, word_scanner},
     symtab::{Interner, Symbol},
     timeutil::ScopedTimeReporter,
     var::{ScopedVar, Var, Variable, Vars},
@@ -113,6 +113,33 @@ fn replace_suffix(session: &mut Session, s: Symbol, newsuf: &Symbol) -> Symbol {
     r.put_u8(b'.');
     r.put_slice(&newsuf);
     session.intern(r.freeze())
+}
+
+/// Rewrite a deferred prerequisite's `%` to `$*` ahead of the second
+/// expansion, the first one of each whitespace-separated token as GNU Make
+/// does. Substituting the stem itself would expand it a third time, which is
+/// wrong for a stem containing `$`.
+fn stem_references(text: &Bytes) -> Bytes {
+    if memchr(b'%', text).is_none() {
+        return text.clone();
+    }
+    let mut ret = BytesMut::with_capacity(text.len() + 8);
+    let mut substituted = false;
+    for &c in text.iter() {
+        match c {
+            b'%' if !substituted => {
+                ret.put_slice(b"$*");
+                substituted = true;
+            }
+            _ => {
+                if c.is_ascii_whitespace() {
+                    substituted = false;
+                }
+                ret.put_u8(c);
+            }
+        }
+    }
+    ret.freeze()
 }
 
 fn apply_output_pattern(
@@ -449,6 +476,11 @@ struct DepBuilder<'a> {
     cur_rule_vars: Option<Arc<Vars>>,
 
     implicit_rules: RuleTrie,
+    /// One second expansion per rule and target, as GNU Make does. The search
+    /// makes two passes over the same rules and probes a rule again before
+    /// using it, and the expansion is free to have side effects. Keyed by the
+    /// rule's address, which the tables hold for the whole build.
+    expanded: HashMap<(usize, Symbol), (Vec<Symbol>, Vec<Symbol>)>,
     /// Cycle guard for the recursive implicit rule search.
     chaining: HashSet<Symbol>,
     wait_sym: Symbol,
@@ -498,6 +530,7 @@ impl<'a> DepBuilder<'a> {
             cur_rule_vars: None,
 
             implicit_rules: RuleTrie::new(),
+            expanded: HashMap::new(),
             chaining: HashSet::new(),
             wait_sym,
             wait_barriers: Vec::new(),
@@ -524,20 +557,20 @@ impl<'a> DepBuilder<'a> {
             eprintln!("*kati*: {} suffix rules", ret.suffix_rules.len());
         }
 
-        ret.handle_special_targets();
+        ret.handle_special_targets()?;
 
         Ok(ret)
     }
 
-    fn handle_special_targets(&mut self) {
+    fn handle_special_targets(&mut self) -> Result<()> {
         let phony = self.ev.session.intern(".PHONY");
-        if let Some((targets, _)) = self.get_rule_inputs(phony) {
+        if let Some((targets, _)) = self.get_rule_inputs(phony)? {
             for t in targets {
                 self.phony.insert(t);
             }
         }
         let restat = self.ev.session.intern(".KATI_RESTAT");
-        if let Some((targets, _)) = self.get_rule_inputs(restat) {
+        if let Some((targets, _)) = self.get_rule_inputs(restat)? {
             for t in targets {
                 self.restat.insert(t);
             }
@@ -547,21 +580,21 @@ impl<'a> DepBuilder<'a> {
         // Only the bare form. With prerequisites it says something narrower
         // that has not been established against GNU Make.
         let not_parallel = self.ev.session.intern(".NOTPARALLEL");
-        if let Some((targets, _)) = self.get_rule_inputs(not_parallel)
+        if let Some((targets, _)) = self.get_rule_inputs(not_parallel)?
             && targets.is_empty()
         {
             self.ev.session.flags.not_parallel = true;
         }
         let one_shell = self.ev.session.intern(".ONESHELL");
-        if self.get_rule_inputs(one_shell).is_some() {
+        if self.get_rule_inputs(one_shell)?.is_some() {
             self.ev.session.flags.one_shell = true;
         }
         let export_all = self.ev.session.intern(".EXPORT_ALL_VARIABLES");
-        if self.get_rule_inputs(export_all).is_some() {
+        if self.get_rule_inputs(export_all)?.is_some() {
             self.ev.session.flags.export_all_variables = true;
         }
         let ignore = self.ev.session.intern(".IGNORE");
-        if let Some((targets, _)) = self.get_rule_inputs(ignore) {
+        if let Some((targets, _)) = self.get_rule_inputs(ignore)? {
             if targets.is_empty() {
                 self.ev.session.flags.ignore_errors = true;
             } else {
@@ -600,11 +633,14 @@ impl<'a> DepBuilder<'a> {
         let suffixes = self.ev.session.intern(".SUFFIXES");
         if let Some(merger) = self.rules.get(&suffixes).cloned() {
             let mut declared: Vec<Symbol> = Vec::new();
-            for rule in &merger.lock().rules {
-                if rule.inputs.is_empty() {
+            let rules = merger.lock().rules.clone();
+            for rule in &rules {
+                let mut inputs = rule.inputs.clone();
+                inputs.extend(self.declared_by(suffixes, rule)?);
+                if inputs.is_empty() {
                     declared.clear();
                 } else {
-                    declared.extend(rule.inputs.iter().copied());
+                    declared.extend(inputs);
                 }
             }
             if declared.is_empty() {
@@ -616,11 +652,12 @@ impl<'a> DepBuilder<'a> {
 
         for p in UNSUPPORTED_BUILTIN_TARGETS.iter().copied() {
             let sym = self.ev.session.intern(p);
-            if let Some((_, loc)) = self.get_rule_inputs(sym) {
+            if let Some((_, loc)) = self.get_rule_inputs(sym)? {
                 let program = self.ev.session.flags.program_name.clone();
                 warn_loc!(self.ev, Some(&loc), "{program} doesn't support {p}");
             }
         }
+        Ok(())
     }
 
     /// A `.x.y:` rule is a suffix rule only while both `.x` and `.y` are on the
@@ -731,52 +768,119 @@ impl<'a> DepBuilder<'a> {
         n.actual_order_only_inputs = order_only;
     }
 
+    /// The prerequisites already recorded for a target, which is what `$<` and
+    /// its neighbours are worth while the rest are being worked out.
+    fn recorded_prerequisites(&mut self, output: Symbol) -> (Vec<Symbol>, Vec<Symbol>) {
+        let Some(merger) = self.rules.get(&output).cloned() else {
+            return (Vec::new(), Vec::new());
+        };
+        let rules = merger.lock().rules.clone();
+        let mut inputs = Vec::new();
+        let mut order_only = Vec::new();
+        for r in &rules {
+            let session = &mut self.ev.session;
+            inputs.extend(apply_output_pattern(session, r, output, &r.inputs));
+            order_only.extend(apply_output_pattern(
+                session,
+                r,
+                output,
+                &r.order_only_inputs,
+            ));
+        }
+        (inputs, order_only)
+    }
+
+    fn joined(&self, syms: &[Symbol], unique: bool) -> Bytes {
+        let mut out = BytesMut::new();
+        {
+            let mut seen = HashSet::new();
+            let mut ww = WordWriter::new(&mut out);
+            for sym in syms {
+                if !unique || seen.insert(*sym) {
+                    ww.write(&sym.as_bytes(&self.ev.session));
+                }
+            }
+        }
+        out.freeze()
+    }
+
     /// The second half of `.SECONDEXPANSION`: expand what the first expansion
-    /// left, now that `$@` has a value, and read the result as prerequisites.
+    /// left, now that `$@` and the stem have values, and read the result as
+    /// prerequisites. A stem is given for a pattern or static pattern rule and
+    /// withheld for an explicit one, where `%` is an ordinary character.
     fn expand_prerequisites_again(
         &mut self,
-        n: &Arc<Mutex<DepNode>>,
         output: Symbol,
+        stem: Option<Bytes>,
+        prerequisites: (&[Symbol], &[Symbol]),
         text: &Bytes,
-    ) -> Result<()> {
+    ) -> Result<(Vec<Symbol>, Vec<Symbol>)> {
         let at = self.ev.session.intern("@");
-        let value = Variable::with_simple_string(
-            output.as_bytes(&self.ev.session),
-            crate::var::VarOrigin::Automatic,
-            None,
-            None,
-        );
+        let star = self.ev.session.intern("*");
+        let less = self.ev.session.intern("<");
+        let hat = self.ev.session.intern("^");
+        let plus = self.ev.session.intern("+");
+        let bar = self.ev.session.intern("|");
+        let automatic = |s: Bytes| {
+            Variable::with_simple_string(s, crate::var::VarOrigin::Automatic, None, None)
+        };
         let scope = self.cur_rule_vars.clone().unwrap_or_default();
+        let text = match &stem {
+            Some(_) => stem_references(text),
+            None => text.clone(),
+        };
+        let (recorded, recorded_order_only) = prerequisites;
+        let first = recorded
+            .first()
+            .map(|s| s.as_bytes(&self.ev.session))
+            .unwrap_or_default();
+        let (hat_value, plus_value, bar_value) = (
+            self.joined(recorded, true),
+            self.joined(recorded, false),
+            self.joined(recorded_order_only, true),
+        );
         let expanded = {
-            let _bound = ScopedVar::new(scope, at, value);
+            let _at = ScopedVar::new(
+                scope.clone(),
+                at,
+                automatic(output.as_bytes(&self.ev.session)),
+            );
+            let _star = stem.map(|s| ScopedVar::new(scope.clone(), star, automatic(s)));
+            let _less = ScopedVar::new(scope.clone(), less, automatic(first));
+            let _hat = ScopedVar::new(scope.clone(), hat, automatic(hat_value));
+            let _plus = ScopedVar::new(scope.clone(), plus, automatic(plus_value));
+            let _bar = ScopedVar::new(scope, bar, automatic(bar_value));
             let mut loc = self.ev.loc.clone().unwrap_or_default();
             let expr = crate::expr::parse_expr(
                 &mut self.ev.session,
                 &mut loc,
-                text.clone(),
+                text,
                 crate::expr::ParseExprOpt::Normal,
             )?;
             expr.eval_to_buf(self.ev)?
         };
 
-        let mut node = n.lock();
-        let mut order_only = false;
-        for word in word_scanner(&expanded) {
-            if word == b"|" {
-                order_only = true;
-                continue;
-            }
-            let sym = self
-                .ev
-                .session
-                .intern(expanded.slice_ref(trim_leading_curdir(word)));
-            if order_only {
-                node.actual_order_only_inputs.push(sym);
-            } else {
-                node.actual_inputs.push(sym);
+        let (before, after) = split_order_only(&expanded);
+        let mut inputs = Vec::new();
+        let mut order_only_inputs = Vec::new();
+        for (text, into) in [(before, &mut inputs), (after, &mut order_only_inputs)] {
+            for word in word_scanner(&text) {
+                let sym = self
+                    .ev
+                    .session
+                    .intern(text.slice_ref(trim_leading_curdir(word)));
+                into.push(sym);
             }
         }
-        Ok(())
+        Ok((inputs, order_only_inputs))
+    }
+
+    /// The stem of `output` under a rule's first output pattern, or None when
+    /// the rule has none and `%` is therefore literal.
+    fn stem_of(&self, rule: &Rule, output: &Bytes) -> Option<Bytes> {
+        let pattern = rule.output_patterns.first()?;
+        let pat = Pattern::new(pattern.as_bytes(&self.ev.session));
+        Some(Bytes::copy_from_slice(pat.stem(output)))
     }
 
     /// `.WAIT` names no file, so it goes before build_plan descends and never
@@ -945,18 +1049,32 @@ impl<'a> DepBuilder<'a> {
             .collect()
     }
 
-    fn get_rule_inputs(&self, s: Symbol) -> Option<(Vec<Symbol>, Loc)> {
-        let merger = self.rules.get(&s)?;
-        let merger = merger.lock();
+    fn get_rule_inputs(&mut self, s: Symbol) -> Result<Option<(Vec<Symbol>, Loc)>> {
+        let Some(merger) = self.rules.get(&s).cloned() else {
+            return Ok(None);
+        };
+        let rules = merger.lock().rules.clone();
+        assert!(!rules.is_empty());
         let mut ret = Vec::new();
-        assert!(!merger.rules.is_empty());
-        for r in &merger.rules {
-            for i in &r.inputs {
-                ret.push(*i);
-            }
+        for r in &rules {
+            ret.extend(r.inputs.iter().copied());
+            ret.extend(self.declared_by(s, r)?);
         }
 
-        Some((ret, merger.rules[0].loc.clone()))
+        Ok(Some((ret, rules[0].loc.clone())))
+    }
+
+    /// GNU Make expands a special target's prerequisites once the makefiles are
+    /// read and before it reads what they declare, so a `.PHONY` written under
+    /// `.SECONDEXPANSION` still declares something.
+    fn declared_by(&mut self, target: Symbol, rule: &Rule) -> Result<Vec<Symbol>> {
+        let Some(text) = &rule.deferred_prerequisites.clone() else {
+            return Ok(Vec::new());
+        };
+        let (mut inputs, order_only) =
+            self.expand_prerequisites_again(target, None, (&[], &[]), text)?;
+        inputs.extend(order_only);
+        Ok(inputs)
     }
 
     fn populate_rules(&mut self) -> Result<()> {
@@ -1046,6 +1164,7 @@ impl<'a> DepBuilder<'a> {
         let output_suffix = output.slice(dot_index + 1..);
         let mut r = rule.clone();
         r.inputs.clear();
+        r.deferred_prerequisites = None;
         let input_sym = self.ev.session.intern(input_suffix);
         r.inputs.push(input_sym);
         r.is_suffix_rule = true;
@@ -1122,23 +1241,64 @@ impl<'a> DepBuilder<'a> {
         self.rule_vars.get(&o).cloned()
     }
 
+    /// Under `.SECONDEXPANSION` a pattern rule's prerequisites are not known
+    /// until the stem is, so the expansion belongs here, once per candidate,
+    /// rather than after the search has settled on one.
+    fn expanded_pattern_inputs(
+        &mut self,
+        rule: &Rule,
+        output: Symbol,
+        pat: &Pattern,
+        output_str: &Bytes,
+    ) -> Result<Option<(Vec<Symbol>, Vec<Symbol>)>> {
+        let Some(text) = rule.deferred_prerequisites.clone() else {
+            return Ok(None);
+        };
+        let key = (rule as *const Rule as usize, output);
+        if let Some(found) = self.expanded.get(&key) {
+            return Ok(Some(found.clone()));
+        }
+        let stem = Bytes::copy_from_slice(pat.stem(output_str));
+        let (recorded, recorded_order_only) = self.recorded_prerequisites(output);
+        let expanded = self.expand_prerequisites_again(
+            output,
+            Some(stem),
+            (&recorded, &recorded_order_only),
+            &text,
+        )?;
+        self.expanded.insert(key, expanded.clone());
+        Ok(Some(expanded))
+    }
+
     fn can_pick_implicit_rule(
         &mut self,
         rule: &Rule,
         output: Symbol,
         n: Arc<Mutex<DepNode>>,
         chaining: bool,
-    ) -> Option<Arc<Rule>> {
+    ) -> Result<Option<Arc<Rule>>> {
         let output_str = output.as_bytes(&self.ev.session);
         let mut matched = None;
+        let mut expanded = None;
         for output_pattern in &rule.output_patterns {
             let pat = Pattern::new(output_pattern.as_bytes(&self.ev.session));
             if pat.matches(&output_str) {
+                let deferred = self.expanded_pattern_inputs(rule, output, &pat, &output_str)?;
+                let inputs = match &deferred {
+                    Some((inputs, _)) => inputs.clone(),
+                    None => rule
+                        .inputs
+                        .iter()
+                        .map(|input| {
+                            let buf =
+                                pat.append_subst(&output_str, &input.as_bytes(&self.ev.session));
+                            self.ev.session.intern(buf)
+                        })
+                        .collect(),
+                };
                 let mut ok = true;
-                for input in &rule.inputs {
-                    let buf = pat.append_subst(&output_str, &input.as_bytes(&self.ev.session));
-                    let sym = self.ev.session.intern(buf);
-                    if !self.exists(sym) && !(chaining && self.can_be_made_implicitly(sym, 0)) {
+                for sym in inputs {
+                    if !self.exists(sym) && !(chaining && self.can_be_made_implicitly(sym, 0)?) {
                         ok = false;
                         break;
                     }
@@ -1146,13 +1306,21 @@ impl<'a> DepBuilder<'a> {
 
                 if ok {
                     matched = Some(*output_pattern);
+                    expanded = deferred;
                     break;
                 }
             }
         }
-        let matched = matched?;
+        let Some(matched) = matched else {
+            return Ok(None);
+        };
 
         let mut rule = rule.clone();
+        if let Some((inputs, order_only_inputs)) = expanded {
+            rule.deferred_prerequisites = None;
+            rule.inputs = inputs;
+            rule.order_only_inputs = order_only_inputs;
+        }
         if rule.output_patterns.len() > 1 {
             // We should mark all other output patterns as used.
             let pat = Pattern::new(matched.as_bytes(&self.ev.session));
@@ -1167,7 +1335,7 @@ impl<'a> DepBuilder<'a> {
             rule.output_patterns.clear();
             rule.output_patterns.push(matched);
         }
-        Some(Arc::new(rule))
+        Ok(Some(Arc::new(rule)))
     }
 
     fn merge_implicit_rule_vars(
@@ -1189,16 +1357,16 @@ impl<'a> DepBuilder<'a> {
     /// Step 6 of GNU Make's implicit rule search: whether an implicit rule could
     /// make this. Nothing is built here — build_plan descends into the
     /// prerequisite anyway, and the search one level down succeeds normally.
-    fn can_be_made_implicitly(&mut self, output: Symbol, depth: usize) -> bool {
+    fn can_be_made_implicitly(&mut self, output: Symbol, depth: usize) -> Result<bool> {
         if depth >= MAX_IMPLICIT_CHAIN || !self.chaining.insert(output) {
-            return false;
+            return Ok(false);
         }
         let answer = self.implicit_chain_exists(output, depth);
         self.chaining.remove(&output);
         answer
     }
 
-    fn implicit_chain_exists(&mut self, output: Symbol, depth: usize) -> bool {
+    fn implicit_chain_exists(&mut self, output: Symbol, depth: usize) -> Result<bool> {
         let output_str = output.as_bytes(&self.ev.session);
         for rule in self
             .implicit_rules
@@ -1217,39 +1385,47 @@ impl<'a> DepBuilder<'a> {
                 if !pat.matches(&output_str) {
                     continue;
                 }
-                let inputs = rule
-                    .inputs
-                    .iter()
-                    .map(|input| {
-                        let buf = pat.append_subst(&output_str, &input.as_bytes(&self.ev.session));
-                        self.ev.session.intern(buf)
-                    })
-                    .collect::<Vec<_>>();
-                if inputs
-                    .into_iter()
-                    .all(|i| self.exists(i) || self.can_be_made_implicitly(i, depth + 1))
-                {
-                    return true;
+                let inputs = match self.expanded_pattern_inputs(&rule, output, &pat, &output_str)? {
+                    Some((inputs, _)) => inputs,
+                    None => rule
+                        .inputs
+                        .iter()
+                        .map(|input| {
+                            let buf =
+                                pat.append_subst(&output_str, &input.as_bytes(&self.ev.session));
+                            self.ev.session.intern(buf)
+                        })
+                        .collect(),
+                };
+                let mut ok = true;
+                for i in inputs {
+                    if !self.exists(i) && !self.can_be_made_implicitly(i, depth + 1)? {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    return Ok(true);
                 }
             }
         }
 
         let Some(suffix) = get_ext(&output_str) else {
-            return false;
+            return Ok(false);
         };
         if !suffix.starts_with(b".") {
-            return false;
+            return Ok(false);
         }
         let Some(found) = self.suffix_rules.get(&suffix[1..]).cloned() else {
-            return false;
+            return Ok(false);
         };
         for irule in &found {
             let input = replace_suffix(&mut self.ev.session, output, &irule.inputs[0]);
-            if self.exists(input) || self.can_be_made_implicitly(input, depth + 1) {
-                return true;
+            if self.exists(input) || self.can_be_made_implicitly(input, depth + 1)? {
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
     fn matches_anything(&self, rule: &Rule) -> bool {
@@ -1258,7 +1434,11 @@ impl<'a> DepBuilder<'a> {
             .any(|p| p.as_bytes(&self.ev.session).as_ref() == b"%")
     }
 
-    fn pick_rule(&mut self, output: Symbol, n: &Arc<Mutex<DepNode>>) -> Option<PickedRuleInfo> {
+    fn pick_rule(
+        &mut self,
+        output: Symbol,
+        n: &Arc<Mutex<DepNode>>,
+    ) -> Result<Option<PickedRuleInfo>> {
         let rule_merger = self.lookup_rule_merger(output);
         let vars = self.lookup_rule_vars(output);
         if let Some(rule_merger) = &rule_merger
@@ -1268,37 +1448,39 @@ impl<'a> DepBuilder<'a> {
             for (sym, _) in &rule_merger.lock().implicit_outputs {
                 vars = self.merge_implicit_rule_vars(*sym, vars);
             }
-            return Some(PickedRuleInfo {
+            return Ok(Some(PickedRuleInfo {
                 merger: Some(rule_merger.clone()),
                 pattern_rule: None,
                 vars,
-            });
+            }));
         }
 
         // Steps 5 then 6, over the same rules. The first pass must finish
         // first: a rule whose prerequisites exist beats one whose would have to
         // be invented, however far down the list it is.
         for chaining in [false, true] {
-            if let Some(picked) = self.pick_pattern_rule(output, n, &rule_merger, &vars, chaining) {
-                return Some(picked);
+            if let Some(picked) =
+                self.pick_pattern_rule(output, n, &rule_merger, &vars, chaining)?
+            {
+                return Ok(Some(picked));
             }
         }
 
         if rule_merger.is_some() {
-            return Some(PickedRuleInfo {
+            return Ok(Some(PickedRuleInfo {
                 merger: rule_merger,
                 pattern_rule: None,
                 vars,
-            });
+            }));
         }
         // Make's step 7, and the last thing it tries. Only for a target with no
         // rule at all that is not already there.
         let default_rule = self.default_rule.clone().filter(|_| !self.exists(output));
-        default_rule.map(|rule| PickedRuleInfo {
+        Ok(default_rule.map(|rule| PickedRuleInfo {
             merger: None,
             pattern_rule: Some(rule),
             vars,
-        })
+        }))
     }
 
     fn pick_pattern_rule(
@@ -1308,63 +1490,67 @@ impl<'a> DepBuilder<'a> {
         rule_merger: &Option<Arc<Mutex<RuleMerger>>>,
         vars: &Option<Arc<Vars>>,
         chaining: bool,
-    ) -> Option<PickedRuleInfo> {
+    ) -> Result<Option<PickedRuleInfo>> {
         let irules = self.implicit_rules.get(&output.as_bytes(&self.ev.session));
         for rule in irules.into_iter().rev() {
             let Some(pattern_rule) =
-                self.can_pick_implicit_rule(&rule, output, n.clone(), chaining)
+                self.can_pick_implicit_rule(&rule, output, n.clone(), chaining)?
             else {
                 continue;
             };
             if rule_merger.is_some() {
-                return Some(PickedRuleInfo {
+                return Ok(Some(PickedRuleInfo {
                     merger: rule_merger.clone(),
                     pattern_rule: Some(pattern_rule),
                     vars: vars.clone(),
-                });
+                }));
             }
             assert!(pattern_rule.output_patterns.len() == 1);
             let vars = self.merge_implicit_rule_vars(pattern_rule.output_patterns[0], vars.clone());
-            return Some(PickedRuleInfo {
+            return Ok(Some(PickedRuleInfo {
                 merger: None,
                 pattern_rule: Some(pattern_rule),
                 vars,
-            });
+            }));
         }
 
         let output_str = output.as_bytes(&self.ev.session);
-        let output_suffix = get_ext(&output_str)?;
+        let Some(output_suffix) = get_ext(&output_str) else {
+            return Ok(None);
+        };
         if !output_suffix.starts_with(b".") {
-            return None;
+            return Ok(None);
         }
-        let found = self.suffix_rules.get(&output_suffix[1..]).cloned()?;
+        let Some(found) = self.suffix_rules.get(&output_suffix[1..]).cloned() else {
+            return Ok(None);
+        };
 
         for irule in &found {
             assert!(irule.inputs.len() == 1);
             let input = replace_suffix(&mut self.ev.session, output, &irule.inputs[0]);
-            if !self.exists(input) && !(chaining && self.can_be_made_implicitly(input, 0)) {
+            if !self.exists(input) && !(chaining && self.can_be_made_implicitly(input, 0)?) {
                 continue;
             }
 
             if rule_merger.is_some() {
-                return Some(PickedRuleInfo {
+                return Ok(Some(PickedRuleInfo {
                     merger: rule_merger.clone(),
                     pattern_rule: Some(irule.clone()),
                     vars: vars.clone(),
-                });
+                }));
             }
             let mut vars = vars.clone();
             if vars.is_some() {
                 assert!(irule.outputs.len() == 1);
                 vars = self.merge_implicit_rule_vars(irule.outputs[0], vars);
             }
-            return Some(PickedRuleInfo {
+            return Ok(Some(PickedRuleInfo {
                 merger: rule_merger.clone(),
                 pattern_rule: Some(irule.clone()),
                 vars,
-            });
+            }));
         }
-        None
+        Ok(None)
     }
 
     fn build_plan(
@@ -1389,7 +1575,7 @@ impl<'a> DepBuilder<'a> {
         );
         self.done.insert(output, n.clone());
 
-        let Some(mut picked_rule_info) = self.pick_rule(output, &n) else {
+        let Some(mut picked_rule_info) = self.pick_rule(output, &n)? else {
             return Ok(n);
         };
         if let Some(merger) = &picked_rule_info.merger
@@ -1398,7 +1584,7 @@ impl<'a> DepBuilder<'a> {
             output = merger.lock().parent_sym.unwrap();
             self.done.insert(output, n.clone());
             n.lock().output = output;
-            let Some(new_picked_rule_info) = self.pick_rule(output, &n) else {
+            let Some(new_picked_rule_info) = self.pick_rule(output, &n)? else {
                 return Ok(n);
             };
             // Update the picked_rule_info with the new values
@@ -1406,16 +1592,25 @@ impl<'a> DepBuilder<'a> {
         }
         let output_str = output.as_bytes(&self.ev.session);
 
-        let deferred = picked_rule_info
+        // A static pattern rule reaches this the same way an explicit one does,
+        // so its stem is read off the rule rather than off the search.
+        let (deferred, independent) = picked_rule_info
             .merger
             .as_ref()
             .map(|merger| {
-                merger
-                    .lock()
+                let merger = merger.lock();
+                let deferred = merger
                     .rules
                     .iter()
-                    .filter_map(|rule| rule.deferred_prerequisites.clone())
-                    .collect::<Vec<_>>()
+                    .filter(|rule| rule.deferred_prerequisites.is_some())
+                    .map(|rule| {
+                        (
+                            rule.deferred_prerequisites.clone().unwrap(),
+                            self.stem_of(rule, &output_str),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (deferred, merger.is_double_colon)
             })
             .unwrap_or_default();
         picked_rule_info
@@ -1428,8 +1623,23 @@ impl<'a> DepBuilder<'a> {
                 &picked_rule_info.pattern_rule,
                 &n,
             );
-        for text in deferred {
-            self.expand_prerequisites_again(&n, output, &text)?;
+        for (text, stem) in deferred {
+            // Each `::` rule stands on its own, so nothing another one declared
+            // is in scope for this one's automatic variables.
+            let recorded = if independent {
+                (Vec::new(), Vec::new())
+            } else {
+                let node = n.lock();
+                (
+                    node.actual_inputs.clone(),
+                    node.actual_order_only_inputs.clone(),
+                )
+            };
+            let (inputs, order_only) =
+                self.expand_prerequisites_again(output, stem, (&recorded.0, &recorded.1), &text)?;
+            let mut node = n.lock();
+            node.actual_inputs.extend(inputs);
+            node.actual_order_only_inputs.extend(order_only);
         }
         self.resolve_vpaths(&n);
         self.take_out_waits(&n);
