@@ -1462,7 +1462,9 @@ impl<'a> DepBuilder<'a> {
             rule.order_only_inputs = order_only_inputs;
         }
         if rule.output_patterns.len() > 1 {
-            // We should mark all other output patterns as used.
+            // A pattern rule with several target patterns is one recipe that
+            // makes all of them, so the rest are this node's outputs and not
+            // merely names it has already been asked about.
             let pat = Pattern::new(matched.as_bytes(&self.ev.session));
             for output_pattern in rule.output_patterns.clone() {
                 if output_pattern == matched {
@@ -1471,6 +1473,7 @@ impl<'a> DepBuilder<'a> {
                 let buf = pat.append_subst(&output_str, &output_pattern.as_bytes(&self.ev.session));
                 let sym = self.ev.session.intern(buf);
                 self.done.insert(sym, n.clone());
+                n.lock().implicit_outputs.push(sym);
             }
             rule.output_patterns.clear();
             rule.output_patterns.push(matched);
