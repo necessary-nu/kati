@@ -457,13 +457,23 @@ pub fn concat_dir(b: &[u8], n: &[u8]) -> Bytes {
     normalize_path(&r)
 }
 
-pub fn echo_escape(s: &[u8]) -> Bytes {
+/// Escape data for a double-quoted argument consumed by POSIX `printf %b`.
+///
+/// A backslash crosses two interpreters, the shell and `printf`, so it needs
+/// four backslashes. Newlines become `\n` to keep the generated command on one
+/// line. The remaining substitutions are the shell's own double-quote syntax:
+/// without them, Makefile data containing `$` or backticks would be evaluated
+/// as shell code instead of printed literally.
+pub fn escape_printf_b(s: &[u8]) -> Bytes {
     let mut buf = BytesMut::new();
     for c in s {
         match c {
             b'\\' => buf.put_slice(b"\\\\\\\\"),
             b'\n' => buf.put_slice(b"\\n"),
-            b'"' => buf.put_slice(b"\\\""),
+            b'"' | b'$' | b'`' => {
+                buf.put_u8(b'\\');
+                buf.put_u8(*c);
+            }
             _ => buf.put_u8(*c),
         }
     }
@@ -550,6 +560,14 @@ mod test {
         );
         assert_eq!(esc(b"echo $PATH"), Bytes::from_static(b"echo \\$PATH"));
         assert_eq!(esc(b"echo $$x"), Bytes::from_static(b"echo \\$\\$x"));
+    }
+
+    #[test]
+    fn test_escape_printf_b() {
+        assert_eq!(
+            escape_printf_b(b"one\\two\n\"$`"),
+            Bytes::from_static(b"one\\\\\\\\two\\n\\\"\\$\\`")
+        );
     }
 
     #[test]

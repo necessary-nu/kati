@@ -39,7 +39,7 @@ use crate::{
     parser::parse_buf,
     session::Session,
     strutil::{
-        Pattern, WordWriter, echo_escape, format_for_command_substitution,
+        Pattern, WordWriter, escape_printf_b, format_for_command_substitution,
         format_for_shell_assignment, has_path_prefix, normalize_path, trim_left_space, trim_space,
         word_scanner,
     },
@@ -869,8 +869,8 @@ fn flavor_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) ->
 /// it cannot — the manifest writer and the graph sink both evaluate with IO
 /// withheld — the text becomes a command instead, and that command has to
 /// survive being written on one line, dequoted by the shell, and then unescaped
-/// back to what the makefile said. `echo_escape` over-escapes for exactly that
-/// round trip.
+/// back to what the Makefile said. [`escape_printf_b`] encodes exactly that
+/// round trip without leaving Makefile text active as shell syntax.
 ///
 /// Upstream spells it `echo -e`, in both the C++ original and this port. That
 /// is a bashism: `/bin/sh` is dash on a Debian system, its `echo` has no `-e`,
@@ -878,14 +878,19 @@ fn flavor_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) ->
 /// the same escapes, is specified by POSIX, and needs no flag.
 const DEFERRED_OUTPUT: &[u8] = b"printf '%b\\n' \"";
 
+fn deferred_output(message: &[u8], suffix: &[u8]) -> Bytes {
+    let mut command = BytesMut::new();
+    command.put_slice(DEFERRED_OUTPUT);
+    command.put_slice(&escape_printf_b(message));
+    command.put_u8(b'"');
+    command.put_slice(suffix);
+    command.freeze()
+}
+
 fn info_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> Result<()> {
     let a = args[0].eval_to_buf(ev)?;
     if ev.avoid_io {
-        let mut s = BytesMut::new();
-        s.put_slice(DEFERRED_OUTPUT);
-        s.put_slice(&echo_escape(&a));
-        s.put_u8(b'"');
-        ev.delayed_output_commands.push(s.freeze());
+        ev.delayed_output_commands.push(deferred_output(&a, b""));
     } else {
         println!("{}", String::from_utf8_lossy(&a));
     }
@@ -895,14 +900,13 @@ fn info_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> 
 fn warning_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> Result<()> {
     let a = args[0].eval_to_buf(ev)?;
     if ev.avoid_io {
-        let mut s = BytesMut::new();
-        s.put_slice(DEFERRED_OUTPUT);
+        let mut message = BytesMut::new();
         let loc = ev.loc.clone().unwrap_or_default();
-        s.put_slice(loc.display(&ev.session).to_string().as_bytes());
-        s.put_slice(b": ");
-        s.put_slice(&echo_escape(&a));
-        s.put_slice(b"\" 2>&1");
-        ev.delayed_output_commands.push(s.freeze());
+        message.put_slice(loc.display(&ev.session).to_string().as_bytes());
+        message.put_slice(b": ");
+        message.put_slice(&a);
+        ev.delayed_output_commands
+            .push(deferred_output(&message, b" 2>&1"));
         return Ok(());
     }
     warn_loc!(ev, ev.loc.as_ref(), "{}", String::from_utf8_lossy(&a));
@@ -912,14 +916,14 @@ fn warning_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) 
 fn error_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> Result<()> {
     let a = args[0].eval_to_buf(ev)?;
     if ev.avoid_io {
-        let mut s = BytesMut::new();
-        s.put_slice(DEFERRED_OUTPUT);
+        let mut message = BytesMut::new();
         let loc = ev.loc.clone().unwrap_or_default();
-        s.put_slice(loc.display(&ev.session).to_string().as_bytes());
-        s.put_slice(b": *** ");
-        s.put_slice(&echo_escape(&a));
-        s.put_slice(b".\" 2>&1 && false");
-        ev.delayed_output_commands.push(s.freeze());
+        message.put_slice(loc.display(&ev.session).to_string().as_bytes());
+        message.put_slice(b": *** ");
+        message.put_slice(&a);
+        message.put_u8(b'.');
+        ev.delayed_output_commands
+            .push(deferred_output(&message, b" 2>&1 && false"));
         return Ok(());
     }
     error_loc!(ev, ev.loc.as_ref(), "*** {}.", String::from_utf8_lossy(&a));
@@ -1567,6 +1571,38 @@ mod tests {
 
     fn string_of(session: &Session, var: crate::var::Var) -> String {
         String::from_utf8(var.read().string(session).unwrap().into_owned()).unwrap()
+    }
+
+    /// Deferred output is Makefile data, not another opportunity to evaluate
+    /// shell syntax. Execute the generated command with `/bin/sh` so the test
+    /// covers both halves of the encoding: the shell's double quotes and
+    /// `printf %b`'s backslash processing.
+    #[test]
+    fn deferred_info_prints_shell_metacharacters_literally() {
+        let mut ev = Evaluator::new(Session::new());
+        ev.avoid_io = true;
+        let (result, out) = eval_with(
+            &mut ev,
+            r#"$(info dollars=$$HOME tick=`printf SUBSTITUTED` slashes=one\ttwo quote=")"#,
+        );
+
+        result.unwrap();
+        assert!(out.is_empty());
+        let command = ev.delayed_output_commands.pop().unwrap();
+        assert!(ev.delayed_output_commands.is_empty());
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(std::str::from_utf8(&command).unwrap())
+            .env("HOME", "EXPANDED")
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout,
+            b"dollars=$HOME tick=`printf SUBSTITUTED` slashes=one\\ttwo quote=\"\n"
+        );
+        assert!(output.stderr.is_empty());
     }
 
     /// A `foreach` body that fails partway must leave the loop variable
