@@ -801,14 +801,16 @@ impl<'a> DepBuilder<'a> {
     }
 
     fn build(&mut self, mut targets: Vec<Symbol>) -> Result<Vec<NamedDepNode>> {
-        let Some(first_rule) = self.first_rule else {
+        if !self.ev.session.flags.gen_all_targets && targets.is_empty() {
+            // Only a build with nothing to aim at has no targets. A goal was
+            // named, so a makefile holding nothing but pattern rules has one.
+            //
             // GNU Make's own wording, because its test suite matches this
             // message exactly to learn what the program under test is called.
             // The name and the `Stop.` are added on the way out.
-            error_loc!(self.ev, None, "*** No targets.");
-        };
-
-        if !self.ev.session.flags.gen_all_targets && targets.is_empty() {
+            let Some(first_rule) = self.first_rule else {
+                error_loc!(self.ev, None, "*** No targets.");
+            };
             targets.push(first_rule);
         }
         if self.ev.session.flags.gen_all_targets {
