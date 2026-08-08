@@ -36,7 +36,7 @@ use crate::session::{Context, Session};
 use crate::stats::StatsRegistry;
 use crate::stmt::{
     AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt, IncludeStmt, RuleSep, RuleStmt,
-    Statement, VpathStmt,
+    Statement, UndefineStmt, VpathStmt,
 };
 use crate::strutil::{
     Pattern, find_outside_paren, is_space_byte, trim_leading_curdir, trim_right_space, word_scanner,
@@ -437,6 +437,23 @@ impl Evaluator {
                     self.loc.clone(),
                     self,
                     &rhs_v,
+                )?;
+            }
+            // `V != cmd` runs the command the way `$(shell)` does, down to
+            // `.SHELLSTATUS`, and keeps what it printed as a simple value.
+            AssignOp::ShellEq => {
+                prev = self.peek_var_in_current_scope(lhs);
+                let ran = Value::Func {
+                    loc: self.loc.clone().unwrap_or_default(),
+                    fi: &crate::func::SHELL_ASSIGNMENT,
+                    args: vec![rhs_v],
+                };
+                result = Variable::with_simple_value(
+                    origin,
+                    current_frame,
+                    self.loc.clone(),
+                    self,
+                    &ran,
                 )?;
             }
             AssignOp::Eq => {
@@ -1053,6 +1070,24 @@ impl Evaluator {
             self.session.vpaths.push((pattern, directories));
         }
         Ok(())
+    }
+
+    /// `undefine name`, which removes the binding rather than emptying it, so
+    /// `$(origin)` and `$(flavor)` answer `undefined` afterwards.
+    ///
+    /// The whole expanded line is one name — GNU Make does not split it into
+    /// words — and it outranks what defined the variable only when the
+    /// directive carried `override`.
+    pub fn eval_undefine(&mut self, stmt: &UndefineStmt) -> Result<()> {
+        self.loc = Some(stmt.loc());
+        self.in_rule = false;
+
+        let name = stmt.expr.eval_to_buf(self)?;
+        if name.is_empty() {
+            error_loc!(self, self.loc.as_ref(), "*** empty variable name.");
+        }
+        let sym = self.session.intern(name);
+        self.session.undefine_global_var(sym, stmt.is_override)
     }
 
     pub fn eval_export(&mut self, stmt: &ExportStmt) -> Result<()> {

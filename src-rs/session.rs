@@ -181,6 +181,11 @@ impl Session {
             .assign(&self.symtab, sym, var, is_override, readonly)
     }
 
+    /// Remove a global variable, if the `undefine` outranks what defined it.
+    pub fn undefine_global_var(&mut self, sym: Symbol, is_override: bool) -> Result<()> {
+        self.globals.undefine(&self.symtab, sym, is_override)
+    }
+
     /// The names of the global variables satisfying `filter`, in symbol order.
     pub fn global_var_names<F: Fn(&Var) -> bool>(&self, filter: F) -> Vec<(Symbol, Bytes)> {
         self.globals

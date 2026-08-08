@@ -39,8 +39,9 @@ use crate::{
     parser::parse_buf,
     session::Session,
     strutil::{
-        Pattern, WordWriter, echo_escape, format_for_command_substitution, has_path_prefix,
-        normalize_path, trim_left_space, trim_space, word_scanner,
+        Pattern, WordWriter, echo_escape, format_for_command_substitution,
+        format_for_shell_assignment, has_path_prefix, normalize_path, trim_left_space, trim_space,
+        word_scanner,
     },
     var::{VarOrigin, Variable},
     warn_loc,
@@ -565,6 +566,7 @@ fn shell_func_impl(
     shellflag: &[u8],
     cmd: &Bytes,
     loc: &Loc,
+    trailing: Trailing,
 ) -> Result<(i32, Bytes, Option<FindCommand>)> {
     log!("ShellFunc: {:?}", cmd);
 
@@ -577,7 +579,10 @@ fn shell_func_impl(
 
     collect_stats_with_slow_report!(session, "func shell time", OsStr::from_bytes(cmd));
     let (status, output) = run_command(shell, shellflag, cmd, RedirectStderr::None)?;
-    let output = Bytes::from(format_for_command_substitution(output));
+    let output = Bytes::from(match trailing {
+        Trailing::Drop => format_for_command_substitution(output),
+        Trailing::Fold => format_for_shell_assignment(output),
+    });
 
     if let Some(exit_code) = status.code() {
         return Ok((exit_code, output, None));
@@ -650,7 +655,38 @@ pub struct CommandResult {
     pub loc: Loc,
 }
 
+/// What a command's run of trailing newlines becomes.
+#[derive(Clone, Copy)]
+enum Trailing {
+    /// `$(shell)` drops the run.
+    Drop,
+    /// `!=` folds it into spaces bar one, which is the only place GNU Make has
+    /// the two differ.
+    Fold,
+}
+
+/// `V != cmd`. Named `shell` for its diagnostics and absent from `FUNC_INFO`,
+/// so no makefile can call it.
+pub const SHELL_ASSIGNMENT: FuncInfo = func(b"shell", shell_assignment_func, 1);
+
+fn shell_assignment_func(
+    args: &[Arc<Value>],
+    ev: &mut Evaluator,
+    out: &mut dyn BufMut,
+) -> Result<()> {
+    shell_func_with(args, ev, out, Trailing::Fold)
+}
+
 fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
+    shell_func_with(args, ev, out, Trailing::Drop)
+}
+
+fn shell_func_with(
+    args: &[Arc<Value>],
+    ev: &mut Evaluator,
+    out: &mut dyn BufMut,
+    trailing: Trailing,
+) -> Result<()> {
     let cmd = args[0].eval_to_buf(ev)?;
     if ev.avoid_io && !has_no_io_in_shell_script(&cmd) {
         if ev.eval_depth > 1 {
@@ -673,7 +709,8 @@ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> 
     let shell = ev.get_shell()?;
     let shellflag = ev.get_shell_flag();
 
-    let (exit_code, output, fc) = shell_func_impl(&ev.session, &shell, shellflag, &cmd, &loc)?;
+    let (exit_code, output, fc) =
+        shell_func_impl(&ev.session, &shell, shellflag, &cmd, &loc, trailing)?;
     out.put_slice(&output);
     if should_store_command_result(&ev.session, &cmd) {
         ev.session.command_results.push(CommandResult {
@@ -716,7 +753,8 @@ fn shell_no_rerun_func(
     let shell = ev.get_shell()?;
     let shellflag = ev.get_shell_flag();
 
-    let (exit_code, output, _) = shell_func_impl(&ev.session, &shell, shellflag, &cmd, &loc)?;
+    let (exit_code, output, _) =
+        shell_func_impl(&ev.session, &shell, shellflag, &cmd, &loc, Trailing::Drop)?;
     out.put_slice(&output);
     ev.session.shell_status = Some(exit_code);
     Ok(())

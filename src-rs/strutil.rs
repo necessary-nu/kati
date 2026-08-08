@@ -431,6 +431,22 @@ pub fn format_for_command_substitution(mut s: Vec<u8>) -> Vec<u8> {
     s
 }
 
+/// Fold a command's output into one line for `V != cmd`.
+///
+/// Every newline becomes a space and one trailing newline is dropped, where
+/// `$(shell)` drops the whole run of them.
+pub fn format_for_shell_assignment(mut s: Vec<u8>) -> Vec<u8> {
+    if s.ends_with(b"\n") {
+        s.truncate(s.len() - 1);
+    }
+    for byte in &mut s {
+        if *byte == b'\n' {
+            *byte = b' ';
+        }
+    }
+    s
+}
+
 pub fn concat_dir(b: &[u8], n: &[u8]) -> Bytes {
     let mut r = BytesMut::new();
     if !b.is_empty() && !n.starts_with(b"/") {

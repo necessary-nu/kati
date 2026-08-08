@@ -43,6 +43,8 @@ pub enum AssignOp {
     ColonEq,
     PlusEq,
     QuestionEq,
+    /// `!=`, which runs the right-hand side and keeps what it printed.
+    ShellEq,
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -356,6 +358,47 @@ impl ExportStmt {
             orig: Bytes::new(),
             expr,
             is_export,
+        })
+    }
+}
+
+/// An `undefine` directive, which removes a variable rather than emptying it.
+pub struct UndefineStmt {
+    loc: Loc,
+    orig: Bytes,
+    pub expr: Arc<Value>,
+    pub is_override: bool,
+}
+
+impl Statement for UndefineStmt {
+    fn loc(&self) -> Loc {
+        self.loc.clone()
+    }
+    fn orig(&self) -> Bytes {
+        self.orig.clone()
+    }
+    fn eval(&self, ev: &mut Evaluator) -> Result<()> {
+        ev.eval_undefine(self)
+    }
+}
+
+impl Debug for UndefineStmt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "UndefineStmt({:?}, {}, loc={:?})",
+            self.expr, self.is_override, self.loc
+        )
+    }
+}
+
+impl UndefineStmt {
+    pub fn new(loc: Loc, expr: Arc<Value>, is_override: bool) -> Arc<UndefineStmt> {
+        Arc::new(UndefineStmt {
+            loc,
+            orig: Bytes::new(),
+            expr,
+            is_override,
         })
     }
 }
