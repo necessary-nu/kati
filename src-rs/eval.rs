@@ -182,14 +182,21 @@ struct IncludeGraph {
 /// An included Makefile that was absent while this source unit was evaluated.
 ///
 /// Evaluation continues so rules later in the Makefile can describe how to
-/// generate it. Dependency analysis then turns buildable entries into ordinary
-/// graph roots; the embedding frontend decides whether to build those roots
-/// and evaluate the source again.
+/// generate it. Dependency analysis then turns buildable entries into
+/// regeneration roots and forgets the rest, which is what GNU Make does with an
+/// included file it cannot remake; the embedding frontend decides whether to
+/// build those roots and evaluate the source again.
 #[derive(Clone)]
-pub(crate) struct MissingInclude {
-    pub(crate) filename: Symbol,
-    pub(crate) required: bool,
-    pub(crate) loc: Loc,
+pub struct MissingInclude {
+    /// The name as the `include` line spelled it, after expansion. A glob that
+    /// matched nothing is kept verbatim, because GNU Make goes on to look for a
+    /// rule making a file of that name.
+    pub filename: Symbol,
+    /// Whether the directive was `include` rather than `-include` or
+    /// `sinclude`, and therefore whether failing to remake it is fatal.
+    pub required: bool,
+    /// Where the directive was read, for the diagnostic that names it.
+    pub loc: Loc,
 }
 
 impl IncludeGraph {
@@ -549,9 +556,25 @@ impl Evaluator {
                             lhs.display(self)
                         );
                     }
-                    result =
-                        prev.read()
-                            .clone_for_assignment(origin, current_frame, self.loc.clone());
+                    // `+=` reads what is in scope and defines the result where
+                    // an ordinary assignment would, which is why precedence is
+                    // decided on the copy rather than on what it was read
+                    // from. An automatic binding is the exception kati has
+                    // never implemented: GNU Make appends through it into the
+                    // file scope it shadows, and there is no way to spell that
+                    // while the binding is a replaced global. Appending in
+                    // place is what this did before the copy existed, and it
+                    // is the closer of the two — GNU Make does not refuse.
+                    if prev.read().origin() == VarOrigin::Automatic {
+                        needs_assign = false;
+                        result = prev.clone();
+                    } else {
+                        result = prev.read().clone_for_assignment(
+                            origin,
+                            current_frame,
+                            self.loc.clone(),
+                        );
+                    }
                     if result.read().immediate_eval() {
                         let buf = rhs_v.eval_to_buf(self)?;
                         let frame = self.current_frame();

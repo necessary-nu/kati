@@ -27,7 +27,7 @@ use std::{
 
 use crate::{
     error_loc,
-    eval::{Evaluator, FrameType},
+    eval::{Evaluator, FrameType, MissingInclude},
     expr::{Evaluable, Value},
     loc::Loc,
     log,
@@ -803,8 +803,16 @@ impl<'a> DepBuilder<'a> {
     fn build(
         &mut self,
         mut targets: Vec<Symbol>,
-        additional_targets: Vec<Symbol>,
-    ) -> Result<Vec<NamedDepNode>> {
+        missing_includes: &[MissingInclude],
+    ) -> Result<(Vec<NamedDepNode>, Vec<NamedDepNode>)> {
+        // Generated included Makefiles are compiler inputs rather than user
+        // goals, and GNU Make remakes them before it picks a goal at all. Both
+        // halves of that matter here: asking the graph for one must not change
+        // what the Makefile builds once it is reread, and a required include
+        // with no rule is the failure the run dies on, ahead of the complaint
+        // about having nothing to aim at.
+        let regeneration_nodes = self.plan_regeneration(missing_includes)?;
+
         if !self.ev.session.flags.gen_all_targets && targets.is_empty() {
             // Only a build with nothing to aim at has no targets. A goal was
             // named, so a makefile holding nothing but pattern rules has one.
@@ -843,37 +851,67 @@ impl<'a> DepBuilder<'a> {
             }
         }
 
-        // Generated included Makefiles are compiler inputs rather than user
-        // goals. Add them only after default-goal selection, so asking the
-        // graph to produce one cannot change what the Makefile builds once it
-        // is reread.
-        for target in additional_targets {
-            if !targets.contains(&target) {
-                targets.push(target);
-            }
-        }
-
         // TODO: LogStats?
 
         let mut nodes = Vec::new();
         for target in targets {
-            let v = Arc::new(Vars::new());
-            self.cur_rule_vars = Some(v.clone());
-            self.ev.current_scope = Some(v.clone());
-            let n = self.build_plan(target, None)?;
-            // A goal is asked for, so it is built and it is kept: GNU Make
-            // reaches one directly rather than through the rule that wanted it,
-            // and never deletes what the command line named.
-            {
-                let mut n = n.lock();
-                n.is_intermediate = false;
-                n.is_disposable = false;
-            }
-            nodes.push((target, n));
-            self.ev.current_scope = None;
-            self.cur_rule_vars = None;
+            nodes.push((target, self.plan_root(target)?));
         }
         self.apply_wait_barriers();
+        Ok((nodes, regeneration_nodes))
+    }
+
+    /// Plan one root of the graph: a goal, or a Makefile that has to be
+    /// generated before the goals mean what they will mean.
+    fn plan_root(&mut self, target: Symbol) -> Result<Arc<Mutex<DepNode>>> {
+        let v = Arc::new(Vars::new());
+        self.cur_rule_vars = Some(v.clone());
+        self.ev.current_scope = Some(v.clone());
+        let n = self.build_plan(target, None)?;
+        // A root is asked for, so it is built and it is kept: GNU Make reaches
+        // one directly rather than through the rule that wanted it, and never
+        // deletes what the command line named.
+        {
+            let mut n = n.lock();
+            n.is_intermediate = false;
+            n.is_disposable = false;
+        }
+        self.ev.current_scope = None;
+        self.cur_rule_vars = None;
+        Ok(n)
+    }
+
+    /// Decide what to do about each Makefile the evaluation could not read.
+    ///
+    /// GNU Make looks for a rule that would make it, and what happens when
+    /// there is none depends on how it was included: `-include` and `sinclude`
+    /// forget it without a word, while `include` reports the read it could not
+    /// do and then dies naming the file as a target it cannot reach. Only the
+    /// ones with a rule come back, as roots an embedding frontend can build
+    /// before reading the Makefile again.
+    fn plan_regeneration(
+        &mut self,
+        missing_includes: &[MissingInclude],
+    ) -> Result<Vec<NamedDepNode>> {
+        let mut nodes = Vec::new();
+        for include in missing_includes {
+            let node = self.plan_root(include.filename)?;
+            if node.lock().has_rule {
+                nodes.push((include.filename, node));
+                continue;
+            }
+            if !include.required {
+                continue;
+            }
+            let name = include.filename.as_bytes(&self.ev.session);
+            let name = String::from_utf8_lossy(&name).into_owned();
+            warn_loc!(
+                self.ev,
+                Some(&include.loc),
+                "{name}: No such file or directory"
+            );
+            error_loc!(self.ev, None, "*** No rule to make target '{name}'.");
+        }
         Ok(nodes)
     }
 
@@ -2111,22 +2149,17 @@ impl<'a> DepBuilder<'a> {
     }
 }
 
-pub fn make_dep(ev: &mut Evaluator, targets: Vec<Symbol>) -> Result<Vec<NamedDepNode>> {
-    let mut db = DepBuilder::new(ev)?;
-    let _tr = ScopedTimeReporter::new(&db.ev.session, "make dep (build)");
-    db.build(targets, Vec::new())
-}
-
-/// Build the requested roots plus compiler-input roots without letting the
-/// latter participate in default-goal selection.
-pub fn make_dep_with_additional_targets(
+/// Reduce the evaluated Makefile to the roots of a graph: the goals that were
+/// asked for, and separately the generated Makefiles that have to exist before
+/// those goals mean what they will mean.
+pub fn make_dep(
     ev: &mut Evaluator,
     targets: Vec<Symbol>,
-    additional_targets: Vec<Symbol>,
-) -> Result<Vec<NamedDepNode>> {
+    missing_includes: &[MissingInclude],
+) -> Result<(Vec<NamedDepNode>, Vec<NamedDepNode>)> {
     let mut db = DepBuilder::new(ev)?;
     let _tr = ScopedTimeReporter::new(&db.ev.session, "make dep (build)");
-    db.build(targets, additional_targets)
+    db.build(targets, missing_includes)
 }
 
 /// Whether the name has the shape Make reserves: the rule for choosing a

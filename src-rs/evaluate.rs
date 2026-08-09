@@ -34,8 +34,7 @@ use anyhow::{Result, bail};
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
 
-use crate::dep::{NamedDepNode, make_dep_with_additional_targets};
-use crate::error_loc;
+use crate::dep::{NamedDepNode, make_dep};
 use crate::eval::{Evaluator, FrameType};
 use crate::expr::Value;
 use crate::file::Source;
@@ -72,9 +71,13 @@ pub struct Evaluated {
     pub nodes: Vec<NamedDepNode>,
     /// Missing included Makefiles that have rules in this provisional graph.
     ///
-    /// They are ordinary graph roots. An embedding frontend may build them and
+    /// They are graph roots like the goals, and a frontend that emits the graph
+    /// has to emit them too, but they are not goals: a build that was not asked
+    /// for one does not produce it. An embedding frontend may build them and
     /// evaluate the Makefile again, just as Ninja rebuilds and reloads its own
-    /// manifest.
+    /// manifest. Missing includes with no rule are not here at all, because
+    /// GNU Make forgets an optional one it cannot remake and dies on a required
+    /// one.
     pub regeneration_nodes: Vec<NamedDepNode>,
 }
 
@@ -370,34 +373,7 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
         );
         let _tr = ScopedTimeReporter::new(&ev.session, "make dep time");
         let missing_includes = std::mem::take(&mut ev.missing_includes);
-        let additional_targets = missing_includes
-            .iter()
-            .map(|include| include.filename)
-            .collect();
-        nodes = make_dep_with_additional_targets(&mut ev, targets, additional_targets)?;
-
-        regeneration_nodes = {
-            let mut regeneration_nodes = Vec::new();
-            for include in missing_includes {
-                let found = nodes
-                    .iter()
-                    .find(|(name, _)| *name == include.filename)
-                    .cloned();
-                if let Some(node) = found.filter(|node| node.1.lock().has_rule) {
-                    regeneration_nodes.push(node);
-                } else if include.required {
-                    let filename = include.filename;
-                    let loc = include.loc;
-                    error_loc!(
-                        &ev,
-                        Some(&loc),
-                        "{}: No such file or directory",
-                        filename.display(&ev)
-                    );
-                }
-            }
-            regeneration_nodes
-        };
+        (nodes, regeneration_nodes) = make_dep(&mut ev, targets, &missing_includes)?;
     }
 
     Ok(Evaluated {
