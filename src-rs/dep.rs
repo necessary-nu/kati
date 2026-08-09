@@ -800,7 +800,11 @@ impl<'a> DepBuilder<'a> {
         });
     }
 
-    fn build(&mut self, mut targets: Vec<Symbol>) -> Result<Vec<NamedDepNode>> {
+    fn build(
+        &mut self,
+        mut targets: Vec<Symbol>,
+        additional_targets: Vec<Symbol>,
+    ) -> Result<Vec<NamedDepNode>> {
         if !self.ev.session.flags.gen_all_targets && targets.is_empty() {
             // Only a build with nothing to aim at has no targets. A goal was
             // named, so a makefile holding nothing but pattern rules has one.
@@ -836,6 +840,16 @@ impl<'a> DepBuilder<'a> {
                 if !non_root_targets.contains(&t) && !is_special_target(&self.ev.session, &t) {
                     targets.push(t);
                 }
+            }
+        }
+
+        // Generated included Makefiles are compiler inputs rather than user
+        // goals. Add them only after default-goal selection, so asking the
+        // graph to produce one cannot change what the Makefile builds once it
+        // is reread.
+        for target in additional_targets {
+            if !targets.contains(&target) {
+                targets.push(target);
             }
         }
 
@@ -2100,7 +2114,19 @@ impl<'a> DepBuilder<'a> {
 pub fn make_dep(ev: &mut Evaluator, targets: Vec<Symbol>) -> Result<Vec<NamedDepNode>> {
     let mut db = DepBuilder::new(ev)?;
     let _tr = ScopedTimeReporter::new(&db.ev.session, "make dep (build)");
-    db.build(targets)
+    db.build(targets, Vec::new())
+}
+
+/// Build the requested roots plus compiler-input roots without letting the
+/// latter participate in default-goal selection.
+pub fn make_dep_with_additional_targets(
+    ev: &mut Evaluator,
+    targets: Vec<Symbol>,
+    additional_targets: Vec<Symbol>,
+) -> Result<Vec<NamedDepNode>> {
+    let mut db = DepBuilder::new(ev)?;
+    let _tr = ScopedTimeReporter::new(&db.ev.session, "make dep (build)");
+    db.build(targets, additional_targets)
 }
 
 /// Whether the name has the shape Make reserves: the rule for choosing a

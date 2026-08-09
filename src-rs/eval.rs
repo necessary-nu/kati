@@ -177,6 +177,19 @@ struct IncludeGraph {
     include_stack: Vec<Arc<Frame>>,
 }
 
+/// An included Makefile that was absent while this source unit was evaluated.
+///
+/// Evaluation continues so rules later in the Makefile can describe how to
+/// generate it. Dependency analysis then turns buildable entries into ordinary
+/// graph roots; the embedding frontend decides whether to build those roots
+/// and evaluate the source again.
+#[derive(Clone)]
+pub(crate) struct MissingInclude {
+    pub(crate) filename: Symbol,
+    pub(crate) required: bool,
+    pub(crate) loc: Loc,
+}
+
 impl IncludeGraph {
     fn new() -> Self {
         Self {
@@ -292,6 +305,9 @@ pub struct Evaluator {
 
     pub profiled_files: Vec<OsString>,
 
+    /// Missing `include` and `-include` inputs, in source order.
+    pub(crate) missing_includes: Vec<MissingInclude>,
+
     pub is_evaluating_command: bool,
     /// Whether expanding the current recipe referenced `MAKE`.
     ///
@@ -361,6 +377,8 @@ impl Evaluator {
             export_allowed: ExportAllowed::Allowed,
 
             profiled_files: Vec::new(),
+
+            missing_includes: Vec::new(),
 
             is_evaluating_command: false,
             expanded_make_in_command: Vec::new(),
@@ -986,6 +1004,23 @@ impl Evaluator {
         pat
     }
 
+    fn note_missing_include(&mut self, filename: Bytes, required: bool, loc: Loc) {
+        let filename = self.session.intern(filename);
+        if let Some(existing) = self
+            .missing_includes
+            .iter_mut()
+            .find(|include| include.filename == filename)
+        {
+            existing.required |= required;
+            return;
+        }
+        self.missing_includes.push(MissingInclude {
+            filename,
+            required,
+            loc,
+        });
+    }
+
     pub fn eval_include(&mut self, stmt: &IncludeStmt) -> Result<()> {
         self.loc = Some(stmt.loc());
         self.in_rule = false;
@@ -996,10 +1031,10 @@ impl Evaluator {
             let pat = self.at_include_dirs(pat);
             let files = self.session.glob(pat.clone());
 
-            if stmt.should_exist {
-                match files.as_ref() {
-                    Err(err) => {
-                        // TODO: Kati does not support building a missing include file.
+            let missing = match files.as_ref() {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                Err(err) => {
+                    if stmt.should_exist {
                         error_loc!(
                             self,
                             self.loc.as_ref(),
@@ -1007,17 +1042,13 @@ impl Evaluator {
                             String::from_utf8_lossy(&pat)
                         );
                     }
-                    Ok(files) => {
-                        if files.is_empty() {
-                            error_loc!(
-                                self,
-                                self.loc.as_ref(),
-                                "{}: Not found",
-                                String::from_utf8_lossy(&pat)
-                            );
-                        }
-                    }
+                    continue;
                 }
+                Ok(files) => files.is_empty(),
+            };
+            if missing {
+                self.note_missing_include(pat, stmt.should_exist, stmt.loc());
+                continue;
             }
             let Ok(files) = files.as_ref() else {
                 continue;

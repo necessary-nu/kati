@@ -34,7 +34,8 @@ use anyhow::{Result, bail};
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
 
-use crate::dep::{NamedDepNode, make_dep};
+use crate::dep::{NamedDepNode, make_dep_with_additional_targets};
+use crate::error_loc;
 use crate::eval::{Evaluator, FrameType};
 use crate::expr::Value;
 use crate::loc::Loc;
@@ -68,6 +69,12 @@ pub struct Evaluated {
     /// The roots of the dependency graph, in the order the targets asked for
     /// them.
     pub nodes: Vec<NamedDepNode>,
+    /// Missing included Makefiles that have rules in this provisional graph.
+    ///
+    /// They are ordinary graph roots. An embedding frontend may build them and
+    /// evaluate the Makefile again, just as Ninja rebuilds and reloads its own
+    /// manifest.
+    pub regeneration_nodes: Vec<NamedDepNode>,
 }
 
 /// The Makefile kati reads before the real one.
@@ -265,6 +272,7 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
     }
 
     let nodes;
+    let regeneration_nodes;
     {
         let _frame = ev.enter(
             FrameType::Phase,
@@ -272,8 +280,40 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
             Loc::default(),
         );
         let _tr = ScopedTimeReporter::new(&ev.session, "make dep time");
-        nodes = make_dep(&mut ev, targets)?;
+        let missing_includes = std::mem::take(&mut ev.missing_includes);
+        let additional_targets = missing_includes
+            .iter()
+            .map(|include| include.filename)
+            .collect();
+        nodes = make_dep_with_additional_targets(&mut ev, targets, additional_targets)?;
+
+        regeneration_nodes = {
+            let mut regeneration_nodes = Vec::new();
+            for include in missing_includes {
+                let found = nodes
+                    .iter()
+                    .find(|(name, _)| *name == include.filename)
+                    .cloned();
+                if let Some(node) = found.filter(|node| node.1.lock().has_rule) {
+                    regeneration_nodes.push(node);
+                } else if include.required {
+                    let filename = include.filename;
+                    let loc = include.loc;
+                    error_loc!(
+                        &ev,
+                        Some(&loc),
+                        "{}: No such file or directory",
+                        filename.display(&ev)
+                    );
+                }
+            }
+            regeneration_nodes
+        };
     }
 
-    Ok(Evaluated { ev, nodes })
+    Ok(Evaluated {
+        ev,
+        nodes,
+        regeneration_nodes,
+    })
 }

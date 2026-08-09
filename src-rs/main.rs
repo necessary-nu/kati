@@ -76,7 +76,7 @@ fn run(session: Session, orig_args: OsString) -> Result<i32> {
         session.clear_glob_cache();
     }
 
-    let Evaluated { mut ev, nodes } = evaluate(session)?;
+    let Evaluated { mut ev, nodes, .. } = evaluate(session)?;
 
     if ev.session.flags.is_syntax_check_only {
         return Ok(0);
