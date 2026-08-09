@@ -26,11 +26,12 @@ use bytes::{Buf, Bytes};
 use memchr::memchr;
 use parking_lot::Mutex;
 
-use crate::expr::Evaluable;
-use crate::expr::Value;
+use crate::expr::{Evaluable, ParseExprOpt, Value, parse_expr};
 use crate::flags::Flags;
 use crate::loc::Loc;
-use crate::parser::{parse_assign_statement, parse_buf_no_stats, take_assign_modifiers};
+use crate::parser::{
+    is_variable_name, parse_assign_statement, parse_buf_no_stats, strip_assign_modifiers,
+};
 use crate::rule::{Rule, glob_word, is_pattern_rule};
 use crate::session::{Context, Session};
 use crate::stats::StatsRegistry;
@@ -428,6 +429,20 @@ impl Evaluator {
         self.is_commandline = false;
     }
 
+    /// Snapshot command-line bindings in the recursive environment form GNU
+    /// Make makes visible again while expanding a recipe after `override
+    /// undefine` removed the makefile-scope value.
+    pub fn capture_command_line_environment(&mut self) {
+        let variables = self
+            .session
+            .globals
+            .matching(|var| var.read().origin() == VarOrigin::CommandLine);
+        for (name, variable) in variables {
+            let recursive = variable.read().clone_for_recipe_environment();
+            self.session.recipe_command_line.define(name, recursive);
+        }
+    }
+
     pub fn current_frame(&self) -> Arc<Frame> {
         self.stack.lock().last().unwrap().clone()
     }
@@ -465,8 +480,34 @@ impl Evaluator {
                     &rhs_v,
                 )?;
             }
+            AssignOp::ImmediateRecursive => {
+                prev = self.peek_var_in_current_scope(lhs);
+                let expanded = rhs_v.eval_to_buf(self)?;
+                let mut escaped = Vec::with_capacity(expanded.len());
+                for byte in expanded {
+                    if byte == b'$' {
+                        escaped.push(byte);
+                    }
+                    escaped.push(byte);
+                }
+                let escaped = Bytes::from(escaped);
+                let mut loc = self.loc.clone().unwrap_or_default();
+                let value = parse_expr(
+                    &mut self.session,
+                    &mut loc,
+                    escaped.clone(),
+                    ParseExprOpt::Normal,
+                )?;
+                result = Variable::new_recursive(
+                    value,
+                    origin,
+                    current_frame,
+                    self.loc.clone(),
+                    escaped,
+                );
+            }
             // `V != cmd` runs the command the way `$(shell)` does, down to
-            // `.SHELLSTATUS`, and keeps what it printed as a simple value.
+            // `.SHELLSTATUS`, then reads its output as a recursive value.
             AssignOp::ShellEq => {
                 prev = self.peek_var_in_current_scope(lhs);
                 let ran = Value::Func {
@@ -474,13 +515,16 @@ impl Evaluator {
                     fi: &crate::func::SHELL_ASSIGNMENT,
                     args: vec![rhs_v],
                 };
-                result = Variable::with_simple_value(
-                    origin,
-                    current_frame,
-                    self.loc.clone(),
-                    self,
-                    &ran,
+                let output = ran.eval_to_buf(self)?;
+                let mut loc = self.loc.clone().unwrap_or_default();
+                let value = parse_expr(
+                    &mut self.session,
+                    &mut loc,
+                    output.clone(),
+                    ParseExprOpt::Normal,
                 )?;
+                result =
+                    Variable::new_recursive(value, origin, current_frame, self.loc.clone(), output);
             }
             AssignOp::Eq => {
                 prev = self.peek_var_in_current_scope(lhs);
@@ -503,7 +547,9 @@ impl Evaluator {
                             lhs.display(self)
                         );
                     }
-                    result = prev;
+                    result =
+                        prev.read()
+                            .clone_for_assignment(origin, current_frame, self.loc.clone());
                     if result.read().immediate_eval() {
                         let buf = rhs_v.eval_to_buf(self)?;
                         let frame = self.current_frame();
@@ -517,7 +563,6 @@ impl Evaluator {
                             self.loc.as_ref(),
                         )?;
                     }
-                    needs_assign = false;
                 } else {
                     result = Variable::new_recursive(
                         rhs_v,
@@ -595,6 +640,7 @@ impl Evaluator {
             is_override,
         )?;
         if needs_assign {
+            var.write().assign_op = Some(stmt.op);
             let mut readonly = false;
             self.session
                 .set_global_var(lhs, var.clone(), is_override, Some(&mut readonly))?;
@@ -693,7 +739,15 @@ impl Evaluator {
         separator_pos: usize,
     ) -> Result<()> {
         let assign = parse_assign_statement(after_targets, separator_pos);
-        let (name, is_private) = take_assign_modifiers(assign.lhs);
+        let modifiers = stmt.assign_modifiers;
+        let name = strip_assign_modifiers(assign.lhs, modifiers.words);
+        if !is_variable_name(name) {
+            error_loc!(
+                self,
+                self.loc.as_ref(),
+                "*** target-specific variable name must be one word."
+            );
+        }
         let var_sym = self.session.intern(after_targets.slice_ref(name));
         let is_final = stmt.sep == RuleSep::FinalEq;
         for target in targets {
@@ -737,7 +791,7 @@ impl Evaluator {
                     rhs.unwrap(),
                     Bytes::from_static(b"*TODO*"),
                     assign.op,
-                    false,
+                    modifiers.directive.is_override,
                 )?;
                 if needs_assign {
                     let mut readonly = false;
@@ -756,7 +810,7 @@ impl Evaluator {
                         );
                     }
                 }
-                if is_private {
+                if modifiers.directive.is_private {
                     rhs_var.write().is_private = true;
                 }
                 if is_final {
@@ -1299,12 +1353,16 @@ impl Evaluator {
         }
 
         if result.is_none() {
-            result = self.lookup_var_global(name);
+            let global = self.lookup_var_global(name);
+            result = global.clone();
             // A rule's scope reaches the global one through a parent, which is
             // the boundary `private` refuses to cross: from inside a rule the
             // variable is not there at all, so `$(origin)` says undefined.
             if self.current_scope.is_some() {
                 result = result.filter(|var| !var.read().is_private);
+            }
+            if global.is_none() && self.is_evaluating_command {
+                result = self.session.recipe_command_line.peek(name);
             }
         }
 

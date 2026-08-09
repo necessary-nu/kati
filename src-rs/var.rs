@@ -69,7 +69,7 @@ pub fn get_origin_str(origin: VarOrigin) -> &'static str {
 
 pub type Var = Arc<RwLock<Variable>>;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Variable {
     loc: Option<Loc>,
 
@@ -90,7 +90,7 @@ pub struct Variable {
     value: InnerVar,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum InnerVar {
     Simple(Vec<u8>),
     Recursive { v: Arc<Value>, orig: Bytes },
@@ -161,6 +161,38 @@ impl Variable {
     }
     pub fn immediate_eval(&self) -> bool {
         matches!(&self.value, InnerVar::Simple(_))
+    }
+
+    /// Copy an existing value before appending, changing only the provenance
+    /// of the assignment that will replace it if precedence permits.
+    pub fn clone_for_assignment(
+        &self,
+        origin: VarOrigin,
+        definition: Option<Arc<Frame>>,
+        loc: Option<Loc>,
+    ) -> Var {
+        let mut variable = self.clone();
+        variable.origin = origin;
+        variable.definition = definition;
+        variable.loc = loc;
+        Arc::new(RwLock::new(variable))
+    }
+
+    /// Copy a command-line value into the recursive environment form recipes
+    /// receive. Recursive expressions stay deferred; simple values become
+    /// literal recursive expressions without being evaluated again.
+    pub fn clone_for_recipe_environment(&self) -> Var {
+        let mut variable = self.clone();
+        if let InnerVar::Simple(value) = &variable.value {
+            let value = Bytes::from(value.clone());
+            variable.value = InnerVar::Recursive {
+                v: Arc::new(Value::Literal(None, value.clone())),
+                orig: value,
+            };
+        }
+        variable.origin = VarOrigin::Environment;
+        variable.assign_op = None;
+        Arc::new(RwLock::new(variable))
     }
     pub fn append_var(
         &mut self,
@@ -420,14 +452,6 @@ impl Evaluable for Variable {
                 a.eval(ev, out)?;
             }
             InnerVar::ShellStatus => {
-                if ev.is_evaluating_command {
-                    error_loc!(
-                        ev,
-                        ev.loc.as_ref(),
-                        "Kati does not support using .SHELLSTATUS inside of a rule"
-                    );
-                }
-
                 if let Some(status) = ev.session.shell_status {
                     out.put_slice(format!("{status}").as_bytes());
                 }
@@ -491,6 +515,10 @@ impl GlobalVars {
     pub fn with_builtins() -> Self {
         let mut vars = Self::new();
         vars.define(Symbol::SHELLSTATUS, Variable::new_shell_status_var());
+        vars.define(
+            Symbol::RECIPEPREFIX,
+            Variable::with_simple_string(Bytes::new(), VarOrigin::Default, None, None),
+        );
         vars.define(
             Symbol::VARIABLES,
             Variable::new_variable_names(b".VARIABLES", true),
@@ -664,8 +692,15 @@ impl Vars {
                 *readonly = true;
                 return Ok(());
             }
+            let assigning = var.read().origin();
             match orig.read().origin() {
-                VarOrigin::Override | VarOrigin::EnvironmentOverride => return Ok(()),
+                VarOrigin::Override if assigning != VarOrigin::Override => return Ok(()),
+                VarOrigin::EnvironmentOverride
+                    if !matches!(assigning, VarOrigin::CommandLine | VarOrigin::Override) =>
+                {
+                    return Ok(());
+                }
+                VarOrigin::CommandLine if assigning == VarOrigin::File => return Ok(()),
                 VarOrigin::Automatic => {
                     error!("overriding automatic variable is not implemented yet");
                 }
@@ -795,6 +830,7 @@ mod tests {
     fn test_builtins_are_scope_state() {
         let scope = GlobalVars::with_builtins();
         assert!(scope.peek(Symbol::SHELLSTATUS).is_some());
+        assert!(scope.peek(Symbol::RECIPEPREFIX).is_some());
         // A scope without builtins: the name is interned all the same but has
         // no binding.
         assert!(GlobalVars::new().peek(Symbol::SHELLSTATUS).is_none());

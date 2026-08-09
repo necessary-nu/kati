@@ -41,6 +41,9 @@ pub trait Statement: Debug {
 pub enum AssignOp {
     Eq,
     ColonEq,
+    /// POSIX `:::=`: expand now, but keep a recursively expanded value whose
+    /// dollars survive until the variable is read.
+    ImmediateRecursive,
     PlusEq,
     QuestionEq,
     /// `!=`, which runs the right-hand side and keeps what it printed.
@@ -54,6 +57,13 @@ pub struct AssignDirective {
     /// `private`: the variable is defined, and withheld from every scope that
     /// reaches this one through a parent.
     pub is_private: bool,
+}
+
+/// Literal modifier words parsed before a target-specific variable name.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct AssignModifiers {
+    pub directive: AssignDirective,
+    pub words: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +89,7 @@ pub struct RuleStmt {
     pub lhs: Arc<Value>,
     pub sep: RuleSep,
     pub rhs: Option<Arc<Value>>,
+    pub assign_modifiers: AssignModifiers,
 }
 
 impl Statement for RuleStmt {
@@ -106,13 +117,20 @@ impl Debug for RuleStmt {
 }
 
 impl RuleStmt {
-    pub fn new(loc: Loc, lhs: Arc<Value>, sep: RuleSep, rhs: Option<Arc<Value>>) -> Arc<RuleStmt> {
+    pub fn new(
+        loc: Loc,
+        lhs: Arc<Value>,
+        sep: RuleSep,
+        rhs: Option<Arc<Value>>,
+        assign_modifiers: AssignModifiers,
+    ) -> Arc<RuleStmt> {
         Arc::new(RuleStmt {
             loc,
             orig: Bytes::new(),
             lhs,
             sep,
             rhs,
+            assign_modifiers,
         })
     }
 }

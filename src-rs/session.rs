@@ -75,6 +75,10 @@ pub struct Session {
     pub symtab: Symtab,
     /// Make's outermost variable scope, keyed by interned symbol.
     pub globals: GlobalVars,
+    /// Command-line values as recipes receive them through Make's exported
+    /// environment, retained even when `override undefine` removes the
+    /// makefile-scope binding.
+    pub(crate) recipe_command_line: GlobalVars,
     /// Named timing and count collection sites.
     pub stats: StatsRegistry,
 
@@ -141,6 +145,7 @@ impl Session {
             invocation_environment: None,
             symtab,
             globals: GlobalVars::with_builtins(),
+            recipe_command_line: GlobalVars::new(),
             stats: StatsRegistry::new(),
             glob_cache: GlobCache::default(),
             makefiles: MakefileCache::new(),

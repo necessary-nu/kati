@@ -27,8 +27,8 @@ use crate::{
     loc::Loc,
     session::Session,
     stmt::{
-        AssignDirective, AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt,
-        IncludeStmt, RuleSep, RuleStmt, Stmt, UndefineStmt, VpathStmt,
+        AssignDirective, AssignModifiers, AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt,
+        IfStmt, IncludeStmt, RuleSep, RuleStmt, Stmt, UndefineStmt, VpathStmt,
     },
     strutil::{
         find_end_of_line, find_outside_paren, trim_left_space, trim_right_space, trim_space,
@@ -62,6 +62,7 @@ struct Parser<'a> {
     out_stmts: Arc<Mutex<Vec<Stmt>>>,
 
     define_name: Option<Bytes>,
+    define_op: AssignOp,
     num_define_nest: i32,
     define_start: usize,
     define_start_line: i32,
@@ -97,6 +98,7 @@ impl<'a> Parser<'a> {
             out_stmts: stmts,
 
             define_name: None,
+            define_op: AssignOp::Eq,
             num_define_nest: 0,
             define_start: 0,
             define_start_line: 0,
@@ -203,13 +205,20 @@ impl<'a> Parser<'a> {
         let s = &line[sep..];
         if s.starts_with(b";") {
             return self.parse_rule(line, None);
-        } else if s.starts_with(b"=") || s[1..].starts_with(b"=") {
-            let sep = if s.starts_with(b"=") { sep } else { sep + 1 };
+        } else if s.starts_with(b"=") {
             if sep != 0 && !is_variable_name(parse_assign_statement(&line, sep).lhs) {
                 return self.parse_rule(line, None);
             }
             return self.parse_assign(line, sep);
         } else if s.starts_with(b":") {
+            let colons = s.iter().take_while(|byte| **byte == b':').count();
+            if (1..=3).contains(&colons) && s.get(colons) == Some(&b'=') {
+                let assign_sep = sep + colons;
+                if sep != 0 && !is_variable_name(parse_assign_statement(&line, assign_sep).lhs) {
+                    return self.parse_rule(line, None);
+                }
+                return self.parse_assign(line, assign_sep);
+            }
             return self.parse_rule(line, Some(sep));
         }
         unreachable!()
@@ -245,6 +254,7 @@ impl<'a> Parser<'a> {
         let rule_lhs: Arc<Value>;
         let mut rule_sep = RuleSep::Null;
         let rule_rhs: Option<Arc<Value>>;
+        let mut assign_modifiers = AssignModifiers::default();
 
         let sep_plus_one = sep.map(|sep| sep + 1).unwrap_or(0);
 
@@ -265,6 +275,11 @@ impl<'a> Parser<'a> {
                 found += 2;
             } else if line[found..].starts_with(b"=") {
                 rule_sep = RuleSep::Eq;
+                if sep.is_some() {
+                    let assignment = &line[sep_plus_one..];
+                    let parsed = parse_assign_statement(assignment, found - sep_plus_one);
+                    assign_modifiers = take_assign_modifiers(parsed.lhs).1;
+                }
             }
             let opt = match rule_sep {
                 RuleSep::Semicolon => ParseExprOpt::Command,
@@ -281,9 +296,13 @@ impl<'a> Parser<'a> {
             rule_rhs = None;
         }
         self.after_rule = true;
-        self.out_stmts
-            .lock()
-            .push(RuleStmt::new(rule_loc, rule_lhs, rule_sep, rule_rhs));
+        self.out_stmts.lock().push(RuleStmt::new(
+            rule_loc,
+            rule_lhs,
+            rule_sep,
+            rule_rhs,
+            assign_modifiers,
+        ));
         Ok(())
     }
 
@@ -376,7 +395,14 @@ impl<'a> Parser<'a> {
         if line.is_empty() {
             error_loc!(&*self.session, Some(&self.loc), "*** empty variable name.");
         }
-        self.define_name = Some(line);
+        if let Some(separator) = find_outside_paren(&line, b"=") {
+            let assign = parse_assign_statement(&line, separator);
+            self.define_name = Some(line.slice_ref(assign.lhs));
+            self.define_op = assign.op;
+        } else {
+            self.define_name = Some(line);
+            self.define_op = AssignOp::Eq;
+        }
         self.num_define_nest = 1;
         self.define_start = 0;
         self.define_start_line = self.loc.line;
@@ -439,11 +465,12 @@ impl<'a> Parser<'a> {
             lhs,
             rhs,
             orig_rhs,
-            AssignOp::Eq,
+            self.define_op,
             self.current_directive,
             false,
         ));
         self.define_name = None;
+        self.define_op = AssignOp::Eq;
         Ok(())
     }
 
@@ -874,7 +901,7 @@ fn starts_assignment(rest: &[u8]) -> bool {
 /// assignment at all and is read as a rule, which then has no separator. Blanks
 /// inside a `$(...)` reference do not divide the name, since the reference is
 /// one token however it expands.
-fn is_variable_name(name: &[u8]) -> bool {
+pub(crate) fn is_variable_name(name: &[u8]) -> bool {
     let mut depth = 0usize;
     for byte in name {
         match byte {
@@ -895,18 +922,33 @@ fn is_variable_name(name: &[u8]) -> bool {
 /// to `private` rather than declaring one. `export`, `unexport` and `override`
 /// are keywords in this position too and are taken off the name; what they mean
 /// for a target-specific variable is not this.
-pub fn take_assign_modifiers(name: &[u8]) -> (&[u8], bool) {
+pub fn take_assign_modifiers(name: &[u8]) -> (&[u8], AssignModifiers) {
     let mut name = name;
-    let mut is_private = false;
+    let mut modifiers = AssignModifiers::default();
     while let Some(end) = memchr2(b' ', b'\t', name) {
         match &name[..end] {
-            b"private" => is_private = true,
-            b"export" | b"unexport" | b"override" => {}
+            b"private" => modifiers.directive.is_private = true,
+            b"export" => modifiers.directive.export = true,
+            b"override" => modifiers.directive.is_override = true,
+            b"unexport" => {}
             _ => break,
         }
+        modifiers.words += 1;
         name = trim_left_space(&name[end..]);
     }
-    (name, is_private)
+    (name, modifiers)
+}
+
+/// Remove the modifier words the parser saw literally. Expanded text that
+/// happens to spell a modifier is part of the variable name, not a keyword.
+pub fn strip_assign_modifiers(mut name: &[u8], words: usize) -> &[u8] {
+    for _ in 0..words {
+        let Some(end) = memchr2(b' ', b'\t', name) else {
+            return name;
+        };
+        name = trim_left_space(&name[end..]);
+    }
+    name
 }
 
 pub struct ParsedAssign<'a> {
@@ -918,7 +960,13 @@ pub fn parse_assign_statement(line: &[u8], sep: usize) -> ParsedAssign<'_> {
     assert!(sep != 0);
     let mut op = AssignOp::Eq;
     let mut lhs = &line[..sep];
-    if lhs.ends_with(b":") {
+    if lhs.ends_with(b":::") {
+        lhs = &lhs[..lhs.len() - 3];
+        op = AssignOp::ImmediateRecursive;
+    } else if lhs.ends_with(b"::") {
+        lhs = &lhs[..lhs.len() - 2];
+        op = AssignOp::ColonEq;
+    } else if lhs.ends_with(b":") {
         lhs = &lhs[..lhs.len() - 1];
         op = AssignOp::ColonEq;
     } else if lhs.ends_with(b"+") {
@@ -956,16 +1004,34 @@ mod tests {
     /// word left over is the name however it is spelled.
     #[test]
     fn modifiers_come_off_a_target_specific_name() {
-        for (line, name, is_private) in [
-            (b"F".as_slice(), b"F".as_slice(), false),
-            (b"private F", b"F", true),
-            (b"export override private _X", b"_X", true),
-            (b"private override B", b"B", true),
-            (b"override X", b"X", false),
-            (b"private", b"private", false),
-            (b"X Y", b"X Y", false),
+        for (line, name, words, is_private) in [
+            (b"F".as_slice(), b"F".as_slice(), 0, false),
+            (b"private F", b"F", 1, true),
+            (b"export override private _X", b"_X", 3, true),
+            (b"private override B", b"B", 2, true),
+            (b"override X", b"X", 1, false),
+            (b"private", b"private", 0, false),
+            (b"X Y", b"X Y", 0, false),
         ] {
-            assert_eq!(take_assign_modifiers(line), (name, is_private));
+            let (actual, modifiers) = take_assign_modifiers(line);
+            assert_eq!(actual, name);
+            assert_eq!(modifiers.words, words);
+            assert_eq!(modifiers.directive.is_private, is_private);
+            assert_eq!(strip_assign_modifiers(line, words), name);
+        }
+    }
+
+    #[test]
+    fn posix_assignment_operators_are_distinct() {
+        for (line, separator, name, op) in [
+            (b"x:=y".as_slice(), 2, b"x".as_slice(), AssignOp::ColonEq),
+            (b"x::=y", 3, b"x", AssignOp::ColonEq),
+            (b"x:::=y", 4, b"x", AssignOp::ImmediateRecursive),
+        ] {
+            let assign = parse_assign_statement(line, separator);
+            assert_eq!(assign.lhs, name);
+            assert_eq!(assign.op, op);
+            assert_eq!(assign.rhs, b"y");
         }
     }
 

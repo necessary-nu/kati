@@ -70,6 +70,7 @@ const WELL_KNOWN: &[&[u8]] = &[
     b"MAKEFILE_LIST",
     b".POSIX",
     b".SHELLSTATUS",
+    b".RECIPEPREFIX",
 ];
 
 /// Slot 0 is reserved and slots 1..=255 are the single-byte names.
@@ -103,6 +104,7 @@ impl Symbol {
     pub const MAKEFILE_LIST: Symbol = Symbol::well_known(6);
     pub const POSIX: Symbol = Symbol::well_known(7);
     pub const SHELLSTATUS: Symbol = Symbol::well_known(8);
+    pub const RECIPEPREFIX: Symbol = Symbol::well_known(9);
 
     /// The bytes this handle was interned from, as borrowed from `names`.
     // [spec:ronin:req:make.no-ambient-state]
@@ -301,10 +303,12 @@ mod tests {
             Symbol::MAKEFILE_LIST,
             Symbol::POSIX,
             Symbol::SHELLSTATUS,
+            Symbol::RECIPEPREFIX,
         ] {
             assert_eq!(a.name(sym), b.name(sym));
         }
         assert_eq!(a.name(Symbol::SHELL), Bytes::from_static(b"SHELL"));
         assert_eq!(b.intern("SHELL"), Symbol::SHELL);
+        assert_eq!(b.intern(".RECIPEPREFIX"), Symbol::RECIPEPREFIX);
     }
 }

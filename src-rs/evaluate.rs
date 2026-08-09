@@ -240,6 +240,7 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
             assert!(asts.len() == 1);
             asts[0].eval(&mut ev)?;
         }
+        ev.capture_command_line_environment();
     }
     ev.in_toplevel_makefile();
 

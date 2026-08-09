@@ -33,6 +33,7 @@ use crate::{
     var::Variable,
 };
 
+#[derive(Clone)]
 pub struct AutoCommandVar {
     typ: AutoCommand,
     sym: Symbol,
