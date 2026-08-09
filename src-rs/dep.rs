@@ -263,8 +263,9 @@ impl RuleTrie {
     }
 }
 
-/// GNU Make's `new_pattern_rule` compares dependency names in order, but not
-/// whether the `|` made one of them order-only.
+/// GNU Make's `new_pattern_rule` compares one dependency-name chain across
+/// both paths. Immediate prerequisites contribute their parsed names, while a
+/// list retained for second expansion contributes its whole text as one name.
 fn pattern_rule_prerequisites_match(rule: &Rule, existing: &Rule) -> bool {
     rule.prerequisite_names == existing.prerequisite_names
 }

@@ -25,7 +25,7 @@ use crate::expr::Value;
 use crate::loc::Loc;
 use crate::session::Session;
 use crate::stmt::{RuleSep, RuleStmt};
-use crate::strutil::{Pattern, trim_leading_curdir, word_scanner};
+use crate::strutil::{Pattern, trim_leading_curdir, trim_space, word_scanner};
 use crate::symtab::Symbol;
 use crate::{error_loc, warn_loc};
 
@@ -40,9 +40,9 @@ pub struct Rule {
     pub is_suffix_rule: bool,
     /// Set when `.SECONDEXPANSION` was declared before this rule was read.
     pub expand_again: bool,
-    /// The first-expanded prerequisite names used to identify a pattern-rule
-    /// definition. The order-only marker changes how a name is scheduled, not
-    /// its place in GNU Make's `new_pattern_rule` comparison.
+    /// The dependency-name chain GNU Make's `new_pattern_rule` compares. An
+    /// immediately parsed list contributes each dependency name; a deferred
+    /// list contributes its entire retained text as one name.
     pub prerequisite_names: Vec<Symbol>,
     /// The prerequisite text as the first expansion left it, kept unparsed for
     /// the second one. Only a list that still has a `$` in it: everything else
@@ -75,33 +75,31 @@ impl Rule {
 
     fn parse_inputs(&mut self, session: &mut Session, inputs_str: &Bytes) {
         let (inputs, order_only) = split_order_only(inputs_str);
-        let inputs_start = self.inputs.len();
         for input in word_scanner(&inputs) {
             let word = inputs.slice_ref(trim_leading_curdir(input));
+            let identity_start = self.inputs.len();
             glob_word(session, word, &mut self.inputs);
-        }
-        let order_only_start = self.order_only_inputs.len();
-        for input in word_scanner(&order_only) {
-            let word = order_only.slice_ref(trim_leading_curdir(input));
-            glob_word(session, word, &mut self.order_only_inputs);
-        }
-        self.prerequisite_names
-            .extend_from_slice(&self.inputs[inputs_start..]);
-        self.prerequisite_names
-            .extend_from_slice(&self.order_only_inputs[order_only_start..]);
-    }
-
-    /// Record the names in a list whose raw text must survive for second
-    /// expansion. Splitting the words here makes whitespace and `|`
-    /// classification independent from the bytes retained for later expansion.
-    fn record_deferred_prerequisite_names(&mut self, session: &mut Session, inputs_str: &Bytes) {
-        let (inputs, order_only) = split_order_only(inputs_str);
-        for text in [inputs, order_only] {
-            for input in word_scanner(&text) {
-                let word = text.slice_ref(trim_leading_curdir(input));
-                self.prerequisite_names.push(session.intern(word));
+            if input != b".WAIT" {
+                self.prerequisite_names
+                    .extend_from_slice(&self.inputs[identity_start..]);
             }
         }
+        for input in word_scanner(&order_only) {
+            let word = order_only.slice_ref(trim_leading_curdir(input));
+            let identity_start = self.order_only_inputs.len();
+            glob_word(session, word, &mut self.order_only_inputs);
+            if input != b".WAIT" {
+                self.prerequisite_names
+                    .extend_from_slice(&self.order_only_inputs[identity_start..]);
+            }
+        }
+    }
+
+    fn defer_prerequisites(&mut self, session: &mut Session, prerequisites: Bytes) {
+        self.prerequisite_names.clear();
+        self.prerequisite_names
+            .push(session.intern(prerequisites.clone()));
+        self.deferred_prerequisites = Some(prerequisites);
     }
 
     pub fn parse_prerequisites(
@@ -127,11 +125,11 @@ impl Rule {
             prereq_string = line.slice(..separator_pos);
         }
 
-        let Some(separator_pos) = memchr(b':', &prereq_string) else {
+        let Some(separator_pos) = find_unescaped_colon(&prereq_string) else {
             // Simple prerequisites
+            let prereq_string = normalize_prerequisites(prereq_string);
             if self.expand_again && memchr(b'$', &prereq_string).is_some() {
-                self.record_deferred_prerequisite_names(session, &prereq_string);
-                self.deferred_prerequisites = Some(prereq_string);
+                self.defer_prerequisites(session, prereq_string);
             } else {
                 self.parse_inputs(session, &prereq_string);
             }
@@ -154,7 +152,7 @@ impl Rule {
         }
 
         let target_prereq = prereq_string.slice(..separator_pos);
-        let prereq_patterns = prereq_string.slice(separator_pos + 1..);
+        let prereq_patterns = normalize_prerequisites(prereq_string.slice(separator_pos + 1..));
 
         let patterns = word_scanner(&target_prereq)
             .map(|p| target_prereq.slice_ref(trim_leading_curdir(p)))
@@ -192,13 +190,65 @@ impl Rule {
             );
         }
         if self.expand_again && memchr(b'$', &prereq_patterns).is_some() {
-            self.record_deferred_prerequisite_names(session, &prereq_patterns);
-            self.deferred_prerequisites = Some(prereq_patterns);
+            self.defer_prerequisites(session, prereq_patterns);
         } else {
             self.parse_inputs(session, &prereq_patterns);
         }
         Ok(())
     }
+}
+
+/// Find the static-pattern separator. A colon is quoted only by an odd run of
+/// immediately preceding backslashes; parentheses have no special meaning.
+fn find_unescaped_colon(prerequisites: &[u8]) -> Option<usize> {
+    let mut preceding_backslashes = 0;
+    for (index, byte) in prerequisites.iter().enumerate() {
+        if *byte == b'\\' {
+            preceding_backslashes += 1;
+            continue;
+        }
+        if *byte == b':' && preceding_backslashes % 2 == 0 {
+            return Some(index);
+        }
+        preceding_backslashes = 0;
+    }
+    None
+}
+
+/// Apply the normalization GNU Make performs before either splitting an
+/// immediate prerequisite list or retaining one for second expansion.
+fn normalize_prerequisites(prerequisites: Bytes) -> Bytes {
+    let prerequisites = prerequisites.slice_ref(trim_space(&prerequisites));
+    if memchr(b'\\', &prerequisites).is_none() || memchr(b':', &prerequisites).is_none() {
+        return prerequisites;
+    }
+
+    let mut normalized = Vec::with_capacity(prerequisites.len());
+    let mut index = 0;
+    while index < prerequisites.len() {
+        if prerequisites[index] != b'\\' {
+            normalized.push(prerequisites[index]);
+            index += 1;
+            continue;
+        }
+
+        let slash_start = index;
+        while index < prerequisites.len() && prerequisites[index] == b'\\' {
+            index += 1;
+        }
+        let slash_count = index - slash_start;
+        if prerequisites.get(index) == Some(&b':') && slash_count % 2 == 1 {
+            normalized
+                .extend_from_slice(&prerequisites[slash_start..slash_start + slash_count / 2]);
+        } else {
+            normalized.extend_from_slice(&prerequisites[slash_start..index]);
+        }
+        if index < prerequisites.len() {
+            normalized.push(prerequisites[index]);
+            index += 1;
+        }
+    }
+    normalized.into()
 }
 
 impl Debug for Rule {
@@ -255,5 +305,38 @@ pub fn glob_word(session: &mut Session, word: Bytes, into: &mut Vec<Symbol>) {
             }
         }
         _ => into.push(session.intern(word)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deferred_prerequisite_normalization_matches_make() {
+        assert_eq!(
+            normalize_prerequisites(Bytes::from_static(b"  one  two \t")),
+            Bytes::from_static(b"one  two")
+        );
+        assert_eq!(
+            normalize_prerequisites(Bytes::from_static(br"one\:two")),
+            Bytes::from_static(b"one:two")
+        );
+        assert_eq!(
+            normalize_prerequisites(Bytes::from_static(br"one\\:two")),
+            Bytes::from_static(br"one\\:two")
+        );
+        assert_eq!(
+            normalize_prerequisites(Bytes::from_static(br"one\\\:two")),
+            Bytes::from_static(br"one\:two")
+        );
+    }
+
+    #[test]
+    fn static_pattern_colon_only_honors_backslash_quoting() {
+        assert_eq!(find_unescaped_colon(b"$(subst :,x,dep)"), Some(8));
+        assert_eq!(find_unescaped_colon(br"dep\:name"), None);
+        assert_eq!(find_unescaped_colon(br"dep\\:pattern"), Some(5));
+        assert_eq!(find_unescaped_colon(br"dep\\\:name:pattern"), Some(11));
     }
 }
