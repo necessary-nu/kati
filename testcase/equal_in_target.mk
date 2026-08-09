@@ -1,4 +1,5 @@
-# TODO fix parser. no rule to make target "test"?
+# A fully expanded rule can carry a target-specific assignment, while an equals
+# sign expanded in a later prerequisite word stays in that prerequisite's name.
 TSV:=test: A=PASS
 A_EQ_B:=A=B
 EQ==

@@ -22,7 +22,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::sync::{Arc, Weak};
 
 use anyhow::Result;
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use memchr::memchr;
 use parking_lot::Mutex;
 
@@ -51,6 +51,58 @@ pub enum RulesAllowed {
     Allowed,
     Warning,
     Error,
+}
+
+/// One expansion of a rule left-hand side, with the end of the source word
+/// that supplied its first colon.
+#[derive(Default)]
+struct RuleLhsExpansion {
+    output: BytesMut,
+    colon: Option<usize>,
+    colon_word_end: Option<usize>,
+    literal_backslash: bool,
+}
+
+impl RuleLhsExpansion {
+    /// Append bytes that stood literally in the source line. Their unescaped
+    /// whitespace separates source words even though expansion output does not.
+    fn push_literal(&mut self, literal: &[u8]) {
+        for byte in literal {
+            let escaped = self.literal_backslash;
+            if self.colon.is_some()
+                && self.colon_word_end.is_none()
+                && byte.is_ascii_whitespace()
+                && !escaped
+            {
+                self.colon_word_end = Some(self.output.len());
+            }
+            if self.colon.is_none() && *byte == b':' {
+                self.colon = Some(self.output.len());
+            }
+            self.output.put_u8(*byte);
+            self.literal_backslash = *byte == b'\\' && !escaped;
+        }
+    }
+
+    /// Append the result of expanding one source expression. Whitespace here
+    /// remains inside that expression's source word.
+    fn push_expansion(&mut self, expansion: &[u8]) {
+        let start = self.output.len();
+        self.output.put_slice(expansion);
+        if self.colon.is_none()
+            && let Some(colon) = memchr(b':', expansion)
+        {
+            self.colon = Some(start + colon);
+        }
+        self.literal_backslash = false;
+    }
+
+    fn finish(self) -> (Bytes, Option<usize>) {
+        let colon_word_end = self
+            .colon
+            .map(|_| self.colon_word_end.unwrap_or(self.output.len()));
+        (self.output.freeze(), colon_word_end)
+    }
 }
 
 /// Whether `export` directives are allowed.
@@ -726,6 +778,105 @@ impl Evaluator {
         Ok((after, targets, pattern_rule_count > 0))
     }
 
+    /// Expand a rule's left-hand side once, while retaining the one source-word
+    /// boundary GNU Make uses to classify a target-specific assignment.
+    ///
+    /// A variable expansion can produce whitespace without ending the source
+    /// word that contains it. Literal whitespace does end that word. Once the
+    /// first colon has appeared, [`RuleLhsExpansion`] records the output offset
+    /// immediately before the next such boundary.
+    fn eval_rule_lhs(&mut self, lhs: &Value) -> Result<(Bytes, Option<usize>)> {
+        let mut expansion = RuleLhsExpansion::default();
+        match lhs {
+            Value::List(_, values) => {
+                for value in values {
+                    match value.as_ref() {
+                        Value::Literal(_, literal) => expansion.push_literal(literal),
+                        _ => {
+                            let value = value.eval_to_buf(self)?;
+                            expansion.push_expansion(&value);
+                        }
+                    }
+                }
+            }
+            Value::Literal(_, literal) => expansion.push_literal(literal),
+            _ => {
+                let value = lhs.eval_to_buf(self)?;
+                expansion.push_expansion(&value);
+            }
+        }
+        Ok(expansion.finish())
+    }
+
+    /// Which separator the rule carries, and where it stands in the text after
+    /// the targets.
+    ///
+    /// GNU Make settles a target-specific assignment on the line as written: it
+    /// stops expanding at the word that carries the colon and runs
+    /// `parse_var_assignment` over the text beyond, which expansion has not
+    /// reached (read.c). So when the colon was written, `sep` is the whole
+    /// answer and an `=` that only exists because a prerequisite expanded to
+    /// one is part of a name — `all: one$(EQ)two` names a prerequisite
+    /// `one=two`, and `.PHONY: all $(EQ)` names one called `=`.
+    ///
+    /// A colon that arrives by expansion is the exception, and it is GNU Make's
+    /// own: an operator in the remainder of that same source word is expanded
+    /// text and can be an assignment. Later source words are still literal at
+    /// that decision point, so an `=` produced by one of them is a prerequisite
+    /// character just as it is after a written colon.
+    ///
+    /// A `;` is not decided the same way. GNU Make looks for one in the
+    /// expanded prerequisites whenever the line as written carried none
+    /// (read.c, `if (cmdleft == 0)`), so `all: $(SEMI)` does start a recipe.
+    fn rule_separator(
+        stmt: &RuleStmt,
+        after_targets: &Bytes,
+        expanded_colon_word: usize,
+    ) -> (Option<u8>, Option<usize>) {
+        // A separator the parser read off the source line ends the text, so all
+        // of what is left is the variable's name.
+        let written_equals = match stmt.sep {
+            RuleSep::Eq | RuleSep::FinalEq => Some(after_targets.len()),
+            _ => None,
+        };
+
+        if stmt.colon_in_source {
+            if let Some(equals) = written_equals {
+                return (Some(b'='), Some(equals));
+            }
+        } else {
+            // Only the expanded remainder of the source word that produced the
+            // colon participates. Outside parentheses, the first expansion can
+            // turn `$$(info a=b)` into `$(info a=b)`; the `=` in the function's
+            // arguments is not an operator.
+            let eligible = &after_targets[..expanded_colon_word.min(after_targets.len())];
+            if let Some(pos) = find_outside_paren(eligible, b"=;") {
+                if eligible[pos] == b';' {
+                    return (Some(b';'), Some(pos));
+                }
+                if pos == 0
+                    || is_variable_name(strip_assign_modifiers(
+                        parse_assign_statement(eligible, pos).lhs,
+                        stmt.assign_modifiers.words,
+                    ))
+                {
+                    return (Some(b'='), Some(pos));
+                }
+            }
+            if let Some(equals) = written_equals {
+                return (Some(b'='), Some(equals));
+            }
+        }
+
+        if stmt.sep != RuleSep::Semicolon
+            && let Some(semicolon) = find_outside_paren(after_targets, b";")
+        {
+            (Some(b';'), Some(semicolon))
+        } else {
+            (None, None)
+        }
+    }
+
     // Strip leading spaces and trailing spaces and colons.
     pub fn format_rule_error(before_term: &[u8]) -> String {
         let before_term = String::from_utf8_lossy(before_term).into_owned();
@@ -765,8 +916,14 @@ impl Evaluator {
     ) -> Result<()> {
         let assign = parse_assign_statement(after_targets, separator_pos);
         let modifiers = stmt.assign_modifiers;
+        // The name is not asked to be one word here. GNU Make asks that of the
+        // line as written, where it decides there is an assignment at all, and
+        // does not ask it again of what the name expands to: with `TWO = a b`,
+        // `all: $(TWO)=x` is an assignment whose name is two words, and Make
+        // records it without complaint. `rule_separator` and the parser hold
+        // that decision between them.
         let name = strip_assign_modifiers(assign.lhs, modifiers.words);
-        if !is_variable_name(name) {
+        if !stmt.colon_in_source && !is_variable_name(name) {
             error_loc!(
                 self,
                 self.loc.as_ref(),
@@ -782,38 +939,38 @@ impl Evaluator {
                 .or_insert_with(|| Arc::new(Vars::new()))
                 .clone();
 
-            let rhs = if assign.rhs.is_empty() {
-                stmt.rhs.clone()
+            let rhs: Arc<Value> = if assign.rhs.is_empty() {
+                // The separator can be the last thing on the line, which
+                // assigns the empty string: `a: x=` leaves x set to nothing,
+                // and there is no statement right-hand side to borrow.
+                stmt.rhs
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(Value::Literal(None, Bytes::new())))
             } else if let Some(stmt_rhs) = stmt.rhs.clone() {
                 let sep = if stmt.sep == RuleSep::Semicolon {
                     b" ; "
                 } else {
                     b" = "
                 };
-                Some(Arc::new(Value::List(
+                Arc::new(Value::List(
                     self.loc.clone(),
                     vec![
                         Arc::new(Value::Literal(None, after_targets.slice_ref(assign.rhs))),
                         Arc::new(Value::Literal(None, Bytes::from_static(sep))),
                         stmt_rhs,
                     ],
-                )))
+                ))
             } else {
-                Some(Arc::new(Value::Literal(
-                    None,
-                    after_targets.slice_ref(assign.rhs),
-                )))
+                Arc::new(Value::Literal(None, after_targets.slice_ref(assign.rhs)))
             };
 
             self.current_scope = Some(scope);
             if var_sym == Symbol::KATI_READONLY {
-                if let Some(rhs) = rhs {
-                    self.mark_vars_readonly(&rhs)?;
-                }
+                self.mark_vars_readonly(&rhs)?;
             } else {
                 let (rhs_var, needs_assign) = self.eval_rhs(
                     var_sym,
-                    rhs.unwrap(),
+                    rhs,
                     Bytes::from_static(b"*TODO*"),
                     assign.op,
                     modifiers.directive.is_override,
@@ -851,7 +1008,7 @@ impl Evaluator {
         self.loc = Some(stmt.loc());
         self.in_rule = false;
 
-        let before_term = stmt.lhs.eval_to_buf(self)?;
+        let (before_term, colon_word_end) = self.eval_rule_lhs(&stmt.lhs)?;
         // See semicolon.mk.
         if before_term.iter().all(|c| b" \t\n;".contains(c)) {
             if stmt.sep == RuleSep::Semicolon {
@@ -869,20 +1026,11 @@ impl Evaluator {
         }
 
         // Figure out if this is a rule-specific variable assignment.
-        // It is an assignment when either after_targets contains an assignment token
-        // or separator is an assignment token, but only if there is no ';' before the
-        // first assignment token.
-        // Outside parentheses: the first expansion turns `$$(info a=b)` into
-        // `$(info a=b)`, and the `=` in a function's arguments is not one.
-        let mut separator_pos = find_outside_paren(&after_targets, b"=;");
-        let separator = if let Some(separator_pos) = separator_pos {
-            Some(after_targets[separator_pos])
-        } else if stmt.sep == RuleSep::Eq || stmt.sep == RuleSep::FinalEq {
-            separator_pos = Some(after_targets.len());
-            Some(b'=')
-        } else {
-            None
-        };
+        let expanded_colon_word = colon_word_end
+            .map(|end| end.saturating_sub(before_term.len() - after_targets.len()))
+            .unwrap_or(after_targets.len());
+        let (separator, separator_pos) =
+            Evaluator::rule_separator(stmt, &after_targets, expanded_colon_word);
 
         // If variable name is not empty, we have rule- or target-specific
         // variable assignment.
@@ -893,7 +1041,7 @@ impl Evaluator {
             return self.eval_rule_specific_assign(&targets, stmt, &after_targets, separator_pos);
         }
 
-        if separator_pos == Some(0) {
+        if separator == Some(b'=') && separator_pos == Some(0) {
             // We used to make this a warning and otherwise accept it, but Make 4.1
             // calls this out as an error, so let's follow.
             error_loc!(self, self.loc.as_ref(), "*** empty variable name.");
@@ -1557,6 +1705,36 @@ impl Evaluator {
 mod tests {
     use super::*;
     use crate::var::VarOrigin;
+
+    #[test]
+    fn rule_expansion_keeps_the_colon_bearing_source_word_boundary() {
+        let mut written_colon = RuleLhsExpansion::default();
+        written_colon.push_literal(b"all: one");
+        written_colon.push_expansion(b"=");
+        written_colon.push_literal(b"two");
+        assert_eq!(
+            written_colon.finish(),
+            (Bytes::from_static(b"all: one=two"), Some(4))
+        );
+
+        let mut expanded_colon = RuleLhsExpansion::default();
+        expanded_colon.push_literal(b"all");
+        expanded_colon.push_expansion(b":");
+        expanded_colon.push_literal(b" one");
+        expanded_colon.push_expansion(b"=");
+        expanded_colon.push_literal(b"two");
+        assert_eq!(
+            expanded_colon.finish(),
+            (Bytes::from_static(b"all: one=two"), Some(4))
+        );
+
+        let mut generated_assignment = RuleLhsExpansion::default();
+        generated_assignment.push_expansion(b"all: X=value");
+        assert_eq!(
+            generated_assignment.finish(),
+            (Bytes::from_static(b"all: X=value"), Some(12))
+        );
+    }
 
     fn automatic(value: &'static [u8]) -> Var {
         Variable::with_simple_string(Bytes::from_static(value), VarOrigin::Automatic, None, None)

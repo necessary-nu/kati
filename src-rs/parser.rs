@@ -254,14 +254,10 @@ impl<'a> Parser<'a> {
         let rule_lhs: Arc<Value>;
         let mut rule_sep = RuleSep::Null;
         let rule_rhs: Option<Arc<Value>>;
-        let mut assign_modifiers = AssignModifiers::default();
+        let (found, assign_modifiers) = literal_rule_term(&line, sep);
 
-        let sep_plus_one = sep.map(|sep| sep + 1).unwrap_or(0);
-
-        let found = find_outside_paren(&line[sep_plus_one..], b"=;");
         let mut mutable_loc = self.loc.clone();
         if let Some(mut found) = found {
-            found += sep_plus_one;
             rule_lhs = parse_expr(
                 self.session,
                 &mut mutable_loc,
@@ -275,11 +271,6 @@ impl<'a> Parser<'a> {
                 found += 2;
             } else if line[found..].starts_with(b"=") {
                 rule_sep = RuleSep::Eq;
-                if sep.is_some() {
-                    let assignment = &line[sep_plus_one..];
-                    let parsed = parse_assign_statement(assignment, found - sep_plus_one);
-                    assign_modifiers = take_assign_modifiers(parsed.lhs).1;
-                }
             }
             let opt = match rule_sep {
                 RuleSep::Semicolon => ParseExprOpt::Command,
@@ -302,6 +293,7 @@ impl<'a> Parser<'a> {
             rule_sep,
             rule_rhs,
             assign_modifiers,
+            sep.is_some(),
         ));
         Ok(())
     }
@@ -894,6 +886,49 @@ fn starts_assignment(rest: &[u8]) -> bool {
         .any(|op| rest.starts_with(op))
 }
 
+/// Find the `=` or `;` that separates a rule as the source line presents it.
+///
+/// A literal colon fixes the assignment decision here. Text before `=` has to
+/// be one variable-name word after modifiers; otherwise the equals sign belongs
+/// to the prerequisite list and only a later semicolon can terminate it.
+fn literal_rule_term(line: &[u8], colon: Option<usize>) -> (Option<usize>, AssignModifiers) {
+    // A `::` rule separates on the pair, so `test:: A=B` carries the name
+    // `A` and not `: A`.
+    let after_colon = match colon {
+        Some(colon) if line[colon + 1..].starts_with(b":") => colon + 2,
+        Some(colon) => colon + 1,
+        None => 0,
+    };
+    let mut modifiers = AssignModifiers::default();
+    let mut found = find_outside_paren(&line[after_colon..], b"=;").map(|at| at + after_colon);
+
+    if let Some(at) = found
+        && line[at] == b'='
+    {
+        let is_separator = match colon {
+            Some(_) if at > after_colon => {
+                let assignment = &line[after_colon..];
+                let parsed = parse_assign_statement(assignment, at - after_colon);
+                let (name, found_modifiers) = take_assign_modifiers(parsed.lhs);
+                if is_variable_name(name) {
+                    modifiers = found_modifiers;
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(_) => true,
+            // With no written colon, retain the old deferred decision only
+            // when an expansion before `=` can supply one.
+            None => memchr(b'$', &line[..at]).is_some(),
+        };
+        if !is_separator {
+            found = find_outside_paren(&line[at + 1..], b";").map(|semi| semi + at + 1);
+        }
+    }
+    (found, modifiers)
+}
+
 /// Whether `name` names a variable.
 ///
 /// GNU Make requires one word: the assignment operator may be separated from
@@ -1032,6 +1067,23 @@ mod tests {
             assert_eq!(assign.lhs, name);
             assert_eq!(assign.op, op);
             assert_eq!(assign.rhs, b"y");
+        }
+    }
+
+    #[test]
+    fn a_rule_term_is_decided_from_literal_text_after_the_colon() {
+        for (line, expected, modifier_words) in [
+            (b"all: one$(EQ)two".as_slice(), None, 0),
+            (b"all: one name=value ; command", Some(b';'), 0),
+            (b"all: $(NAME)=value", Some(b'='), 0),
+            (b"all:: private override NAME=value", Some(b'='), 2),
+            (b"all$(COLON) NAME=value", Some(b'='), 0),
+            (b"$(RULE)".as_slice(), None, 0),
+        ] {
+            let colon = find_outside_paren(line, b":");
+            let (term, modifiers) = literal_rule_term(line, colon);
+            assert_eq!(term.map(|at| line[at]), expected, "{line:?}");
+            assert_eq!(modifiers.words, modifier_words, "{line:?}");
         }
     }
 

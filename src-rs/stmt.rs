@@ -90,6 +90,19 @@ pub struct RuleStmt {
     pub sep: RuleSep,
     pub rhs: Option<Arc<Value>>,
     pub assign_modifiers: AssignModifiers,
+    /// Whether the colon that ends the targets stood in the source line.
+    ///
+    /// GNU Make reads a target-specific assignment off the line as written: it
+    /// stops expanding at the word that carries the colon and looks for the
+    /// assignment operator in the text beyond, which expansion has not reached
+    /// (read.c, `parse_var_assignment` over `lb_next`). So `sep` is the whole
+    /// answer whenever the colon was written, and an `=` that only appears once
+    /// a prerequisite has expanded is part of a name.
+    ///
+    /// A colon that arrives by expansion is the exception, and it is GNU Make's
+    /// own: what follows such a colon is the rest of the word that produced it,
+    /// which is expanded text, so the operator is read off that instead.
+    pub colon_in_source: bool,
 }
 
 impl Statement for RuleStmt {
@@ -123,6 +136,7 @@ impl RuleStmt {
         sep: RuleSep,
         rhs: Option<Arc<Value>>,
         assign_modifiers: AssignModifiers,
+        colon_in_source: bool,
     ) -> Arc<RuleStmt> {
         Arc::new(RuleStmt {
             loc,
@@ -131,6 +145,7 @@ impl RuleStmt {
             sep,
             rhs,
             assign_modifiers,
+            colon_in_source,
         })
     }
 }
