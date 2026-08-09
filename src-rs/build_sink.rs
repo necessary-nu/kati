@@ -125,21 +125,17 @@ pub struct SinkRule<'a> {
     pub subninjas: &'a [SinkSubninja<'a>],
     /// At least one line in the recipe is a recursive `$(MAKE)` invocation.
     /// This can be true while [`Self::subninjas`] is empty when a multi-line
-    /// `.ONESHELL` recipe or one shell line cannot be safely split into static
-    /// units.
+    /// `.ONESHELL` recipe, one shell line holding more than one MAKE
+    /// reference, or a recursion GNU Make classified but that sits where no
+    /// static child invocation can be lifted out, cannot be split safely. A
+    /// sink refuses those rather than running them, because running them is a
+    /// nested Make process.
     pub contains_recursive: bool,
     /// The non-recursive recipe lines, assembled after extracting subninjas.
     /// A graph sink runs this parent action after the child graphs.
     pub residual_command: Option<SinkCommand<'a>>,
-    /// The `+` subset of [`Self::residual_command`].
-    pub residual_dry_run_command: &'a [u8],
     /// Whether every residual line ignores failure.
     pub residual_ignore_errors: bool,
-    /// The subset of the recipe Make runs even when told not to run anything:
-    /// the lines the Makefile prefixed `+`. Assembled the same way as
-    /// [`SinkRule::command`] and empty when there are none. The manifest writer
-    /// ignores it — Ninja's `-n` runs nothing at all.
-    pub dry_run_command: &'a [u8],
     /// What to print while the command runs, if the Makefile said — literal
     /// text, with the shell quoting already off.
     ///

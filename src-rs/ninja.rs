@@ -456,7 +456,6 @@ impl<'a> NinjaGenerator<'a> {
         name: &Bytes,
         commands: &[Command],
         cmd_buf: &mut BytesMut,
-        dry_buf: &mut BytesMut,
         description: &mut Option<Bytes>,
     ) -> bool {
         // A nonzero status is certainly an ignored failure only when every line
@@ -518,15 +517,10 @@ impl<'a> NinjaGenerator<'a> {
                 fragment.put_slice(b" ; true ; }");
             }
 
-            for buf in [Some(&mut *cmd_buf), c.always_run.then_some(&mut *dry_buf)]
-                .into_iter()
-                .flatten()
-            {
-                if !buf.is_empty() {
-                    buf.put_slice(separator);
-                }
-                buf.put_slice(&fragment);
+            if !cmd_buf.is_empty() {
+                cmd_buf.put_slice(separator);
             }
+            cmd_buf.put_slice(&fragment);
         }
         // A script with nothing left in it has no status to read, and a whole
         // recipe can be absorbed: a lone `mkdir -p` of the output's directory.
@@ -593,14 +587,12 @@ impl<'a> NinjaGenerator<'a> {
             let id = nn.rule_id.unwrap();
             let mut description = None;
             let mut cmd_buf = BytesMut::new();
-            let mut dry_buf = BytesMut::new();
             let output_str = node.output.as_bytes(&self.ce.ev.session);
             let ignore_errors = Self::gen_shell_script(
                 &self.ce.ev.session.flags,
                 &output_str,
                 &nn.commands,
                 &mut cmd_buf,
-                &mut dry_buf,
                 &mut description,
             );
             if description.is_none() && self.phony_aliases.resolve(node.output) != node.output {
@@ -614,7 +606,6 @@ impl<'a> NinjaGenerator<'a> {
             // TODO: Find this number automatically.
             let too_long_for_argv = cmd_buf.len() > 100 * 1000;
             let script = cmd_buf.freeze();
-            let dry_run_script = dry_buf.freeze();
             let contains_recursive = nn
                 .commands
                 .iter()
@@ -624,9 +615,18 @@ impl<'a> NinjaGenerator<'a> {
             // hidden in the discarded executor script. A multi-line
             // `.ONESHELL` recipe shares shell state across lines, and more
             // than one MAKE reference on a line does not identify one static
-            // child compilation.
+            // child compilation. A line GNU Make classified recursive whose
+            // invocation cannot be lifted out is the third way that happens,
+            // and the one that used to pass unseen: it carries no
+            // `recursive_make`, so it would have been read as ordinary
+            // residual work and left to start a nested Make beside the child
+            // graphs its siblings became.
             let composable_subninjas = contains_recursive
                 && (!self.ce.ev.session.flags.one_shell || nn.commands.len() == 1)
+                && nn
+                    .commands
+                    .iter()
+                    .all(|command| !command.uncomposable_recursion)
                 && nn
                     .commands
                     .iter()
@@ -664,14 +664,12 @@ impl<'a> NinjaGenerator<'a> {
                 Vec::new()
             };
             let mut residual_buf = BytesMut::new();
-            let mut residual_dry_buf = BytesMut::new();
             let mut residual_description = None;
             let residual_ignore_errors = Self::gen_shell_script(
                 &self.ce.ev.session.flags,
                 &output_str,
                 &residual_commands,
                 &mut residual_buf,
-                &mut residual_dry_buf,
                 &mut residual_description,
             );
             // Automatic depfile detection appends the copy to kati's manifest
@@ -692,7 +690,6 @@ impl<'a> NinjaGenerator<'a> {
             }
             let residual_too_long = residual_buf.len() > 100 * 1000;
             let residual_script = residual_buf.freeze();
-            let residual_dry_run_script = residual_dry_buf.freeze();
             sink.declare_rule(
                 &self.ce.ev.session,
                 &SinkRule {
@@ -713,9 +710,7 @@ impl<'a> NinjaGenerator<'a> {
                             SinkCommand::Inline(&residual_script)
                         },
                     ),
-                    residual_dry_run_command: &residual_dry_run_script,
                     residual_ignore_errors,
-                    dry_run_command: &dry_run_script,
                     description: description.as_deref(),
                     depfile: depfile.as_deref(),
                     restat: node.is_restat,
@@ -1434,23 +1429,21 @@ mod tests {
                 echo: true,
                 ignore_error: *ignore_error,
                 force_no_subshell: false,
-                always_run: false,
+                recursive_line: false,
                 recursive_make: Vec::new(),
+                uncomposable_recursion: false,
             })
             .collect();
         let mut cmd_buf = BytesMut::new();
-        let mut dry_buf = BytesMut::new();
         let mut description = None;
         let ignore_errors = NinjaGenerator::gen_shell_script(
             &Flags::default(),
             &Bytes::from_static(b"out"),
             &commands,
             &mut cmd_buf,
-            &mut dry_buf,
             &mut description,
         );
         assert_eq!(description, None, "no Makefile echo, so no description");
-        assert!(dry_buf.is_empty(), "no + prefix, so nothing runs under -n");
         (cmd_buf.freeze(), ignore_errors)
     }
 
@@ -1490,11 +1483,7 @@ mod tests {
                     subninjas: &[],
                     contains_recursive: false,
                     residual_command: None,
-                    residual_dry_run_command: b"",
                     residual_ignore_errors: false,
-                    // Ninja's -n runs nothing, so the manifest writer has no
-                    // use for the subset Make would still run.
-                    dry_run_command: b"",
                     description,
                     depfile: None,
                     restat: false,

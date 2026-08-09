@@ -24,12 +24,12 @@ use crate::{
     error_loc,
     eval::Evaluator,
     exec::ExecStatus,
-    expr::Evaluable,
+    expr::{Evaluable, Value},
     fileutil::get_timestamp,
     strutil::{
         Pattern, WordWriter, basename, dirname, find_end_of_line, trim_left_space, word_scanner,
     },
-    symtab::Symbol,
+    symtab::{Interner, Symbol},
     var::Variable,
 };
 
@@ -201,22 +201,149 @@ pub struct Command {
     pub echo: bool,
     pub ignore_error: bool,
     pub force_no_subshell: bool,
-    /// The `+` prefix: run this line even when the run is only pretending.
-    pub always_run: bool,
-    /// Values produced by `MAKE` references while expanding this recipe line.
+    /// GNU Make's recursive-line classification, read from the recipe before
+    /// it is expanded: the `+` prefix, or a `$(MAKE)`/`${MAKE}` reference.
+    ///
+    /// GNU Make 4.4.1 uses it to decide which lines run under `-n`, `-t` and
+    /// `-q`, because running the child is the only way it can learn what the
+    /// child would do. Here it is a compiler input and nothing else: a
+    /// classified line describes recursion, so the child Makefile is compiled
+    /// and composed into the graph instead. Verified against 4.4.1: with
+    /// `MAKE_ALIAS = $(MAKE)`, the line `$(MAKE_ALIAS) --version` is printed
+    /// and not run under `-n`, so it is the reference that classifies and not
+    /// the value it expands to.
+    pub recursive_line: bool,
+    /// Values produced by `MAKE` references while expanding this recipe line,
+    /// kept only where the expansion put one in the invoked command position.
     pub recursive_make: Vec<Bytes>,
+    /// A recursion this compiler can see but cannot turn into a child
+    /// compilation: the line is classified recursive and starts a Make process
+    /// somewhere a shell begins a command, but not in a position
+    /// [`invokes_make`] can lift out as one static invocation.
+    ///
+    /// A line like this carries no [`Self::recursive_make`], so a recipe that
+    /// splits its other lines into child graphs would read this one as
+    /// ordinary residual work and leave it to start a nested Make beside them.
+    /// Naming it lets the compiler decline to split the recipe at all, which
+    /// is the rule the split already claimed to follow.
+    pub uncomposable_recursion: bool,
+}
+
+/// Whether an unexpanded recipe references `MAKE` the way GNU Make's own
+/// classification reads it.
+///
+/// GNU Make scans the recipe text for the literal `$(MAKE)` or `${MAKE}`, so
+/// what counts is the reference and not what it expands to. Both spellings
+/// parse to the same [`Value::SymRef`], and every other way of naming the
+/// variable — `$(MAKE:x=y)`, `$($(V))` with `V = MAKE`, a variable holding
+/// `$(MAKE)` — parses to something else, which is exactly the set 4.4.1
+/// declines to classify. Function arguments are walked because the text
+/// inside them is text GNU Make scans too: `$(info $(MAKE))` is classified.
+fn references_make(value: &Value, names: &impl Interner) -> bool {
+    match value {
+        Value::Literal(_, _) => false,
+        Value::SymRef(_, sym) => sym.as_bytes(names).as_ref() == b"MAKE",
+        Value::List(_, values) => values.iter().any(|value| references_make(value, names)),
+        Value::VarRef(_, name) => references_make(name, names),
+        // `$(MAKE:x=y)` holds the name as a literal rather than a reference,
+        // and 4.4.1 does not classify it. The pattern and replacement are
+        // ordinary text and can hold a reference of their own.
+        Value::VarSubst {
+            loc: _,
+            name: _,
+            pat,
+            subst,
+        } => references_make(pat, names) || references_make(subst, names),
+        Value::Func {
+            loc: _,
+            fi: _,
+            args,
+        } => args.iter().any(|arg| references_make(arg, names)),
+    }
+}
+
+fn starts_with_word(command: &[u8], word: &[u8]) -> bool {
+    command.starts_with(word)
+        && command
+            .get(word.len())
+            .is_none_or(|next| next.is_ascii_whitespace())
+}
+
+/// Split an expanded recipe line where a shell would begin a new command.
+///
+/// Quoting is respected, so the `;` in `echo "a; make b"` is text rather than
+/// a separator and the line keeps its one segment. Redirections and
+/// substitutions are left alone: they change what a segment reads or writes,
+/// not where the next one starts.
+fn command_segments(command: &[u8]) -> Vec<&[u8]> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut index = 0;
+    while index < command.len() {
+        let byte = command[index];
+        match quote {
+            Some(delimiter) => {
+                if byte == delimiter {
+                    quote = None;
+                } else if byte == b'\\' && delimiter == b'"' {
+                    index += 1;
+                }
+            }
+            None => match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'\\' => index += 1,
+                b';' | b'&' | b'|' | b'(' | b')' | b'\n' => {
+                    segments.push(&command[start..index]);
+                    // A two-byte operator must not leave its second byte to be
+                    // read as the head of the next segment.
+                    if command.get(index + 1) == Some(&byte) && matches!(byte, b'&' | b'|') {
+                        index += 1;
+                    }
+                    start = index + 1;
+                }
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    segments.push(&command[start..]);
+    segments
+}
+
+/// Whether one expanded `MAKE` value starts a process anywhere in the line.
+///
+/// Wider than [`invokes_make`], which asks the narrower question of whether
+/// the line is *one* invocation that can be lifted out as a child
+/// compilation. This asks only whether a nested Make would be started at all,
+/// so `test -d sub && $(MAKE) -C sub` answers yes while `echo "run $(MAKE)"`
+/// answers no.
+fn spawns_make(command: &[u8], make: &[u8]) -> bool {
+    command_segments(command).into_iter().any(|segment| {
+        let mut segment = segment.trim_ascii_start();
+        // A leading `VAR=value` sequence, and `env` or `exec` before the
+        // program, are the shell's way of saying the same command differently.
+        while let Some(word) = segment
+            .split(|byte| byte.is_ascii_whitespace())
+            .next()
+            .filter(|word| !word.is_empty())
+            .filter(|word| {
+                *word == b"env"
+                    || *word == b"exec"
+                    || word.split(|byte| *byte == b'=').next().is_some_and(|name| {
+                        name.len() < word.len() && !name.is_empty() && !name.contains(&b'/')
+                    })
+            })
+        {
+            segment = segment[word.len()..].trim_ascii_start();
+        }
+        starts_with_word(segment, make)
+    })
 }
 
 /// Whether one expanded `MAKE` value occupies the command position of a
 /// recipe line rather than merely being printed or passed as data.
 fn invokes_make(command: &[u8], make: &[u8]) -> bool {
-    fn starts_with_word(command: &[u8], word: &[u8]) -> bool {
-        command.starts_with(word)
-            && command
-                .get(word.len())
-                .is_none_or(|next| next.is_ascii_whitespace())
-    }
-
     let mut command = command.trim_ascii_start();
     if starts_with_word(command, b"exec") {
         command = command[b"exec".len()..].trim_ascii_start();
@@ -243,7 +370,7 @@ fn parse_command_prefixes(
     cmds: Bytes,
     echo: &mut bool,
     ignore_error: &mut bool,
-    always_run: &mut bool,
+    recursive_line: &mut bool,
 ) -> Bytes {
     let mut s = trim_left_space(&cmds);
     while !s.is_empty() {
@@ -255,7 +382,7 @@ fn parse_command_prefixes(
                 *ignore_error = true;
             }
             b'+' => {
-                *always_run = true;
+                *recursive_line = true;
             }
             _ => {
                 break;
@@ -364,19 +491,21 @@ impl<'a> CommandEvaluator<'a> {
             self.ev.loc = v.loc();
             self.ev.expanded_make_in_command.clear();
             let cmds_buf = v.eval_to_buf(self.ev)?;
-            let recursive_make = self.ev.expanded_make_in_command.clone();
+            let make_values = self.ev.expanded_make_in_command.clone();
             let mut cmds = cmds_buf.clone();
             let mut global_echo = !self.ev.session.flags.is_silent_mode;
             // `-i` is the `-` prefix asked for once instead of per line, so it
             // starts each recipe where a leading `-` would have left it.
             let mut global_ignore_error =
                 self.ev.session.flags.ignore_errors || node_ignores_errors;
-            let mut global_always_run = false;
+            // The classification is read from the recipe as written, so it has
+            // to be taken before anything is expanded away.
+            let mut global_recursive_line = references_make(&v, &self.ev.session);
             cmds = parse_command_prefixes(
                 cmds,
                 &mut global_echo,
                 &mut global_ignore_error,
-                &mut global_always_run,
+                &mut global_recursive_line,
             );
             if cmds.is_empty() {
                 continue;
@@ -388,23 +517,32 @@ impl<'a> CommandEvaluator<'a> {
 
                 let mut echo = global_echo;
                 let mut ignore_error = global_ignore_error;
-                let mut always_run = global_always_run;
-                cmd = parse_command_prefixes(cmd, &mut echo, &mut ignore_error, &mut always_run);
+                let mut recursive_line = global_recursive_line;
+                cmd =
+                    parse_command_prefixes(cmd, &mut echo, &mut ignore_error, &mut recursive_line);
 
                 if !cmd.is_empty() {
-                    let recursive_make = recursive_make
+                    let recursive_make: Vec<Bytes> = make_values
                         .iter()
                         .filter(|make| invokes_make(&cmd, make))
                         .cloned()
                         .collect();
+                    // Only a classified line is held to this. A `MAKE`-valued
+                    // variable that GNU Make never classified is composed when
+                    // the expansion makes that possible and otherwise left as
+                    // written, exactly as 4.4.1 leaves it.
+                    let uncomposable_recursion = recursive_line
+                        && recursive_make.is_empty()
+                        && make_values.iter().any(|make| spawns_make(&cmd, make));
                     result.push(Command {
                         output: n.lock().output,
                         cmd,
                         echo,
                         ignore_error,
                         force_no_subshell: false,
-                        always_run,
+                        recursive_line,
                         recursive_make,
+                        uncomposable_recursion,
                     })
                 }
             }
@@ -420,8 +558,9 @@ impl<'a> CommandEvaluator<'a> {
                     echo: false,
                     ignore_error: false,
                     force_no_subshell: true,
-                    always_run: false,
+                    recursive_line: false,
                     recursive_make: Vec::new(),
+                    uncomposable_recursion: false,
                 })
             }
             // Prepend |output_commands|.
@@ -439,7 +578,11 @@ impl<'a> CommandEvaluator<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::invokes_make;
+    use super::{invokes_make, references_make, spawns_make};
+    use crate::expr::{ParseExprOpt, parse_expr};
+    use crate::loc::Loc;
+    use crate::session::Session;
+    use bytes::Bytes;
 
     #[test]
     fn make_must_occupy_the_invoked_command_position() {
@@ -450,5 +593,51 @@ mod tests {
         assert!(!invokes_make(b"printf '%s' make", b"make"));
         assert!(!invokes_make(b"echo make && true", b"make"));
         assert!(!invokes_make(b"make-believe child", b"make"));
+    }
+
+    /// Whether a recipe line as written classifies as recursive, which is the
+    /// question GNU Make 4.4.1 answers by looking for the literal `$(MAKE)` or
+    /// `${MAKE}` before anything is expanded.
+    fn classified(recipe: &'static [u8]) -> bool {
+        let mut session = Session::new();
+        let value = parse_expr(
+            &mut session,
+            &mut Loc::default(),
+            Bytes::from_static(recipe),
+            ParseExprOpt::Command,
+        )
+        .expect("a parsable recipe line");
+        references_make(&value, &session)
+    }
+
+    /// Probed against GNU Make 4.4.1 under `-n`, which runs a classified line
+    /// and prints the rest: the first three lines wrote their file and the
+    /// last three did not.
+    #[test]
+    fn the_reference_classifies_a_recipe_line_and_not_the_value() {
+        assert!(classified(b"$(MAKE) -C sub"));
+        assert!(classified(b"${MAKE} --version"));
+        assert!(classified(b"echo info $(info $(MAKE))"));
+        // `MAKE_ALIAS = $(MAKE)` holds the same value and is not the same
+        // reference, and 4.4.1 declines it.
+        assert!(!classified(b"$(MAKE_ALIAS) --version"));
+        assert!(!classified(b"echo subst $(MAKE:x=y)"));
+        // `V = MAKE`, so the name is computed rather than written.
+        assert!(!classified(b"echo indirect $($(V))"));
+        assert!(!classified(b"echo plain"));
+    }
+
+    #[test]
+    fn a_nested_make_is_found_wherever_a_shell_would_start_one() {
+        assert!(spawns_make(b"test -d sub && make -C sub", b"make"));
+        assert!(spawns_make(b"cd sub; make child", b"make"));
+        assert!(spawns_make(b"true || make fallback", b"make"));
+        assert!(spawns_make(b"V=1 exec make child", b"make"));
+        // Mentioning it is not starting it, and a separator inside quotes is
+        // text rather than a separator.
+        assert!(!spawns_make(b"echo \"run make install\"", b"make"));
+        assert!(!spawns_make(b"echo 'a; make b'", b"make"));
+        assert!(!spawns_make(b"printf '%s' make", b"make"));
+        assert!(!spawns_make(b"echo done > make", b"make"));
     }
 }
