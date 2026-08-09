@@ -252,19 +252,49 @@ impl RuleTrie {
     fn len(&self) -> usize {
         self.rules.len() + self.children.values().map(|c| c.len()).sum::<usize>()
     }
+
+    fn remove_rule(&mut self, rule: &Arc<Rule>) {
+        self.rules
+            .retain(|entry| !Arc::ptr_eq(&entry.candidate.rule, rule));
+        self.children.retain(|_, child| {
+            child.remove_rule(rule);
+            !child.rules.is_empty() || !child.children.is_empty()
+        });
+    }
 }
 
-/// Whether two pattern rules are the rule GNU Make would have replaced.
+/// GNU Make's `new_pattern_rule` compares dependency names in order, but not
+/// whether the `|` made one of them order-only.
+fn pattern_rule_prerequisites_match(rule: &Rule, existing: &Rule) -> bool {
+    match (
+        &rule.deferred_prerequisites,
+        &existing.deferred_prerequisites,
+    ) {
+        (Some(rule), Some(existing)) => rule == existing,
+        (None, None) => rule
+            .inputs
+            .iter()
+            .chain(&rule.order_only_inputs)
+            .eq(existing.inputs.iter().chain(&existing.order_only_inputs)),
+        _ => false,
+    }
+}
+
+/// Whether GNU Make's `new_pattern_rule` removes `existing` for `rule`.
 ///
-/// `new_pattern_rule` in GNU Make's rule.c drops an existing pattern rule when
-/// a new one repeats its targets and its prerequisites, so the later recipe is
-/// the only one left to find. Same targets and same prerequisites, and nothing
-/// else: two rules that differ in a prerequisite are two rules.
-fn repeats_rule(rule: &Rule, other: &Rule) -> bool {
-    rule.output_patterns == other.output_patterns
-        && rule.inputs == other.inputs
-        && rule.order_only_inputs == other.order_only_inputs
-        && rule.deferred_prerequisites == other.deferred_prerequisites
+/// Its nested target loop is deliberately asymmetric: every target of the old
+/// rule must equal one target of the new rule. In ordinary rules that means a
+/// later grouped rule containing an older single target replaces it, while the
+/// reverse does not. Replacement happens while the rule list is populated, so
+/// the new rule moves to the end of that list before any target is searched.
+fn replaces_pattern_rule(rule: &Rule, existing: &Rule) -> bool {
+    pattern_rule_prerequisites_match(rule, existing)
+        && rule.output_patterns.iter().any(|target| {
+            existing
+                .output_patterns
+                .iter()
+                .all(|existing_target| existing_target == target)
+        })
 }
 
 fn is_suffix_rule(names: &impl Interner, output: &Symbol) -> bool {
@@ -516,13 +546,18 @@ struct DepBuilder<'a> {
     cur_rule_vars: Option<Arc<Vars>>,
 
     implicit_rules: RuleTrie,
+    /// Pattern rules still present after GNU Make's population-time
+    /// `new_pattern_rule` replacement.
+    implicit_rule_defs: Vec<Arc<Rule>>,
     /// How many target patterns have been recorded, which is the next one's
     /// place in the order they were written.
     implicit_rule_order: usize,
     /// One second expansion per rule and target, as GNU Make does. The search
     /// makes two passes over the same rules and probes a rule again before
     /// using it, and the expansion is free to have side effects. Keyed by the
-    /// rule's address, which the tables hold for the whole build.
+    /// candidate's definition order and requested output. The candidate order
+    /// distinguishes two target patterns of the same rule, including duplicate
+    /// patterns whose expansions can have side effects.
     expanded: HashMap<(usize, Symbol), (Vec<Symbol>, Vec<Symbol>)>,
     /// Cycle guard for the recursive implicit rule search.
     chaining: HashSet<Symbol>,
@@ -593,6 +628,7 @@ impl<'a> DepBuilder<'a> {
             cur_rule_vars: None,
 
             implicit_rules: RuleTrie::new(),
+            implicit_rule_defs: Vec::new(),
             implicit_rule_order: 0,
             expanded: HashMap::new(),
             chaining: HashSet::new(),
@@ -1424,6 +1460,16 @@ impl<'a> DepBuilder<'a> {
     }
 
     fn populate_implicit_rule(&mut self, rule: Arc<Rule>) -> Result<()> {
+        if let Some(index) = self
+            .implicit_rule_defs
+            .iter()
+            .position(|existing| replaces_pattern_rule(&rule, existing))
+        {
+            let existing = self.implicit_rule_defs.remove(index);
+            self.implicit_rules.remove_rule(&existing);
+        }
+        self.implicit_rule_defs.push(rule.clone());
+
         for output_pattern in rule.output_patterns.clone() {
             let op = output_pattern.as_bytes(&self.ev.session);
             if op.as_ref() != b"%" || !Self::is_ignorable_implicit_rule(&self.ev.session, &rule) {
@@ -1472,6 +1518,7 @@ impl<'a> DepBuilder<'a> {
     fn expanded_pattern_inputs(
         &mut self,
         rule: &Rule,
+        candidate_order: usize,
         output: Symbol,
         pat: &Pattern,
         output_str: &Bytes,
@@ -1479,7 +1526,7 @@ impl<'a> DepBuilder<'a> {
         let Some(text) = rule.deferred_prerequisites.clone() else {
             return Ok(None);
         };
-        let key = (rule as *const Rule as usize, output);
+        let key = (candidate_order, output);
         if let Some(found) = self.expanded.get(&key) {
             return Ok(Some(found.clone()));
         }
@@ -1501,8 +1548,8 @@ impl<'a> DepBuilder<'a> {
     /// `pattern_search` collects one candidate per target pattern that matches,
     /// in the order the rules were written, and then stable-sorts them by stem
     /// length: the most specific rule is tried first and a tie is settled by
-    /// which was written first. A rule a later one repeated outright is gone
-    /// before the search begins, so it is dropped here.
+    /// which was written first. Population has already removed any rule that a
+    /// later definition replaced.
     fn ordered_candidates(&self, output_str: &Bytes) -> Vec<ImplicitCandidate> {
         let mut candidates = self.implicit_rules.get(output_str);
         candidates.retain(|candidate| {
@@ -1512,21 +1559,6 @@ impl<'a> DepBuilder<'a> {
             let pat = Pattern::new(candidate.pattern.as_bytes(&self.ev.session));
             (pat.stem(output_str).len(), candidate.order)
         });
-        let superseded = candidates
-            .iter()
-            .enumerate()
-            .map(|(index, candidate)| {
-                candidates[index + 1..].iter().any(|later| {
-                    !Arc::ptr_eq(&candidate.rule, &later.rule)
-                        && repeats_rule(&candidate.rule, &later.rule)
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut index = 0;
-        candidates.retain(|_| {
-            index += 1;
-            !superseded[index - 1]
-        });
         candidates
     }
 
@@ -1534,13 +1566,15 @@ impl<'a> DepBuilder<'a> {
         &mut self,
         rule: &Rule,
         matched: Symbol,
+        candidate_order: usize,
         output: Symbol,
         n: Arc<Mutex<DepNode>>,
         chaining: bool,
     ) -> Result<Option<Arc<Rule>>> {
         let output_str = output.as_bytes(&self.ev.session);
         let pat = Pattern::new(matched.as_bytes(&self.ev.session));
-        let deferred = self.expanded_pattern_inputs(rule, output, &pat, &output_str)?;
+        let deferred =
+            self.expanded_pattern_inputs(rule, candidate_order, output, &pat, &output_str)?;
         let inputs: Vec<(Symbol, bool)> = match &deferred {
             // A deferred list is one string until it is expanded, so
             // which word the `%` was in is no longer knowable.
@@ -1640,7 +1674,13 @@ impl<'a> DepBuilder<'a> {
                 continue;
             }
             let pat = Pattern::new(candidate.pattern.as_bytes(&self.ev.session));
-            let inputs = match self.expanded_pattern_inputs(&rule, output, &pat, &output_str)? {
+            let inputs = match self.expanded_pattern_inputs(
+                &rule,
+                candidate.order,
+                output,
+                &pat,
+                &output_str,
+            )? {
                 Some((inputs, _)) => inputs,
                 None => rule
                     .inputs
@@ -1749,6 +1789,7 @@ impl<'a> DepBuilder<'a> {
             let Some(pattern_rule) = self.can_pick_implicit_rule(
                 &candidate.rule,
                 candidate.pattern,
+                candidate.order,
                 output,
                 n.clone(),
                 chaining,
