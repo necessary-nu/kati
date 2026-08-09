@@ -183,8 +183,24 @@ fn apply_output_pattern(
     ret
 }
 
-struct RuleTrieEntry {
+/// One target pattern of one pattern rule, as the search considers it.
+///
+/// A rule with several target patterns is several candidates: GNU Make's
+/// `pattern_search` records one `tryrule` per target that matches, so which
+/// of a rule's patterns matched is part of the candidate rather than something
+/// recovered afterwards.
+#[derive(Clone)]
+struct ImplicitCandidate {
     rule: Arc<Rule>,
+    /// The rule's own target pattern this candidate was reached through.
+    pattern: Symbol,
+    /// Where the rule was written, counting one per target pattern, which is
+    /// what breaks a tie between two rules that match a target equally well.
+    order: usize,
+}
+
+struct RuleTrieEntry {
+    candidate: ImplicitCandidate,
     suffix: Vec<u8>,
 }
 
@@ -201,10 +217,10 @@ impl RuleTrie {
         }
     }
 
-    fn add(&mut self, name: &[u8], rule: Arc<Rule>) {
+    fn add(&mut self, name: &[u8], candidate: ImplicitCandidate) {
         if name.is_empty() || name.starts_with(b"%") {
             self.rules.push(RuleTrieEntry {
-                rule,
+                candidate,
                 suffix: name.to_vec(),
             });
             return;
@@ -213,14 +229,14 @@ impl RuleTrie {
         self.children
             .entry(c)
             .or_insert_with(RuleTrie::new)
-            .add(&name[1..], rule)
+            .add(&name[1..], candidate)
     }
 
-    fn get(&self, name: &[u8]) -> Vec<Arc<Rule>> {
+    fn get(&self, name: &[u8]) -> Vec<ImplicitCandidate> {
         let mut ret = Vec::new();
         for ent in &self.rules {
             if (ent.suffix.is_empty() && name.is_empty()) || name.ends_with(&ent.suffix[1..]) {
-                ret.push(ent.rule.clone())
+                ret.push(ent.candidate.clone())
             }
         }
         if name.is_empty() {
@@ -236,6 +252,19 @@ impl RuleTrie {
     fn len(&self) -> usize {
         self.rules.len() + self.children.values().map(|c| c.len()).sum::<usize>()
     }
+}
+
+/// Whether two pattern rules are the rule GNU Make would have replaced.
+///
+/// `new_pattern_rule` in GNU Make's rule.c drops an existing pattern rule when
+/// a new one repeats its targets and its prerequisites, so the later recipe is
+/// the only one left to find. Same targets and same prerequisites, and nothing
+/// else: two rules that differ in a prerequisite are two rules.
+fn repeats_rule(rule: &Rule, other: &Rule) -> bool {
+    rule.output_patterns == other.output_patterns
+        && rule.inputs == other.inputs
+        && rule.order_only_inputs == other.order_only_inputs
+        && rule.deferred_prerequisites == other.deferred_prerequisites
 }
 
 fn is_suffix_rule(names: &impl Interner, output: &Symbol) -> bool {
@@ -487,6 +516,9 @@ struct DepBuilder<'a> {
     cur_rule_vars: Option<Arc<Vars>>,
 
     implicit_rules: RuleTrie,
+    /// How many target patterns have been recorded, which is the next one's
+    /// place in the order they were written.
+    implicit_rule_order: usize,
     /// One second expansion per rule and target, as GNU Make does. The search
     /// makes two passes over the same rules and probes a rule again before
     /// using it, and the expansion is free to have side effects. Keyed by the
@@ -561,6 +593,7 @@ impl<'a> DepBuilder<'a> {
             cur_rule_vars: None,
 
             implicit_rules: RuleTrie::new(),
+            implicit_rule_order: 0,
             expanded: HashMap::new(),
             chaining: HashSet::new(),
             intermediates: HashSet::new(),
@@ -1410,7 +1443,16 @@ impl<'a> DepBuilder<'a> {
                     );
                 }
 
-                self.implicit_rules.add(&op, rule.clone())
+                let order = self.implicit_rule_order;
+                self.implicit_rule_order += 1;
+                self.implicit_rules.add(
+                    &op,
+                    ImplicitCandidate {
+                        rule: rule.clone(),
+                        pattern: output_pattern,
+                        order,
+                    },
+                )
             }
         }
         Ok(())
@@ -1453,72 +1495,94 @@ impl<'a> DepBuilder<'a> {
         Ok(Some(expanded))
     }
 
+    /// The pattern rules that could make `output`, in the order GNU Make tries
+    /// them.
+    ///
+    /// `pattern_search` collects one candidate per target pattern that matches,
+    /// in the order the rules were written, and then stable-sorts them by stem
+    /// length: the most specific rule is tried first and a tie is settled by
+    /// which was written first. A rule a later one repeated outright is gone
+    /// before the search begins, so it is dropped here.
+    fn ordered_candidates(&self, output_str: &Bytes) -> Vec<ImplicitCandidate> {
+        let mut candidates = self.implicit_rules.get(output_str);
+        candidates.retain(|candidate| {
+            Pattern::new(candidate.pattern.as_bytes(&self.ev.session)).matches(output_str)
+        });
+        candidates.sort_by_key(|candidate| {
+            let pat = Pattern::new(candidate.pattern.as_bytes(&self.ev.session));
+            (pat.stem(output_str).len(), candidate.order)
+        });
+        let superseded = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                candidates[index + 1..].iter().any(|later| {
+                    !Arc::ptr_eq(&candidate.rule, &later.rule)
+                        && repeats_rule(&candidate.rule, &later.rule)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut index = 0;
+        candidates.retain(|_| {
+            index += 1;
+            !superseded[index - 1]
+        });
+        candidates
+    }
+
     fn can_pick_implicit_rule(
         &mut self,
         rule: &Rule,
+        matched: Symbol,
         output: Symbol,
         n: Arc<Mutex<DepNode>>,
         chaining: bool,
     ) -> Result<Option<Arc<Rule>>> {
         let output_str = output.as_bytes(&self.ev.session);
-        let mut matched = None;
-        let mut expanded = None;
-        for output_pattern in &rule.output_patterns {
-            let pat = Pattern::new(output_pattern.as_bytes(&self.ev.session));
-            if pat.matches(&output_str) {
-                let deferred = self.expanded_pattern_inputs(rule, output, &pat, &output_str)?;
-                let inputs: Vec<(Symbol, bool)> = match &deferred {
-                    // A deferred list is one string until it is expanded, so
-                    // which word the `%` was in is no longer knowable.
-                    Some((inputs, _)) => inputs.iter().map(|input| (*input, false)).collect(),
-                    None => rule
-                        .inputs
-                        .iter()
-                        .map(|input| {
-                            let text = input.as_bytes(&self.ev.session);
-                            let from_pattern = text.contains(&b'%');
-                            let buf = pat.append_subst(&output_str, &text);
-                            (self.ev.session.intern(buf), from_pattern)
-                        })
-                        .collect(),
-                };
-                let mut ok = true;
-                let mut invented = Vec::new();
-                for (sym, from_pattern) in inputs {
-                    if self.exists(sym) {
-                        continue;
-                    }
-                    if !(chaining && self.can_be_made_implicitly(sym, 0)?) {
-                        ok = false;
-                        break;
-                    }
-                    if from_pattern && !self.mentioned.contains(&sym) {
-                        invented.push(sym);
-                    }
-                }
-
-                if ok {
-                    self.intermediates.extend(invented);
-                    matched = Some(*output_pattern);
-                    expanded = deferred;
-                    break;
-                }
+        let pat = Pattern::new(matched.as_bytes(&self.ev.session));
+        let deferred = self.expanded_pattern_inputs(rule, output, &pat, &output_str)?;
+        let inputs: Vec<(Symbol, bool)> = match &deferred {
+            // A deferred list is one string until it is expanded, so
+            // which word the `%` was in is no longer knowable.
+            Some((inputs, _)) => inputs.iter().map(|input| (*input, false)).collect(),
+            None => rule
+                .inputs
+                .iter()
+                .map(|input| {
+                    let text = input.as_bytes(&self.ev.session);
+                    let from_pattern = text.contains(&b'%');
+                    let buf = pat.append_subst(&output_str, &text);
+                    (self.ev.session.intern(buf), from_pattern)
+                })
+                .collect(),
+        };
+        let mut invented = Vec::new();
+        for (sym, from_pattern) in inputs {
+            if self.exists(sym) {
+                continue;
+            }
+            if !(chaining && self.can_be_made_implicitly(sym, 0)?) {
+                return Ok(None);
+            }
+            if from_pattern && !self.mentioned.contains(&sym) {
+                invented.push(sym);
             }
         }
-        let Some(matched) = matched else {
-            return Ok(None);
-        };
+        self.intermediates.extend(invented);
 
         let mut rule = rule.clone();
-        if let Some((inputs, order_only_inputs)) = expanded {
+        if let Some((inputs, order_only_inputs)) = deferred {
             rule.deferred_prerequisites = None;
             rule.inputs = inputs;
             rule.order_only_inputs = order_only_inputs;
         }
         if rule.output_patterns.len() > 1 {
             // A pattern rule with several target patterns is one recipe that
-            // makes all of them, so the rest are this node's outputs and not
-            // merely names it has already been asked about.
+            // makes all of them, so the rest are this node's outputs — unless
+            // the name already has a maker of its own. GNU Make's `also_make`
+            // only marks such a name updated when this recipe runs; it does not
+            // take it away from the rule its own search chose, and two rules
+            // that can each make one name is not an error to it.
             let pat = Pattern::new(matched.as_bytes(&self.ev.session));
             for output_pattern in rule.output_patterns.clone() {
                 if output_pattern == matched {
@@ -1526,6 +1590,9 @@ impl<'a> DepBuilder<'a> {
                 }
                 let buf = pat.append_subst(&output_str, &output_pattern.as_bytes(&self.ev.session));
                 let sym = self.ev.session.intern(buf);
+                if self.done.contains_key(&sym) {
+                    continue;
+                }
                 self.done.insert(sym, n.clone());
                 n.lock().implicit_outputs.push(sym);
             }
@@ -1565,45 +1632,34 @@ impl<'a> DepBuilder<'a> {
 
     fn implicit_chain_exists(&mut self, output: Symbol, depth: usize) -> Result<bool> {
         let output_str = output.as_bytes(&self.ev.session);
-        for rule in self
-            .implicit_rules
-            .get(&output_str)
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-        {
+        for candidate in self.ordered_candidates(&output_str) {
+            let rule = candidate.rule;
             // Make's step 6a: a non-terminal match-anything rule is not allowed
             // to make an intermediate.
             if rule.cmds.is_empty() || (!rule.is_double_colon && self.matches_anything(&rule)) {
                 continue;
             }
-            for output_pattern in rule.output_patterns.clone() {
-                let pat = Pattern::new(output_pattern.as_bytes(&self.ev.session));
-                if !pat.matches(&output_str) {
-                    continue;
+            let pat = Pattern::new(candidate.pattern.as_bytes(&self.ev.session));
+            let inputs = match self.expanded_pattern_inputs(&rule, output, &pat, &output_str)? {
+                Some((inputs, _)) => inputs,
+                None => rule
+                    .inputs
+                    .iter()
+                    .map(|input| {
+                        let buf = pat.append_subst(&output_str, &input.as_bytes(&self.ev.session));
+                        self.ev.session.intern(buf)
+                    })
+                    .collect(),
+            };
+            let mut ok = true;
+            for i in inputs {
+                if !self.exists(i) && !self.can_be_made_implicitly(i, depth + 1)? {
+                    ok = false;
+                    break;
                 }
-                let inputs = match self.expanded_pattern_inputs(&rule, output, &pat, &output_str)? {
-                    Some((inputs, _)) => inputs,
-                    None => rule
-                        .inputs
-                        .iter()
-                        .map(|input| {
-                            let buf =
-                                pat.append_subst(&output_str, &input.as_bytes(&self.ev.session));
-                            self.ev.session.intern(buf)
-                        })
-                        .collect(),
-                };
-                let mut ok = true;
-                for i in inputs {
-                    if !self.exists(i) && !self.can_be_made_implicitly(i, depth + 1)? {
-                        ok = false;
-                        break;
-                    }
-                }
-                if ok {
-                    return Ok(true);
-                }
+            }
+            if ok {
+                return Ok(true);
             }
         }
 
@@ -1688,10 +1744,15 @@ impl<'a> DepBuilder<'a> {
         vars: &Option<Arc<Vars>>,
         chaining: bool,
     ) -> Result<Option<PickedRuleInfo>> {
-        let irules = self.implicit_rules.get(&output.as_bytes(&self.ev.session));
-        for rule in irules.into_iter().rev() {
-            let Some(pattern_rule) =
-                self.can_pick_implicit_rule(&rule, output, n.clone(), chaining)?
+        let candidates = self.ordered_candidates(&output.as_bytes(&self.ev.session));
+        for candidate in candidates {
+            let Some(pattern_rule) = self.can_pick_implicit_rule(
+                &candidate.rule,
+                candidate.pattern,
+                output,
+                n.clone(),
+                chaining,
+            )?
             else {
                 continue;
             };
