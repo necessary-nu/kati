@@ -266,18 +266,7 @@ impl RuleTrie {
 /// GNU Make's `new_pattern_rule` compares dependency names in order, but not
 /// whether the `|` made one of them order-only.
 fn pattern_rule_prerequisites_match(rule: &Rule, existing: &Rule) -> bool {
-    match (
-        &rule.deferred_prerequisites,
-        &existing.deferred_prerequisites,
-    ) {
-        (Some(rule), Some(existing)) => rule == existing,
-        (None, None) => rule
-            .inputs
-            .iter()
-            .chain(&rule.order_only_inputs)
-            .eq(existing.inputs.iter().chain(&existing.order_only_inputs)),
-        _ => false,
-    }
+    rule.prerequisite_names == existing.prerequisite_names
 }
 
 /// Whether GNU Make's `new_pattern_rule` removes `existing` for `rule`.
@@ -1411,9 +1400,11 @@ impl<'a> DepBuilder<'a> {
         let output_suffix = output.slice(dot_index + 1..);
         let mut r = rule.clone();
         r.inputs.clear();
+        r.prerequisite_names.clear();
         r.deferred_prerequisites = None;
         let input_sym = self.ev.session.intern(input_suffix);
         r.inputs.push(input_sym);
+        r.prerequisite_names.push(input_sym);
         r.is_suffix_rule = true;
         self.suffix_rules
             .entry(output_suffix)

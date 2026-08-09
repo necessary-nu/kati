@@ -40,6 +40,10 @@ pub struct Rule {
     pub is_suffix_rule: bool,
     /// Set when `.SECONDEXPANSION` was declared before this rule was read.
     pub expand_again: bool,
+    /// The first-expanded prerequisite names used to identify a pattern-rule
+    /// definition. The order-only marker changes how a name is scheduled, not
+    /// its place in GNU Make's `new_pattern_rule` comparison.
+    pub prerequisite_names: Vec<Symbol>,
     /// The prerequisite text as the first expansion left it, kept unparsed for
     /// the second one. Only a list that still has a `$` in it: everything else
     /// would expand to itself, and holding it back would hide it from the
@@ -61,6 +65,7 @@ impl Rule {
             is_double_colon,
             is_suffix_rule: false,
             expand_again: false,
+            prerequisite_names: Vec::new(),
             deferred_prerequisites: None,
             cmds: Vec::new(),
             loc,
@@ -70,13 +75,32 @@ impl Rule {
 
     fn parse_inputs(&mut self, session: &mut Session, inputs_str: &Bytes) {
         let (inputs, order_only) = split_order_only(inputs_str);
+        let inputs_start = self.inputs.len();
         for input in word_scanner(&inputs) {
             let word = inputs.slice_ref(trim_leading_curdir(input));
             glob_word(session, word, &mut self.inputs);
         }
+        let order_only_start = self.order_only_inputs.len();
         for input in word_scanner(&order_only) {
             let word = order_only.slice_ref(trim_leading_curdir(input));
             glob_word(session, word, &mut self.order_only_inputs);
+        }
+        self.prerequisite_names
+            .extend_from_slice(&self.inputs[inputs_start..]);
+        self.prerequisite_names
+            .extend_from_slice(&self.order_only_inputs[order_only_start..]);
+    }
+
+    /// Record the names in a list whose raw text must survive for second
+    /// expansion. Splitting the words here makes whitespace and `|`
+    /// classification independent from the bytes retained for later expansion.
+    fn record_deferred_prerequisite_names(&mut self, session: &mut Session, inputs_str: &Bytes) {
+        let (inputs, order_only) = split_order_only(inputs_str);
+        for text in [inputs, order_only] {
+            for input in word_scanner(&text) {
+                let word = text.slice_ref(trim_leading_curdir(input));
+                self.prerequisite_names.push(session.intern(word));
+            }
         }
     }
 
@@ -106,6 +130,7 @@ impl Rule {
         let Some(separator_pos) = memchr(b':', &prereq_string) else {
             // Simple prerequisites
             if self.expand_again && memchr(b'$', &prereq_string).is_some() {
+                self.record_deferred_prerequisite_names(session, &prereq_string);
                 self.deferred_prerequisites = Some(prereq_string);
             } else {
                 self.parse_inputs(session, &prereq_string);
@@ -167,6 +192,7 @@ impl Rule {
             );
         }
         if self.expand_again && memchr(b'$', &prereq_patterns).is_some() {
+            self.record_deferred_prerequisite_names(session, &prereq_patterns);
             self.deferred_prerequisites = Some(prereq_patterns);
         } else {
             self.parse_inputs(session, &prereq_patterns);
