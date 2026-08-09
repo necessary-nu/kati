@@ -197,6 +197,82 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
     Ok(())
 }
 
+/// Install the Make interface variables an embedding frontend already parsed.
+///
+/// `MAKEFLAGS` is a recursive file-origin variable whose raw value refers to
+/// `MAKEOVERRIDES`; the latter is a default-origin proxy for an automatic
+/// simple variable. Keeping that relationship instead of importing a flattened
+/// environment string means a Makefile can inspect origins and can deliberately
+/// replace `MAKEOVERRIDES`, just as it can under GNU Make.
+fn install_compiler_invocation_variables(ev: &mut Evaluator) {
+    let Some(makeflags) = ev.session.flags.makeflags.clone() else {
+        return;
+    };
+    let make_overrides = ev.session.flags.make_overrides.clone().unwrap_or_default();
+    let inherited_overrides =
+        ev.session
+            .invocation_environment
+            .as_ref()
+            .and_then(|environment| {
+                environment
+                    .iter()
+                    .rev()
+                    .find(|(name, _)| name.as_bytes() == b"MAKEOVERRIDES")
+                    .map(|(_, value)| !value.as_bytes().is_empty())
+            })
+            .or_else(|| {
+                ev.session.invocation_environment.is_none().then(|| {
+                    std::env::var_os("MAKEOVERRIDES").is_some_and(|value| !value.is_empty())
+                })
+            })
+            .unwrap_or(false);
+
+    let command_variables = ev.session.intern("-*-command-variables-*-");
+    ev.session.globals.define(
+        command_variables,
+        Variable::with_simple_string(make_overrides.clone(), VarOrigin::Automatic, None, None),
+    );
+
+    let overrides = ev.session.intern("MAKEOVERRIDES");
+    if ev.session.peek_global_var(overrides).is_none() {
+        ev.session.globals.define(
+            overrides,
+            Variable::new_recursive(
+                Arc::new(Value::SymRef(Loc::default(), command_variables)),
+                VarOrigin::Default,
+                None,
+                None,
+                Bytes::from_static(b"${-*-command-variables-*-}"),
+            ),
+        );
+    }
+
+    let has_overrides = !make_overrides.is_empty() || inherited_overrides;
+    let (value, original) = if has_overrides {
+        let mut prefix = BytesMut::from(makeflags.as_ref());
+        prefix.put_slice(b" -- ");
+        let mut original = prefix.clone();
+        original.put_slice(b"$(MAKEOVERRIDES)");
+        (
+            Arc::new(Value::List(
+                None,
+                vec![
+                    Arc::new(Value::Literal(None, prefix.freeze())),
+                    Arc::new(Value::SymRef(Loc::default(), overrides)),
+                ],
+            )),
+            original.freeze(),
+        )
+    } else {
+        (Arc::new(Value::Literal(None, makeflags.clone())), makeflags)
+    };
+    let makeflags = ev.session.intern("MAKEFLAGS");
+    ev.session.globals.define(
+        makeflags,
+        Variable::new_recursive(value, VarOrigin::File, None, None, original),
+    );
+}
+
 /// Evaluate the Makefile `session` names into the graph it describes.
 ///
 /// # Errors
@@ -210,6 +286,7 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
     let mut ev = Evaluator::new(session);
     ev.start()?;
     read_invocation_state(&mut ev)?;
+    install_compiler_invocation_variables(&mut ev);
 
     let bootstrap_asts = read_bootstrap_makefile(&mut ev.session, &targets)?;
     {

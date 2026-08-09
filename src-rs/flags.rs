@@ -99,6 +99,13 @@ pub struct Flags {
     pub subkati_args: Vec<OsString>,
     pub targets: Vec<crate::symtab::Symbol>,
     pub cl_vars: Vec<Bytes>,
+    /// The option portion of `MAKEFLAGS`, supplied by an embedding Make
+    /// frontend. Assignments stay separate so evaluation can expose GNU Make's
+    /// recursive `$(MAKEOVERRIDES)` relationship rather than a flattened
+    /// environment string. `None` preserves standalone kati's inherited
+    /// environment behavior.
+    pub makeflags: Option<Bytes>,
+    pub make_overrides: Option<Bytes>,
     pub writable: Vec<OsString>,
     pub traced_variables_pattern: Vec<crate::strutil::Pattern>,
 
