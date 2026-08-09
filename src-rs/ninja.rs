@@ -25,6 +25,8 @@ use std::{
     sync::Arc,
 };
 
+mod path_alias;
+
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use memchr::{memchr2, memmem};
@@ -46,6 +48,7 @@ use crate::{
     symtab::{Interner, Symbol},
     timeutil::ScopedTimeReporter,
 };
+use path_alias::PhonyAliases;
 
 /// The pool kati declares for itself, so that `--remote_num_jobs` can let ninja
 /// run wide while the commands kati generated stay capped at `--jobs`.
@@ -186,6 +189,7 @@ struct NinjaGenerator<'a> {
     shell_flags: Bytes,
     used_envs: HashMap<Symbol, OsString>,
     nodes: Vec<NinjaNode>,
+    phony_aliases: PhonyAliases,
 }
 
 impl<'a> NinjaGenerator<'a> {
@@ -204,6 +208,7 @@ impl<'a> NinjaGenerator<'a> {
             shell_flags,
             used_envs: HashMap::new(),
             nodes: Vec::new(),
+            phony_aliases: PhonyAliases::default(),
         })
     }
 
@@ -230,6 +235,17 @@ impl<'a> NinjaGenerator<'a> {
         for (_symbol, depnode) in nodes {
             self.populate_ninja_node(depnode)?;
         }
+        let mut occupied = self.done.clone();
+        let mut phonies = Vec::new();
+        for generated in &self.nodes {
+            let node = generated.node.lock();
+            occupied.extend(node.implicit_outputs.iter().copied());
+            if node.is_phony {
+                phonies.push(node.output);
+            }
+        }
+        self.phony_aliases
+            .prepare(&mut self.ce.ev.session.symtab, &occupied, &phonies);
         Ok(())
     }
 
@@ -587,6 +603,9 @@ impl<'a> NinjaGenerator<'a> {
                 &mut dry_buf,
                 &mut description,
             );
+            if description.is_none() && self.phony_aliases.resolve(node.output) != node.output {
+                description = Some(output_str.clone());
+            }
             // Extracting the depfile can rewrite the command, so it has to
             // happen before the command is measured or handed over.
             let depfile = self.get_depfile(&node, &mut cmd_buf)?;
@@ -718,17 +737,27 @@ impl<'a> NinjaGenerator<'a> {
 
         // The sink is given the names, not the nodes behind them: an edge
         // refers to its inputs, it does not own them.
-        let symbols = |deps: &[NamedDepNode]| deps.iter().map(|(s, _)| *s).collect::<Vec<_>>();
+        let symbols = |deps: &[NamedDepNode]| {
+            deps.iter()
+                .map(|(symbol, _)| self.phony_aliases.resolve(*symbol))
+                .collect::<Vec<_>>()
+        };
         let inputs = symbols(&node.deps);
         let order_only_inputs = symbols(&node.order_onlys);
         let validations = symbols(&node.validations);
+        let implicit_outputs = node
+            .implicit_outputs
+            .iter()
+            .map(|symbol| self.phony_aliases.resolve(*symbol))
+            .collect::<Vec<_>>();
+        let output = self.phony_aliases.resolve(node.output);
 
         sink.declare_edge(
             &self.ce.ev.session,
             &SinkEdge {
                 rule: rule_id,
-                output: node.output,
-                implicit_outputs: &node.implicit_outputs,
+                output,
+                implicit_outputs: &implicit_outputs,
                 inputs: &inputs,
                 order_only_inputs: &order_only_inputs,
                 validations: &validations,
@@ -741,7 +770,7 @@ impl<'a> NinjaGenerator<'a> {
             },
         )?;
 
-        Ok(node.is_default_target.then_some(node.output))
+        Ok(node.is_default_target.then_some(output))
     }
 
     /// Drive a sink through the whole graph.
@@ -763,7 +792,11 @@ impl<'a> NinjaGenerator<'a> {
             let targets = if flags.targets.is_empty() || flags.gen_all_targets {
                 vec![default_target.unwrap()]
             } else {
-                flags.targets.clone()
+                flags
+                    .targets
+                    .iter()
+                    .map(|target| self.phony_aliases.resolve(*target))
+                    .collect()
             };
             sink.set_default_targets(&self.ce.ev.session, &targets)?;
         }
