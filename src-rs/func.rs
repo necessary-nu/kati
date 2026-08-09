@@ -935,23 +935,34 @@ fn file_read_func(
     out: &mut dyn BufMut,
     rerun: bool,
 ) -> Result<()> {
-    if !std::fs::exists(filename)? {
-        if should_store_command_result(&ev.session, filename.as_bytes()) {
-            let loc = ev.loc.clone().unwrap_or_default();
-            ev.session.command_results.push(CommandResult {
-                op: CommandOp::ReadMissing,
-                shell: Bytes::new(),
-                shellflag: Bytes::new(),
-                cmd: Bytes::from(filename.as_bytes().to_vec()),
-                find: None,
-                result: Bytes::new(),
-                loc,
-            })
+    // A file that is not there reads as nothing, which is `$(file <)`'s own
+    // rule and not a failure. Anything else the system refuses is one, and it
+    // is reported at the line that asked for the file.
+    let mut buf = match std::fs::read(filename) {
+        Ok(buf) => buf,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if should_store_command_result(&ev.session, filename.as_bytes()) {
+                let loc = ev.loc.clone().unwrap_or_default();
+                ev.session.command_results.push(CommandResult {
+                    op: CommandOp::ReadMissing,
+                    shell: Bytes::new(),
+                    shellflag: Bytes::new(),
+                    cmd: Bytes::from(filename.as_bytes().to_vec()),
+                    find: None,
+                    result: Bytes::new(),
+                    loc,
+                })
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
-
-    let mut buf = std::fs::read(filename)?;
+        Err(err) => error_loc!(
+            ev,
+            ev.loc.as_ref(),
+            "*** open: {}: {}.",
+            filename.to_string_lossy(),
+            crate::strerror(&err)
+        ),
+    };
     if buf.ends_with(b"\n") {
         buf.pop();
     }
@@ -981,13 +992,31 @@ fn file_write_func(
     rerun: bool,
 ) -> Result<()> {
     {
-        let mut f = File::options()
+        let opened = File::options()
             .write(true)
             .append(append)
             .truncate(!append)
             .create(true)
-            .open(filename)?;
-        f.write_all(&text)?;
+            .open(filename);
+        let mut f = match opened {
+            Ok(f) => f,
+            Err(err) => error_loc!(
+                ev,
+                ev.loc.as_ref(),
+                "*** open: {}: {}.",
+                filename.to_string_lossy(),
+                crate::strerror(&err)
+            ),
+        };
+        if let Err(err) = f.write_all(&text) {
+            error_loc!(
+                ev,
+                ev.loc.as_ref(),
+                "*** write: {}: {}.",
+                filename.to_string_lossy(),
+                crate::strerror(&err)
+            );
+        }
     }
 
     if rerun && should_store_command_result(&ev.session, filename.as_bytes()) {
@@ -1280,13 +1309,23 @@ fn extra_file_deps_func(
         let files = arg.eval_to_buf(ev)?;
         for file in word_scanner(&files) {
             let fname = <OsStr as OsStrExt>::from_bytes(file);
-            if !std::fs::exists(fname)? {
-                error_loc!(
+            match std::fs::exists(fname) {
+                Ok(true) => {}
+                Ok(false) => error_loc!(
                     ev,
                     ev.loc.as_ref(),
                     "*** file does not exist: {}",
                     fname.to_string_lossy()
-                );
+                ),
+                // The system could not answer either way — a directory on the
+                // way that cannot be searched. Say so, at the line that asked.
+                Err(err) => error_loc!(
+                    ev,
+                    ev.loc.as_ref(),
+                    "*** {}: {}",
+                    fname.to_string_lossy(),
+                    crate::strerror(&err)
+                ),
             }
             ev.session
                 .makefiles

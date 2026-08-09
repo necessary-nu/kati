@@ -228,11 +228,8 @@ impl Session {
         self.find_emulator.get_or_init(FindEmulator::new)
     }
 
-    /// A parsed makefile, read and parsed on first use.
-    pub fn get_makefile(
-        &mut self,
-        filename: &OsStr,
-    ) -> Result<Option<std::sync::Arc<crate::file::Makefile>>> {
+    /// A parsed makefile, read and parsed on first use, or why it was not.
+    pub fn get_makefile(&mut self, filename: &OsStr) -> Result<crate::file::Source> {
         crate::file_cache::get_makefile(self, filename)
     }
 }

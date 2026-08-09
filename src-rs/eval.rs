@@ -27,6 +27,7 @@ use memchr::memchr;
 use parking_lot::Mutex;
 
 use crate::expr::{Evaluable, ParseExprOpt, Value, parse_expr};
+use crate::file::Source;
 use crate::flags::Flags;
 use crate::loc::Loc;
 use crate::parser::{
@@ -395,7 +396,8 @@ impl Evaluator {
         if filename == "-" {
             self.assignment_tracefile = Some(Box::new(std::io::stderr()));
         } else {
-            let f = std::fs::File::create(filename)?;
+            let f = std::fs::File::create(filename)
+                .map_err(|err| crate::io_failure(std::path::Path::new(filename), &err))?;
             let w = BufWriter::new(f);
             self.assignment_tracefile = Some(Box::new(w));
         }
@@ -994,17 +996,34 @@ impl Evaluator {
         Ok(())
     }
 
-    pub fn do_include(&mut self, fname: &Bytes) -> Result<()> {
+    /// Evaluate `fname` as part of the file including it.
+    ///
+    /// `required` is the difference between `include` and `-include`: a
+    /// Makefile that wrote the second has said it does not care whether the
+    /// file is there or readable, and GNU Make reports nothing when it is
+    /// neither.
+    pub fn do_include(&mut self, fname: &Bytes, required: bool) -> Result<()> {
         let filename = OsString::from_vec(fname.to_vec());
         collect_stats_with_slow_report!(self, "included makefiles", &filename);
 
-        let Some(mk) = self.session.get_makefile(&filename)? else {
-            error_loc!(
+        let mk = match self.session.get_makefile(&filename)? {
+            Source::Read(mk) => mk,
+            Source::Absent => error_loc!(
                 self,
                 self.loc.as_ref(),
                 "{} does not exist",
                 filename.to_string_lossy()
-            );
+            ),
+            Source::Unreadable(_) if !required => return Ok(()),
+            // The system's own reason, at the `include` that asked for the
+            // file: an `io::Error` reaching the user on its own names neither.
+            Source::Unreadable(err) => error_loc!(
+                self,
+                self.loc.as_ref(),
+                "{}: {}",
+                filename.to_string_lossy(),
+                crate::strerror(&err)
+            ),
         };
 
         let v = fname.slice_ref(trim_leading_curdir(fname));
@@ -1092,8 +1111,9 @@ impl Evaluator {
                         error_loc!(
                             self,
                             self.loc.as_ref(),
-                            "{}: {err}",
-                            String::from_utf8_lossy(&pat)
+                            "{}: {}",
+                            String::from_utf8_lossy(&pat),
+                            crate::strerror(err)
                         );
                     }
                     continue;
@@ -1128,7 +1148,10 @@ impl Evaluator {
                         "In file included from {}:",
                         stmt.loc().display(&self.session)
                     );
-                    anyhow::Context::with_context(self.do_include(fname), || included_from)?;
+                    anyhow::Context::with_context(
+                        self.do_include(fname, stmt.should_exist),
+                        || included_from,
+                    )?;
                 }
             }
         }
@@ -1443,7 +1466,8 @@ impl Evaluator {
         let mut w: Box<dyn std::io::Write> = if filename == OsStr::new("-") {
             Box::new(std::io::stdout())
         } else {
-            let f = std::fs::File::create(filename)?;
+            let f = std::fs::File::create(filename)
+                .map_err(|err| crate::io_failure(std::path::Path::new(filename), &err))?;
             Box::new(BufWriter::new(f))
         };
 

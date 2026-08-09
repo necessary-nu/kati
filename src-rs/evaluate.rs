@@ -38,6 +38,7 @@ use crate::dep::{NamedDepNode, make_dep_with_additional_targets};
 use crate::error_loc;
 use crate::eval::{Evaluator, FrameType};
 use crate::expr::Value;
+use crate::file::Source;
 use crate::loc::Loc;
 use crate::log;
 use crate::session::Session;
@@ -335,8 +336,18 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
             Bytes::from(makefile.as_bytes().to_vec()),
             Loc::default(),
         );
-        let Some(mk) = ev.session.get_makefile(&makefile)? else {
-            bail!("makefile not found")
+        let mk = match ev.session.get_makefile(&makefile)? {
+            Source::Read(mk) => mk,
+            Source::Absent => bail!("makefile not found"),
+            // No `include` asked for this one, so there is no line to point
+            // at; the diagnostic still has to say which file and why.
+            Source::Unreadable(err) => error_loc!(
+                &ev,
+                None,
+                "*** {}: {}",
+                makefile.to_string_lossy(),
+                crate::strerror(&err)
+            ),
         };
         let stmts = mk.stmts.lock().clone();
         for stmt in stmts {

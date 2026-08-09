@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, ffi::OsStr, os::unix::ffi::OsStrExt, sync::Arc, time::SystemTime};
+use std::{
+    collections::HashMap, ffi::OsStr, os::unix::ffi::OsStrExt, path::Path, sync::Arc,
+    time::SystemTime,
+};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -134,8 +137,11 @@ impl<'a> Executor<'a> {
         let order_onlys = n.lock().order_onlys.clone();
         for (_, d) in order_onlys {
             let dep_out = d.lock().output.as_bytes(&self.ce.ev.session);
-            if std::fs::exists(OsStr::from_bytes(&dep_out))? {
-                continue;
+            let dep_path = Path::new(OsStr::from_bytes(&dep_out));
+            match std::fs::exists(dep_path) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(err) => return Err(crate::io_failure(dep_path, &err)),
             }
             let ts = self.exec_node(&d, Some(&output_str))?;
             if latest < ts {

@@ -19,6 +19,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::{
     collections::HashMap,
     ffi::{CStr, CString, OsStr},
+    path::Path,
     process::{Command, ExitStatus},
     slice,
     sync::Arc,
@@ -39,13 +40,23 @@ pub enum RedirectStderr {
     DevNull,
 }
 
+/// When `filename` was last written, or `None` when it is not there.
+///
+/// One `stat` rather than an `exists` and then a `metadata`, and a failure
+/// that is not "no such file" names the path it happened to: a bare
+/// `io::Error` reaching a caller from here says only what went wrong, never
+/// which of a build's files it went wrong on.
 pub fn get_timestamp(filename: &[u8]) -> Result<Option<SystemTime>> {
     let filename = <OsStr as OsStrExt>::from_bytes(filename);
-    if !std::fs::exists(filename)? {
-        return Ok(None);
-    }
-    let metadata = std::fs::metadata(filename)?;
-    Ok(Some(metadata.modified()?))
+    let metadata = match std::fs::metadata(filename) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(crate::io_failure(Path::new(filename), &err)),
+    };
+    metadata
+        .modified()
+        .map(Some)
+        .map_err(|err| crate::io_failure(Path::new(filename), &err))
 }
 
 pub fn run_command(

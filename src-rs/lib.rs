@@ -143,6 +143,38 @@ macro_rules! error_loc {
 /// How GNU Make ends the diagnostic it dies on: two spaces, then `Stop.`.
 const STOP: &str = "  Stop.";
 
+/// The system's own words for an I/O failure, as `strerror` gives them.
+///
+/// Rust renders an `io::Error` as `strerror(errno)` with ` (os error N)`
+/// appended. GNU Make quotes `strerror` and nothing else, and so does the
+/// manifest front end this crate compiles for, so the suffix comes off: it is
+/// Rust's spelling rather than either tool's. It is removed by the errno the
+/// error itself reports rather than by scanning the text for a shape, so a
+/// message that legitimately contains those words keeps them.
+///
+/// An error with no errno behind it — one built from a `Kind`, or from another
+/// error — renders as it is.
+pub fn strerror(error: &std::io::Error) -> String {
+    let rendered = error.to_string();
+    let Some(code) = error.raw_os_error() else {
+        return rendered;
+    };
+    match rendered.strip_suffix(&format!(" (os error {code})")) {
+        Some(message) => message.to_owned(),
+        None => rendered,
+    }
+}
+
+/// An I/O failure that names the path it happened to.
+///
+/// For the sites that read or write a file with no evaluation location to hand
+/// — the executor's own stats, a file the caller named on the command line.
+/// Where there is a location, raise through [`error_loc!`] instead so the
+/// diagnostic points at the directive that asked for the file.
+pub fn io_failure(path: &std::path::Path, error: &std::io::Error) -> anyhow::Error {
+    anyhow::format_err!("{}: {}", path.display(), strerror(error))
+}
+
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 const MAGENTA: &str = "\x1b[35m";
@@ -207,5 +239,43 @@ fn color_warn_log(ctx: &impl crate::session::Context, loc: Option<&crate::loc::L
         eprintln!("{BOLD}{loc}: {MAGENTA}warning: {RESET}{BOLD}{filtered}{RESET}")
     } else {
         eprintln!("{loc}: {msg}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_system_error_reads_as_strerror_alone() {
+        let denied = std::io::Error::from_raw_os_error(13);
+        assert!(denied.to_string().contains("(os error 13)"));
+        assert_eq!(strerror(&denied), "Permission denied");
+    }
+
+    #[test]
+    fn an_error_with_no_errno_reads_as_it_is() {
+        let ours = std::io::Error::other("something we said ourselves");
+        assert_eq!(strerror(&ours), "something we said ourselves");
+    }
+
+    #[test]
+    fn a_message_that_says_os_error_itself_keeps_it() {
+        // Keyed on the errno the error reports rather than on the shape of the
+        // text, so a message that happens to carry those words survives.
+        let quoting = std::io::Error::other("the words (os error 2) appeared in a file");
+        assert_eq!(
+            strerror(&quoting),
+            "the words (os error 2) appeared in a file"
+        );
+    }
+
+    #[test]
+    fn an_io_failure_names_the_path_it_happened_to() {
+        let denied = std::io::Error::from_raw_os_error(13);
+        assert_eq!(
+            io_failure(std::path::Path::new("sub/inc.mk"), &denied).to_string(),
+            "sub/inc.mk: Permission denied"
+        );
     }
 }

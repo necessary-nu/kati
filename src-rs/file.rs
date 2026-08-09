@@ -27,17 +27,41 @@ pub struct Makefile {
     pub stmts: Arc<Mutex<Vec<Stmt>>>,
 }
 
-impl Makefile {
-    pub fn from_file(session: &mut Session, filename: &OsStr) -> Result<Option<Arc<Makefile>>> {
-        if !std::fs::exists(filename)? {
-            return Ok(None);
-        }
+/// What asking for a makefile found.
+///
+/// A file that is not there and a file that will not open are different
+/// answers: the first is an ordinary thing for a Makefile to describe how to
+/// generate, and the second is a failure the caller has to report. Telling
+/// them apart here is what lets the caller name the path and the directive
+/// that asked for it — an `io::Error` on its own carries neither.
+pub enum Source {
+    /// The file, parsed.
+    Read(Arc<Makefile>),
+    /// Nothing is at that path.
+    Absent,
+    /// Something is, and the system would not let us read it. The caller
+    /// passed the path in, so what comes back is the system's reason alone.
+    Unreadable(std::io::Error),
+}
 
-        let buf = Bytes::from(std::fs::read(filename)?);
+impl Makefile {
+    /// Read and parse `filename`.
+    ///
+    /// One `read` rather than an `exists` and then a `read`. The two asked the
+    /// same question, the pair could disagree when something else was writing
+    /// the tree, and `exists` answered a failure it could not classify — a
+    /// directory that cannot be searched — with the same `Err` as everything
+    /// else, which is the context this reports instead.
+    pub fn from_file(session: &mut Session, filename: &OsStr) -> Result<Source> {
+        let buf = match std::fs::read(filename) {
+            Ok(buf) => Bytes::from(buf),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Source::Absent),
+            Err(err) => return Ok(Source::Unreadable(err)),
+        };
 
         let filename = session.intern(filename.as_bytes().to_vec());
         let stmts = parse_file(session, &buf, filename)?;
 
-        Ok(Some(Arc::new(Makefile { filename, stmts })))
+        Ok(Source::Read(Arc::new(Makefile { filename, stmts })))
     }
 }

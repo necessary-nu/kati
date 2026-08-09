@@ -22,7 +22,10 @@ use std::{
 
 use anyhow::Result;
 
-use crate::{file::Makefile, session::Session};
+use crate::{
+    file::{Makefile, Source},
+    session::Session,
+};
 
 /// Parsed makefiles and extra file dependencies, for one session.
 // [spec:ronin:req:make.no-ambient-state]
@@ -66,12 +69,31 @@ impl MakefileCache {
 /// The parsed form of `filename`, read and parsed on first use.
 ///
 /// Parsing interns, so this takes the whole session rather than the cache.
-pub fn get_makefile(session: &mut Session, filename: &OsStr) -> Result<Option<Arc<Makefile>>> {
+///
+/// A file that would not open is still a file this evaluation depended on and
+/// did not get, so it joins the set a later run compares timestamps against.
+/// The failure itself is handed straight back rather than cached, so a second
+/// `include` of it asks the system again rather than being told it is absent —
+/// which it is not.
+pub fn get_makefile(session: &mut Session, filename: &OsStr) -> Result<Source> {
     if let Some(mk) = session.makefiles.cache.get(filename) {
-        return Ok(mk.clone());
+        return Ok(match mk {
+            Some(mk) => Source::Read(mk.clone()),
+            None => Source::Absent,
+        });
     }
     let filename = filename.to_os_string();
-    let mk = Makefile::from_file(session, &filename)?;
-    session.makefiles.cache.insert(filename, mk.clone());
-    Ok(mk)
+    let source = Makefile::from_file(session, &filename)?;
+    match &source {
+        Source::Read(mk) => {
+            session.makefiles.cache.insert(filename, Some(mk.clone()));
+        }
+        Source::Absent => {
+            session.makefiles.cache.insert(filename, None);
+        }
+        Source::Unreadable(_) => {
+            session.makefiles.extra_file_deps.insert(filename);
+        }
+    }
+    Ok(source)
 }
