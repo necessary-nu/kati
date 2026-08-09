@@ -39,7 +39,7 @@ use crate::eval::{Evaluator, FrameType};
 use crate::expr::Value;
 use crate::file::Source;
 use crate::loc::Loc;
-use crate::log;
+use crate::{error_loc, log};
 use crate::session::Session;
 use crate::stmt::Stmt;
 use crate::symtab::{Symbol, join_symbols};
