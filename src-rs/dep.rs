@@ -34,7 +34,10 @@ use crate::{
     rule::{Rule, glob_word, split_order_only},
     session::{Context, Session},
     stmt::AssignOp,
-    strutil::{Pattern, WordWriter, get_ext, strip_ext, trim_leading_curdir, word_scanner},
+    strutil::{
+        Pattern, WordWriter, get_ext, is_space_byte, makefile_word_scanner, strip_ext,
+        trim_leading_curdir, word_scanner,
+    },
     symtab::{Interner, Symbol},
     timeutil::ScopedTimeReporter,
     var::{ScopedVar, Var, Variable, Vars},
@@ -151,6 +154,63 @@ fn stem_references(text: &Bytes) -> Bytes {
         }
     }
     ret.freeze()
+}
+
+/// Split the retained prerequisite text of an implicit pattern rule the way
+/// GNU Make's `get_next_word` does before second expansion. A raw backslash
+/// does not quote a blank at this stage. Variable references stay whole, and a
+/// pipe ends the current chunk so expansion can still decide whether it is an
+/// order-only separator.
+fn implicit_prerequisite_words(source: &Bytes) -> impl Iterator<Item = Bytes> + '_ {
+    let mut index = 0usize;
+    std::iter::from_fn(move || {
+        while source.get(index).is_some_and(is_space_byte) {
+            index += 1;
+        }
+        if index == source.len() {
+            return None;
+        }
+
+        let start = index;
+        while let Some(&byte) = source.get(index) {
+            match byte {
+                b' ' | b'\t' => break,
+                b'|' => {
+                    index += 1;
+                    break;
+                }
+                b'$' => {
+                    index += 1;
+                    let Some(&open) = source.get(index) else {
+                        break;
+                    };
+                    index += 1;
+                    if open == b'$' {
+                        continue;
+                    }
+                    let close = match open {
+                        b'(' => b')',
+                        b'{' => b'}',
+                        _ => continue,
+                    };
+                    let mut depth = 0usize;
+                    while let Some(&inner) = source.get(index) {
+                        index += 1;
+                        if inner == open {
+                            depth += 1;
+                        } else if inner == close {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                    }
+                }
+                _ => index += 1,
+            }
+        }
+        Some(source.slice(start..index))
+    })
 }
 
 fn apply_output_pattern(
@@ -1046,14 +1106,43 @@ impl<'a> DepBuilder<'a> {
 
     /// The second half of `.SECONDEXPANSION`: expand what the first expansion
     /// left, now that `$@` and the stem have values, and read the result as
-    /// prerequisites. A stem is given for a pattern or static pattern rule and
-    /// withheld for an explicit one, where `%` is an ordinary character.
+    /// prerequisites. A stem is given for a static pattern rule and withheld
+    /// for an explicit one, where `%` is an ordinary character.
     fn expand_prerequisites_again(
         &mut self,
         output: Symbol,
         stem: Option<Bytes>,
         prerequisites: (&[Symbol], &[Symbol]),
         text: &Bytes,
+    ) -> Result<(Vec<Symbol>, Vec<Symbol>)> {
+        self.expand_deferred_prerequisites(output, stem, prerequisites, vec![text.clone()])
+    }
+
+    /// An implicit pattern rule expands each raw prerequisite word
+    /// independently. This keeps a backslash at the end of one raw word from
+    /// quoting the blank before the next one, while still letting an expansion
+    /// introduce an escaped blank inside its own result.
+    fn expand_pattern_prerequisites_again(
+        &mut self,
+        output: Symbol,
+        stem: Bytes,
+        prerequisites: (&[Symbol], &[Symbol]),
+        text: &Bytes,
+    ) -> Result<(Vec<Symbol>, Vec<Symbol>)> {
+        self.expand_deferred_prerequisites(
+            output,
+            Some(stem),
+            prerequisites,
+            implicit_prerequisite_words(text).collect(),
+        )
+    }
+
+    fn expand_deferred_prerequisites(
+        &mut self,
+        output: Symbol,
+        stem: Option<Bytes>,
+        prerequisites: (&[Symbol], &[Symbol]),
+        texts: Vec<Bytes>,
     ) -> Result<(Vec<Symbol>, Vec<Symbol>)> {
         let at = self.ev.session.intern("@");
         let star = self.ev.session.intern("*");
@@ -1065,9 +1154,12 @@ impl<'a> DepBuilder<'a> {
             Variable::with_simple_string(s, crate::var::VarOrigin::Automatic, None, None)
         };
         let scope = self.cur_rule_vars.clone().unwrap_or_default();
-        let text = match &stem {
-            Some(_) => stem_references(text),
-            None => text.clone(),
+        let texts = match &stem {
+            Some(_) => texts
+                .into_iter()
+                .map(|text| stem_references(&text))
+                .collect::<Vec<_>>(),
+            None => texts,
         };
         let (recorded, recorded_order_only) = prerequisites;
         let first = recorded
@@ -1090,23 +1182,36 @@ impl<'a> DepBuilder<'a> {
             let _hat = ScopedVar::new(scope.clone(), hat, automatic(hat_value));
             let _plus = ScopedVar::new(scope.clone(), plus, automatic(plus_value));
             let _bar = ScopedVar::new(scope, bar, automatic(bar_value));
-            let mut loc = self.ev.loc.clone().unwrap_or_default();
-            let expr = crate::expr::parse_expr(
-                &mut self.ev.session,
-                &mut loc,
-                text,
-                crate::expr::ParseExprOpt::Normal,
-            )?;
-            expr.eval_to_buf(self.ev)?
+            let mut expanded = Vec::with_capacity(texts.len());
+            for text in texts {
+                let mut loc = self.ev.loc.clone().unwrap_or_default();
+                let expr = crate::expr::parse_expr(
+                    &mut self.ev.session,
+                    &mut loc,
+                    text,
+                    crate::expr::ParseExprOpt::Normal,
+                )?;
+                expanded.push(expr.eval_to_buf(self.ev)?);
+            }
+            expanded
         };
 
-        let (before, after) = split_order_only(&expanded);
         let mut inputs = Vec::new();
         let mut order_only_inputs = Vec::new();
-        for (text, into) in [(before, &mut inputs), (after, &mut order_only_inputs)] {
-            for word in word_scanner(&text) {
-                let word = text.slice_ref(trim_leading_curdir(word));
-                glob_word(&mut self.ev.session, word, into);
+        let mut order_only = false;
+        for expanded_word in expanded {
+            let (before, after) = if order_only {
+                (Bytes::new(), expanded_word)
+            } else {
+                let split = split_order_only(&expanded_word);
+                order_only = memchr(b'|', &expanded_word).is_some();
+                split
+            };
+            for (text, into) in [(before, &mut inputs), (after, &mut order_only_inputs)] {
+                for word in makefile_word_scanner(&text) {
+                    let word = word.slice_ref(trim_leading_curdir(&word));
+                    glob_word(&mut self.ev.session, word, into);
+                }
             }
         }
         Ok((inputs, order_only_inputs))
@@ -1524,9 +1629,9 @@ impl<'a> DepBuilder<'a> {
         }
         let stem = Bytes::copy_from_slice(pat.stem(output_str));
         let (recorded, recorded_order_only) = self.recorded_prerequisites(output);
-        let expanded = self.expand_prerequisites_again(
+        let expanded = self.expand_pattern_prerequisites_again(
             output,
-            Some(stem),
+            stem,
             (&recorded, &recorded_order_only),
             &text,
         )?;
@@ -2305,6 +2410,21 @@ pub fn is_buildable_target(names: &impl Interner, output: &Symbol) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_prerequisite_words_keep_reference_contents_whole() {
+        let source = Bytes::from_static(b"\n %.a\\ $(subst |,x,$(S))| |tail");
+        let words = implicit_prerequisite_words(&source).collect::<Vec<_>>();
+        assert_eq!(
+            words,
+            vec![
+                Bytes::from_static(br"%.a\"),
+                Bytes::from_static(b"$(subst |,x,$(S))|"),
+                Bytes::from_static(b"|"),
+                Bytes::from_static(b"tail"),
+            ]
+        );
+    }
 
     #[test]
     fn test_is_suffix_rule() {

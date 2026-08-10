@@ -40,7 +40,8 @@ use crate::stmt::{
     RuleStmt, Statement, UndefineStmt, VpathStmt,
 };
 use crate::strutil::{
-    Pattern, is_space_byte, trim_leading_curdir, trim_left_space, trim_right_space, word_scanner,
+    Pattern, is_space_byte, makefile_word_scanner, trim_leading_curdir, trim_left_space,
+    trim_right_space, word_scanner,
 };
 use crate::symtab::{Interner, Symbol, Symtab};
 use crate::var::{Var, VarOrigin, Variable, Vars};
@@ -1158,8 +1159,8 @@ impl Evaluator {
         let after = before_term.slice(delimiter.colon + 1..);
         let mut pattern_rule_count = 0;
         let mut targets: Vec<Symbol> = Vec::new();
-        for word in word_scanner(&targets_string) {
-            let target = targets_string.slice_ref(trim_leading_curdir(word));
+        for word in makefile_word_scanner(&targets_string) {
+            let target = word.slice_ref(trim_leading_curdir(&word));
             glob_word(session, target, &mut targets);
         }
         // The `%` is read off what the glob left, as GNU Make does.

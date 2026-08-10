@@ -42,6 +42,68 @@ pub fn word_scanner(s: &[u8]) -> impl Iterator<Item = &[u8]> {
     s.split(is_space_byte).filter(|s| !s.is_empty())
 }
 
+fn is_makefile_blank(byte: &u8) -> bool {
+    matches!(byte, b' ' | b'\t')
+}
+
+/// Split a rule's file-name sequence the way GNU Make's `PARSE_FILE_SEQ`
+/// does after expansion. Backslashes only quote blank separators here: half
+/// of each run remains, and an odd run makes the following space or tab part
+/// of the current name.
+pub fn makefile_word_scanner(source: &Bytes) -> impl Iterator<Item = Bytes> + '_ {
+    let mut index = 0usize;
+    std::iter::from_fn(move || {
+        while source.get(index).is_some_and(is_space_byte) {
+            index += 1;
+        }
+        if index == source.len() {
+            return None;
+        }
+
+        let word_start = index;
+        let mut copied = word_start;
+        let mut compacted = None::<BytesMut>;
+        while index < source.len() {
+            if is_makefile_blank(&source[index]) {
+                break;
+            }
+            if source[index] != b'\\' {
+                index += 1;
+                continue;
+            }
+
+            let slash_start = index;
+            while source.get(index) == Some(&b'\\') {
+                index += 1;
+            }
+            let slash_count = index - slash_start;
+            if !source.get(index).is_some_and(is_makefile_blank) {
+                continue;
+            }
+
+            let word = compacted.get_or_insert_with(BytesMut::new);
+            word.put_slice(&source[copied..slash_start]);
+            for _ in 0..slash_count / 2 {
+                word.put_u8(b'\\');
+            }
+            copied = index;
+            if slash_count.is_multiple_of(2) {
+                break;
+            }
+            word.put_u8(source[index]);
+            index += 1;
+            copied = index;
+        }
+
+        Some(if let Some(mut word) = compacted {
+            word.put_slice(&source[copied..index]);
+            word.freeze()
+        } else {
+            source.slice(word_start..index)
+        })
+    })
+}
+
 pub struct WordWriter<'a> {
     pub out: &'a mut dyn BufMut,
     needs_space: bool,
@@ -539,6 +601,44 @@ mod test {
 
         let ss = word_scanner(b" a  b").collect::<Vec<&[u8]>>();
         assert_eq!(ss, vec![b"a", b"b"]);
+    }
+
+    #[test]
+    fn makefile_words_compact_backslashes_that_quote_blanks() {
+        let scan = |source: &'static [u8]| {
+            let source = Bytes::from_static(source);
+            makefile_word_scanner(&source).collect::<Vec<_>>()
+        };
+
+        assert_eq!(scan(br"a\ b"), vec![Bytes::from_static(b"a b")]);
+        assert_eq!(
+            scan(br"a\\ b"),
+            vec![Bytes::from_static(br"a\"), Bytes::from_static(b"b")]
+        );
+        assert_eq!(scan(br"a\\\ b"), vec![Bytes::from_static(br"a\ b")]);
+        assert_eq!(
+            scan(br"a\\\\ b"),
+            vec![Bytes::from_static(br"a\\"), Bytes::from_static(b"b")]
+        );
+        assert_eq!(scan(b"a\\\tb"), vec![Bytes::from_static(b"a\tb")]);
+        assert_eq!(
+            scan(b"a\\\\\tb"),
+            vec![Bytes::from_static(br"a\"), Bytes::from_static(b"b")]
+        );
+        assert_eq!(scan(b"a\nb"), vec![Bytes::from_static(b"a\nb")]);
+        assert_eq!(scan(b"\n\rone"), vec![Bytes::from_static(b"one")]);
+    }
+
+    #[test]
+    fn ordinary_makefile_words_are_zero_copy() {
+        let source = Bytes::from_static(b"one two");
+        let words = makefile_word_scanner(&source).collect::<Vec<_>>();
+        assert_eq!(
+            words,
+            vec![Bytes::from_static(b"one"), Bytes::from_static(b"two")]
+        );
+        assert_eq!(words[0].as_ptr(), source.as_ptr());
+        assert_eq!(words[1].as_ptr(), source[4..].as_ptr());
     }
 
     /// Escaping for a shell is about the shell and about nothing else.

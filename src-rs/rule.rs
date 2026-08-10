@@ -24,7 +24,7 @@ use memchr::memchr;
 use crate::expr::Value;
 use crate::loc::Loc;
 use crate::session::Session;
-use crate::strutil::{Pattern, trim_leading_curdir, trim_space, word_scanner};
+use crate::strutil::{Pattern, makefile_word_scanner, trim_leading_curdir, trim_space};
 use crate::symtab::Symbol;
 use crate::{error_loc, warn_loc};
 
@@ -74,20 +74,20 @@ impl Rule {
 
     fn parse_inputs(&mut self, session: &mut Session, inputs_str: &Bytes) {
         let (inputs, order_only) = split_order_only(inputs_str);
-        for input in word_scanner(&inputs) {
-            let word = inputs.slice_ref(trim_leading_curdir(input));
+        for input in makefile_word_scanner(&inputs) {
+            let word = input.slice_ref(trim_leading_curdir(&input));
             let identity_start = self.inputs.len();
             glob_word(session, word, &mut self.inputs);
-            if input != b".WAIT" {
+            if input.as_ref() != b".WAIT" {
                 self.prerequisite_names
                     .extend_from_slice(&self.inputs[identity_start..]);
             }
         }
-        for input in word_scanner(&order_only) {
-            let word = order_only.slice_ref(trim_leading_curdir(input));
+        for input in makefile_word_scanner(&order_only) {
+            let word = input.slice_ref(trim_leading_curdir(&input));
             let identity_start = self.order_only_inputs.len();
             glob_word(session, word, &mut self.order_only_inputs);
-            if input != b".WAIT" {
+            if input.as_ref() != b".WAIT" {
                 self.prerequisite_names
                     .extend_from_slice(&self.order_only_inputs[identity_start..]);
             }
@@ -139,8 +139,8 @@ impl Rule {
         let target_prereq = prereq_string.slice(..separator_pos);
         let prereq_patterns = normalize_prerequisites(prereq_string.slice(separator_pos + 1..));
 
-        let patterns = word_scanner(&target_prereq)
-            .map(|p| target_prereq.slice_ref(trim_leading_curdir(p)))
+        let patterns = makefile_word_scanner(&target_prereq)
+            .map(|pattern| pattern.slice_ref(trim_leading_curdir(&pattern)))
             .collect::<Vec<_>>();
         for target_pattern in patterns {
             let pat = Pattern::new(target_pattern.clone());
