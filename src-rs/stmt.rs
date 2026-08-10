@@ -74,35 +74,9 @@ pub enum CondOp {
     Ifndef,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuleSep {
-    Null,
-    Semicolon,
-    Eq,
-    FinalEq,
-}
-
 pub struct RuleStmt {
     loc: Loc,
     orig: Bytes,
-
-    pub lhs: Arc<Value>,
-    pub sep: RuleSep,
-    pub rhs: Option<Arc<Value>>,
-    pub assign_modifiers: AssignModifiers,
-    /// Whether the colon that ends the targets stood in the source line.
-    ///
-    /// GNU Make reads a target-specific assignment off the line as written: it
-    /// stops expanding at the word that carries the colon and looks for the
-    /// assignment operator in the text beyond, which expansion has not reached
-    /// (read.c, `parse_var_assignment` over `lb_next`). So `sep` is the whole
-    /// answer whenever the colon was written, and an `=` that only appears once
-    /// a prerequisite has expanded is part of a name.
-    ///
-    /// A colon that arrives by expansion is the exception, and it is GNU Make's
-    /// own: what follows such a colon is the rest of the word that produced it,
-    /// which is expanded text, so the operator is read off that instead.
-    pub colon_in_source: bool,
 }
 
 impl Statement for RuleStmt {
@@ -121,32 +95,13 @@ impl Statement for RuleStmt {
 
 impl Debug for RuleStmt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "RuleStmt(lhs={:?} sep={:?} rhs={:?} loc={:?})",
-            self.lhs, self.sep, self.rhs, self.loc
-        )
+        write!(f, "RuleStmt(orig={:?} loc={:?})", self.orig, self.loc)
     }
 }
 
 impl RuleStmt {
-    pub fn new(
-        loc: Loc,
-        lhs: Arc<Value>,
-        sep: RuleSep,
-        rhs: Option<Arc<Value>>,
-        assign_modifiers: AssignModifiers,
-        colon_in_source: bool,
-    ) -> Arc<RuleStmt> {
-        Arc::new(RuleStmt {
-            loc,
-            orig: Bytes::new(),
-            lhs,
-            sep,
-            rhs,
-            assign_modifiers,
-            colon_in_source,
-        })
+    pub fn new(loc: Loc, orig: Bytes) -> Arc<RuleStmt> {
+        Arc::new(RuleStmt { loc, orig })
     }
 }
 

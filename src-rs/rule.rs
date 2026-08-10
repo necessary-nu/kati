@@ -24,7 +24,6 @@ use memchr::memchr;
 use crate::expr::Value;
 use crate::loc::Loc;
 use crate::session::Session;
-use crate::stmt::{RuleSep, RuleStmt};
 use crate::strutil::{Pattern, trim_leading_curdir, trim_space, word_scanner};
 use crate::symtab::Symbol;
 use crate::{error_loc, warn_loc};
@@ -102,28 +101,14 @@ impl Rule {
         self.deferred_prerequisites = Some(prerequisites);
     }
 
-    pub fn parse_prerequisites(
-        &mut self,
-        session: &mut Session,
-        line: &Bytes,
-        separator_pos: Option<usize>,
-        rule_stmt: &RuleStmt,
-    ) -> Result<()> {
+    pub fn parse_prerequisites(&mut self, session: &mut Session, line: &Bytes) -> Result<()> {
         // line is either
-        //    prerequisites [ ; command ]
+        //    prerequisites
         // or
-        //    target-prerequisites : prereq-patterns [ ; command ]
-        // First, separate command. At this point separator_pos should point to ';'
-        // unless null.
-        let mut prereq_string = line.clone();
-        if let Some(separator_pos) = separator_pos
-            && rule_stmt.sep != RuleSep::Semicolon
-        {
-            assert!(line[separator_pos] == b';');
-            let value = line.slice(separator_pos + 1..);
-            self.cmds.push(Arc::new(Value::Literal(None, value)));
-            prereq_string = line.slice(..separator_pos);
-        }
+        //    target-prerequisites : prereq-patterns
+        // The evaluator has already separated an inline command at the point
+        // GNU Make decides whether this is a target-specific assignment.
+        let prereq_string = line.clone();
 
         let Some(separator_pos) = find_unescaped_colon(&prereq_string) else {
             // Simple prerequisites
