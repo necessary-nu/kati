@@ -63,15 +63,6 @@ const LOCAL_POOL: &[u8] = b"local_pool";
 /// here rather than pushed through [`BuildSink`].
 const ALWAYS_BUILD: &[u8] = b"_kati_always_build_";
 
-/// What a rule prints while it runs when the Makefile did not say.
-///
-/// This is a ninja *expression*, not a string: `$out` is evaluated per edge, so
-/// the same three rules cannot be pushed through [`BuildSink`] as a
-/// description. Nothing outside a manifest could evaluate it, and expanding it
-/// here would put a path where the manifest wants the reference. So the front
-/// end sends `None` and each sink says "no description" in its own terms.
-const DEFAULT_DESCRIPTION: &str = "build $out";
-
 /// Where a script too long for an argument list is written.
 ///
 /// Also a ninja expression, and also the writer's alone: it is one file per
@@ -453,10 +444,9 @@ impl<'a> NinjaGenerator<'a> {
     /// Assemble the recipe into one shell script, and say what to print while
     /// it runs if the recipe itself said so.
     ///
-    /// `description` is left `None` when the Makefile did not say, rather than
-    /// filled with a default: what a build prints when nobody chose is a
-    /// question for whatever consumes the graph, and the manifest writer
-    /// answers it in Ninja's own terms, which are not available here.
+    /// `description` is left `None` when the Makefile did not say. Each sink
+    /// can then narrate an inline recipe with the expanded script itself,
+    /// without making this front end choose a destination-specific format.
     ///
     /// Returns whether the script's own status can be read as an ignored
     /// error, which is [`SinkRule::ignore_errors`].
@@ -1180,12 +1170,15 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
         self.write_location(names, rule.loc)?;
         writeln!(self.out, "rule rule{}", rule.id)?;
 
-        self.out.write_all(b" description = ")?;
-        match rule.description {
-            Some(description) => self.out.write_all(&escape_ninja_value(description))?,
-            None => self.out.write_all(DEFAULT_DESCRIPTION.as_bytes())?,
+        let description = rule.description.or(match rule.command {
+            SinkCommand::Inline(script) => Some(script),
+            SinkCommand::ResponseFile(_) => None,
+        });
+        if let Some(description) = description {
+            self.out.write_all(b" description = ")?;
+            self.out.write_all(&escape_ninja_value(description))?;
+            self.out.write_all(b"\n")?;
         }
-        self.out.write_all(b"\n")?;
 
         if let Some(depfile) = rule.depfile {
             write!(self.out, " depfile = ")?;
@@ -1657,12 +1650,16 @@ mod tests {
         assert_eq!(binding(&manifest, "rspfile"), RESPONSE_FILE);
     }
 
-    /// A description the Makefile chose is text and gets escaped; the default
-    /// is a ninja expression the writer owns and must not be.
+    /// A description the Makefile chose is text and gets escaped. Without one,
+    /// use a short inline recipe itself, but do not duplicate an oversized
+    /// response-file script into the build's narration.
     #[test]
-    fn test_writer_owns_the_default_description() {
+    fn test_writer_uses_the_inline_recipe_as_its_default_description() {
         let manifest = declare_rule_for(SinkCommand::Inline(b"true"), None);
-        assert_eq!(binding(&manifest, "description"), DEFAULT_DESCRIPTION);
+        assert_eq!(binding(&manifest, "description"), "true");
+
+        let manifest = declare_rule_for(SinkCommand::ResponseFile(b"true"), None);
+        assert!(!manifest.contains(" description = "), "{manifest}");
 
         let manifest = declare_rule_for(SinkCommand::Inline(b"true"), Some(b"making $PATH"));
         assert_eq!(binding(&manifest, "description"), "making $$PATH");

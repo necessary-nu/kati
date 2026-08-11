@@ -41,9 +41,8 @@ limitations under the License.
 //! * **Ninja expressions.** A manifest can say `$out` and have it mean a
 //!   different path per edge. That is a property of the format, not of the
 //!   build, so nothing shaped like it crosses this trait — the writer keeps
-//!   both of the ones kati relies on, the default description and the
-//!   response-file path, and a sink that cannot evaluate them never receives
-//!   them.
+//!   the response-file path kati relies on, and a sink that cannot evaluate it
+//!   never receives it.
 //!
 //! * **`_kati_always_build_`.** A `.PHONY` target names no file, so nothing can
 //!   ever decide it is up to date. In a manifest kati expresses that by giving
@@ -151,8 +150,8 @@ pub struct SinkRule<'a> {
     /// text, with the shell quoting already off.
     ///
     /// `None` is not "print nothing": it is nobody having chosen, which leaves
-    /// the choice to the sink. The manifest writer picks a ninja expression
-    /// that names the outputs.
+    /// the choice to the sink. A sink can use a short inline recipe itself and
+    /// leave an oversized response-file command undescribed.
     pub description: Option<&'a [u8]>,
     /// A file the command writes its discovered dependencies to, in the format
     /// `cc -MD` produces. kati never emits any other format.
