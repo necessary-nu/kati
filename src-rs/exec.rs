@@ -24,6 +24,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 
 use crate::{
+    build_sink::NewInputsTiming,
     command::CommandEvaluator,
     dep::{DepNode, NamedDepNode},
     error, error_loc,
@@ -71,7 +72,7 @@ impl<'a> Executor<'a> {
         let shell = ev.get_shell()?;
         let shellflag = ev.get_shell_flag();
         Ok(Executor {
-            ce: CommandEvaluator::new(ev)?,
+            ce: CommandEvaluator::new(ev, NewInputsTiming::RecipeShell)?,
             done: HashMap::new(),
             shell,
             shellflag,

@@ -27,6 +27,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use memchr::memchr;
 use parking_lot::Mutex;
 
+use crate::build_sink::NewInputsTiming;
 use crate::expr::{Evaluable, ParseExprOpt, Value, parse_expr};
 use crate::file::Source;
 use crate::flags::Flags;
@@ -777,6 +778,11 @@ pub struct Evaluator {
     assignment_sep: String,
 
     pub avoid_io: bool,
+    /// Where the selected destination resolves `$?`.
+    pub(crate) new_inputs_timing: NewInputsTiming,
+    /// `filter-out` patterns applied to the deferred `$?` marker while the
+    /// current recipe is expanded.
+    pub(crate) deferred_new_inputs_filter_out: Vec<Bytes>,
     // This value tracks the nest level of make expressions. For
     // example, $(YYY) in $(XXX $(YYY)) is evaluated with depth==2.
     // This will be used to disallow $(shell) in other make constructs.
@@ -921,6 +927,8 @@ impl Evaluator {
             assignment_sep: "\n".to_string(),
 
             avoid_io: false,
+            new_inputs_timing: NewInputsTiming::RecipeShell,
+            deferred_new_inputs_filter_out: Vec::new(),
             eval_depth: 0,
             delayed_output_commands: Vec::new(),
 

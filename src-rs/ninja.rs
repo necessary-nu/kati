@@ -35,9 +35,9 @@ use parking_lot::Mutex;
 use crate::error;
 use crate::func::CommandOp;
 use crate::io::{dump_int, dump_string, dump_systemtime, dump_usize, dump_vec_string};
-use crate::strutil::{basename, concat_dir, dirname, strip_ext, strip_ext_vec};
+use crate::strutil::{Pattern, basename, concat_dir, dirname, strip_ext, strip_ext_vec};
 use crate::{
-    build_sink::{BuildSink, RuleId, SinkCommand, SinkEdge, SinkPool, SinkRule},
+    build_sink::{BuildSink, NewInputsTiming, RuleId, SinkCommand, SinkEdge, SinkPool, SinkRule},
     command::{Command, CommandEvaluator},
     dep::{DepNode, NamedDepNode, is_buildable_target},
     eval::Evaluator,
@@ -179,6 +179,8 @@ struct NinjaNode {
     node: Arc<Mutex<DepNode>>,
     commands: Vec<Command>,
     rule_id: Option<RuleId>,
+    deferred_new_inputs: bool,
+    deferred_new_inputs_filter_out: Vec<Bytes>,
 }
 
 struct NinjaGenerator<'a> {
@@ -283,6 +285,11 @@ impl<'a> NinjaGenerator<'a> {
         }
 
         let commands = self.ce.eval(node)?;
+        let deferred_new_inputs = self.ce.ev.new_inputs_timing
+            == NewInputsTiming::SchedulerBoundary
+            && *self.ce.found_new_inputs.lock();
+        let deferred_new_inputs_filter_out =
+            std::mem::take(&mut self.ce.ev.deferred_new_inputs_filter_out);
         let rule_id = if commands.is_empty() {
             None
         } else {
@@ -295,6 +302,8 @@ impl<'a> NinjaGenerator<'a> {
             node: node.clone(),
             commands,
             rule_id,
+            deferred_new_inputs,
+            deferred_new_inputs_filter_out,
         });
 
         let deps = node.lock().deps.clone();
@@ -749,28 +758,52 @@ impl<'a> NinjaGenerator<'a> {
             .map(|symbol| self.phony_aliases.resolve(*symbol))
             .collect::<Vec<_>>();
         let output = self.phony_aliases.resolve(node.output);
-        let deferred_freshness_outputs = node
-            .grouped_double_action
-            .as_ref()
-            .map(|action| {
-                action
-                    .members
-                    .iter()
-                    .map(|member| self.phony_aliases.resolve(*member))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let deferred_always_new_inputs = node
-            .grouped_double_action
-            .as_ref()
-            .map(|action| {
-                action
-                    .phony_inputs
-                    .iter()
-                    .map(|input| self.phony_aliases.resolve(*input))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let deferred_freshness_outputs = if let Some(action) = &node.grouped_double_action {
+            action
+                .members
+                .iter()
+                .map(|member| self.phony_aliases.resolve(*member))
+                .collect::<Vec<_>>()
+        } else if nn.deferred_new_inputs {
+            vec![self.phony_aliases.resolve(node.recipe_output)]
+        } else {
+            Vec::new()
+        };
+        let deferred_always_new_inputs = if let Some(action) = &node.grouped_double_action {
+            action
+                .phony_inputs
+                .iter()
+                .map(|input| self.phony_aliases.resolve(*input))
+                .collect::<Vec<_>>()
+        } else if nn.deferred_new_inputs {
+            node.deps
+                .iter()
+                .filter(|(_, dependency)| dependency.lock().is_phony)
+                .map(|(input, _)| self.phony_aliases.resolve(*input))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let visible_inputs = node.actual_inputs.iter().copied().collect::<HashSet<_>>();
+        let filter_out = nn
+            .deferred_new_inputs_filter_out
+            .iter()
+            .cloned()
+            .map(Pattern::new)
+            .collect::<Vec<_>>();
+        let deferred_excluded_new_inputs = if nn.deferred_new_inputs {
+            node.deps
+                .iter()
+                .filter_map(|(input, _)| {
+                    let name = input.as_bytes(&self.ce.ev.session);
+                    (!visible_inputs.contains(input)
+                        || filter_out.iter().any(|pattern| pattern.matches(&name)))
+                    .then(|| self.phony_aliases.resolve(*input))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
         sink.declare_edge(
             &self.ce.ev.session,
@@ -786,8 +819,9 @@ impl<'a> NinjaGenerator<'a> {
                 deferred_freshness_always_dirty: node
                     .grouped_double_action
                     .as_ref()
-                    .is_some_and(|action| action.has_phony_member),
+                    .map_or(node.is_phony, |action| action.has_phony_member),
                 deferred_always_new_inputs: &deferred_always_new_inputs,
+                deferred_excluded_new_inputs: &deferred_excluded_new_inputs,
                 completion_join: node.grouped_double_join,
                 intermediate: node.is_intermediate,
                 disposable: node.is_disposable,
@@ -997,6 +1031,8 @@ impl<'a> NinjaGenerator<'a> {
 impl Drop for NinjaGenerator<'_> {
     fn drop(&mut self) {
         self.ce.ev.avoid_io = false;
+        self.ce.ev.new_inputs_timing = NewInputsTiming::RecipeShell;
+        self.ce.ev.deferred_new_inputs_filter_out.clear();
     }
 }
 
@@ -1309,7 +1345,7 @@ pub fn generate_ninja(
     orig_args: &[u8],
     start_time: SystemTime,
 ) -> Result<()> {
-    let mut ng = NinjaGenerator::new(CommandEvaluator::new(ev)?)?;
+    let mut ng = NinjaGenerator::new(CommandEvaluator::new(ev, NewInputsTiming::RecipeShell)?)?;
     ng.generate(nodes, orig_args, start_time)?;
     Ok(())
 }
@@ -1328,7 +1364,8 @@ pub fn emit_build(
     ev: &mut Evaluator,
     sink: &mut dyn BuildSink,
 ) -> Result<()> {
-    let mut ng = NinjaGenerator::new(CommandEvaluator::new(ev)?)?;
+    let new_inputs_timing = sink.new_inputs_timing();
+    let mut ng = NinjaGenerator::new(CommandEvaluator::new(ev, new_inputs_timing)?)?;
     ng.populate_ninja_nodes(nodes)?;
     ng.emit(sink)
 }
@@ -1372,6 +1409,7 @@ mod tests {
                     deferred_freshness_outputs: &[],
                     deferred_freshness_always_dirty: false,
                     deferred_always_new_inputs: &[],
+                    deferred_excluded_new_inputs: &[],
                     completion_join: false,
                     intermediate: false,
                     disposable: false,

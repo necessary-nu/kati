@@ -20,6 +20,7 @@ use parking_lot::Mutex;
 use std::{collections::HashSet, fmt::Debug, sync::Arc};
 
 use crate::{
+    build_sink::NewInputsTiming,
     dep::DepNode,
     error_loc,
     eval::Evaluator,
@@ -32,6 +33,8 @@ use crate::{
     symtab::{Interner, Symbol},
     var::Variable,
 };
+
+pub(crate) const DEFERRED_NEW_INPUTS_REFERENCE: &[u8] = b"${KATI_NEW_INPUTS}";
 
 #[derive(Clone)]
 pub struct AutoCommandVar {
@@ -49,7 +52,10 @@ enum AutoCommand {
     Plus,
     Bar,
     Star,
-    Question { found_new_inputs: Arc<Mutex<bool>> },
+    Question {
+        found_new_inputs: Arc<Mutex<bool>>,
+        timing: NewInputsTiming,
+    },
     NotImplemented,
 }
 
@@ -131,16 +137,22 @@ impl AutoCommandVar {
                     out.put_slice(pat.stem(&current_dep_node.recipe_output.as_bytes(names)))
                 }
             }
-            AutoCommand::Question { found_new_inputs } => {
+            AutoCommand::Question {
+                found_new_inputs,
+                timing,
+            } => {
                 let mut seen: HashSet<Symbol> = HashSet::new();
 
-                if ev.avoid_io && current_dep_node.grouped_double_action.is_some() {
+                if ev.avoid_io
+                    && (*timing == NewInputsTiming::SchedulerBoundary
+                        || current_dep_node.grouped_double_action.is_some())
+                {
                     // The grouped action's comparison is deliberately made by
                     // the scheduler after its prerequisites finish.  It binds
                     // this value when the edge is launched; doing a second
                     // shell-side timestamp test would move the snapshot past
                     // the prerequisite boundary.
-                    out.put_slice(b"${KATI_NEW_INPUTS}");
+                    out.put_slice(DEFERRED_NEW_INPUTS_REFERENCE);
                     *found_new_inputs.lock() = true;
                 } else if let Some(action) = &current_dep_node.grouped_double_action {
                     let mut oldest_member = None;
@@ -173,7 +185,7 @@ impl AutoCommandVar {
                     let mut delayed = None;
                     // Check timestamps using the shell at the start of rule execution
                     // instead.
-                    out.put_slice(b"${KATI_NEW_INPUTS}");
+                    out.put_slice(DEFERRED_NEW_INPUTS_REFERENCE);
                     if !*found_new_inputs.lock() {
                         let mut def = BytesMut::new();
 
@@ -435,7 +447,8 @@ pub struct CommandEvaluator<'a> {
 }
 
 impl<'a> CommandEvaluator<'a> {
-    pub fn new(ev: &'a mut Evaluator) -> Result<Self> {
+    pub fn new(ev: &'a mut Evaluator, new_inputs_timing: NewInputsTiming) -> Result<Self> {
+        ev.new_inputs_timing = new_inputs_timing;
         let found_new_inputs = Arc::new(Mutex::new(false));
         let mut ret = Self {
             ev,
@@ -447,7 +460,13 @@ impl<'a> CommandEvaluator<'a> {
         ret.register_autocommand('^', AutoCommand::Hat)?;
         ret.register_autocommand('+', AutoCommand::Plus)?;
         ret.register_autocommand('*', AutoCommand::Star)?;
-        ret.register_autocommand('?', AutoCommand::Question { found_new_inputs })?;
+        ret.register_autocommand(
+            '?',
+            AutoCommand::Question {
+                found_new_inputs,
+                timing: new_inputs_timing,
+            },
+        )?;
         // TODO: Implement them.
         ret.register_bare_autocommand('|', AutoCommand::Bar)?;
         ret.register_autocommand('%', AutoCommand::NotImplemented)?;
@@ -522,6 +541,7 @@ impl<'a> CommandEvaluator<'a> {
         self.ev.is_evaluating_command = true;
         *self.current_dep_node.lock() = Some(n.clone());
         *self.found_new_inputs.lock() = false;
+        self.ev.deferred_new_inputs_filter_out.clear();
         for v in node_cmds {
             self.ev.loc = v.loc();
             self.ev.expanded_make_in_command.clear();

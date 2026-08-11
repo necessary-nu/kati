@@ -62,6 +62,17 @@ use crate::symtab::{Interner, Symbol};
 /// Names the rule an edge runs. Unique within one generation.
 pub type RuleId = usize;
 
+/// When the final value of Make's `$?` automatic variable is determined.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NewInputsTiming {
+    /// The generated recipe computes `$?` immediately before invoking its
+    /// command because the destination cannot represent a scheduler boundary.
+    RecipeShell,
+    /// The destination computes `$?` after prerequisites settle and before it
+    /// launches the edge.
+    SchedulerBoundary,
+}
+
 /// A pool kati declares for itself.
 ///
 /// Pools kati only *refers* to — the ones `.KATI_NINJA_POOL` and
@@ -202,6 +213,12 @@ pub struct SinkEdge<'a> {
     /// Normal inputs that are phony and therefore always belong to the late
     /// new-input set used by the recipe.
     pub deferred_always_new_inputs: &'a [Symbol],
+    /// Normal inputs hidden from the late new-input value by Make evaluation,
+    /// for example by `$(filter-out $(PHONY),$?)`.
+    ///
+    /// They still participate in the edge's freshness decision; only the
+    /// automatic variable's published value omits them.
+    pub deferred_excluded_new_inputs: &'a [Symbol],
     /// This edge publishes a real output only after its private action inputs
     /// have settled.  It runs no command itself.
     pub completion_join: bool,
@@ -237,6 +254,16 @@ pub struct SinkEdge<'a> {
 /// key that map on a `usize` instead of re-hashing every path on every edge
 /// that mentions it.
 pub trait BuildSink {
+    /// When this sink can compute `$?` after prerequisites have settled.
+    ///
+    /// A manifest writer cannot express that scheduling boundary and keeps
+    /// kati's legacy shell fallback. Ronin's direct graph sink can, so command
+    /// evaluation leaves a marker and describes the late comparison on the
+    /// edge instead.
+    fn new_inputs_timing(&self) -> NewInputsTiming {
+        NewInputsTiming::RecipeShell
+    }
+
     /// Called once, before anything else, with the pools kati declares.
     fn start(&mut self, pools: &[SinkPool<'_>]) -> Result<()>;
 

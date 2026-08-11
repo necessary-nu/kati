@@ -28,7 +28,10 @@ use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
-    collect_stats, collect_stats_with_slow_report, error_loc,
+    build_sink::NewInputsTiming,
+    collect_stats, collect_stats_with_slow_report,
+    command::DEFERRED_NEW_INPUTS_REFERENCE,
+    error_loc,
     eval::{Evaluator, ExportAllowed, FrameType},
     expr::{Evaluable, Value},
     fileutil::{RedirectStderr, run_command},
@@ -212,6 +215,14 @@ fn filter_out_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut
         .collect();
     let mut ww = WordWriter::new(out);
     for tok in word_scanner(&text) {
+        if ev.new_inputs_timing == NewInputsTiming::SchedulerBoundary
+            && tok == DEFERRED_NEW_INPUTS_REFERENCE
+        {
+            ev.deferred_new_inputs_filter_out
+                .extend(pats.iter().map(|pattern| pattern.as_bytes().clone()));
+            ww.write(tok);
+            continue;
+        }
         let mut matched = false;
         for pat in &pats {
             if pat.matches(tok) {
