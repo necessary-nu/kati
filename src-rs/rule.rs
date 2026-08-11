@@ -36,6 +36,8 @@ pub struct Rule {
     pub output_patterns: Vec<Symbol>,
     pub validations: Vec<Symbol>,
     pub is_double_colon: bool,
+    /// `&:` / `&::` makes every output one group produced by one recipe.
+    pub is_grouped: bool,
     pub is_suffix_rule: bool,
     /// Set when `.SECONDEXPANSION` was declared before this rule was read.
     pub expand_again: bool,
@@ -54,7 +56,7 @@ pub struct Rule {
 }
 
 impl Rule {
-    pub fn new(loc: Loc, is_double_colon: bool) -> Self {
+    pub fn new(loc: Loc, is_double_colon: bool, is_grouped: bool) -> Self {
         Self {
             outputs: Vec::new(),
             inputs: Vec::new(),
@@ -62,6 +64,7 @@ impl Rule {
             output_patterns: Vec::new(),
             validations: Vec::new(),
             is_double_colon,
+            is_grouped,
             is_suffix_rule: false,
             expand_again: false,
             prerequisite_names: Vec::new(),
@@ -247,6 +250,9 @@ impl Debug for Rule {
         }
         if self.is_double_colon {
             write!(f, " is_double_colon")?;
+        }
+        if self.is_grouped {
+            write!(f, " is_grouped")?;
         }
         if self.is_suffix_rule {
             write!(f, " is_suffix_rule")?;

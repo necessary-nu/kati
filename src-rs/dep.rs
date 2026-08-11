@@ -22,6 +22,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
     os::unix::ffi::OsStrExt,
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -46,13 +47,39 @@ use crate::{
 
 pub type NamedDepNode = (Symbol, Arc<Mutex<DepNode>>);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct DoubleActionId {
+    rule: usize,
+    /// An ordinary multi-target `::` record is one action per member. A
+    /// grouped record has one action for the whole record.
+    trigger: Option<Symbol>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GroupedDoubleAction {
+    /// Every real filesystem member declared by this exact `&::` record.
+    pub members: Vec<Symbol>,
+    /// A phony member forces the whole record whenever any member is reached.
+    pub has_phony_member: bool,
+    /// Normal prerequisites declared phony are always present in `$?`.
+    pub phony_inputs: Vec<Symbol>,
+}
+
 /// The cycle guard cannot catch `%.a: %.b.a` against `%.b.a: %.a`, where every
 /// name visited is new. The deepest chain in GNU Make's suite is three.
 const MAX_IMPLICIT_CHAIN: usize = 6;
 
 #[derive(Debug)]
 pub struct DepNode {
+    /// The graph edge's primary output. An exact grouped action uses a private
+    /// virtual name here so independent records never compete for a member.
     pub output: Symbol,
+    /// The logical Make target used by automatic variables and diagnostics.
+    pub recipe_output: Symbol,
+    /// Runtime freshness metadata for one exact grouped double-colon record.
+    pub grouped_double_action: Option<GroupedDoubleAction>,
+    /// A public member joining every independent action that declares it.
+    pub grouped_double_join: bool,
     pub cmds: Vec<Arc<Value>>,
     pub deps: Vec<NamedDepNode>,
     pub order_onlys: Vec<NamedDepNode>,
@@ -93,6 +120,9 @@ impl DepNode {
     ) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
             output,
+            recipe_output: output,
+            grouped_double_action: None,
+            grouped_double_join: false,
             cmds: Vec::new(),
             deps: Vec::new(),
             order_onlys: Vec::new(),
@@ -529,6 +559,17 @@ impl RuleMerger {
         }
     }
 
+    fn fill_grouped_outputs(&self, output: Symbol, rule: &Rule, node: &mut DepNode) {
+        if !rule.is_grouped {
+            return;
+        }
+        for grouped_output in &rule.outputs {
+            if *grouped_output != output && !node.implicit_outputs.contains(grouped_output) {
+                node.implicit_outputs.push(*grouped_output);
+            }
+        }
+    }
+
     fn fill_dep_node_loc(&self, r: &Rule, n: &mut DepNode) {
         n.loc = Some(r.loc.clone());
         if !r.cmds.is_empty()
@@ -543,12 +584,22 @@ impl RuleMerger {
         session: &mut Session,
         output: Symbol,
         pattern_rule: &Option<Arc<Rule>>,
+        grouped_outputs: &[Symbol],
         n: &Arc<Mutex<DepNode>>,
     ) {
         let mut n = n.lock();
         if let Some(primary_rule) = &self.primary_rule {
             assert!(pattern_rule.is_none());
             self.fill_dep_node_from_rule(session, output, primary_rule, &mut n);
+            if primary_rule.is_grouped && !primary_rule.is_double_colon {
+                for grouped_output in grouped_outputs {
+                    if *grouped_output != output && !n.implicit_outputs.contains(grouped_output) {
+                        n.implicit_outputs.push(*grouped_output);
+                    }
+                }
+            } else {
+                self.fill_grouped_outputs(output, primary_rule, &mut n);
+            }
             self.fill_dep_node_loc(primary_rule, &mut n);
             n.cmds = primary_rule.cmds.clone();
         } else if let Some(pattern_rule) = pattern_rule {
@@ -564,6 +615,9 @@ impl RuleMerger {
                 continue;
             }
             self.fill_dep_node_from_rule(session, output, r, &mut n);
+            if self.is_double_colon {
+                self.fill_grouped_outputs(output, r, &mut n);
+            }
             if n.loc.is_none() {
                 n.loc = Some(r.loc.clone())
             }
@@ -594,6 +648,20 @@ struct DepBuilder<'a> {
     rules: HashMap<Symbol, Arc<Mutex<RuleMerger>>>,
     rule_vars: HashMap<Symbol, Arc<Vars>>,
     cur_rule_vars: Option<Arc<Vars>>,
+    /// Every explicit double-colon record is an independent action. Grouped
+    /// records can share a real member, so the graph needs the full membership
+    /// set before assigning producers.
+    double_memberships: HashMap<Symbol, Vec<Arc<Rule>>>,
+    /// One action node per exact double-colon action: one per grouped record,
+    /// or one per member of an ordinary multi-target record.
+    double_actions: HashMap<DoubleActionId, Arc<Mutex<DepNode>>>,
+    /// Invocation-local creation order, used to serialize overlapping records
+    /// in the same order GNU Make reaches them.
+    double_action_creation_indices: HashMap<DoubleActionId, usize>,
+    next_double_action_creation: usize,
+    /// Stable evaluation-order identity for collision-free private outputs.
+    double_action_indices: HashMap<DoubleActionId, usize>,
+    next_double_action: usize,
 
     implicit_rules: RuleTrie,
     /// Pattern rules still present after GNU Make's population-time
@@ -676,6 +744,12 @@ impl<'a> DepBuilder<'a> {
             rules: HashMap::new(),
             rule_vars,
             cur_rule_vars: None,
+            double_memberships: HashMap::new(),
+            double_actions: HashMap::new(),
+            double_action_creation_indices: HashMap::new(),
+            next_double_action_creation: 0,
+            double_action_indices: HashMap::new(),
+            next_double_action: 0,
 
             implicit_rules: RuleTrie::new(),
             implicit_rule_defs: Vec::new(),
@@ -1422,6 +1496,16 @@ impl<'a> DepBuilder<'a> {
     fn populate_rules(&mut self) -> Result<()> {
         // TODO: Is this take necessary, or can we refactor how we pass around ev?
         for rule in std::mem::take(&mut self.ev.rules) {
+            if rule.is_grouped
+                && rule.cmds.is_empty()
+                && (!rule.outputs.is_empty() || !rule.output_patterns.is_empty())
+            {
+                error_loc!(
+                    self.ev,
+                    Some(&rule.loc),
+                    "*** grouped targets must provide a recipe."
+                );
+            }
             let rule = Arc::new(rule);
             if rule.outputs.is_empty() {
                 self.populate_implicit_rule(rule)?;
@@ -1520,6 +1604,36 @@ impl<'a> DepBuilder<'a> {
     }
 
     fn populate_explicit_rule(&mut self, rule: Arc<Rule>) -> Result<()> {
+        if rule.is_double_colon {
+            let rule_id = Self::rule_id(&rule);
+            if rule.is_grouped {
+                self.double_action_indices.insert(
+                    DoubleActionId {
+                        rule: rule_id,
+                        trigger: None,
+                    },
+                    self.next_double_action,
+                );
+                self.next_double_action += 1;
+            } else {
+                for output in &rule.outputs {
+                    self.double_action_indices.insert(
+                        DoubleActionId {
+                            rule: rule_id,
+                            trigger: Some(*output),
+                        },
+                        self.next_double_action,
+                    );
+                    self.next_double_action += 1;
+                }
+            }
+            for output in &rule.outputs {
+                self.double_memberships
+                    .entry(*output)
+                    .or_default()
+                    .push(rule.clone());
+            }
+        }
         for input in rule.inputs.iter().chain(&rule.order_only_inputs) {
             if !input.as_bytes(&self.ev.session).contains(&b'%') {
                 self.mentioned.insert(*input);
@@ -1607,6 +1721,394 @@ impl<'a> DepBuilder<'a> {
 
     fn lookup_rule_vars(&self, o: Symbol) -> Option<Arc<Vars>> {
         self.rule_vars.get(&o).cloned()
+    }
+
+    /// Second expansion reads target-specific variables for the target whose
+    /// prerequisite list is being expanded.  Dependency execution gets a
+    /// different scope later: for grouped peers that is the member which
+    /// triggered the shared action.
+    fn push_expansion_scope(
+        &mut self,
+        vars: Option<&Arc<Vars>>,
+    ) -> (Option<Arc<Vars>>, Option<Arc<Vars>>) {
+        let previous_rule_scope = self.cur_rule_vars.clone();
+        let previous_eval_scope = self.ev.current_scope.clone();
+        let Some(vars) = vars else {
+            return (previous_rule_scope, previous_eval_scope);
+        };
+        let scope = Arc::new(Vars::new());
+        if let Some(previous) = &previous_rule_scope {
+            scope.merge_from(previous);
+        }
+        scope.merge_from(vars);
+        self.cur_rule_vars = Some(scope.clone());
+        self.ev.current_scope = Some(scope);
+        (previous_rule_scope, previous_eval_scope)
+    }
+
+    fn pop_expansion_scope(&mut self, previous: (Option<Arc<Vars>>, Option<Arc<Vars>>)) {
+        self.cur_rule_vars = previous.0;
+        self.ev.current_scope = previous.1;
+    }
+
+    fn rule_id(rule: &Arc<Rule>) -> usize {
+        Arc::as_ptr(rule) as usize
+    }
+
+    fn double_action_id(rule: &Arc<Rule>, trigger: Symbol) -> DoubleActionId {
+        DoubleActionId {
+            rule: Self::rule_id(rule),
+            trigger: (!rule.is_grouped).then_some(trigger),
+        }
+    }
+
+    /// Give one exact record a stable, compiler-owned graph output. Real group
+    /// members remain public join nodes, so no action competes to produce a
+    /// path another independent record also names.
+    fn double_action_output(&mut self, action: DoubleActionId) -> Symbol {
+        let index = self.double_action_indices[&action];
+        let mut directory = self
+            .ev
+            .session
+            .flags
+            .ninja_dir
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        directory.push(".ronin_grouped_double");
+
+        for suffix in 0usize.. {
+            let filename = if suffix == 0 {
+                index.to_string()
+            } else {
+                format!("{index}_{suffix}")
+            };
+            let output = {
+                let mut path = directory.clone();
+                path.push(filename);
+                self.ev.session.intern(path.as_os_str().as_bytes().to_vec())
+            };
+            if self.rules.contains_key(&output)
+                || self.done.contains_key(&output)
+                || self.mentioned.contains(&output)
+                || self.phony.contains(&output)
+            {
+                continue;
+            }
+            return output;
+        }
+        unreachable!("an unbounded numeric suffix has an available stamp name")
+    }
+
+    /// Build one independent double-colon action. The rule is the identity for
+    /// `&::`; ordinary `::` also includes the triggering member so a
+    /// multi-target record still runs once per target.
+    fn build_double_action(
+        &mut self,
+        rule: Arc<Rule>,
+        trigger: Symbol,
+    ) -> Result<(Arc<Mutex<DepNode>>, bool)> {
+        let id = Self::double_action_id(&rule, trigger);
+        if let Some(action) = self.double_actions.get(&id) {
+            return Ok((action.clone(), false));
+        }
+
+        let graph_output = self.double_action_output(id);
+        let has_recipe = !rule.cmds.is_empty();
+        let action = DepNode::new(
+            graph_output,
+            false,
+            false,
+            self.ignore_errors.contains(&trigger),
+            false,
+            false,
+        );
+        {
+            let mut node = action.lock();
+            node.recipe_output = trigger;
+            if has_recipe {
+                let members = if rule.is_grouped {
+                    rule.outputs.clone()
+                } else {
+                    vec![trigger]
+                };
+                node.grouped_double_action = Some(GroupedDoubleAction {
+                    has_phony_member: members.iter().any(|output| self.phony.contains(output)),
+                    members,
+                    phony_inputs: Vec::new(),
+                });
+            }
+            node.cmds = rule.cmds.clone();
+            node.actual_inputs =
+                apply_output_pattern(&mut self.ev.session, &rule, trigger, &rule.inputs);
+            node.actual_order_only_inputs = apply_output_pattern(
+                &mut self.ev.session,
+                &rule,
+                trigger,
+                &rule.order_only_inputs,
+            );
+            node.output_pattern = rule.output_patterns.first().copied();
+            node.loc = rule.cmd_loc.clone().or_else(|| Some(rule.loc.clone()));
+            node.has_rule = true;
+            node.is_default_target = false;
+        }
+
+        // Cache before descending so a prerequisite cycle finds the same
+        // action rather than recursively creating another producer.
+        self.double_actions.insert(id, action.clone());
+        self.double_action_creation_indices
+            .insert(id, self.next_double_action_creation);
+        self.next_double_action_creation += 1;
+        self.done.insert(graph_output, action.clone());
+
+        if let Some(text) = &rule.deferred_prerequisites {
+            let trigger_text = trigger.as_bytes(&self.ev.session);
+            let stem = self.stem_of(&rule, &trigger_text);
+            let recorded = {
+                let node = action.lock();
+                (
+                    node.actual_inputs.clone(),
+                    node.actual_order_only_inputs.clone(),
+                )
+            };
+            let vars = self.lookup_rule_vars(trigger);
+            let previous_scope = self.push_expansion_scope(vars.as_ref());
+            let expanded =
+                self.expand_prerequisites_again(trigger, stem, (&recorded.0, &recorded.1), text);
+            self.pop_expansion_scope(previous_scope);
+            let (inputs, order_only) = expanded?;
+            let mut node = action.lock();
+            node.actual_inputs.extend(inputs);
+            node.actual_order_only_inputs.extend(order_only);
+        }
+
+        self.resolve_vpaths(&action);
+        self.take_out_waits(&action);
+        {
+            let mut node = action.lock();
+            let phony_inputs = node
+                .actual_inputs
+                .iter()
+                .copied()
+                .filter(|input| self.phony.contains(input))
+                .collect::<Vec<_>>();
+            if let Some(metadata) = &mut node.grouped_double_action {
+                metadata.phony_inputs = phony_inputs;
+            }
+        }
+        let vars = self.lookup_rule_vars(trigger);
+        let mut scoped_vars = Vec::new();
+        let mut private_scoped_vars = Vec::new();
+        let trigger_text = trigger.as_bytes(&self.ev.session);
+        let frame = self.ev.enter(
+            FrameType::Dependency,
+            trigger_text,
+            action.lock().loc.clone().unwrap_or_default(),
+        );
+        if let Some(vars) = &vars {
+            let mut targeted = vars
+                .0
+                .lock()
+                .iter()
+                .map(|(name, var)| (*name, var.clone()))
+                .collect::<Vec<_>>();
+            targeted.sort_by_cached_key(|(name, _)| name.as_bytes(&self.ev.session));
+            targeted.sort_by_key(|(_, var)| var.read().assign_op == Some(AssignOp::PlusEq));
+            for (name, var) in &targeted {
+                let is_private = var.read().is_private;
+                let mut new_var = var.clone();
+                match var.read().assign_op {
+                    Some(AssignOp::PlusEq) => {
+                        if let Some(old_var) = self.ev.lookup_var(*name)? {
+                            let mut value = old_var.read().eval_to_buf_mut(self.ev)?;
+                            if !value.is_empty() {
+                                value.put_u8(b' ');
+                            }
+                            new_var.read().eval(self.ev, &mut value)?;
+                            new_var = Variable::with_simple_string(
+                                value.freeze(),
+                                old_var.read().origin(),
+                                frame.current(),
+                                action.lock().loc.clone(),
+                            );
+                        }
+                    }
+                    Some(AssignOp::QuestionEq) if self.ev.lookup_var(*name)?.is_some() => {
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                if *name == self.depfile_var_name {
+                    action.lock().depfile_var = Some(new_var);
+                } else if *name == self.implicit_outputs_var_name
+                    || *name == self.validations_var_name
+                {
+                } else if *name == self.ninja_pool_var_name {
+                    action.lock().ninja_pool_var = Some(new_var);
+                } else if *name == self.tags_var_name {
+                    action.lock().tags_var = Some(new_var);
+                } else {
+                    let scoped =
+                        ScopedVar::new(self.cur_rule_vars.clone().unwrap(), *name, new_var);
+                    if is_private {
+                        private_scoped_vars.push(scoped);
+                    } else {
+                        scoped_vars.push(scoped);
+                    }
+                }
+            }
+        }
+
+        let scope = self.cur_rule_vars.as_ref().map(|vars| {
+            let scope = Vars::new();
+            scope.merge_from(vars);
+            Arc::new(scope)
+        });
+        drop(private_scoped_vars);
+        action.lock().rule_vars = scope;
+
+        let actual_inputs = action.lock().actual_inputs.clone();
+        for input in actual_inputs {
+            let dependency = self.build_plan(input, Some(trigger))?;
+            action.lock().deps.push((input, dependency));
+        }
+        let actual_order_only_inputs = action.lock().actual_order_only_inputs.clone();
+        for input in actual_order_only_inputs {
+            let dependency = self.build_plan(input, Some(trigger))?;
+            action.lock().order_onlys.push((input, dependency));
+        }
+        drop(scoped_vars);
+
+        Ok((action, true))
+    }
+
+    fn add_validations(
+        &mut self,
+        output: Symbol,
+        n: &Arc<Mutex<DepNode>>,
+        validations: Vec<Symbol>,
+    ) -> Result<()> {
+        for validation in validations {
+            if n.lock().actual_validations.contains(&validation) {
+                continue;
+            }
+            if !self.ev.session.flags.use_ninja_validations {
+                error_loc!(
+                    self.ev,
+                    n.lock().loc.as_ref(),
+                    ".KATI_VALIDATIONS not allowed without --use_ninja_validations"
+                );
+            }
+            let dependency = self.build_plan(validation, Some(output))?;
+            let mut node = n.lock();
+            node.actual_validations.push(validation);
+            node.validations.push((validation, dependency));
+        }
+        Ok(())
+    }
+
+    /// Every real member is a public completion join. It owns no recipe;
+    /// consumers wait for every independent action that declared the member.
+    fn build_grouped_double_member(
+        &mut self,
+        output: Symbol,
+        join: Arc<Mutex<DepNode>>,
+        rules: Vec<Arc<Rule>>,
+        validations: Vec<Symbol>,
+    ) -> Result<Arc<Mutex<DepNode>>> {
+        let shared = self
+            .double_memberships
+            .get(&output)
+            .is_some_and(|memberships| memberships.len() > 1);
+        let mut actions = Vec::with_capacity(rules.len());
+        let mut created_action = false;
+        for rule in rules {
+            let id = Self::double_action_id(&rule, output);
+            let (action, newly_created) = self.build_double_action(rule, output)?;
+            created_action |= newly_created;
+            actions.push((id, action));
+        }
+        if shared && created_action {
+            actions.sort_by_key(|(id, _)| self.double_action_creation_indices[id]);
+            for pair in actions.windows(2) {
+                let previous = &pair[0].1;
+                let action = &pair[1].1;
+                let previous_output = previous.lock().output;
+                if !action
+                    .lock()
+                    .order_onlys
+                    .iter()
+                    .any(|(output, _)| *output == previous_output)
+                {
+                    action
+                        .lock()
+                        .order_onlys
+                        .push((previous_output, previous.clone()));
+                }
+            }
+        }
+
+        {
+            let mut node = join.lock();
+            node.recipe_output = output;
+            node.grouped_double_join = true;
+            node.has_rule = true;
+            node.is_default_target = self.first_rule == Some(output);
+            node.loc = actions
+                .first()
+                .and_then(|(_, action)| action.lock().loc.clone());
+            for (_, action) in &actions {
+                let action_output = action.lock().output;
+                node.actual_inputs.push(action_output);
+                node.deps.push((action_output, action.clone()));
+            }
+        }
+        self.done.insert(output, join.clone());
+        self.add_validations(output, &join, validations)?;
+        Ok(join)
+    }
+
+    /// An ordinary grouped rule keeps the outputs written on that rule even
+    /// when a later grouped recipe changes which action one peer selects when
+    /// reached directly. The rules attached to each peer still contribute
+    /// scheduling prerequisites to this action, including another expansion
+    /// of the shared rule in that peer's scope. They are returned separately so they do
+    /// not enter `$<`, `$^`, `$+`, `$?`, or `$|`, and their target-specific
+    /// variables never replace the triggering member's scope.
+    fn grouped_single_peers(
+        &self,
+        output: Symbol,
+        merger: &Arc<Mutex<RuleMerger>>,
+    ) -> (Vec<Symbol>, Vec<(Symbol, Arc<Rule>)>) {
+        let locked = merger.lock();
+        let Some(primary_rule) = locked
+            .primary_rule
+            .as_ref()
+            .filter(|rule| rule.is_grouped && !rule.is_double_colon)
+            .cloned()
+        else {
+            return (Vec::new(), Vec::new());
+        };
+
+        let grouped_outputs = primary_rule.outputs.clone();
+        let mut peer_rules = Vec::new();
+        for grouped_output in &primary_rule.outputs {
+            if *grouped_output == output {
+                continue;
+            }
+            let Some(peer_merger) = self.rules.get(grouped_output) else {
+                continue;
+            };
+            let peer_merger = peer_merger.lock();
+            let mut seen = HashSet::new();
+            for rule in &peer_merger.rules {
+                if seen.insert(Self::rule_id(rule)) {
+                    peer_rules.push((*grouped_output, rule.clone()));
+                }
+            }
+        }
+        (grouped_outputs, peer_rules)
     }
 
     /// Under `.SECONDEXPANSION` a pattern rule's prerequisites are not known
@@ -1994,6 +2496,28 @@ impl<'a> DepBuilder<'a> {
             // Update the picked_rule_info with the new values
             picked_rule_info = new_picked_rule_info;
         }
+        if let Some(merger) = &picked_rule_info.merger {
+            let grouped_double = {
+                let merger = merger.lock();
+                (merger.is_double_colon
+                    && merger
+                        .rules
+                        .iter()
+                        .any(|rule| rule.is_grouped && rule.is_double_colon))
+                .then(|| (merger.rules.clone(), merger.validations.clone()))
+            };
+            if let Some((rules, validations)) = grouped_double {
+                return self.build_grouped_double_member(output, n, rules, validations);
+            }
+        }
+        let mut grouped_outputs = Vec::new();
+        let mut grouped_peer_rules = Vec::new();
+        if let Some(merger) = picked_rule_info.merger.take() {
+            let (outputs, peer_rules) = self.grouped_single_peers(output, &merger);
+            picked_rule_info.merger = Some(merger);
+            grouped_outputs = outputs;
+            grouped_peer_rules = peer_rules;
+        }
         let output_str = output.as_bytes(&self.ev.session);
 
         // A static pattern rule reaches this the same way an explicit one does,
@@ -2019,34 +2543,126 @@ impl<'a> DepBuilder<'a> {
             .unwrap_or_default();
         picked_rule_info
             .merger
+            .clone()
             .unwrap_or_else(RuleMerger::new)
             .lock()
             .fill_dep_node(
                 &mut self.ev.session,
                 output,
                 &picked_rule_info.pattern_rule,
+                &grouped_outputs,
                 &n,
             );
-        for (text, stem) in deferred {
-            // Each `::` rule stands on its own, so nothing another one declared
-            // is in scope for this one's automatic variables.
-            let recorded = if independent {
-                (Vec::new(), Vec::new())
-            } else {
-                let node = n.lock();
-                (
-                    node.actual_inputs.clone(),
-                    node.actual_order_only_inputs.clone(),
-                )
-            };
-            let (inputs, order_only) =
-                self.expand_prerequisites_again(output, stem, (&recorded.0, &recorded.1), &text)?;
-            let mut node = n.lock();
-            node.actual_inputs.extend(inputs);
-            node.actual_order_only_inputs.extend(order_only);
+        let grouped_is_phony = picked_rule_info.merger.as_ref().is_some_and(|merger| {
+            let merger = merger.lock();
+            grouped_outputs
+                .iter()
+                .any(|grouped_output| self.phony.contains(grouped_output))
+                || merger.rules.iter().any(|rule| {
+                    rule.is_grouped
+                        && rule
+                            .outputs
+                            .iter()
+                            .any(|grouped_output| self.phony.contains(grouped_output))
+                })
+        });
+        if grouped_is_phony {
+            n.lock().is_phony = true;
         }
+
+        let previous_scope = (!grouped_outputs.is_empty())
+            .then(|| self.push_expansion_scope(picked_rule_info.vars.as_ref()));
+        let expanded = (|| -> Result<()> {
+            for (text, stem) in deferred {
+                // Each `::` rule stands on its own, so nothing another one
+                // declared is in scope for this one's automatic variables.
+                let recorded = if independent {
+                    (Vec::new(), Vec::new())
+                } else {
+                    let node = n.lock();
+                    (
+                        node.actual_inputs.clone(),
+                        node.actual_order_only_inputs.clone(),
+                    )
+                };
+                let (inputs, order_only) = self.expand_prerequisites_again(
+                    output,
+                    stem,
+                    (&recorded.0, &recorded.1),
+                    &text,
+                )?;
+                let mut node = n.lock();
+                node.actual_inputs.extend(inputs);
+                node.actual_order_only_inputs.extend(order_only);
+            }
+            Ok(())
+        })();
+        if let Some(previous_scope) = previous_scope {
+            self.pop_expansion_scope(previous_scope);
+        }
+        expanded?;
+
+        // Ordinary `&:` includes every peer rule in the shared action's
+        // scheduling and freshness test, but GNU Make hides those peer-only
+        // prerequisites from the triggering member's automatic variables.
+        let mut grouped_peer_inputs = Vec::new();
+        let mut grouped_peer_order_only = Vec::new();
+        for (peer_output, rule) in grouped_peer_rules {
+            grouped_peer_inputs.extend(apply_output_pattern(
+                &mut self.ev.session,
+                &rule,
+                peer_output,
+                &rule.inputs,
+            ));
+            grouped_peer_order_only.extend(apply_output_pattern(
+                &mut self.ev.session,
+                &rule,
+                peer_output,
+                &rule.order_only_inputs,
+            ));
+            if let Some(text) = &rule.deferred_prerequisites {
+                let peer_text = peer_output.as_bytes(&self.ev.session);
+                let stem = self.stem_of(&rule, &peer_text);
+                let recorded = self.recorded_prerequisites(peer_output);
+                let peer_vars = self.lookup_rule_vars(peer_output);
+                let previous_scope = self.push_expansion_scope(peer_vars.as_ref());
+                let expanded = self.expand_prerequisites_again(
+                    peer_output,
+                    stem,
+                    (&recorded.0, &recorded.1),
+                    text,
+                );
+                self.pop_expansion_scope(previous_scope);
+                let (inputs, order_only) = expanded?;
+                grouped_peer_inputs.extend(inputs);
+                grouped_peer_order_only.extend(order_only);
+            }
+        }
+
+        // VPATH applies to hidden peer dependencies too. Append them for one
+        // pass, then split them away before automatic variables see the node.
+        let (visible_inputs, visible_order_only) = {
+            let mut node = n.lock();
+            let visible_inputs = node.actual_inputs.len();
+            let visible_order_only = node.actual_order_only_inputs.len();
+            node.actual_inputs.extend(grouped_peer_inputs);
+            node.actual_order_only_inputs
+                .extend(grouped_peer_order_only);
+            (visible_inputs, visible_order_only)
+        };
         self.resolve_vpaths(&n);
+        let (grouped_peer_inputs, grouped_peer_order_only) = {
+            let mut node = n.lock();
+            let grouped_peer_inputs = node.actual_inputs.split_off(visible_inputs);
+            let grouped_peer_order_only =
+                node.actual_order_only_inputs.split_off(visible_order_only);
+            (grouped_peer_inputs, grouped_peer_order_only)
+        };
         self.take_out_waits(&n);
+        let (grouped_peer_inputs, barriers) = self.without_waits(grouped_peer_inputs);
+        self.wait_barriers.extend(barriers);
+        let (grouped_peer_order_only, barriers) = self.without_waits(grouped_peer_order_only);
+        self.wait_barriers.extend(barriers);
 
         let mut sv = Vec::new();
         let mut private_sv = Vec::new();
@@ -2175,6 +2791,14 @@ impl<'a> DepBuilder<'a> {
             }
         }
 
+        // A grouped output may already have been reached through another
+        // dependency path.  In that case its existing producer owns the name;
+        // this action keeps only the peers that are still unclaimed.
+        n.lock().implicit_outputs.retain(|implicit_output| {
+            self.done
+                .get(implicit_output)
+                .is_none_or(|claimed| Arc::ptr_eq(claimed, &n))
+        });
         let implicit_outputs = n.lock().implicit_outputs.clone();
         for output in implicit_outputs {
             self.done.insert(output, n.clone());
@@ -2230,7 +2854,7 @@ impl<'a> DepBuilder<'a> {
         }
 
         let actual_inputs = n.lock().actual_inputs.clone();
-        for input in actual_inputs {
+        for input in actual_inputs.into_iter().chain(grouped_peer_inputs) {
             let c = self.build_plan(input, Some(output))?;
             n.lock().deps.push((input, c.clone()));
 
@@ -2260,7 +2884,10 @@ impl<'a> DepBuilder<'a> {
         }
 
         let actual_order_only_inputs = n.lock().actual_order_only_inputs.clone();
-        for input in actual_order_only_inputs {
+        for input in actual_order_only_inputs
+            .into_iter()
+            .chain(grouped_peer_order_only)
+        {
             let c = self.build_plan(input, Some(output))?;
             n.lock().order_onlys.push((input, c));
         }

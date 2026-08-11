@@ -587,16 +587,19 @@ impl<'a> NinjaGenerator<'a> {
             let id = nn.rule_id.unwrap();
             let mut description = None;
             let mut cmd_buf = BytesMut::new();
-            let output_str = node.output.as_bytes(&self.ce.ev.session);
+            let recipe_output_str = node.recipe_output.as_bytes(&self.ce.ev.session);
             let ignore_errors = Self::gen_shell_script(
                 &self.ce.ev.session.flags,
-                &output_str,
+                &recipe_output_str,
                 &nn.commands,
                 &mut cmd_buf,
                 &mut description,
             );
-            if description.is_none() && self.phony_aliases.resolve(node.output) != node.output {
-                description = Some(output_str.clone());
+            if description.is_none()
+                && (self.phony_aliases.resolve(node.output) != node.output
+                    || node.grouped_double_action.is_some())
+            {
+                description = Some(recipe_output_str.clone());
             }
             // Extracting the depfile can rewrite the command, so it has to
             // happen before the command is measured or handed over.
@@ -667,7 +670,7 @@ impl<'a> NinjaGenerator<'a> {
             let mut residual_description = None;
             let residual_ignore_errors = Self::gen_shell_script(
                 &self.ce.ev.session.flags,
-                &output_str,
+                &recipe_output_str,
                 &residual_commands,
                 &mut residual_buf,
                 &mut residual_description,
@@ -746,6 +749,28 @@ impl<'a> NinjaGenerator<'a> {
             .map(|symbol| self.phony_aliases.resolve(*symbol))
             .collect::<Vec<_>>();
         let output = self.phony_aliases.resolve(node.output);
+        let deferred_freshness_outputs = node
+            .grouped_double_action
+            .as_ref()
+            .map(|action| {
+                action
+                    .members
+                    .iter()
+                    .map(|member| self.phony_aliases.resolve(*member))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let deferred_always_new_inputs = node
+            .grouped_double_action
+            .as_ref()
+            .map(|action| {
+                action
+                    .phony_inputs
+                    .iter()
+                    .map(|input| self.phony_aliases.resolve(*input))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         sink.declare_edge(
             &self.ce.ev.session,
@@ -757,6 +782,13 @@ impl<'a> NinjaGenerator<'a> {
                 order_only_inputs: &order_only_inputs,
                 validations: &validations,
                 always_dirty: node.is_phony,
+                deferred_freshness_outputs: &deferred_freshness_outputs,
+                deferred_freshness_always_dirty: node
+                    .grouped_double_action
+                    .as_ref()
+                    .is_some_and(|action| action.has_phony_member),
+                deferred_always_new_inputs: &deferred_always_new_inputs,
+                completion_join: node.grouped_double_join,
                 intermediate: node.is_intermediate,
                 disposable: node.is_disposable,
                 pool: pool.as_deref(),
@@ -1337,6 +1369,10 @@ mod tests {
                     order_only_inputs: &[],
                     validations: &[],
                     always_dirty: true,
+                    deferred_freshness_outputs: &[],
+                    deferred_freshness_always_dirty: false,
+                    deferred_always_new_inputs: &[],
+                    completion_join: false,
                     intermediate: false,
                     disposable: false,
                     pool: None,

@@ -190,6 +190,21 @@ pub struct SinkEdge<'a> {
     /// `phony_output` or wires in a synthetic always-dirty input; a sink that
     /// builds a graph directly should do neither.
     pub always_dirty: bool,
+    /// Real outputs whose pre-prerequisite state defines this edge's
+    /// freshness.  An empty slice means ordinary timestamp semantics.
+    ///
+    /// The edge's own output may be a private virtual completion identity;
+    /// sinks with scheduler support keep this relation as graph metadata.
+    pub deferred_freshness_outputs: &'a [Symbol],
+    /// One of the deferred freshness outputs is phony, so reaching the action
+    /// always requires it to run even if a file with that spelling exists.
+    pub deferred_freshness_always_dirty: bool,
+    /// Normal inputs that are phony and therefore always belong to the late
+    /// new-input set used by the recipe.
+    pub deferred_always_new_inputs: &'a [Symbol],
+    /// This edge publishes a real output only after its private action inputs
+    /// have settled.  It runs no command itself.
+    pub completion_join: bool,
     /// The output's absence is no reason to remake what reads it: the implicit
     /// rule search invented the name to complete a chain, or `.INTERMEDIATE` or
     /// `.SECONDARY` said so.

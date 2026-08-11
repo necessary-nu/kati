@@ -1532,6 +1532,7 @@ impl Evaluator {
         };
         debug_assert_eq!(before_term[delimiter.colon], b':');
         log!("Rule colon: {:?}", delimiter.origin);
+        let is_grouped = before_term.get(delimiter.colon.wrapping_sub(1)) == Some(&b'&');
 
         let loc = self.loc.clone().unwrap();
         let (mut after_targets, targets, is_pattern_rule) =
@@ -1587,7 +1588,7 @@ impl Evaluator {
             self.second_expansion = true;
         }
 
-        let mut rule = Rule::new(self.loc.clone().unwrap(), is_double_colon);
+        let mut rule = Rule::new(self.loc.clone().unwrap(), is_double_colon, is_grouped);
         rule.expand_again = self.second_expansion;
         if is_pattern_rule {
             rule.output_patterns = targets;

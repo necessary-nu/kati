@@ -94,7 +94,7 @@ impl AutoCommandVar {
 
         match &self.typ {
             AutoCommand::At => {
-                out.put_slice(&current_dep_node.output.as_bytes(names));
+                out.put_slice(&current_dep_node.recipe_output.as_bytes(names));
             }
             AutoCommand::Less => {
                 if let Some(ai) = current_dep_node.actual_inputs.first() {
@@ -128,13 +128,48 @@ impl AutoCommandVar {
             AutoCommand::Star => {
                 if let Some(output_pattern) = &current_dep_node.output_pattern {
                     let pat = Pattern::new(output_pattern.as_bytes(names));
-                    out.put_slice(pat.stem(&current_dep_node.output.as_bytes(names)))
+                    out.put_slice(pat.stem(&current_dep_node.recipe_output.as_bytes(names)))
                 }
             }
             AutoCommand::Question { found_new_inputs } => {
                 let mut seen: HashSet<Symbol> = HashSet::new();
 
-                if ev.avoid_io {
+                if ev.avoid_io && current_dep_node.grouped_double_action.is_some() {
+                    // The grouped action's comparison is deliberately made by
+                    // the scheduler after its prerequisites finish.  It binds
+                    // this value when the edge is launched; doing a second
+                    // shell-side timestamp test would move the snapshot past
+                    // the prerequisite boundary.
+                    out.put_slice(b"${KATI_NEW_INPUTS}");
+                    *found_new_inputs.lock() = true;
+                } else if let Some(action) = &current_dep_node.grouped_double_action {
+                    let mut oldest_member = None;
+                    let mut missing_member = action.has_phony_member;
+                    for member in &action.members {
+                        match get_timestamp(&member.as_bytes(names))? {
+                            Some(mtime) => {
+                                oldest_member = Some(
+                                    oldest_member
+                                        .map_or(mtime, |oldest| std::cmp::min(oldest, mtime)),
+                                );
+                            }
+                            None => missing_member = true,
+                        }
+                    }
+                    let mut ww = WordWriter::new(out);
+                    for ai in &current_dep_node.actual_inputs {
+                        let ai_str = ai.as_bytes(names);
+                        let input_mtime = get_timestamp(&ai_str)?;
+                        if seen.insert(*ai)
+                            && (missing_member
+                                || action.phony_inputs.contains(ai)
+                                || input_mtime.is_none()
+                                || oldest_member.is_some_and(|oldest| input_mtime > Some(oldest)))
+                        {
+                            ww.write(&ai_str);
+                        }
+                    }
+                } else if ev.avoid_io {
                     let mut delayed = None;
                     // Check timestamps using the shell at the start of rule execution
                     // instead.
@@ -150,9 +185,9 @@ impl AutoCommandVar {
                             }
                         }
                         ww.write(b"$(test -e");
-                        ww.write(&current_dep_node.output.as_bytes(names));
+                        ww.write(&current_dep_node.recipe_output.as_bytes(names));
                         ww.write(b"&& echo -newer");
-                        ww.write(&current_dep_node.output.as_bytes(names));
+                        ww.write(&current_dep_node.recipe_output.as_bytes(names));
                         ww.write(b")) && export KATI_NEW_INPUTS");
                         delayed = Some(def.freeze());
                         *found_new_inputs.lock() = true;
@@ -163,7 +198,7 @@ impl AutoCommandVar {
                 } else {
                     let mut ww = WordWriter::new(out);
                     let target_age = ExecStatus::Timestamp(get_timestamp(
-                        &current_dep_node.output.as_bytes(names),
+                        &current_dep_node.recipe_output.as_bytes(names),
                     )?);
                     for ai in current_dep_node.actual_inputs.iter() {
                         let ai_str = ai.as_bytes(names);
@@ -535,7 +570,7 @@ impl<'a> CommandEvaluator<'a> {
                         && recursive_make.is_empty()
                         && make_values.iter().any(|make| spawns_make(&cmd, make));
                     result.push(Command {
-                        output: n.lock().output,
+                        output: n.lock().recipe_output,
                         cmd,
                         echo,
                         ignore_error,
@@ -553,7 +588,7 @@ impl<'a> CommandEvaluator<'a> {
             let node = n.lock();
             for cmd in &self.ev.delayed_output_commands {
                 output_commands.push(Command {
-                    output: node.output,
+                    output: node.recipe_output,
                     cmd: cmd.clone(),
                     echo: false,
                     ignore_error: false,
