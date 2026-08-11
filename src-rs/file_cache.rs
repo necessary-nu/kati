@@ -21,6 +21,7 @@ use std::{
 };
 
 use anyhow::Result;
+use bytes::Bytes;
 
 use crate::{
     file::{Makefile, Source},
@@ -31,6 +32,7 @@ use crate::{
 // [spec:ronin:req:make.no-ambient-state]
 pub struct MakefileCache {
     cache: HashMap<OsString, Option<Arc<Makefile>>>,
+    supplied: HashMap<OsString, Bytes>,
     extra_file_deps: HashSet<OsString>,
 }
 
@@ -44,12 +46,18 @@ impl MakefileCache {
     pub fn new() -> Self {
         Self {
             cache: HashMap::new(),
+            supplied: HashMap::new(),
             extra_file_deps: HashSet::new(),
         }
     }
 
     pub fn add_extra_file_dep(&mut self, filename: OsString) {
         self.extra_file_deps.insert(filename);
+    }
+
+    /// Supply a makefile's bytes without requiring a filesystem path.
+    pub fn supply(&mut self, filename: OsString, contents: Bytes) {
+        self.supplied.insert(filename, contents);
     }
 
     /// Every file the session read, which is what the regeneration stamp
@@ -83,7 +91,12 @@ pub fn get_makefile(session: &mut Session, filename: &OsStr) -> Result<Source> {
         });
     }
     let filename = filename.to_os_string();
-    let source = Makefile::from_file(session, &filename)?;
+    let supplied = session.makefiles.supplied.get(&filename).cloned();
+    let source = if let Some(contents) = supplied {
+        Source::Read(Makefile::from_bytes(session, &filename, contents)?)
+    } else {
+        Makefile::from_file(session, &filename)?
+    };
     match &source {
         Source::Read(mk) => {
             session.makefiles.cache.insert(filename, Some(mk.clone()));

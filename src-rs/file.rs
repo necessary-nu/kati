@@ -45,6 +45,17 @@ pub enum Source {
 }
 
 impl Makefile {
+    /// Parse `buf` as the makefile named by `filename`.
+    pub(crate) fn from_bytes(
+        session: &mut Session,
+        filename: &OsStr,
+        buf: Bytes,
+    ) -> Result<Arc<Self>> {
+        let filename = session.intern(filename.as_bytes().to_vec());
+        let stmts = parse_file(session, &buf, filename)?;
+        Ok(Arc::new(Self { filename, stmts }))
+    }
+
     /// Read and parse `filename`.
     ///
     /// One `read` rather than an `exists` and then a `read`. The two asked the
@@ -59,9 +70,6 @@ impl Makefile {
             Err(err) => return Ok(Source::Unreadable(err)),
         };
 
-        let filename = session.intern(filename.as_bytes().to_vec());
-        let stmts = parse_file(session, &buf, filename)?;
-
-        Ok(Source::Read(Arc::new(Makefile { filename, stmts })))
+        Ok(Source::Read(Self::from_bytes(session, filename, buf)?))
     }
 }

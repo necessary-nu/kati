@@ -3008,12 +3008,15 @@ pub fn make_dep(
     db.build(targets, missing_includes)
 }
 
-/// Whether the name has the shape Make reserves: the rule for choosing a
-/// default goal, and wider than the names that mean anything. To decide whether
-/// something belongs in the graph, ask [`is_buildable_target`].
+/// Whether the name has the shape Make reserves: a leading dot before any
+/// directory separator.  A hidden-directory path such as `.deps/file.Po` is an
+/// ordinary file target, including for default-goal selection.
+///
+/// This is wider than the names that mean anything. To decide whether something
+/// belongs in the graph, ask [`is_buildable_target`].
 pub fn is_special_target(names: &impl Interner, output: &Symbol) -> bool {
     let s = output.as_bytes(names);
-    s.starts_with(b".") && !s[1..].starts_with(b".")
+    s.starts_with(b".") && !s[1..].starts_with(b".") && !s.contains(&b'/')
 }
 
 const CONSUMED_BUILTIN_TARGETS: &[&str] = &[
@@ -3080,17 +3083,19 @@ mod tests {
         let foo = session.intern("foo");
         let dotco = session.intern(".co");
         let cob = session.intern(".c.o.b");
+        let dep = session.intern(".deps/file.Po");
         assert!(is_suffix_rule(&session, &co));
         assert!(!is_suffix_rule(&session, &foo));
         assert!(!is_suffix_rule(&session, &dotco));
         assert!(!is_suffix_rule(&session, &cob));
+        assert!(!is_suffix_rule(&session, &dep));
     }
 
     #[test]
     fn a_dot_named_target_is_something_to_build() {
         let mut session = Session::new();
         // An empty static-pattern stem leaves `.1`, which Make builds.
-        for name in [".1", ".x", "foo", ".."] {
+        for name in [".1", ".x", "foo", "..", ".deps/file.Po"] {
             let sym = session.intern(name);
             assert!(
                 is_buildable_target(&session, &sym),

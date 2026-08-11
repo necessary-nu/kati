@@ -123,6 +123,16 @@ impl Default for Session {
 }
 
 impl Session {
+    /// Supply the bytes read for a named makefile.
+    ///
+    /// The ordinary cache still parses and records it on first use.  This is
+    /// how an embedding frontend implements GNU Make's `-f -` while retaining
+    /// `-` as the source name in diagnostics and `MAKEFILE_LIST`.
+    pub fn supply_makefile(&mut self, filename: OsString, contents: Vec<u8>) {
+        self.makefiles
+            .supply(filename, bytes::Bytes::from(contents));
+    }
+
     /// A session with default flags.
     pub fn new() -> Self {
         Self::with_flags(Flags::default())
