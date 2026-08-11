@@ -804,12 +804,14 @@ impl<'a> NinjaGenerator<'a> {
                 inputs: &inputs,
                 order_only_inputs: &order_only_inputs,
                 validations: &validations,
-                always_dirty: node.is_phony,
+                always_dirty: node.is_phony || node.unconditional_double_colon,
                 deferred_freshness_outputs: &deferred_freshness_outputs,
                 deferred_freshness_always_dirty: node
                     .grouped_double_action
                     .as_ref()
-                    .map_or(node.is_phony, |action| action.has_phony_member),
+                    .map_or(node.is_phony || node.unconditional_double_colon, |action| {
+                        action.has_phony_member
+                    }),
                 deferred_always_new_inputs: &deferred_always_new_inputs,
                 deferred_excluded_new_inputs: &deferred_excluded_new_inputs,
                 completion_join: node.grouped_double_join,
@@ -1166,6 +1168,7 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
         Ok(())
     }
 
+    // [spec:ronin:req:make.state-outside-the-tree+2]
     fn declare_rule(&mut self, names: &dyn Interner, rule: &SinkRule<'_>) -> Result<()> {
         self.write_location(names, rule.loc)?;
         writeln!(self.out, "rule rule{}", rule.id)?;
@@ -1232,6 +1235,10 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
             }
         }
 
+        // GNU Make uses timestamps, not a persisted recipe hash, to decide
+        // whether a current target needs rebuilding. `generator` carries that
+        // policy in the emitted Ninja graph just as GraphSink does directly.
+        writeln!(self.out, " generator = 1")?;
         if rule.restat {
             writeln!(self.out, " restat = 1")?;
         }
@@ -1667,6 +1674,13 @@ mod tests {
             ninja_unescape(binding(&manifest, "description").as_bytes()),
             b"making $PATH"
         );
+    }
+
+    // [spec:ronin:req:make.state-outside-the-tree+2/test]
+    #[test]
+    fn writer_marks_recipes_timestamp_only() {
+        let manifest = declare_rule_for(SinkCommand::Inline(b"true"), None);
+        assert_eq!(binding(&manifest, "generator"), "1");
     }
 
     /// `exit` leaves a subshell before anything after it inside runs, so the

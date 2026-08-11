@@ -87,6 +87,10 @@ pub struct DepNode {
     pub has_rule: bool,
     pub is_default_target: bool,
     pub is_phony: bool,
+    /// At least one ordinary `::` recipe has no prerequisites. GNU Make runs
+    /// that action whenever the target is considered, even when the file is
+    /// otherwise current.
+    pub unconditional_double_colon: bool,
     pub is_restat: bool,
     /// `.IGNORE` named this target: a failing recipe line is not a failure.
     pub is_ignore_error: bool,
@@ -130,6 +134,7 @@ impl DepNode {
             has_rule: false,
             is_default_target: false,
             is_phony,
+            unconditional_double_colon: false,
             is_restat,
             is_ignore_error,
             is_intermediate,
@@ -2522,7 +2527,7 @@ impl<'a> DepBuilder<'a> {
 
         // A static pattern rule reaches this the same way an explicit one does,
         // so its stem is read off the rule rather than off the search.
-        let (deferred, independent) = picked_rule_info
+        let (deferred, independent, unconditional_double_colon) = picked_rule_info
             .merger
             .as_ref()
             .map(|merger| {
@@ -2535,12 +2540,24 @@ impl<'a> DepBuilder<'a> {
                         (
                             rule.deferred_prerequisites.clone().unwrap(),
                             self.stem_of(rule, &output_str),
+                            merger.is_double_colon
+                                && !rule.cmds.is_empty()
+                                && rule.inputs.is_empty()
+                                && rule.order_only_inputs.is_empty(),
                         )
                     })
                     .collect::<Vec<_>>();
-                (deferred, merger.is_double_colon)
+                let unconditional = merger.is_double_colon
+                    && merger.rules.iter().any(|rule| {
+                        !rule.cmds.is_empty()
+                            && rule.inputs.is_empty()
+                            && rule.order_only_inputs.is_empty()
+                            && rule.deferred_prerequisites.is_none()
+                    });
+                (deferred, merger.is_double_colon, unconditional)
             })
             .unwrap_or_default();
+        n.lock().unconditional_double_colon = unconditional_double_colon;
         picked_rule_info
             .merger
             .clone()
@@ -2573,7 +2590,7 @@ impl<'a> DepBuilder<'a> {
         let previous_scope = (!grouped_outputs.is_empty())
             .then(|| self.push_expansion_scope(picked_rule_info.vars.as_ref()));
         let expanded = (|| -> Result<()> {
-            for (text, stem) in deferred {
+            for (text, stem, unconditional_candidate) in deferred {
                 // Each `::` rule stands on its own, so nothing another one
                 // declared is in scope for this one's automatic variables.
                 let recorded = if independent {
@@ -2591,7 +2608,10 @@ impl<'a> DepBuilder<'a> {
                     (&recorded.0, &recorded.1),
                     &text,
                 )?;
+                let unconditional =
+                    unconditional_candidate && inputs.is_empty() && order_only.is_empty();
                 let mut node = n.lock();
+                node.unconditional_double_colon |= unconditional;
                 node.actual_inputs.extend(inputs);
                 node.actual_order_only_inputs.extend(order_only);
             }
