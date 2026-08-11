@@ -1594,6 +1594,12 @@ impl<'a> DepBuilder<'a> {
         let input_suffix = output.slice(..dot_index);
         let output_suffix = output.slice(dot_index + 1..);
         let mut r = rule.clone();
+        let mut output_pattern = BytesMut::with_capacity(output_suffix.len() + 2);
+        output_pattern.put_slice(b"%.");
+        output_pattern.put_slice(&output_suffix);
+        r.output_patterns.clear();
+        r.output_patterns
+            .push(self.ev.session.intern(output_pattern.freeze()));
         r.inputs.clear();
         r.prerequisite_names.clear();
         r.deferred_prerequisites = None;
