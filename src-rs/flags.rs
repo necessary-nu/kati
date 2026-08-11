@@ -28,6 +28,41 @@ use crate::{
 };
 use bytes::Bytes;
 
+/// The canonical switch state produced after a Makefile writes `MAKEFLAGS`.
+///
+/// The evaluator owns when a global assignment takes effect, while an
+/// embedding Make frontend owns the option grammar. This value is the narrow
+/// boundary between them: kati never grows a second GNU Make option parser.
+pub struct DecodedMakeflags {
+    /// `MAKEFLAGS` before the optional `MAKEOVERRIDES` reference.
+    pub makeflags: Bytes,
+    /// The same switches in command-line spelling.
+    pub mflags: Bytes,
+    pub is_dry_run: bool,
+    pub is_silent_mode: bool,
+    pub ignore_errors: bool,
+    pub environment_overrides: bool,
+    pub no_builtin_rules: bool,
+    pub no_builtin_variables: bool,
+}
+
+/// Decode one evaluated Makefile assignment into GNU Make's switch table.
+pub type MakeflagsDecoder =
+    fn(previous: &[u8], assigned: &[u8], protected: &[u8]) -> Result<DecodedMakeflags, String>;
+
+/// Session-owned state for GNU Make's special `MAKEFLAGS` assignment rules.
+pub struct MakeflagsAssignment {
+    pub decoder: MakeflagsDecoder,
+    /// Switches inherited from the environment and argv, which outrank writes
+    /// in the Makefile.
+    pub protected: Bytes,
+    /// The accumulated, canonical switch table after the last assignment.
+    pub effective: Bytes,
+    /// Command-line overrides make `$(MAKEOVERRIDES)` a permanent recursive
+    /// suffix of `MAKEFLAGS`, even if the Makefile later empties it.
+    pub has_overrides: bool,
+}
+
 /// Everything the command line says, as a value.
 ///
 /// This used to be a `LazyLock` that read `std::env::args_os()` the first time
@@ -106,6 +141,9 @@ pub struct Flags {
     /// environment behavior.
     pub makeflags: Option<Bytes>,
     pub make_overrides: Option<Bytes>,
+    /// How an embedding Make frontend handles writes to `MAKEFLAGS`.
+    /// Standalone kati leaves this absent and retains its historical behavior.
+    pub makeflags_assignment: Option<MakeflagsAssignment>,
     pub writable: Vec<OsString>,
     pub traced_variables_pattern: Vec<crate::strutil::Pattern>,
 

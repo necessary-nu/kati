@@ -252,6 +252,10 @@ fn install_compiler_invocation_variables(ev: &mut Evaluator) {
     }
 
     let has_overrides = !make_overrides.is_empty() || inherited_overrides;
+    if let Some(state) = &mut ev.session.flags.makeflags_assignment {
+        state.has_overrides = has_overrides;
+        state.effective = makeflags.clone();
+    }
     let (value, original) = if has_overrides {
         let mut prefix = BytesMut::from(makeflags.as_ref());
         prefix.put_slice(b" -- ");

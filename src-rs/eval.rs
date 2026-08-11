@@ -137,6 +137,33 @@ struct ExpandedRuleHead {
     had_source_word: bool,
 }
 
+/// A canonical switch prefix, optionally retaining GNU Make's recursive
+/// command-line override suffix.
+fn makeflags_value(
+    makeflags: Bytes,
+    has_overrides: bool,
+    overrides: Symbol,
+) -> (Arc<Value>, Bytes) {
+    if !has_overrides {
+        return (Arc::new(Value::Literal(None, makeflags.clone())), makeflags);
+    }
+
+    let mut prefix = BytesMut::from(makeflags.as_ref());
+    prefix.put_slice(b" -- ");
+    let mut original = prefix.clone();
+    original.put_slice(b"$(MAKEOVERRIDES)");
+    (
+        Arc::new(Value::List(
+            None,
+            vec![
+                Arc::new(Value::Literal(None, prefix.freeze())),
+                Arc::new(Value::SymRef(Loc::default(), overrides)),
+            ],
+        )),
+        original.freeze(),
+    )
+}
+
 struct HybridRuleText {
     text: Bytes,
 }
@@ -800,6 +827,71 @@ impl Context for Evaluator {
 }
 
 impl Evaluator {
+    /// Apply GNU Make's special post-assignment treatment of `MAKEFLAGS`.
+    ///
+    /// A normal recursive variable keeps the bytes assigned to it. GNU Make
+    /// instead reads these bytes as switches, mutates a persistent option
+    /// table, and immediately writes the canonical table back. The embedding
+    /// frontend supplies the grammar; kati supplies the exact assignment
+    /// boundary and preserves the variable's provenance.
+    fn normalize_makeflags_assignment(
+        &mut self,
+        lhs: Symbol,
+        variable: &Var,
+        assigned: bool,
+    ) -> Result<()> {
+        if !assigned || lhs.as_bytes(&self.session).as_ref() != b"MAKEFLAGS" {
+            return Ok(());
+        }
+        let Some((decoder, previous, protected, has_overrides)) = self
+            .session
+            .flags
+            .makeflags_assignment
+            .as_ref()
+            .map(|state| {
+                (
+                    state.decoder,
+                    state.effective.clone(),
+                    state.protected.clone(),
+                    state.has_overrides,
+                )
+            })
+        else {
+            return Ok(());
+        };
+
+        let value = self.eval_var(lhs)?;
+        let decoded = decoder(&previous, &value, &protected).map_err(anyhow::Error::msg)?;
+        let overrides = self.session.intern("MAKEOVERRIDES");
+        let (value, original) =
+            makeflags_value(decoded.makeflags.clone(), has_overrides, overrides);
+        variable.write().replace_recursive_value(value, original);
+
+        let mflags = self.session.intern("MFLAGS");
+        let mflags_value = Arc::new(Value::Literal(None, decoded.mflags.clone()));
+        self.session.globals.define(
+            mflags,
+            Variable::new_recursive(
+                mflags_value,
+                VarOrigin::Environment,
+                None,
+                None,
+                decoded.mflags.clone(),
+            ),
+        );
+
+        self.session.flags.is_dry_run = decoded.is_dry_run;
+        self.session.flags.is_silent_mode = decoded.is_silent_mode;
+        self.session.flags.ignore_errors = decoded.ignore_errors;
+        self.session.flags.environment_overrides = decoded.environment_overrides;
+        self.session.flags.no_builtin_rules = decoded.no_builtin_rules;
+        self.session.flags.no_builtin_variables = decoded.no_builtin_variables;
+        if let Some(state) = &mut self.session.flags.makeflags_assignment {
+            state.effective = decoded.makeflags;
+        }
+        Ok(())
+    }
+
     pub fn new(session: Session) -> Self {
         let trace = session.flags.dump_variable_assignment_trace.is_some()
             || session.flags.dump_include_graph.is_some();
@@ -1136,6 +1228,7 @@ impl Evaluator {
         if stmt.is_final {
             var.write().readonly = true
         }
+        self.normalize_makeflags_assignment(lhs, &var, needs_assign)?;
         self.trace_variable_assign(&lhs, &var)?;
         Ok(())
     }

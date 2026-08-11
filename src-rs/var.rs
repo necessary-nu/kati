@@ -100,6 +100,17 @@ pub enum InnerVar {
 }
 
 impl Variable {
+    /// Replace only this variable's recursive expression.
+    ///
+    /// GNU Make canonicalises `MAKEFLAGS` after assigning it while preserving
+    /// the assignment's origin, location, `private`, and `override` metadata.
+    pub fn replace_recursive_value(&mut self, value: Arc<Value>, original: Bytes) {
+        self.value = InnerVar::Recursive {
+            v: value,
+            orig: original,
+        };
+    }
+
     pub fn loc(&self) -> &Option<Loc> {
         &self.loc
     }
