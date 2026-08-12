@@ -239,12 +239,14 @@ impl Pattern {
     }
 
     pub fn append_subst_ref(&self, s: &Bytes, subst: &Bytes) -> Bytes {
-        if self.percent_index.is_some() && subst.contains(&b'%') {
+        if self.percent_index.is_some() {
             return self.append_subst(s, subst);
         }
-        let s = trim_suffix(s, &self.pat);
-        let mut ret = BytesMut::with_capacity(s.len() + subst.len());
-        ret.put_slice(s);
+        let Some(stem) = s.strip_suffix(self.pat.as_ref()) else {
+            return s.clone();
+        };
+        let mut ret = BytesMut::with_capacity(stem.len() + subst.len());
+        ret.put_slice(stem);
         ret.put_slice(subst);
         ret.into()
     }
@@ -708,6 +710,13 @@ mod test {
         String::from_utf8(p.append_subst(&s, &subst).to_vec()).unwrap()
     }
 
+    fn subst_ref(s: &'static [u8], pat: &'static [u8], subst: &'static [u8]) -> String {
+        let p = Pattern::new(Bytes::from_static(pat));
+        let s = Bytes::from_static(s);
+        let subst = Bytes::from_static(subst);
+        String::from_utf8(p.append_subst_ref(&s, &subst).to_vec()).unwrap()
+    }
+
     #[test]
     fn test_subst_pattern() {
         assert_eq!(subst_pattern(b"x.c", b"%.c", b"%.o"), "x.o");
@@ -719,6 +728,16 @@ mod test {
         assert_eq!(subst_pattern(b"x.c.c", b"x.c", b"XX"), "x.c.c");
         assert_eq!(subst_pattern(b"x.x.c", b"x.c", b"XX"), "x.x.c");
         assert_eq!(subst_pattern(b"/", b"%/", b"%"), "");
+    }
+
+    #[test]
+    fn substitution_reference_changes_only_matching_words() {
+        assert_eq!(subst_ref(b"debug.c", b".c", b".o"), "debug.o");
+        assert_eq!(subst_ref(b"debug.o", b".S", b".o"), "debug.o");
+        assert_eq!(subst_ref(b"start.S", b".S", b".o"), "start.o");
+        assert_eq!(subst_ref(b"debug.c", b"%.c", b"object"), "object");
+        assert_eq!(subst_ref(b"debug.o", b"%.c", b"object"), "debug.o");
+        assert_eq!(subst_ref(b"debug.c", b".c", b"%.o"), "debug%.o");
     }
 
     #[test]
