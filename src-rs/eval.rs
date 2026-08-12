@@ -1702,8 +1702,13 @@ impl Evaluator {
         }
 
         for o in &rule.outputs {
-            if o == &Symbol::POSIX {
+            // `.POSIX:` is read where it stands rather than collected with the
+            // other special targets: it changes what the rest of the Makefile
+            // reads, so a later `$(CC)` has to see `c99` and an earlier one
+            // must not.
+            if o == &Symbol::POSIX && !self.is_posix {
                 self.is_posix = true;
+                crate::builtins::install_posix_variables(&mut self.session);
             }
         }
 

@@ -83,25 +83,16 @@ pub struct Evaluated {
 
 /// The Makefile kati reads before the real one.
 ///
-/// Half of it is GNU Make's built-in variables and suffix rules, and half is
-/// kati telling the Makefile about the invocation: what `$(MAKE)` re-runs, what
-/// goals were asked for, and where the run started.
+/// Half of it is GNU Make's built-in suffix rules, and half is kati telling the
+/// Makefile about the invocation: what `$(MAKE)` re-runs, what goals were asked
+/// for, and where the run started. The tool defaults `-R` withholds are not
+/// here — they are a catalogue with origins of their own, installed by
+/// [`crate::builtins::install_default_variables`].
 fn read_bootstrap_makefile(
     session: &mut Session,
     targets: &[Symbol],
 ) -> Result<Arc<Mutex<Vec<Stmt>>>> {
     let mut bootstrap = BytesMut::new();
-    // The tool defaults, and the only part `-R` withholds. Everything below is
-    // Make describing itself, which it goes on doing.
-    if !session.flags.no_builtin_variables {
-        bootstrap.put_slice(b"CC?=cc\n");
-        if cfg!(target_os = "macos") {
-            bootstrap.put_slice(b"CXX?=c++\n");
-        } else {
-            bootstrap.put_slice(b"CXX?=g++\n");
-        }
-        bootstrap.put_slice(b"AR?=ar\n");
-    }
     // The one place a GNU Make version is claimed, because Makefiles branch on
     // it. It names the version this front end is measured against rather than
     // the one the vendored Go harness pinned: a Makefile that tests
@@ -296,6 +287,14 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
     read_invocation_state(&mut ev)?;
     install_compiler_invocation_variables(&mut ev);
 
+    // GNU Make's `define_default_variables`, in its place: after the
+    // environment, so an inherited `CC` outranks the catalogue, and before any
+    // Makefile, so the Makefile outranks it in turn.
+    let catalogue_installed = !ev.session.flags.no_builtin_variables;
+    if catalogue_installed {
+        crate::builtins::install_default_variables(&mut ev.session)?;
+    }
+
     let bootstrap_asts = read_bootstrap_makefile(&mut ev.session, &targets)?;
     {
         let _frame = ev.enter(
@@ -361,6 +360,14 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
             log!("{stmt:?}");
             stmt.eval(&mut ev)?;
         }
+    }
+
+    // A Makefile's own `MAKEFLAGS += -rR` is decoded where it is written, but
+    // GNU Make withdraws the catalogue only once the whole read is over. The
+    // difference is visible: `$(origin CC)` on the next line still answers
+    // `default`, and the recipe that runs afterwards expands to nothing.
+    if catalogue_installed && ev.session.flags.no_builtin_variables {
+        crate::builtins::undefine_default_variables(&mut ev.session);
     }
 
     if let Some(filename) = ev.session.flags.dump_include_graph.clone() {

@@ -46,6 +46,7 @@ pub use anyhow;
 pub use bytes;
 
 pub mod build_sink;
+pub mod builtins;
 pub mod command;
 pub mod dep;
 pub mod eval;
