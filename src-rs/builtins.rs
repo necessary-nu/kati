@@ -195,11 +195,11 @@ const POSIX_VARIABLES: &[(&str, &str)] = &[
     ("FC", "fort77"),
     ("FFLAGS", "-O1"),
     ("SCCSGETFLAGS", "-s"),
-    // GNU Make's own 4.4.1 sources say `-rv` here. The oracle this corpus is
-    // recorded against — Debian's `make-dfsg` build of 4.4.1, which is the
-    // `make` a Makefile written on this platform is written against — asks
-    // `ar` for a non-deterministic archive as well.
-    ("ARFLAGS", "-rvU"),
+    // Same value the ordinary catalogue holds, and installed again because
+    // `.POSIX:` makes it simple where the catalogue made it recursive. Debian
+    // patches this one to `-rvU`, asking `ar` for a non-deterministic archive;
+    // that is Debian's answer rather than GNU's, and it is not implemented.
+    ("ARFLAGS", "-rv"),
 ];
 
 /// The name, if a default may still claim it.
