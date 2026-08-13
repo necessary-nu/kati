@@ -801,6 +801,16 @@ pub struct Evaluator {
     /// Missing `include` and `-include` inputs, in source order.
     pub(crate) missing_includes: Vec<MissingInclude>,
 
+    /// Every Makefile the read reached, in the order it reached them, whether
+    /// or not it was there.
+    ///
+    /// GNU Make treats each one as a target it tries to bring up to date before
+    /// it chooses a goal, so this is the list dependency analysis consults to
+    /// plan Makefile remaking. It is not `MAKEFILE_LIST`: that variable is the
+    /// Makefile's to read and to overwrite, and it never names a file the read
+    /// could not open.
+    pub(crate) read_makefiles: Vec<Symbol>,
+
     pub is_evaluating_command: bool,
     /// Whether expanding the current recipe referenced `MAKE`.
     ///
@@ -939,6 +949,7 @@ impl Evaluator {
             profiled_files: Vec::new(),
 
             missing_includes: Vec::new(),
+            read_makefiles: Vec::new(),
 
             is_evaluating_command: false,
             expanded_make_in_command: Vec::new(),
@@ -1839,6 +1850,7 @@ impl Evaluator {
         };
 
         let v = fname.slice_ref(trim_leading_curdir(fname));
+        self.note_read_makefile(v.clone());
         if let Some(var_list) = self.lookup_var(Symbol::MAKEFILE_LIST)? {
             let frame = self.current_frame();
             var_list.write().append_str(&self.session, &v, frame)?;
@@ -1889,7 +1901,19 @@ impl Evaluator {
         pat
     }
 
+    /// Record that the read reached this Makefile, so remaking can consider it.
+    ///
+    /// The order is the order GNU Make attempts them in, and a file included
+    /// twice is one target, so a repeat is dropped rather than appended.
+    pub(crate) fn note_read_makefile(&mut self, filename: Bytes) {
+        let filename = self.session.intern(filename);
+        if !self.read_makefiles.contains(&filename) {
+            self.read_makefiles.push(filename);
+        }
+    }
+
     fn note_missing_include(&mut self, filename: Bytes, required: bool, loc: Loc) {
+        self.note_read_makefile(filename.clone());
         let filename = self.session.intern(filename);
         if let Some(existing) = self
             .missing_includes

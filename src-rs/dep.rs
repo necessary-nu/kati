@@ -1001,6 +1001,7 @@ impl<'a> DepBuilder<'a> {
     fn build(
         &mut self,
         mut targets: Vec<Symbol>,
+        read_makefiles: &[Symbol],
         missing_includes: &[MissingInclude],
     ) -> Result<(Vec<NamedDepNode>, Vec<NamedDepNode>)> {
         // Generated included Makefiles are compiler inputs rather than user
@@ -1009,7 +1010,7 @@ impl<'a> DepBuilder<'a> {
         // what the Makefile builds once it is reread, and a required include
         // with no rule is the failure the run dies on, ahead of the complaint
         // about having nothing to aim at.
-        let regeneration_nodes = self.plan_regeneration(missing_includes)?;
+        let regeneration_nodes = self.plan_regeneration(read_makefiles, missing_includes)?;
 
         if !self.ev.session.flags.gen_all_targets && targets.is_empty() {
             // Only a build with nothing to aim at has no targets. A goal was
@@ -1079,25 +1080,37 @@ impl<'a> DepBuilder<'a> {
         Ok(n)
     }
 
-    /// Decide what to do about each Makefile the evaluation could not read.
+    /// Decide what to do about each Makefile the read reached.
     ///
-    /// GNU Make looks for a rule that would make it, and what happens when
-    /// there is none depends on how it was included: `-include` and `sinclude`
-    /// forget it without a word, while `include` reports the read it could not
-    /// do and then dies naming the file as a target it cannot reach. Only the
-    /// ones with a rule come back, as roots an embedding frontend can build
-    /// before reading the Makefile again.
+    /// GNU Make looks for a rule that would make every one of them — the file
+    /// the invocation named as much as the files it included — and hands the
+    /// ones it finds to an ordinary update before it chooses a goal. A Makefile
+    /// that is actually remade sends make back to the start to read it again,
+    /// so the roots returned here are what an embedding frontend builds and
+    /// then re-evaluates on.
+    ///
+    /// A file the read could not open is the same question with a louder
+    /// answer when there is no rule: `-include` and `sinclude` forget it
+    /// without a word, while `include` reports the read it could not do and
+    /// then dies naming the file as a target it cannot reach.
     fn plan_regeneration(
         &mut self,
+        read_makefiles: &[Symbol],
         missing_includes: &[MissingInclude],
     ) -> Result<Vec<NamedDepNode>> {
         let mut nodes = Vec::new();
-        for include in missing_includes {
-            let node = self.plan_root(include.filename)?;
-            if node.lock().has_rule {
-                nodes.push((include.filename, node));
+        for &makefile in read_makefiles {
+            let node = self.plan_root(makefile)?;
+            if Self::is_remakable(&node) {
+                nodes.push((makefile, node));
                 continue;
             }
+            let Some(include) = missing_includes
+                .iter()
+                .find(|include| include.filename == makefile)
+            else {
+                continue;
+            };
             if !include.required {
                 continue;
             }
@@ -1111,6 +1124,17 @@ impl<'a> DepBuilder<'a> {
             error_loc!(self.ev, None, "*** No rule to make target '{name}'.");
         }
         Ok(nodes)
+    }
+
+    /// Whether GNU Make would try to bring this Makefile up to date.
+    ///
+    /// A rule has to say how. Two shapes that have one are still refused,
+    /// because each would be remade every time it was considered and so would
+    /// restart the read forever: a Makefile declared `.PHONY`, and one whose
+    /// `::` recipe has no prerequisites.
+    fn is_remakable(node: &Arc<Mutex<DepNode>>) -> bool {
+        let node = node.lock();
+        node.has_rule && !node.is_phony && !node.unconditional_double_colon
     }
 
     fn exists(&self, target: Symbol) -> bool {
@@ -3007,11 +3031,12 @@ impl<'a> DepBuilder<'a> {
 pub fn make_dep(
     ev: &mut Evaluator,
     targets: Vec<Symbol>,
+    read_makefiles: &[Symbol],
     missing_includes: &[MissingInclude],
 ) -> Result<(Vec<NamedDepNode>, Vec<NamedDepNode>)> {
     let mut db = DepBuilder::new(ev)?;
     let _tr = ScopedTimeReporter::new(&db.ev.session, "make dep (build)");
-    db.build(targets, missing_includes)
+    db.build(targets, read_makefiles, missing_includes)
 }
 
 /// Whether the name has the shape Make reserves: a leading dot before any

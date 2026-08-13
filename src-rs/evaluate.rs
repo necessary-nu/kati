@@ -152,9 +152,13 @@ fn read_bootstrap_makefile(
 
 /// Seed the evaluator with `MAKEFILE_LIST` and the process environment.
 fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
+    let makefile = ev.session.flags.makefile.clone().unwrap();
+    // The Makefile the invocation named is the first one GNU Make tries to
+    // remake, ahead of anything it goes on to include.
+    ev.note_read_makefile(Bytes::from(makefile.as_bytes().to_vec()));
     let mut makefile_list = BytesMut::new();
     makefile_list.put_u8(b' ');
-    makefile_list.put_slice(ev.session.flags.makefile.clone().unwrap().as_bytes());
+    makefile_list.put_slice(makefile.as_bytes());
     let frame = ev.current_frame();
     let loc = ev.loc.clone();
     let makefile_list_sym = ev.session.intern("MAKEFILE_LIST");
@@ -384,7 +388,9 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
         );
         let _tr = ScopedTimeReporter::new(&ev.session, "make dep time");
         let missing_includes = std::mem::take(&mut ev.missing_includes);
-        (nodes, regeneration_nodes) = make_dep(&mut ev, targets, &missing_includes)?;
+        let read_makefiles = std::mem::take(&mut ev.read_makefiles);
+        (nodes, regeneration_nodes) =
+            make_dep(&mut ev, targets, &read_makefiles, &missing_includes)?;
     }
 
     Ok(Evaluated {
