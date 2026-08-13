@@ -175,6 +175,48 @@ pub fn trim_suffix<'a>(s: &'a [u8], suffix: &[u8]) -> &'a [u8] {
     }
 }
 
+/// GNU Make's `find_percent` (read.c): the first `%` that a backslash has not
+/// escaped, with the escaping compressed out of the text on the way to it.
+///
+/// A run of N backslashes immediately before a `%` collapses to N/2 of them,
+/// and the `%` is the wildcard only when N is even — so `\%` is a literal
+/// percent with no backslash left, `\\%` is a literal backslash followed by the
+/// wildcard, and `\\\%` is a literal backslash followed by a literal percent.
+///
+/// Backslashes anywhere else are left exactly as they were written, including
+/// before a `%` that follows the wildcard: GNU stops rewriting the moment it
+/// has its answer, so `%x\%y` keeps its backslash and matches a name that
+/// carries one.
+fn find_percent(pat: Bytes) -> (Bytes, Option<usize>) {
+    match memchr(b'%', &pat) {
+        None => return (pat, None),
+        Some(at) if at == 0 || pat[at - 1] != b'\\' => return (pat, Some(at)),
+        Some(_) => {}
+    }
+    let mut text = pat.to_vec();
+    let mut from = 0;
+    let percent_index = loop {
+        let Some(offset) = memchr(b'%', &text[from..]) else {
+            break None;
+        };
+        let at = from + offset;
+        let mut backslashes = 0;
+        while at > backslashes && text[at - backslashes - 1] == b'\\' {
+            backslashes += 1;
+        }
+        if backslashes == 0 {
+            break Some(at);
+        }
+        let removed = backslashes.div_ceil(2);
+        text.drain(at - backslashes..at - backslashes + removed);
+        if backslashes % 2 == 0 {
+            break Some(at - removed);
+        }
+        from = at - backslashes / 2;
+    };
+    (Bytes::from(text), percent_index)
+}
+
 #[derive(Debug)]
 pub struct Pattern {
     pat: Bytes,
@@ -183,15 +225,12 @@ pub struct Pattern {
 
 impl Pattern {
     pub fn new(pat: Bytes) -> Pattern {
-        let idx = memchr(b'%', &pat);
-        Pattern {
-            pat,
-            percent_index: idx,
-        }
+        let (pat, percent_index) = find_percent(pat);
+        Pattern { pat, percent_index }
     }
 
-    /// The pattern as it was written, so two can be compared for being the
-    /// same pattern rather than for matching the same names.
+    /// The pattern with its percent escaping resolved, so two can be compared
+    /// for being the same pattern rather than for matching the same names.
     pub fn as_bytes(&self) -> &Bytes {
         &self.pat
     }
@@ -217,7 +256,14 @@ impl Pattern {
         &[]
     }
 
+    /// Substitute into `s`, where a `%` in `subst` stands for the stem.
+    ///
+    /// The replacement carries the same percent escaping the pattern does —
+    /// `$(patsubst abc,\%,abc)` is a literal percent — so it is resolved here
+    /// rather than scanned for a bare `%`.
     pub fn append_subst(&self, s: &Bytes, subst: &Bytes) -> Bytes {
+        let (subst, subst_percent) = find_percent(subst.clone());
+        let subst = &subst;
         let Some(percent_index) = self.percent_index else {
             if s == &self.pat {
                 return subst.clone();
@@ -226,7 +272,7 @@ impl Pattern {
         };
 
         if self.match_impl(s, percent_index) {
-            if let Some(subst_percent_index) = memchr(b'%', subst) {
+            if let Some(subst_percent_index) = subst_percent {
                 let mut ret = BytesMut::with_capacity(subst.len() + s.len() - self.pat.len() + 1);
                 ret.put_slice(&subst[..subst_percent_index]);
                 ret.put_slice(&s[percent_index..(percent_index + s.len() + 1 - self.pat.len())]);
@@ -316,8 +362,19 @@ pub fn basename(s: &[u8]) -> &[u8] {
     &s[found + 1..]
 }
 
+/// The filename suffix GNU Make's `$(suffix)` sees: the last dot in the final
+/// pathname component, and everything after it.
+///
+/// GNU scans back from the end of the word for whichever comes first, a dot or
+/// a directory separator, so a dot inside a directory name names no suffix:
+/// `dir.d/file` has none. A name that is nothing but its suffix keeps it —
+/// `.hidden` is its own suffix — and a trailing dot is a suffix of one
+/// character. This is the same boundary [`strip_ext`] takes the name from.
 pub fn get_ext(s: &[u8]) -> Option<&[u8]> {
     let found = memrchr(b'.', s)?;
+    if memrchr(b'/', s).is_some_and(|slash| found < slash) {
+        return None;
+    }
     Some(&s[found..])
 }
 
@@ -701,6 +758,48 @@ mod test {
         assert!(Pattern::new(Bytes::from_static(b"foo%")).matches(b"foo"));
         assert!(Pattern::new(Bytes::from_static(b"foo%bar")).matches(b"foobar"));
         assert!(Pattern::new(Bytes::from_static(b"foo%bar")).matches(b"fooxbar"));
+    }
+
+    /// The pattern text and wildcard position a written pattern resolves to.
+    fn percent_of(pat: &'static [u8]) -> (String, Option<usize>) {
+        let p = Pattern::new(Bytes::from_static(pat));
+        (
+            String::from_utf8(p.as_bytes().to_vec()).unwrap(),
+            p.percent_index,
+        )
+    }
+
+    #[test]
+    fn escaped_percent_is_a_literal_percent() {
+        assert_eq!(percent_of(b"foo%bar"), ("foo%bar".to_owned(), Some(3)));
+        assert_eq!(percent_of(b"foo\\%bar"), ("foo%bar".to_owned(), None));
+        assert_eq!(
+            percent_of(b"foo\\\\%bar"),
+            ("foo\\%bar".to_owned(), Some(4))
+        );
+        assert_eq!(percent_of(b"foo\\\\\\%bar"), ("foo\\%bar".to_owned(), None));
+        assert_eq!(percent_of(b"\\%%"), ("%%".to_owned(), Some(1)));
+        assert_eq!(percent_of(b"\\%"), ("%".to_owned(), None));
+    }
+
+    #[test]
+    fn escaping_stops_at_the_wildcard() {
+        // GNU stops rewriting the moment it has its answer, so a later
+        // escape stays exactly as it was written.
+        assert_eq!(percent_of(b"%x\\%y"), ("%x\\%y".to_owned(), Some(0)));
+        assert!(Pattern::new(Bytes::from_static(b"%x\\%y")).matches(b"ax\\%y"));
+        assert!(!Pattern::new(Bytes::from_static(b"%x\\%y")).matches(b"ax%y"));
+    }
+
+    #[test]
+    fn suffix_stops_at_a_directory_separator() {
+        assert_eq!(get_ext(b".hidden"), Some(b".hidden".as_slice()));
+        assert_eq!(get_ext(b"dir/.hidden"), Some(b".hidden".as_slice()));
+        assert_eq!(get_ext(b"a."), Some(b".".as_slice()));
+        assert_eq!(get_ext(b"a.b.c"), Some(b".c".as_slice()));
+        assert_eq!(get_ext(b"dir.d/file"), None);
+        assert_eq!(get_ext(b"plain"), None);
+        assert_eq!(get_ext(b"/"), None);
     }
 
     fn subst_pattern(s: &'static [u8], pat: &'static [u8], subst: &'static [u8]) -> String {

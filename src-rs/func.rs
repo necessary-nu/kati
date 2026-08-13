@@ -43,8 +43,8 @@ use crate::{
     session::Session,
     strutil::{
         Pattern, WordWriter, escape_printf_b, format_for_command_substitution,
-        format_for_shell_assignment, has_path_prefix, normalize_path, trim_left_space, trim_space,
-        word_scanner,
+        format_for_shell_assignment, has_path_prefix, is_space_byte, normalize_path,
+        trim_left_space, trim_space, word_scanner,
     },
     var::{VarOrigin, Variable},
     warn_loc,
@@ -61,6 +61,15 @@ pub struct FuncInfo {
     pub trim_space: bool,
     // Only for the first parameter.
     pub trim_right_space_1st: bool,
+    /// Whether GNU Make expands this function's arguments before the function
+    /// sees them.
+    ///
+    /// Every function here expands its own arguments, so this changes nothing
+    /// about a direct call. It decides what `$(call)` hands over: `$(call)`
+    /// expands its arguments first, and a function that would have expanded
+    /// them again then does — `$(call foreach,v,1 2,$$(v))` iterates, where
+    /// `$(call notdir,$$(V))` gets the literal text `$(V)`.
+    pub pre_expanded_args: bool,
 }
 
 // Function pointers are not comparable, so just compare by name
@@ -459,17 +468,16 @@ fn addprefix_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut)
     Ok(())
 }
 
+/// GNU Make resolves `$(realpath)` where it reads it, so a word that names
+/// nothing on disk — including a symbolic link with no target — leaves the
+/// output altogether rather than appearing as an empty word.
+///
+/// Like `$(wildcard)`, this answers during evaluation even when the value is
+/// bound for a recipe: upstream kati deferred it into a helper the recipe's
+/// shell would run, which is a different value at a different time, and puts
+/// shell syntax where the Makefile asked for a pathname.
 fn realpath_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
     let text = args[0].eval_to_buf(ev)?;
-    if ev.avoid_io {
-        out.put_slice(b"$(");
-        out.put_slice(std::env::current_exe()?.as_os_str().as_bytes());
-        out.put_slice(b" --realpath ");
-        out.put_slice(&text);
-        out.put_slice(b" 2> /dev/null)");
-        return Ok(());
-    }
-
     let mut ww = WordWriter::new(out);
     for tok in word_scanner(&text) {
         let tok = <OsStr as OsStrExt>::from_bytes(tok);
@@ -775,9 +783,64 @@ fn shell_no_rerun_func(
     Ok(())
 }
 
+/// `$(call name,...)` where the name is a built-in function's.
+///
+/// GNU Make's `func_call` looks the name up in the function table before it
+/// looks for a variable, so a built-in always wins — a Makefile that defines
+/// `notdir` cannot reach its own through `$(call)`. Calling one with no
+/// arguments at all is not an error but an empty answer; too few for the
+/// function is the same diagnostic a direct call would give.
+///
+/// The arguments arrive expanded, because `$(call)` expands its own. A
+/// function GNU would have handed unexpanded text therefore expands it a second
+/// time, which is why `$(call foreach,v,1 2,$$(v))` iterates while a single
+/// `$` there would not have survived to be bound.
+fn call_builtin(
+    fi: &'static FuncInfo,
+    args: &[Arc<Value>],
+    ev: &mut Evaluator,
+    out: &mut dyn BufMut,
+) -> Result<()> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    if (args.len() as i16) < fi.min_arity {
+        error_loc!(
+            ev,
+            ev.loc.as_ref(),
+            "*** insufficient number of arguments ({}) to function `{}'.",
+            args.len(),
+            String::from_utf8_lossy(fi.name)
+        );
+    }
+    let loc = ev.loc.clone().unwrap_or_default();
+    let mut expanded = Vec::with_capacity(args.len());
+    for arg in args {
+        let text = arg.eval_to_buf(ev)?;
+        expanded.push(if fi.pre_expanded_args {
+            Arc::new(Value::Literal(None, text))
+        } else {
+            crate::expr::parse_expr(
+                &mut ev.session,
+                &mut loc.clone(),
+                text,
+                crate::expr::ParseExprOpt::Normal,
+            )?
+        });
+    }
+    let _frame = ev.enter(FrameType::FunCall, Bytes::from_static(fi.name), loc);
+    (fi.func)(&expanded, ev, out)
+}
+
 fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
     let func_name_buf = args[0].eval_to_buf(ev)?;
     let func_name_buf = func_name_buf.slice_ref(trim_space(&func_name_buf));
+    if func_name_buf.is_empty() {
+        return Ok(());
+    }
+    if let Some(fi) = get_func_info(&func_name_buf) {
+        return call_builtin(fi, &args[1..], ev, out);
+    }
     let func_sym = ev.session.intern(func_name_buf.clone());
     let func = ev.lookup_var(func_sym)?;
     if let Some(func) = &func {
@@ -852,6 +915,143 @@ fn foreach_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -
         ev.with_bound(varname, v, |ev| args[2].eval(ev, ww.out))?;
     }
     ev.eval_depth += 1;
+    Ok(())
+}
+
+/// `$(let names,list,body)`: bind each name to one word of the list for the
+/// duration of the body, and the last name to everything the others left.
+///
+/// The remainder really is the remainder, not a re-joined word list: leading
+/// whitespace comes off, and what is inside and after it stays. Names past the
+/// end of the list bind to the empty string rather than going unbound, and the
+/// bindings are automatic ones that unwind when the body is done, so a name
+/// that already meant something means it again afterwards.
+fn let_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
+    let names = args[0].eval_to_buf(ev)?;
+    let list = args[1].eval_to_buf(ev)?;
+    let mut rest = list.slice_ref(trim_left_space(&list));
+    let mut bindings = Vec::new();
+    let mut remaining_names = word_scanner(&names).count();
+    for name in word_scanner(&names) {
+        let sym = ev.session.intern(names.slice_ref(name));
+        remaining_names -= 1;
+        let value = if remaining_names == 0 {
+            std::mem::take(&mut rest)
+        } else {
+            let word_len = rest.iter().position(is_space_byte).unwrap_or(rest.len());
+            let word = rest.slice(..word_len);
+            rest = rest.slice_ref(trim_left_space(&rest[word_len..]));
+            word
+        };
+        let var = Variable::with_simple_string(value, VarOrigin::Automatic, None, None);
+        bindings.push((sym, var));
+    }
+    ev.eval_depth -= 1;
+    ev.with_bounds(bindings, |ev| args[2].eval(ev, out))?;
+    ev.eval_depth += 1;
+    Ok(())
+}
+
+/// One side of an `$(intcmp)` comparison, as GNU Make reads it: optional
+/// whitespace, an optional sign, and digits.
+///
+/// The digits are kept from the first nonzero one, and `sign` is zero for a
+/// zero however it was written — so `-0`, `0` and `000` are one value, and the
+/// two-argument form answers with `0`.
+struct MakeInt {
+    sign: i32,
+    digits: Bytes,
+}
+
+impl MakeInt {
+    /// GNU Make's `parse_textint`. `ordinal` names which argument this is, for
+    /// the diagnostic a non-numeric one dies with.
+    fn parse(text: &Bytes, ordinal: &str, ev: &mut Evaluator) -> Result<MakeInt> {
+        let trimmed = trim_space(text);
+        if trimmed.is_empty() {
+            error_loc!(
+                ev,
+                ev.loc.as_ref(),
+                "*** non-numeric {ordinal} argument to `intcmp' function: empty value."
+            );
+        }
+        let negative = trimmed[0] == b'-';
+        let after_sign = usize::from(negative || trimmed[0] == b'+');
+        let digits = &trimmed[after_sign..];
+        let end = digits
+            .iter()
+            .position(|byte| !byte.is_ascii_digit())
+            .unwrap_or(digits.len());
+        if end == 0 || end != digits.len() {
+            error_loc!(
+                ev,
+                ev.loc.as_ref(),
+                "*** non-numeric {ordinal} argument to `intcmp' function: '{}'.",
+                String::from_utf8_lossy(text)
+            );
+        }
+        let first_significant = digits.iter().position(|byte| *byte != b'0').unwrap_or(end);
+        let digits = text.slice_ref(&digits[first_significant..]);
+        let sign = i32::from(!digits.is_empty()) * if negative { -1 } else { 1 };
+        Ok(MakeInt { sign, digits })
+    }
+
+    /// GNU Make compares the sign, then the number of significant digits, then
+    /// the digits themselves — which orders two negatives by magnitude rather
+    /// than by value, so it reads `-5` as below `-6`. Replicated because this
+    /// is what `$(intcmp)` means in the Make being ported.
+    fn cmp(&self, other: &MakeInt) -> std::cmp::Ordering {
+        self.sign
+            .cmp(&other.sign)
+            .then_with(|| self.digits.len().cmp(&other.digits.len()))
+            .then_with(|| self.digits.cmp(&other.digits))
+    }
+
+    fn write(&self, out: &mut dyn BufMut) {
+        if self.sign == 0 {
+            out.put_u8(b'0');
+            return;
+        }
+        if self.sign < 0 {
+            out.put_u8(b'-');
+        }
+        out.put_slice(&self.digits);
+    }
+}
+
+/// `$(intcmp lhs,rhs[,lt[,eq[,gt]]])`: compare two integers and expand the arm
+/// the comparison chose.
+///
+/// With no arms at all it answers with the value when the two are equal and
+/// with nothing when they are not. A missing greater-than arm falls back to the
+/// equal one rather than to nothing, and a missing equal arm means an equal or
+/// greater comparison expands to nothing.
+fn intcmp_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
+    let lhs = args[0].eval_to_buf(ev)?;
+    let rhs = args[1].eval_to_buf(ev)?;
+    let lhs = MakeInt::parse(&lhs, "first", ev)?;
+    let rhs = MakeInt::parse(&rhs, "second", ev)?;
+    let ordering = lhs.cmp(&rhs);
+    if args.len() == 2 {
+        if ordering.is_eq() {
+            lhs.write(out);
+        }
+        return Ok(());
+    }
+    let chosen = match ordering {
+        std::cmp::Ordering::Less => 2,
+        std::cmp::Ordering::Equal => 3,
+        std::cmp::Ordering::Greater => {
+            if args.len() > 4 {
+                4
+            } else {
+                3
+            }
+        }
+    };
+    if let Some(arm) = args.get(chosen) {
+        arm.eval(ev, out)?;
+    }
     Ok(())
 }
 
@@ -1480,6 +1680,16 @@ const fn func(name: &'static [u8], f: MakeFuncImpl, arity: i16) -> FuncInfo {
         min_arity: arity,
         trim_space: false,
         trim_right_space_1st: false,
+        pre_expanded_args: true,
+    }
+}
+
+/// A function whose arguments GNU Make leaves unexpanded for it, because what
+/// the function does with them is not "read their value once".
+const fn lazy_func(name: &'static [u8], f: MakeFuncImpl, arity: i16) -> FuncInfo {
+    FuncInfo {
+        pre_expanded_args: false,
+        ..func(name, f, arity)
     }
 }
 const FUNC_INFO: &[FuncInfo] = &[
@@ -1511,6 +1721,7 @@ const FUNC_INFO: &[FuncInfo] = &[
         arity: 3,
         min_arity: 2,
         trim_space: false,
+        pre_expanded_args: false,
         trim_right_space_1st: true,
     },
     FuncInfo {
@@ -1519,6 +1730,7 @@ const FUNC_INFO: &[FuncInfo] = &[
         arity: 0,
         min_arity: 0,
         trim_space: true,
+        pre_expanded_args: false,
         trim_right_space_1st: false,
     },
     FuncInfo {
@@ -1527,13 +1739,24 @@ const FUNC_INFO: &[FuncInfo] = &[
         arity: 0,
         min_arity: 0,
         trim_space: true,
+        pre_expanded_args: false,
         trim_right_space_1st: false,
     },
     func(b"value", value_func, 1),
     func(b"eval", eval_func, 1),
     func(b"shell", shell_func, 1),
     func(b"call", call_func, 0),
-    func(b"foreach", foreach_func, 3),
+    lazy_func(b"foreach", foreach_func, 3),
+    lazy_func(b"let", let_func, 3),
+    FuncInfo {
+        name: b"intcmp",
+        func: intcmp_func,
+        arity: 5,
+        min_arity: 2,
+        trim_space: false,
+        pre_expanded_args: false,
+        trim_right_space_1st: false,
+    },
     func(b"origin", origin_func, 1),
     func(b"flavor", flavor_func, 1),
     func(b"info", info_func, 1),
@@ -1545,6 +1768,7 @@ const FUNC_INFO: &[FuncInfo] = &[
         arity: 2,
         min_arity: 1,
         trim_space: false,
+        pre_expanded_args: true,
         trim_right_space_1st: false,
     },
     /* Kati custom extension functions */
@@ -1554,6 +1778,7 @@ const FUNC_INFO: &[FuncInfo] = &[
         arity: 2,
         min_arity: 1,
         trim_space: false,
+        pre_expanded_args: true,
         trim_right_space_1st: false,
     },
     FuncInfo {
@@ -1562,6 +1787,7 @@ const FUNC_INFO: &[FuncInfo] = &[
         arity: 2,
         min_arity: 1,
         trim_space: false,
+        pre_expanded_args: true,
         trim_right_space_1st: false,
     },
     func(b"KATI_deprecate_export", deprecate_export_func, 1),
@@ -1570,13 +1796,14 @@ const FUNC_INFO: &[FuncInfo] = &[
     func(b"KATI_variable_location", variable_location_func, 1),
     func(b"KATI_extra_file_deps", extra_file_deps_func, 0),
     func(b"KATI_shell_no_rerun", shell_no_rerun_func, 1),
-    func(b"KATI_foreach_sep", foreach_sep_func, 4),
+    lazy_func(b"KATI_foreach_sep", foreach_sep_func, 4),
     FuncInfo {
         name: b"KATI_file_no_rerun",
         func: file_no_rerun_func,
         arity: 2,
         min_arity: 1,
         trim_space: false,
+        pre_expanded_args: true,
         trim_right_space_1st: false,
     },
     FuncInfo {
@@ -1585,6 +1812,7 @@ const FUNC_INFO: &[FuncInfo] = &[
         arity: 2,
         min_arity: 1,
         trim_space: false,
+        pre_expanded_args: true,
         trim_right_space_1st: false,
     },
     func(b"KATI_debug_var", debug_func, 1),
@@ -1764,5 +1992,67 @@ mod tests {
         assert_eq!(out.as_ref(), b"x");
         assert!(ev.session.peek_global_var(one).is_none());
         assert!(ev.session.peek_global_var(two).is_none());
+    }
+
+    /// `let` binds every name at once, the way `call` binds its positional
+    /// arguments, so a body that fails must leave all of them as it found them.
+    #[test]
+    fn let_restores_bindings_when_body_fails() {
+        let mut ev = Evaluator::new(Session::new());
+        let bound = ev.session.intern("KATI_TEST_LET_BOUND");
+        let unbound = ev.session.intern("KATI_TEST_LET_UNBOUND");
+        ev.session
+            .set_global_var(bound, simple(b"outer"), false, None)
+            .unwrap();
+
+        let (result, out) = eval_with(
+            &mut ev,
+            "$(let KATI_TEST_LET_BOUND KATI_TEST_LET_UNBOUND,a b,\
+             $(KATI_TEST_LET_BOUND)$(error stop))",
+        );
+
+        assert!(result.is_err());
+        assert_eq!(out.as_ref(), b"a");
+        assert!(ev.session.peek_global_var(unbound).is_none());
+        let var = ev.session.peek_global_var(bound).unwrap();
+        assert_eq!(string_of(&ev.session, var), "outer");
+    }
+
+    /// An argument that is not an integer stops the build, and an empty one
+    /// says so in its own words rather than quoting nothing.
+    #[test]
+    fn intcmp_refuses_a_non_numeric_argument() {
+        let mut ev = Evaluator::new(Session::new());
+        let (result, _) = eval_with(&mut ev, "$(intcmp 12a,1,foo)");
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("non-numeric first argument to `intcmp' function: '12a'."),
+            "{message}"
+        );
+
+        let (result, _) = eval_with(&mut ev, "$(intcmp 0, ,foo)");
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("non-numeric second argument to `intcmp' function: empty value."),
+            "{message}"
+        );
+    }
+
+    /// A builtin reached through `$(call)` answers to the same argument count
+    /// it would have refused directly — except for none at all, which GNU Make
+    /// answers with nothing rather than a diagnostic.
+    #[test]
+    fn call_refuses_too_few_builtin_arguments() {
+        let mut ev = Evaluator::new(Session::new());
+        let (result, _) = eval_with(&mut ev, "$(call filter,%.c)");
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("insufficient number of arguments (1) to function `filter'."),
+            "{message}"
+        );
+
+        let (result, out) = eval_with(&mut ev, "$(call filter)");
+        result.unwrap();
+        assert!(out.is_empty());
     }
 }
