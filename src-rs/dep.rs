@@ -96,6 +96,9 @@ pub struct DepNode {
     pub order_onlys: Vec<NamedDepNode>,
     pub validations: Vec<NamedDepNode>,
     pub has_rule: bool,
+    /// Whether this node is the first rule of the read. Read only where a
+    /// manifest needs a `default` line and the goals cannot supply one —
+    /// `--gen_all_targets`, where they are all of them.
     pub is_default_target: bool,
     pub is_phony: bool,
     /// At least one ordinary `::` recipe has no prerequisites. GNU Make runs
@@ -730,6 +733,13 @@ struct DepBuilder<'a> {
     default_rule: Option<Arc<Rule>>,
     suffix_rules: SuffixRuleMap,
 
+    /// The first target of the read that could stand for the Makefile as a
+    /// whole, from before a goal could be named.
+    ///
+    /// `.DEFAULT_GOAL` decides what an invocation naming no goal builds, and it
+    /// is answered by the evaluation rather than from here. This survives for
+    /// `--gen_all_targets`, where every root is a target and the manifest still
+    /// wants one of them written on its `default` line.
     first_rule: Option<Symbol>,
     done: HashMap<Symbol, Arc<Mutex<DepNode>>>,
     phony: HashSet<Symbol>,
@@ -1114,6 +1124,44 @@ impl<'a> DepBuilder<'a> {
         });
     }
 
+    /// The goal an invocation that named none builds.
+    ///
+    /// `.DEFAULT_GOAL` answers, and it is read here rather than remembered
+    /// from the read that set it: what counts is the value the last line of
+    /// the last Makefile left, whether that was the first eligible target's
+    /// name or something the Makefile wrote over it with.
+    ///
+    /// The value names one target. Empty means nothing was ever eligible and
+    /// nothing was asked for, which is a build with nothing to aim at. More
+    /// than one name is a Makefile asking for something Make cannot do, and it
+    /// says so rather than picking one.
+    fn default_goal(&mut self) -> Result<Symbol> {
+        let value = self.ev.eval_var(Symbol::DEFAULT_GOAL)?;
+        let mut named = makefile_word_scanner(&value);
+        let Some(goal) = named.next() else {
+            // GNU Make's own wording, because its test suite matches this
+            // message exactly to learn what the program under test is called.
+            // The name and the `Stop.` are added on the way out.
+            error_loc!(self.ev, None, "*** No targets.");
+        };
+        if named.next().is_none() {
+            return Ok(self.ev.session.intern(goal.to_vec()));
+        }
+        // A name is a name before it is a list. GNU Make asks whether the whole
+        // value is a target it has heard of before it reads words out of it, so
+        // `a\ xb` — one target whose name holds a space — is that target rather
+        // than two it has never heard of.
+        let whole = self.ev.session.intern(value.to_vec());
+        if self.rules.contains_key(&whole) || self.mentioned.contains(&whole) {
+            return Ok(whole);
+        }
+        error_loc!(
+            self.ev,
+            None,
+            "*** .DEFAULT_GOAL contains more than one target."
+        );
+    }
+
     fn build(
         &mut self,
         mut targets: Vec<Symbol>,
@@ -1129,16 +1177,7 @@ impl<'a> DepBuilder<'a> {
         let regeneration_nodes = self.plan_regeneration(read_makefiles, missing_includes)?;
 
         if !self.ev.session.flags.gen_all_targets && targets.is_empty() {
-            // Only a build with nothing to aim at has no targets. A goal was
-            // named, so a makefile holding nothing but pattern rules has one.
-            //
-            // GNU Make's own wording, because its test suite matches this
-            // message exactly to learn what the program under test is called.
-            // The name and the `Stop.` are added on the way out.
-            let Some(first_rule) = self.first_rule else {
-                error_loc!(self.ev, None, "*** No targets.");
-            };
-            targets.push(first_rule);
+            targets.push(self.default_goal()?);
         }
         if self.ev.session.flags.gen_all_targets {
             let mut non_root_targets = HashSet::new();
@@ -1168,6 +1207,7 @@ impl<'a> DepBuilder<'a> {
 
         // TODO: LogStats?
 
+        self.ev.goals.clone_from(&targets);
         let mut nodes = Vec::new();
         for target in targets {
             nodes.push((target, self.plan_root(target)?));
@@ -3191,7 +3231,7 @@ pub fn make_dep(
 
 /// Whether the name has the shape Make reserves: a leading dot before any
 /// directory separator.  A hidden-directory path such as `.deps/file.Po` is an
-/// ordinary file target, including for default-goal selection.
+/// ordinary file target.
 ///
 /// This is wider than the names that mean anything. To decide whether something
 /// belongs in the graph, ask [`is_buildable_target`].

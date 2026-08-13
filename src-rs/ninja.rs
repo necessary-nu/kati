@@ -884,12 +884,24 @@ impl<'a> NinjaGenerator<'a> {
                 }
             }
 
-            let flags = &self.ce.ev.session.flags;
-            let targets = if flags.targets.is_empty() || flags.gen_all_targets {
+            // What the graph is aimed at is what dependency analysis resolved,
+            // which is the goals the invocation named or the one
+            // `.DEFAULT_GOAL` chose when it named none. Asking the evaluation
+            // rather than the flags is what lets a default goal with no rule
+            // of its own — a file that is simply already there — still be the
+            // thing asked for, and it keeps a Makefile a front end has to
+            // remake first from being mistaken for something to build.
+            //
+            // `--gen_all_targets` is the exception, because there every root
+            // is a target and the manifest still wants one default: the first
+            // rule of the read, which is what it meant before a goal could be
+            // named at all.
+            let targets = if self.ce.ev.session.flags.gen_all_targets {
                 vec![default_target.unwrap()]
             } else {
-                flags
-                    .targets
+                self.ce
+                    .ev
+                    .goals
                     .iter()
                     .map(|target| self.phony_aliases.resolve(*target))
                     .collect()

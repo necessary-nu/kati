@@ -276,6 +276,26 @@ fn install_compiler_invocation_variables(ev: &mut Evaluator) {
     );
 }
 
+/// Bind `.DEFAULT_GOAL` to the empty selection every read starts from.
+///
+/// The variable exists before any Makefile is read, which is what lets one be
+/// asked `$(origin .DEFAULT_GOAL)` and be told `file` rather than `undefined`.
+/// The origin is not decoration: it is the rank the binding assigns at, so an
+/// exported `.DEFAULT_GOAL=x` in the environment is outranked and discarded
+/// here — while under `-e`, where the environment outranks the Makefile, the
+/// same assignment survives and chooses the goal.
+///
+/// GNU Make does this in `main`, between the default variables and the first
+/// line of any Makefile, and so does this.
+fn install_default_goal(ev: &mut Evaluator) -> Result<()> {
+    ev.session.set_global_var(
+        Symbol::DEFAULT_GOAL,
+        Variable::with_simple_string(Bytes::new(), VarOrigin::File, None, None),
+        false,
+        None,
+    )
+}
+
 /// Evaluate the Makefile `session` names into the graph it describes.
 ///
 /// # Errors
@@ -298,6 +318,8 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
     if catalogue_installed {
         crate::builtins::install_default_variables(&mut ev.session)?;
     }
+
+    install_default_goal(&mut ev)?;
 
     let bootstrap_asts = read_bootstrap_makefile(&mut ev.session, &targets)?;
     {

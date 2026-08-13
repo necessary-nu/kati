@@ -135,6 +135,26 @@ impl Variable {
             InnerVar::VariableNames { .. } => "kati_variable_names",
         }
     }
+    /// Whether the variable's text — what was written, before any expansion —
+    /// holds nothing.
+    ///
+    /// A simple variable's text is its value; a recursive one's is the
+    /// expression rather than what the expression produces. GNU Make reads
+    /// `.DEFAULT_GOAL` this way when it decides whether a recorded target
+    /// should become the default goal, so `.DEFAULT_GOAL = $(EMPTY)` keeps
+    /// selection disarmed while expanding to nothing at all.
+    ///
+    /// A variable whose value is computed rather than written — a shell
+    /// status, the name list — has no text and is never empty in this sense.
+    pub fn text_is_empty(&self) -> bool {
+        match &self.value {
+            InnerVar::Simple(value) => value.is_empty(),
+            InnerVar::Recursive { orig, .. } => orig.is_empty(),
+            InnerVar::AutoCommand(_, _)
+            | InnerVar::ShellStatus
+            | InnerVar::VariableNames { .. } => false,
+        }
+    }
     pub fn used(&self, ev: &Evaluator, sym: &Symbol) -> Result<()> {
         if let Some(obsolete) = &self.obsolete {
             error_loc!(

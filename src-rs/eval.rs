@@ -825,6 +825,15 @@ pub struct Evaluator {
     /// could not open.
     pub(crate) read_makefiles: Vec<ReadMakefile>,
 
+    /// What the build this evaluation describes is aimed at: the goals the
+    /// invocation named, or the single goal `.DEFAULT_GOAL` held once the read
+    /// was over when it named none.
+    ///
+    /// Dependency analysis resolves it and leaves it here because the answer is
+    /// not recoverable afterwards from the graph's roots: a front end adds the
+    /// Makefiles it has to remake to those, and those are not goals.
+    pub goals: Vec<Symbol>,
+
     pub is_evaluating_command: bool,
     /// Whether expanding the current recipe referenced `MAKE`.
     ///
@@ -964,6 +973,7 @@ impl Evaluator {
 
             missing_includes: Vec::new(),
             read_makefiles: Vec::new(),
+            goals: Vec::new(),
 
             is_evaluating_command: false,
             expanded_make_in_command: Vec::new(),
@@ -1736,6 +1746,7 @@ impl Evaluator {
                 crate::builtins::install_posix_variables(&mut self.session);
             }
         }
+        self.record_default_goal(&rule.outputs)?;
 
         log!("Rule: {:?}", rule);
         match self.get_allow_rules()? {
@@ -1759,6 +1770,54 @@ impl Evaluator {
         }
         self.rules.push(rule);
         self.rule_state = RuleState::Active;
+        Ok(())
+    }
+
+    /// Whether `.DEFAULT_GOAL` still holds the empty text a read starts from.
+    ///
+    /// The global binding and no other: a target-specific `.DEFAULT_GOAL` is a
+    /// value that recipe sees, not a statement about what the build aims at.
+    fn default_goal_unset(&self) -> bool {
+        self.session
+            .peek_global_var(Symbol::DEFAULT_GOAL)
+            .is_none_or(|var| var.read().text_is_empty())
+    }
+
+    /// Offer a rule's targets to `.DEFAULT_GOAL`, as GNU Make offers every
+    /// target it records.
+    ///
+    /// Selection is armed only while the variable's text is empty, and that
+    /// single condition is the whole of three behaviours: the first eligible
+    /// target of the read wins; a Makefile that assigns the variable takes the
+    /// choice away from every target after it; and one that assigns it empty
+    /// again hands the choice to the next target recorded.
+    ///
+    /// Not every target is eligible. A pattern ends the offer rather than
+    /// skipping it — a rule that says how to make things names none. A name
+    /// Make reserved is passed over while the targets beside it are still
+    /// considered, and reserved means a leading dot with no directory
+    /// separator after it: `.PHONY` is a declaration, `.deps/x.Po` is a file.
+    fn record_default_goal(&mut self, outputs: &[Symbol]) -> Result<()> {
+        if !self.default_goal_unset() {
+            return Ok(());
+        }
+        for output in outputs {
+            let name = output.as_bytes(&self.session);
+            if name.contains(&b'%') {
+                return Ok(());
+            }
+            if name.starts_with(b".") && !name.contains(&b'/') {
+                continue;
+            }
+            let frame = self.current_frame();
+            let loc = self.loc.clone();
+            return self.session.set_global_var(
+                Symbol::DEFAULT_GOAL,
+                Variable::with_simple_string(name, VarOrigin::File, Some(frame), loc),
+                false,
+                None,
+            );
+        }
         Ok(())
     }
 
