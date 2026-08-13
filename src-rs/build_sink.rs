@@ -72,6 +72,24 @@ pub enum NewInputsTiming {
     SchedulerBoundary,
 }
 
+/// Who answers a `$(shell)` written inside a recipe.
+///
+/// GNU Make always answers it itself, while it expands the recipe. kati grew
+/// the other answer for Android: when the destination is a manifest some other
+/// program will run, writing the call through as a shell command substitution
+/// keeps it out of every regeneration. That is a different language — the
+/// value never reaches a Make function, and a quoted one is never substituted
+/// at all — so it is the destination's choice rather than kati's.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellEvaluation {
+    /// The recipe's own shell answers it, as a command substitution written
+    /// into the generated command.
+    RecipeShell,
+    /// Make answers it while it expands the recipe, which is GNU Make's
+    /// `func_shell`.
+    Expansion,
+}
+
 /// A pool kati declares for itself.
 ///
 /// Pools kati only *refers* to — the ones `.KATI_NINJA_POOL` and
@@ -275,6 +293,16 @@ pub trait BuildSink {
     /// edge instead.
     fn new_inputs_timing(&self) -> NewInputsTiming {
         NewInputsTiming::RecipeShell
+    }
+
+    /// Who answers a `$(shell)` written inside a recipe.
+    ///
+    /// A manifest writer keeps kati's deferral, because the value would
+    /// otherwise be frozen into a file that outlives the run that wrote it.
+    /// Ronin's direct graph sink runs the build itself and so answers where
+    /// GNU Make does.
+    fn shell_evaluation(&self) -> ShellEvaluation {
+        ShellEvaluation::RecipeShell
     }
 
     /// Called once, before anything else, with the pools kati declares.

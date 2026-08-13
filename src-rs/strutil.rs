@@ -540,32 +540,48 @@ pub fn trim_leading_curdir(mut s: &[u8]) -> &[u8] {
     s
 }
 
-pub fn format_for_command_substitution(mut s: Vec<u8>) -> Vec<u8> {
-    while s.ends_with(b"\n") {
-        s.truncate(s.len() - 1)
-    }
-    let mut search = 0;
-    while let Some(idx) = memchr(b'\n', &s[search..]) {
-        search += idx;
-        s[search] = b' ';
-    }
-    s
-}
-
-/// Fold a command's output into one line for `V != cmd`.
+/// Fold a command's output into one line, GNU Make's `fold_newlines`.
 ///
-/// Every newline becomes a space and one trailing newline is dropped, where
-/// `$(shell)` drops the whole run of them.
-pub fn format_for_shell_assignment(mut s: Vec<u8>) -> Vec<u8> {
-    if s.ends_with(b"\n") {
-        s.truncate(s.len() - 1);
-    }
-    for byte in &mut s {
-        if *byte == b'\n' {
-            *byte = b' ';
+/// Every newline becomes a space, and a `\r` immediately before one is dropped
+/// rather than kept — a lone `\r` survives, so the rule is about line endings
+/// and not about the byte. Trailing newlines are then cut back to the last byte
+/// that was not one: `trim` takes the whole run, which is `$(shell)`, and
+/// leaving it off keeps all but one of them, which is `!=`.
+///
+/// GNU Make reads the output as a C string, so a `NUL` ends it and everything
+/// the command wrote after one is lost.
+fn fold_newlines(s: &[u8], trim: bool) -> Vec<u8> {
+    let s = &s[..memchr(0, s).unwrap_or(s.len())];
+    let mut folded = Vec::with_capacity(s.len());
+    // One past the last byte to keep, so that "kept nothing" is expressible.
+    let mut end = 0;
+    let mut rest = s;
+    while let Some((byte, tail)) = rest.split_first() {
+        rest = tail;
+        match byte {
+            b'\r' if tail.first() == Some(&b'\n') => continue,
+            b'\n' => folded.push(b' '),
+            _ => {
+                folded.push(*byte);
+                end = folded.len();
+            }
         }
     }
-    s
+    if !trim {
+        end = end.max(folded.len().saturating_sub(1));
+    }
+    folded.truncate(end);
+    folded
+}
+
+/// `$(shell cmd)`, which drops the whole run of trailing newlines.
+pub fn format_for_command_substitution(s: Vec<u8>) -> Vec<u8> {
+    fold_newlines(&s, true)
+}
+
+/// `V != cmd`, which keeps all but one of the trailing newlines as spaces.
+pub fn format_for_shell_assignment(s: Vec<u8>) -> Vec<u8> {
+    fold_newlines(&s, false)
 }
 
 pub fn concat_dir(b: &[u8], n: &[u8]) -> Bytes {
@@ -986,5 +1002,29 @@ mod test {
     #[test]
     fn test_find_outside_paren_combinations() {
         assert_eq!(find_outside_paren(b"a(b\\:c):d", b":"), Some(7)); // Escaped ':' inside (), find ':' outside
+    }
+
+    /// GNU Make's `fold_newlines` reads the output as a C string, drops the
+    /// `\r` of a `\r\n` pair without touching a lone one, and cuts the whole
+    /// run of trailing newlines away.
+    #[test]
+    fn shell_output_folds_crlf_and_stops_at_nul() {
+        let fold = |s: &[u8]| format_for_command_substitution(s.to_vec());
+        assert_eq!(fold(b"a\r\nb\rc\n\r\n"), b"a b\rc");
+        assert_eq!(fold(b"a\0b\n"), b"a");
+        assert_eq!(fold(b"\n\n\n"), b"");
+        assert_eq!(fold(b"x"), b"x");
+    }
+
+    /// `!=` folds the same way but keeps every trailing newline bar one, and
+    /// an output that was nothing but newlines still loses exactly one.
+    #[test]
+    fn shell_assignment_keeps_all_but_one_newline() {
+        let fold = |s: &[u8]| format_for_shell_assignment(s.to_vec());
+        assert_eq!(fold(b"a\nb\n\n\n"), b"a b  ");
+        assert_eq!(fold(b"a\r\nb\r\n\r\n"), b"a b ");
+        assert_eq!(fold(b"\n\n\n"), b"  ");
+        assert_eq!(fold(b"\n"), b"");
+        assert_eq!(fold(b""), b"");
     }
 }

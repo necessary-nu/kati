@@ -20,7 +20,10 @@ use std::{
     fmt::Debug,
     fs::File,
     io::Write,
-    os::unix::ffi::{OsStrExt, OsStringExt},
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        process::ExitStatusExt,
+    },
     sync::{Arc, LazyLock},
 };
 
@@ -603,10 +606,12 @@ fn shell_func_impl(
         Trailing::Fold => format_for_shell_assignment(output),
     });
 
-    if let Some(exit_code) = status.code() {
-        return Ok((exit_code, output, None));
-    }
-    let exit_code = if status.success() { 0 } else { 1 };
+    // A command killed by a signal exited with nothing, and GNU Make's
+    // `shell_completed` reports it the way a shell reports one of its own
+    // children: 128 plus the signal number.
+    let exit_code = status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or_default());
     Ok((exit_code, output, None))
 }
 
@@ -707,7 +712,7 @@ fn shell_func_with(
     trailing: Trailing,
 ) -> Result<()> {
     let cmd = args[0].eval_to_buf(ev)?;
-    if ev.avoid_io && !has_no_io_in_shell_script(&cmd) {
+    if ev.defers_shell_to_the_recipe() && !has_no_io_in_shell_script(&cmd) {
         if ev.eval_depth > 1 {
             let program = ev.session.flags.program_name.clone();
             error_loc!(
@@ -758,7 +763,7 @@ fn shell_no_rerun_func(
     out: &mut dyn BufMut,
 ) -> Result<()> {
     let cmd = args[0].eval_to_buf(ev)?;
-    if ev.avoid_io && !has_no_io_in_shell_script(&cmd) {
+    if ev.defers_shell_to_the_recipe() && !has_no_io_in_shell_script(&cmd) {
         // In the regular ShellFunc, if it sees a $(shell) inside of a rule when in
         // ninja mode, the shell command will just be written to the ninja file
         // instead of run directly by kati. So it already has the benefits of not
@@ -1830,7 +1835,9 @@ pub fn get_func_info(name: &[u8]) -> Option<&'static FuncInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build_sink::ShellEvaluation;
     use crate::expr::{ParseExprOpt, parse_expr};
+    use crate::symtab::Symbol;
 
     /// Evaluate a Make expression with a fresh evaluator, returning both the
     /// result and whatever the expression managed to write before failing.
@@ -1853,6 +1860,45 @@ mod tests {
 
     fn string_of(session: &Session, var: crate::var::Var) -> String {
         String::from_utf8(var.read().string(session).unwrap().into_owned()).unwrap()
+    }
+
+    /// A destination that runs the build itself gets GNU Make's answer: the
+    /// value arrives during the recipe's own expansion, so it composes with the
+    /// functions around it instead of being written out as shell syntax that
+    /// only an unquoted position would ever substitute.
+    #[test]
+    fn a_recipe_shell_composes_when_expansion_answers() {
+        let mut ev = Evaluator::new(Session::new());
+        ev.avoid_io = true;
+        ev.shell_evaluation = ShellEvaluation::Expansion;
+        ev.session
+            .set_global_var(Symbol::SHELL, simple(b"/bin/sh"), false, None)
+            .unwrap();
+        ev.session
+            .set_global_var(Symbol::SHELLFLAGS, simple(b"-c"), false, None)
+            .unwrap();
+
+        let (result, out) = eval_with(&mut ev, "$(subst b,B,$(shell echo abc))");
+        result.unwrap();
+        assert_eq!(out, "aBc");
+        assert_eq!(ev.session.shell_status, Some(0));
+    }
+
+    /// The other destination is a manifest, where the recipe's own shell is
+    /// what answers. A composed one has nowhere to put the answer and says so
+    /// rather than writing a command substitution into the middle of a value.
+    #[test]
+    fn a_recipe_shell_defers_when_a_manifest_runs() {
+        let mut ev = Evaluator::new(Session::new());
+        ev.avoid_io = true;
+
+        let (result, out) = eval_with(&mut ev, "$(shell echo abc)");
+        result.unwrap();
+        assert_eq!(out, "$(echo abc)");
+        assert!(ev.session.shell_status.is_none());
+
+        let (composed, _) = eval_with(&mut ev, "$(subst b,B,$(shell echo abc))");
+        assert!(composed.is_err());
     }
 
     /// Deferred output is Makefile data, not another opportunity to evaluate

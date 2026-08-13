@@ -27,7 +27,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use memchr::memchr;
 use parking_lot::Mutex;
 
-use crate::build_sink::NewInputsTiming;
+use crate::build_sink::{NewInputsTiming, ShellEvaluation};
 use crate::expr::{Evaluable, ParseExprOpt, Value, parse_expr};
 use crate::file::Source;
 use crate::flags::Flags;
@@ -799,6 +799,8 @@ pub struct Evaluator {
     pub avoid_io: bool,
     /// Where the selected destination resolves `$?`.
     pub(crate) new_inputs_timing: NewInputsTiming,
+    /// Who the selected destination lets answer a `$(shell)` in a recipe.
+    pub(crate) shell_evaluation: ShellEvaluation,
     /// `filter-out` patterns applied to the deferred `$?` marker while the
     /// current recipe is expanded.
     pub(crate) deferred_new_inputs_filter_out: Vec<Bytes>,
@@ -967,6 +969,7 @@ impl Evaluator {
 
             avoid_io: false,
             new_inputs_timing: NewInputsTiming::RecipeShell,
+            shell_evaluation: ShellEvaluation::RecipeShell,
             deferred_new_inputs_filter_out: Vec::new(),
             eval_depth: 0,
             delayed_output_commands: Vec::new(),
@@ -2409,6 +2412,16 @@ impl Evaluator {
         let parent = self.stack.lock().last().cloned();
         let frame = Frame::new(frame_type, parent, Some(loc), name);
         ScopedFrame::new(self.stack.clone(), Some(Arc::new(frame)))
+    }
+
+    /// Whether a `$(shell)` reached from here is written into the recipe for
+    /// the recipe's own shell to answer, rather than answered now.
+    ///
+    /// Only a recipe being compiled for a manifest defers: outside one there is
+    /// no recipe to write into, and a destination that runs the build itself
+    /// asked for GNU Make's answer.
+    pub fn defers_shell_to_the_recipe(&self) -> bool {
+        self.avoid_io && self.shell_evaluation == ShellEvaluation::RecipeShell
     }
 
     pub fn get_shell(&mut self) -> Result<Bytes> {

@@ -24,7 +24,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 
 use crate::{
-    build_sink::NewInputsTiming,
+    build_sink::{NewInputsTiming, ShellEvaluation},
     command::CommandEvaluator,
     dep::{DepNode, NamedDepNode},
     error, error_loc,
@@ -70,7 +70,11 @@ impl<'a> Executor<'a> {
     fn new(ev: &'a mut Evaluator) -> Result<Self> {
         let shell = ev.get_shell()?;
         Ok(Executor {
-            ce: CommandEvaluator::new(ev, NewInputsTiming::RecipeShell)?,
+            ce: CommandEvaluator::new(
+                ev,
+                NewInputsTiming::RecipeShell,
+                ShellEvaluation::Expansion,
+            )?,
             done: HashMap::new(),
             shell,
             num_commands: 0,

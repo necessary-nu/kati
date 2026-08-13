@@ -37,7 +37,10 @@ use crate::func::CommandOp;
 use crate::io::{dump_int, dump_string, dump_systemtime, dump_usize, dump_vec_string};
 use crate::strutil::{Pattern, basename, concat_dir, dirname, strip_ext, strip_ext_vec};
 use crate::{
-    build_sink::{BuildSink, NewInputsTiming, RuleId, SinkCommand, SinkEdge, SinkPool, SinkRule},
+    build_sink::{
+        BuildSink, NewInputsTiming, RuleId, ShellEvaluation, SinkCommand, SinkEdge, SinkPool,
+        SinkRule,
+    },
     command::{Command, CommandEvaluator},
     dep::{DepNode, NamedDepNode, is_buildable_target},
     eval::Evaluator,
@@ -1079,6 +1082,7 @@ impl Drop for NinjaGenerator<'_> {
     fn drop(&mut self) {
         self.ce.ev.avoid_io = false;
         self.ce.ev.new_inputs_timing = NewInputsTiming::RecipeShell;
+        self.ce.ev.shell_evaluation = ShellEvaluation::RecipeShell;
         self.ce.ev.deferred_new_inputs_filter_out.clear();
     }
 }
@@ -1400,7 +1404,11 @@ pub fn generate_ninja(
     orig_args: &[u8],
     start_time: SystemTime,
 ) -> Result<()> {
-    let mut ng = NinjaGenerator::new(CommandEvaluator::new(ev, NewInputsTiming::RecipeShell)?)?;
+    let mut ng = NinjaGenerator::new(CommandEvaluator::new(
+        ev,
+        NewInputsTiming::RecipeShell,
+        ShellEvaluation::RecipeShell,
+    )?)?;
     ng.generate(nodes, orig_args, start_time)?;
     Ok(())
 }
@@ -1420,7 +1428,12 @@ pub fn emit_build(
     sink: &mut dyn BuildSink,
 ) -> Result<()> {
     let new_inputs_timing = sink.new_inputs_timing();
-    let mut ng = NinjaGenerator::new(CommandEvaluator::new(ev, new_inputs_timing)?)?;
+    let shell_evaluation = sink.shell_evaluation();
+    let mut ng = NinjaGenerator::new(CommandEvaluator::new(
+        ev,
+        new_inputs_timing,
+        shell_evaluation,
+    )?)?;
     ng.populate_ninja_nodes(nodes)?;
     ng.emit(sink)
 }

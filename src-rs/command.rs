@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use std::{collections::HashSet, fmt::Debug, sync::Arc};
 
 use crate::{
-    build_sink::NewInputsTiming,
+    build_sink::{NewInputsTiming, ShellEvaluation},
     dep::DepNode,
     error_loc,
     eval::Evaluator,
@@ -458,8 +458,13 @@ pub struct CommandEvaluator<'a> {
 }
 
 impl<'a> CommandEvaluator<'a> {
-    pub fn new(ev: &'a mut Evaluator, new_inputs_timing: NewInputsTiming) -> Result<Self> {
+    pub fn new(
+        ev: &'a mut Evaluator,
+        new_inputs_timing: NewInputsTiming,
+        shell_evaluation: ShellEvaluation,
+    ) -> Result<Self> {
         ev.new_inputs_timing = new_inputs_timing;
+        ev.shell_evaluation = shell_evaluation;
         let found_new_inputs = Arc::new(Mutex::new(false));
         let mut ret = Self {
             ev,
