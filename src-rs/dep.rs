@@ -32,7 +32,7 @@ use crate::{
     expr::{Evaluable, Value},
     loc::Loc,
     log,
-    rule::{Rule, glob_word, split_order_only},
+    rule::{Rule, glob_word, is_pattern_rule, split_order_only},
     session::{Context, Session},
     stmt::AssignOp,
     strutil::{
@@ -112,6 +112,13 @@ pub struct DepNode {
     /// The build deletes this file once it has finished with it, which every
     /// intermediate but a `.SECONDARY` one and a goal is.
     pub is_disposable: bool,
+    /// The outputs of this action a failed recipe leaves half-made, which
+    /// `.DELETE_ON_ERROR` says must not be left behind.
+    ///
+    /// Empty unless the Makefile declared `.DELETE_ON_ERROR`, and then only the
+    /// outputs that survive the exclusions: `.PRECIOUS` protects a name from
+    /// deletion, and a `.PHONY` name stands for no file to delete.
+    pub delete_on_error_outputs: Vec<Symbol>,
     pub implicit_outputs: Vec<Symbol>,
     pub actual_inputs: Vec<Symbol>,
     pub actual_order_only_inputs: Vec<Symbol>,
@@ -150,6 +157,7 @@ impl DepNode {
             is_ignore_error,
             is_intermediate,
             is_disposable,
+            delete_on_error_outputs: Vec::new(),
             implicit_outputs: Vec::new(),
             actual_inputs: Vec::new(),
             actual_order_only_inputs: Vec::new(),
@@ -729,6 +737,21 @@ struct DepBuilder<'a> {
     /// The targets `.IGNORE` named. Empty when it named none, which is the
     /// form that means every target and sets the flag instead.
     ignore_errors: HashSet<Symbol>,
+    /// The Makefile declared `.DELETE_ON_ERROR`, which is one global answer:
+    /// GNU Make reads the name once, as a target rather than a prerequisite,
+    /// and any prerequisites it was given mean nothing.
+    delete_on_error: bool,
+    /// The names `.PRECIOUS` protects from deletion, and the target patterns it
+    /// protects.
+    ///
+    /// The two are not one list under different spellings. A pattern protects a
+    /// name only when an implicit rule whose target pattern is written exactly
+    /// that way is the rule that made it, so `.PRECIOUS: %.bar` says nothing
+    /// about a `foo.bar` an explicit rule built. Matching the pattern against
+    /// the finished name instead would protect both, and GNU Make protects
+    /// neither.
+    precious: HashSet<Symbol>,
+    precious_patterns: HashSet<Symbol>,
     depfile_var_name: Symbol,
     /// `VPATH`, the variable form of the directory search.
     vpath_var_name: Symbol,
@@ -790,6 +813,9 @@ impl<'a> DepBuilder<'a> {
             phony: HashSet::new(),
             restat: HashSet::new(),
             ignore_errors: HashSet::new(),
+            delete_on_error: false,
+            precious: HashSet::new(),
+            precious_patterns: HashSet::new(),
             depfile_var_name,
             vpath_var_name,
             implicit_outputs_var_name,
@@ -842,6 +868,7 @@ impl<'a> DepBuilder<'a> {
             self.ev.session.flags.export_all_variables = true;
         }
         self.handle_intermediate_targets()?;
+        self.handle_deletion_targets()?;
         let ignore = self.ev.session.intern(".IGNORE");
         if let Some((targets, _)) = self.get_rule_inputs(ignore)? {
             if targets.is_empty() {
@@ -900,6 +927,84 @@ impl<'a> DepBuilder<'a> {
         }
 
         Ok(())
+    }
+
+    /// Read the two targets that decide what a failed recipe leaves behind.
+    ///
+    /// `.DELETE_ON_ERROR` is a switch and not a list: GNU Make asks only
+    /// whether the name was written as a target, so prerequisites beside it
+    /// neither narrow it nor widen it. `.PRECIOUS` is the list, and a name on
+    /// it that looks like a pattern is kept apart because it is matched against
+    /// the rule that made a file rather than against the file.
+    fn handle_deletion_targets(&mut self) -> Result<()> {
+        let delete_on_error = self.ev.session.intern(".DELETE_ON_ERROR");
+        self.delete_on_error = self.get_rule_inputs(delete_on_error)?.is_some();
+        let precious = self.ev.session.intern(".PRECIOUS");
+        if let Some((targets, _)) = self.get_rule_inputs(precious)? {
+            for t in targets {
+                if is_pattern_rule(&t.as_bytes(&self.ev.session)) {
+                    self.precious_patterns.insert(t);
+                } else {
+                    self.precious.insert(t);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `.PRECIOUS` protects this name, given the implicit rule pattern
+    /// that made it if one did.
+    fn is_precious(&self, output: Symbol, output_pattern: Option<Symbol>) -> bool {
+        self.precious.contains(&output)
+            || output_pattern.is_some_and(|pattern| self.precious_patterns.contains(&pattern))
+    }
+
+    /// Record which of each action's outputs a failed recipe must not leave
+    /// behind.
+    ///
+    /// Asked once the whole graph is planned rather than as each node is built,
+    /// because an action's outputs are not all known when it is: a grouped
+    /// record and a multi-target pattern rule both acquire the rest of theirs
+    /// later, and a name protected by a pattern acquires that protection when
+    /// the rule that makes it is chosen.
+    ///
+    /// A node with no recipe is skipped: nothing can fail, so nothing is
+    /// half-made.
+    fn mark_delete_on_error(&self) {
+        if !self.delete_on_error {
+            return;
+        }
+        let mut seen = HashSet::new();
+        let nodes = self
+            .done
+            .values()
+            .filter(|node| seen.insert(Arc::as_ptr(node)))
+            .cloned()
+            .collect::<Vec<_>>();
+        for node in nodes {
+            let mut node = node.lock();
+            if node.cmds.is_empty() {
+                continue;
+            }
+            // The rule's target pattern speaks for the name the search matched
+            // it against and for no other. A multi-target pattern rule's other
+            // names were protected by their own patterns when they were
+            // invented, which is where each one's pattern was still known.
+            let recipe_output = node.recipe_output;
+            let output_pattern = node.output_pattern;
+            let mut outputs = node
+                .grouped_double_action
+                .as_ref()
+                .map_or_else(|| vec![recipe_output], |action| action.members.clone());
+            outputs.extend(node.implicit_outputs.iter().copied());
+            outputs.retain(|output| {
+                let pattern = (*output == recipe_output)
+                    .then_some(output_pattern)
+                    .flatten();
+                !self.phony.contains(output) && !self.is_precious(*output, pattern)
+            });
+            node.delete_on_error_outputs = outputs;
+        }
     }
 
     /// Read the three targets that argue over which files are intermediate.
@@ -1068,6 +1173,7 @@ impl<'a> DepBuilder<'a> {
             nodes.push((target, self.plan_root(target)?));
         }
         self.apply_wait_barriers();
+        self.mark_delete_on_error();
         Ok((nodes, regeneration_nodes))
     }
 
@@ -2279,6 +2385,12 @@ impl<'a> DepBuilder<'a> {
                 if self.done.contains_key(&sym) {
                     continue;
                 }
+                // Each of these names is protected by the pattern that spelled
+                // it, not by the one the search matched, and this is the last
+                // point at which the two are still told apart.
+                if self.precious_patterns.contains(&output_pattern) {
+                    self.precious.insert(sym);
+                }
                 self.done.insert(sym, n.clone());
                 n.lock().implicit_outputs.push(sym);
             }
@@ -3082,12 +3194,13 @@ const CONSUMED_BUILTIN_TARGETS: &[&str] = &[
     ".INTERMEDIATE",
     ".SECONDARY",
     ".NOTINTERMEDIATE",
+    ".DELETE_ON_ERROR",
+    ".PRECIOUS",
 ];
 
-/// Special targets asking for what already happens: we never echo a recipe,
-/// never delete a target whose recipe failed, and 4.x ignores the last two.
-const ACCEPTED_BUILTIN_TARGETS: &[&str] =
-    &[".SILENT", ".PRECIOUS", ".LOW_RESOLUTION_TIME", ".POSIX"];
+/// Special targets asking for what already happens: we never echo a recipe, and
+/// 4.x ignores the last two.
+const ACCEPTED_BUILTIN_TARGETS: &[&str] = &[".SILENT", ".LOW_RESOLUTION_TIME", ".POSIX"];
 
 /// A closed list, because being a directive is not a property of the name's
 /// shape: `.1` looks exactly like `.PHONY` and is an ordinary target.

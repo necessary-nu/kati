@@ -779,32 +779,27 @@ impl<'a> NinjaGenerator<'a> {
                 .map(|(symbol, _)| self.phony_aliases.resolve(*symbol))
                 .collect::<Vec<_>>()
         };
+        let named = |names: &[Symbol]| {
+            names
+                .iter()
+                .map(|name| self.phony_aliases.resolve(*name))
+                .collect::<Vec<_>>()
+        };
         let inputs = symbols(&node.deps);
         let order_only_inputs = symbols(&node.order_onlys);
         let validations = symbols(&node.validations);
-        let implicit_outputs = node
-            .implicit_outputs
-            .iter()
-            .map(|symbol| self.phony_aliases.resolve(*symbol))
-            .collect::<Vec<_>>();
+        let implicit_outputs = named(&node.implicit_outputs);
         let output = self.phony_aliases.resolve(node.output);
+        let delete_on_error_outputs = named(&node.delete_on_error_outputs);
         let deferred_freshness_outputs = if let Some(action) = &node.grouped_double_action {
-            action
-                .members
-                .iter()
-                .map(|member| self.phony_aliases.resolve(*member))
-                .collect::<Vec<_>>()
+            named(&action.members)
         } else if nn.deferred_new_inputs {
             vec![self.phony_aliases.resolve(node.recipe_output)]
         } else {
             Vec::new()
         };
         let deferred_always_new_inputs = if let Some(action) = &node.grouped_double_action {
-            action
-                .phony_inputs
-                .iter()
-                .map(|input| self.phony_aliases.resolve(*input))
-                .collect::<Vec<_>>()
+            named(&action.phony_inputs)
         } else if nn.deferred_new_inputs {
             node.deps
                 .iter()
@@ -857,6 +852,7 @@ impl<'a> NinjaGenerator<'a> {
                 completion_join: node.grouped_double_join,
                 intermediate: node.is_intermediate,
                 disposable: node.is_disposable,
+                delete_on_error_outputs: &delete_on_error_outputs,
                 pool: pool.as_deref(),
                 tags: tags.as_deref(),
                 loc: node.loc.as_ref(),
@@ -1453,6 +1449,7 @@ mod tests {
                     completion_join: false,
                     intermediate: false,
                     disposable: false,
+                    delete_on_error_outputs: &[],
                     pool: None,
                     tags: None,
                     loc: None,

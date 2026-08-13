@@ -232,6 +232,20 @@ pub struct SinkEdge<'a> {
     /// The build should delete this output once it has finished with it, which
     /// is every intermediate but a `.SECONDARY` one and a goal.
     pub disposable: bool,
+    /// The outputs a failed recipe must not leave behind, which is what
+    /// `.DELETE_ON_ERROR` asks for. Empty means keep whatever the recipe wrote.
+    ///
+    /// The names rather than a flag, because the exclusions are per output and
+    /// not per edge: `.PRECIOUS` protects one member of a grouped record while
+    /// its peers still go. Which of them the failed recipe actually touched is
+    /// the running build's question and not this one's, so every eligible name
+    /// is listed and the sink compares timestamps.
+    ///
+    /// Nothing in a manifest says this — Ninja has no notion of an output the
+    /// build withdraws when the command fails — so the writer ignores it, as it
+    /// ignores [`Self::intermediate`] and [`Self::disposable`], and a sink that
+    /// runs the build is the one that answers for it.
+    pub delete_on_error_outputs: &'a [Symbol],
     /// The pool that limits how many edges like this run at once, unescaped.
     pub pool: Option<&'a [u8]>,
     /// Opaque per-edge metadata from `.KATI_TAGS`, for consumers of the graph
