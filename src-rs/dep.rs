@@ -28,7 +28,7 @@ use std::{
 
 use crate::{
     error_loc,
-    eval::{Evaluator, FrameType, MissingInclude, ReadMakefile},
+    eval::{Evaluator, FrameType, MissingInclude, ReadMakefile, ScopedFrame},
     expr::{Evaluable, Value},
     loc::Loc,
     log,
@@ -46,6 +46,17 @@ use crate::{
 };
 
 pub type NamedDepNode = (Symbol, Arc<Mutex<DepNode>>);
+
+/// Undo scope bindings the way a scope unwinds: last installed, first removed.
+///
+/// `Vec`'s own drop runs front to back, which is wrong as soon as two of them
+/// bind the same name — as two matching pattern scopes do. The outer binding
+/// would be restored first, and the guard that shadowed it would then restore
+/// what *it* replaced, leaving the inner value behind for whatever is built
+/// next.
+fn unbind(mut bindings: Vec<ScopedVar>) {
+    while bindings.pop().is_some() {}
+}
 
 /// One Makefile the read consulted that a rule says how to remake.
 ///
@@ -674,6 +685,12 @@ struct DepBuilder<'a> {
     ev: &'a mut Evaluator,
     rules: HashMap<Symbol, Arc<Mutex<RuleMerger>>>,
     rule_vars: HashMap<Symbol, Arc<Vars>>,
+    /// The pattern keys of `rule_vars` in the order GNU Make would reach them:
+    /// shortest pattern first, and among patterns of one length, the order they
+    /// were written. Every entry matching a target applies, and a later one
+    /// outranks an earlier one, so a longer pattern — which is to say the one
+    /// leaving the shorter stem — wins.
+    pattern_var_order: Vec<(Symbol, Pattern)>,
     cur_rule_vars: Option<Arc<Vars>>,
     /// Every explicit double-colon record is an independent action. Grouped
     /// records can share a real member, so the graph needs the full membership
@@ -775,12 +792,22 @@ struct DepBuilder<'a> {
 struct PickedRuleInfo {
     merger: Option<Arc<Mutex<RuleMerger>>>,
     pattern_rule: Option<Arc<Rule>>,
-    vars: Option<Arc<Vars>>,
+    /// Weakest first. See `DepBuilder::applicable_rule_vars`.
+    vars: Vec<Arc<Vars>>,
 }
 
 impl<'a> DepBuilder<'a> {
     fn new(ev: &'a mut Evaluator) -> Result<Self> {
         let rule_vars = std::mem::take(&mut ev.rule_vars);
+        let mut pattern_var_order = std::mem::take(&mut ev.pattern_rule_var_order)
+            .into_iter()
+            .map(|sym| {
+                let text = sym.as_bytes(&ev.session);
+                (sym, Pattern::new(text))
+            })
+            .collect::<Vec<_>>();
+        // Stable, so patterns of equal length keep the order they were written.
+        pattern_var_order.sort_by_key(|(_, pattern)| pattern.as_bytes().len());
         let depfile_var_name = ev.session.intern(".KATI_DEPFILE");
         let vpath_var_name = ev.session.intern("VPATH");
         let implicit_outputs_var_name = ev.session.intern(".KATI_IMPLICIT_OUTPUTS");
@@ -792,6 +819,7 @@ impl<'a> DepBuilder<'a> {
             ev,
             rules: HashMap::new(),
             rule_vars,
+            pattern_var_order,
             cur_rule_vars: None,
             double_memberships: HashMap::new(),
             double_actions: HashMap::new(),
@@ -1922,24 +1950,51 @@ impl<'a> DepBuilder<'a> {
         self.rule_vars.get(&o).cloned()
     }
 
+    /// Every pattern scope that applies to `output`, weakest first, in GNU
+    /// Make's order. The target's own scope goes on top of these; see
+    /// `scopes_for`.
+    ///
+    /// The scopes stay separate rather than being merged, because `+=` in one
+    /// of them appends to what the ones before it left rather than to the
+    /// makefile-level value, and a merged map cannot say what came first.
+    fn matching_pattern_vars(&self, output: Symbol) -> Vec<Arc<Vars>> {
+        let name = output.as_bytes(&self.ev.session);
+        let mut scopes = Vec::new();
+        for (sym, pattern) in &self.pattern_var_order {
+            // A pattern variable needs a stem to have matched: GNU Make skips
+            // any pattern at least as long as the name, so `%.z` reaches `a.z`
+            // and not `.z`. Pattern *rules* match the empty stem, which is why
+            // this is not `Pattern::matches` alone.
+            if pattern.as_bytes().len() > name.len() || !pattern.matches(&name) {
+                continue;
+            }
+            if let Some(vars) = self.rule_vars.get(sym) {
+                scopes.push(vars.clone());
+            }
+        }
+        scopes
+    }
+
     /// Second expansion reads target-specific variables for the target whose
     /// prerequisite list is being expanded.  Dependency execution gets a
     /// different scope later: for grouped peers that is the member which
     /// triggered the shared action.
     fn push_expansion_scope(
         &mut self,
-        vars: Option<&Arc<Vars>>,
+        vars: &[Arc<Vars>],
     ) -> (Option<Arc<Vars>>, Option<Arc<Vars>>) {
         let previous_rule_scope = self.cur_rule_vars.clone();
         let previous_eval_scope = self.ev.current_scope.clone();
-        let Some(vars) = vars else {
+        if vars.is_empty() {
             return (previous_rule_scope, previous_eval_scope);
-        };
+        }
         let scope = Arc::new(Vars::new());
         if let Some(previous) = &previous_rule_scope {
             scope.merge_from(previous);
         }
-        scope.merge_from(vars);
+        for vars in vars {
+            scope.merge_from(vars);
+        }
         self.cur_rule_vars = Some(scope.clone());
         self.ev.current_scope = Some(scope);
         (previous_rule_scope, previous_eval_scope)
@@ -2070,8 +2125,8 @@ impl<'a> DepBuilder<'a> {
                     node.actual_order_only_inputs.clone(),
                 )
             };
-            let vars = self.lookup_rule_vars(trigger);
-            let previous_scope = self.push_expansion_scope(vars.as_ref());
+            let vars = self.applicable_rule_vars(trigger);
+            let previous_scope = self.push_expansion_scope(&vars);
             let expanded =
                 self.expand_prerequisites_again(trigger, stem, (&recorded.0, &recorded.1), text);
             self.pop_expansion_scope(previous_scope);
@@ -2103,7 +2158,7 @@ impl<'a> DepBuilder<'a> {
                 && node.actual_inputs.is_empty()
                 && node.actual_order_only_inputs.is_empty();
         }
-        let vars = self.lookup_rule_vars(trigger);
+        let vars = self.applicable_rule_vars(trigger);
         let mut scoped_vars = Vec::new();
         let mut private_scoped_vars = Vec::new();
         let trigger_text = trigger.as_bytes(&self.ev.session);
@@ -2112,67 +2167,20 @@ impl<'a> DepBuilder<'a> {
             trigger_text,
             action.lock().loc.clone().unwrap_or_default(),
         );
-        if let Some(vars) = &vars {
-            let mut targeted = vars
-                .0
-                .lock()
-                .iter()
-                .map(|(name, var)| (*name, var.clone()))
-                .collect::<Vec<_>>();
-            targeted.sort_by_cached_key(|(name, _)| name.as_bytes(&self.ev.session));
-            targeted.sort_by_key(|(_, var)| var.read().assign_op == Some(AssignOp::PlusEq));
-            for (name, var) in &targeted {
-                let is_private = var.read().is_private;
-                let mut new_var = var.clone();
-                match var.read().assign_op {
-                    Some(AssignOp::PlusEq) => {
-                        if let Some(old_var) = self.ev.lookup_var(*name)? {
-                            let mut value = old_var.read().eval_to_buf_mut(self.ev)?;
-                            if !value.is_empty() {
-                                value.put_u8(b' ');
-                            }
-                            new_var.read().eval(self.ev, &mut value)?;
-                            new_var = Variable::with_simple_string(
-                                value.freeze(),
-                                old_var.read().origin(),
-                                frame.current(),
-                                action.lock().loc.clone(),
-                            );
-                        }
-                    }
-                    Some(AssignOp::QuestionEq) if self.ev.lookup_var(*name)?.is_some() => {
-                        continue;
-                    }
-                    _ => {}
-                }
-
-                if *name == self.depfile_var_name {
-                    action.lock().depfile_var = Some(new_var);
-                } else if *name == self.implicit_outputs_var_name
-                    || *name == self.validations_var_name
-                {
-                } else if *name == self.ninja_pool_var_name {
-                    action.lock().ninja_pool_var = Some(new_var);
-                } else if *name == self.tags_var_name {
-                    action.lock().tags_var = Some(new_var);
-                } else {
-                    let scoped =
-                        ScopedVar::new(self.cur_rule_vars.clone().unwrap(), *name, new_var);
-                    if is_private {
-                        private_scoped_vars.push(scoped);
-                    } else {
-                        scoped_vars.push(scoped);
-                    }
-                }
-            }
-        }
+        self.apply_rule_vars(
+            &vars,
+            &action,
+            &frame,
+            &mut scoped_vars,
+            &mut private_scoped_vars,
+        )?;
 
         let scope = self.cur_rule_vars.as_ref().map(|vars| {
             let scope = Vars::new();
             scope.merge_from(vars);
             Arc::new(scope)
         });
-        drop(private_scoped_vars);
+        unbind(private_scoped_vars);
         action.lock().rule_vars = scope;
 
         let actual_inputs = action.lock().actual_inputs.clone();
@@ -2185,7 +2193,7 @@ impl<'a> DepBuilder<'a> {
             let dependency = self.build_plan(input, Some(trigger))?;
             action.lock().order_onlys.push((input, dependency));
         }
-        drop(scoped_vars);
+        unbind(scoped_vars);
 
         Ok((action, true))
     }
@@ -2551,6 +2559,9 @@ impl<'a> DepBuilder<'a> {
         n: &Arc<Mutex<DepNode>>,
     ) -> Result<Option<PickedRuleInfo>> {
         let rule_merger = self.lookup_rule_merger(output);
+        // Applies however the recipe is found — GNU Make looks pattern
+        // variables up from the target's name, not from the rule that makes it.
+        let patterns = self.matching_pattern_vars(output);
         let vars = self.lookup_rule_vars(output);
         if let Some(rule_merger) = &rule_merger
             && rule_merger.lock().primary_rule.is_some()
@@ -2562,7 +2573,7 @@ impl<'a> DepBuilder<'a> {
             return Ok(Some(PickedRuleInfo {
                 merger: Some(rule_merger.clone()),
                 pattern_rule: None,
-                vars,
+                vars: Self::scopes_for(&patterns, vars),
             }));
         }
 
@@ -2571,7 +2582,7 @@ impl<'a> DepBuilder<'a> {
         // be invented, however far down the list it is.
         for chaining in [false, true] {
             if let Some(picked) =
-                self.pick_pattern_rule(output, n, &rule_merger, &vars, chaining)?
+                self.pick_pattern_rule(output, n, &rule_merger, &patterns, &vars, chaining)?
             {
                 return Ok(Some(picked));
             }
@@ -2581,7 +2592,7 @@ impl<'a> DepBuilder<'a> {
             return Ok(Some(PickedRuleInfo {
                 merger: rule_merger,
                 pattern_rule: None,
-                vars,
+                vars: Self::scopes_for(&patterns, vars),
             }));
         }
         // Make's step 7, and the last thing it tries. Only for a target with no
@@ -2590,8 +2601,105 @@ impl<'a> DepBuilder<'a> {
         Ok(default_rule.map(|rule| PickedRuleInfo {
             merger: None,
             pattern_rule: Some(rule),
-            vars,
+            vars: Self::scopes_for(&patterns, vars),
         }))
+    }
+
+    /// The matching patterns, then the target's own scope on top of them.
+    fn scopes_for(patterns: &[Arc<Vars>], own: Option<Arc<Vars>>) -> Vec<Arc<Vars>> {
+        let mut scopes = patterns.to_vec();
+        scopes.extend(own);
+        scopes
+    }
+
+    /// Every scope that applies to `output`, weakest first, without consulting
+    /// the rule that makes it. For callers that have a target's name and no
+    /// picked rule to go with it.
+    fn applicable_rule_vars(&self, output: Symbol) -> Vec<Arc<Vars>> {
+        let patterns = self.matching_pattern_vars(output);
+        Self::scopes_for(&patterns, self.lookup_rule_vars(output))
+    }
+
+    /// Install `scopes` into the rule scope, weakest first, and record the
+    /// bindings so the caller can decide how long each one lives.
+    ///
+    /// One scope at a time rather than all at once: `+=` in a later scope
+    /// appends to what the earlier ones left, which is what reading down GNU
+    /// Make's chain of variable sets does, and merging them first would lose
+    /// every value but the last.
+    fn apply_rule_vars(
+        &mut self,
+        scopes: &[Arc<Vars>],
+        node: &Arc<Mutex<DepNode>>,
+        frame: &ScopedFrame,
+        scoped: &mut Vec<ScopedVar>,
+        private_scoped: &mut Vec<ScopedVar>,
+    ) -> Result<()> {
+        for vars in scopes {
+            // Sorted because the order is observable and a HashMap's varies per
+            // process. By name, not Make's order, which is as written — this
+            // buys reproducibility only.
+            let mut targeted = vars
+                .0
+                .lock()
+                .iter()
+                .map(|(name, var)| (*name, var.clone()))
+                .collect::<Vec<_>>();
+            targeted.sort_by_cached_key(|(name, _)| name.as_bytes(&self.ev.session));
+            // `+=` last, and its right-hand side expanded once every other
+            // target-specific variable is in scope. `all: A += $(Z)` beside
+            // `all: Z = changed` appends `changed`, not whatever Z was outside
+            // the rule, and expanding while the scope is half built reads the
+            // outer one.
+            targeted.sort_by_key(|(_, var)| var.read().assign_op == Some(AssignOp::PlusEq));
+            for (name, var) in &targeted {
+                // Off the declaration rather than the value: `+=` resolves to a
+                // fresh simple variable and would leave the keyword behind.
+                let is_private = var.read().is_private;
+                let mut new_var = var.clone();
+                match var.read().assign_op {
+                    Some(AssignOp::PlusEq) => {
+                        if let Some(old_var) = self.ev.lookup_var(*name)? {
+                            let mut s = old_var.read().eval_to_buf_mut(self.ev)?;
+                            if !s.is_empty() {
+                                s.put_u8(b' ')
+                            }
+                            new_var.read().eval(self.ev, &mut s)?;
+                            new_var = Variable::with_simple_string(
+                                s.freeze(),
+                                old_var.read().origin(),
+                                frame.current(),
+                                node.lock().loc.clone(),
+                            );
+                        }
+                    }
+                    Some(AssignOp::QuestionEq) if self.ev.lookup_var(*name)?.is_some() => {
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                if *name == self.depfile_var_name {
+                    node.lock().depfile_var = Some(new_var);
+                } else if *name == self.implicit_outputs_var_name
+                    || *name == self.validations_var_name
+                {
+                } else if *name == self.ninja_pool_var_name {
+                    node.lock().ninja_pool_var = Some(new_var);
+                } else if *name == self.tags_var_name {
+                    node.lock().tags_var = Some(new_var);
+                } else {
+                    let scoped_var =
+                        ScopedVar::new(self.cur_rule_vars.clone().unwrap(), *name, new_var);
+                    if is_private {
+                        private_scoped.push(scoped_var);
+                    } else {
+                        scoped.push(scoped_var);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn pick_pattern_rule(
@@ -2599,6 +2707,7 @@ impl<'a> DepBuilder<'a> {
         output: Symbol,
         n: &Arc<Mutex<DepNode>>,
         rule_merger: &Option<Arc<Mutex<RuleMerger>>>,
+        patterns: &[Arc<Vars>],
         vars: &Option<Arc<Vars>>,
         chaining: bool,
     ) -> Result<Option<PickedRuleInfo>> {
@@ -2615,19 +2724,13 @@ impl<'a> DepBuilder<'a> {
             else {
                 continue;
             };
-            if rule_merger.is_some() {
-                return Ok(Some(PickedRuleInfo {
-                    merger: rule_merger.clone(),
-                    pattern_rule: Some(pattern_rule),
-                    vars: vars.clone(),
-                }));
-            }
-            assert!(pattern_rule.output_patterns.len() == 1);
-            let vars = self.merge_implicit_rule_vars(pattern_rule.output_patterns[0], vars.clone());
+            // The picked rule's own output pattern needs no special merge: it
+            // matched this target, so `matching_pattern_vars` already found any
+            // variables written against it.
             return Ok(Some(PickedRuleInfo {
-                merger: None,
+                merger: rule_merger.clone(),
                 pattern_rule: Some(pattern_rule),
-                vars,
+                vars: Self::scopes_for(patterns, vars.clone()),
             }));
         }
 
@@ -2654,22 +2757,17 @@ impl<'a> DepBuilder<'a> {
                 }
             }
 
-            if rule_merger.is_some() {
-                return Ok(Some(PickedRuleInfo {
-                    merger: rule_merger.clone(),
-                    pattern_rule: Some(irule.clone()),
-                    vars: vars.clone(),
-                }));
-            }
             let mut vars = vars.clone();
-            if vars.is_some() {
+            // A suffix rule keeps `.c.o` as its written name, so variables set
+            // against that name still belong to what it makes.
+            if rule_merger.is_none() && vars.is_some() {
                 assert!(irule.outputs.len() == 1);
                 vars = self.merge_implicit_rule_vars(irule.outputs[0], vars);
             }
             return Ok(Some(PickedRuleInfo {
                 merger: rule_merger.clone(),
                 pattern_rule: Some(irule.clone()),
-                vars,
+                vars: Self::scopes_for(patterns, vars),
             }));
         }
         Ok(None)
@@ -2808,7 +2906,7 @@ impl<'a> DepBuilder<'a> {
         }
 
         let previous_scope = (!grouped_outputs.is_empty())
-            .then(|| self.push_expansion_scope(picked_rule_info.vars.as_ref()));
+            .then(|| self.push_expansion_scope(&picked_rule_info.vars));
         let expanded = (|| -> Result<()> {
             for (text, stem, unconditional_candidate) in deferred {
                 // Each `::` rule stands on its own, so nothing another one
@@ -2864,8 +2962,8 @@ impl<'a> DepBuilder<'a> {
                 let peer_text = peer_output.as_bytes(&self.ev.session);
                 let stem = self.stem_of(&rule, &peer_text);
                 let recorded = self.recorded_prerequisites(peer_output);
-                let peer_vars = self.lookup_rule_vars(peer_output);
-                let previous_scope = self.push_expansion_scope(peer_vars.as_ref());
+                let peer_vars = self.applicable_rule_vars(peer_output);
+                let previous_scope = self.push_expansion_scope(&peer_vars);
                 let expanded = self.expand_prerequisites_again(
                     peer_output,
                     stem,
@@ -2912,66 +3010,7 @@ impl<'a> DepBuilder<'a> {
             n.lock().loc.clone().unwrap_or_default(),
         );
 
-        if let Some(vars) = &picked_rule_info.vars {
-            // Sorted because the order is observable and a HashMap's varies per
-            // process. By name, not Make's order, which is as written — this
-            // buys reproducibility only.
-            let mut targeted = vars
-                .0
-                .lock()
-                .iter()
-                .map(|(name, var)| (*name, var.clone()))
-                .collect::<Vec<_>>();
-            targeted.sort_by_cached_key(|(name, _)| name.as_bytes(&self.ev.session));
-            // `+=` last, and its right-hand side expanded once every other
-            // target-specific variable is in scope. `all: A += $(Z)` beside
-            // `all: Z = changed` appends `changed`, not whatever Z was outside
-            // the rule, and expanding while the scope is half built reads the
-            // outer one.
-            targeted.sort_by_key(|(_, var)| var.read().assign_op == Some(AssignOp::PlusEq));
-            for (name, var) in &targeted {
-                // Off the declaration rather than the value: `+=` resolves to a
-                // fresh simple variable and would leave the keyword behind.
-                let is_private = var.read().is_private;
-                let mut new_var = var.clone();
-                match var.read().assign_op {
-                    Some(AssignOp::PlusEq) => {
-                        if let Some(old_var) = self.ev.lookup_var(*name)? {
-                            let mut s = old_var.read().eval_to_buf_mut(self.ev)?;
-                            if !s.is_empty() {
-                                s.put_u8(b' ')
-                            }
-                            new_var.read().eval(self.ev, &mut s)?;
-                            new_var = Variable::with_simple_string(
-                                s.freeze(),
-                                old_var.read().origin(),
-                                frame.current(),
-                                n.lock().loc.clone(),
-                            );
-                        }
-                    }
-                    Some(AssignOp::QuestionEq) if self.ev.lookup_var(*name)?.is_some() => {
-                        continue;
-                    }
-                    _ => {}
-                }
-
-                if *name == self.depfile_var_name {
-                    n.lock().depfile_var = Some(new_var);
-                } else if *name == self.implicit_outputs_var_name
-                    || *name == self.validations_var_name
-                {
-                } else if *name == self.ninja_pool_var_name {
-                    n.lock().ninja_pool_var = Some(new_var);
-                } else if *name == self.tags_var_name {
-                    n.lock().tags_var = Some(new_var);
-                } else {
-                    let scoped =
-                        ScopedVar::new(self.cur_rule_vars.clone().unwrap(), *name, new_var);
-                    if is_private { &mut private_sv } else { &mut sv }.push(scoped);
-                }
-            }
-        }
+        self.apply_rule_vars(&picked_rule_info.vars, &n, &frame, &mut sv, &mut private_sv)?;
 
         // A `private` target-specific variable belongs to this target's own
         // recipe and to no prerequisite's, so the scope is read here, with it in
@@ -2981,7 +3020,7 @@ impl<'a> DepBuilder<'a> {
             v.merge_from(vars);
             Arc::new(v)
         });
-        drop(private_sv);
+        unbind(private_sv);
 
         if self.ev.session.flags.warn_phony_looks_real
             && n.lock().is_phony
@@ -3211,6 +3250,7 @@ impl<'a> DepBuilder<'a> {
             n.rule_vars = scope;
         }
 
+        unbind(sv);
         Ok(n)
     }
 }

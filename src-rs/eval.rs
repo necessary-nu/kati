@@ -771,6 +771,11 @@ pub struct Evaluator {
     pub session: Session,
 
     pub rule_vars: HashMap<Symbol, Arc<Vars>>,
+    /// The pattern keys of `rule_vars`, in the order their first assignment was
+    /// read. GNU Make keeps its pattern variables in one list and applies every
+    /// entry that matches a target, so which of two equally specific patterns
+    /// wins is decided by which was written first; a `HashMap` alone cannot say.
+    pub pattern_rule_var_order: Vec<Symbol>,
     pub rules: Vec<Rule>,
     pub exports: HashMap<Symbol, bool>,
     symbols_for_eval: HashSet<Symbol>,
@@ -937,6 +942,7 @@ impl Evaluator {
         Self {
             session,
             rule_vars: HashMap::new(),
+            pattern_rule_var_order: Vec::new(),
             rules: Vec::new(),
             exports: HashMap::new(),
             symbols_for_eval: HashSet::new(),
@@ -1042,6 +1048,31 @@ impl Evaluator {
         self.stack.lock().last().unwrap().clone()
     }
 
+    /// Run `f` with the rule scope lifted off the lookup chain, so an expansion
+    /// reads what the makefile reads at this point and nothing the scope being
+    /// built holds. Restores the scope even though the caller still needs it to
+    /// assign into: for a pattern-specific assignment GNU Make separates the
+    /// two roles, expanding in the ambient scope while defining into the
+    /// pattern's own set.
+    fn in_ambient_scope<T>(
+        &mut self,
+        ambient: bool,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        if !ambient {
+            return f(self);
+        }
+        let saved = self.current_scope.take();
+        let result = f(self);
+        self.current_scope = saved;
+        result
+    }
+
+    /// `ambient_value` expands the right-hand side with the current rule scope
+    /// lifted off. It says nothing about where the result is defined, or about
+    /// where `+=` and `?=` read the value they build on: those stay in the
+    /// scope, because a second assignment to the same pattern accumulates onto
+    /// the first.
     pub fn eval_rhs(
         &mut self,
         lhs: Symbol,
@@ -1049,6 +1080,7 @@ impl Evaluator {
         orig_rhs: Bytes,
         op: AssignOp,
         is_override: bool,
+        ambient_value: bool,
     ) -> Result<(Var, bool)> {
         let (origin, current_frame) = if self.is_bootstrap {
             (VarOrigin::Default, None)
@@ -1067,17 +1099,14 @@ impl Evaluator {
         match op {
             AssignOp::ColonEq => {
                 prev = self.peek_var_in_current_scope(lhs);
-                result = Variable::with_simple_value(
-                    origin,
-                    current_frame,
-                    self.loc.clone(),
-                    self,
-                    &rhs_v,
-                )?;
+                let loc = self.loc.clone();
+                result = self.in_ambient_scope(ambient_value, |ev| {
+                    Variable::with_simple_value(origin, current_frame, loc, ev, &rhs_v)
+                })?;
             }
             AssignOp::ImmediateRecursive => {
                 prev = self.peek_var_in_current_scope(lhs);
-                let expanded = rhs_v.eval_to_buf(self)?;
+                let expanded = self.in_ambient_scope(ambient_value, |ev| rhs_v.eval_to_buf(ev))?;
                 let mut escaped = Vec::with_capacity(expanded.len());
                 for byte in expanded {
                     if byte == b'$' {
@@ -1110,7 +1139,7 @@ impl Evaluator {
                     fi: &crate::func::SHELL_ASSIGNMENT,
                     args: vec![rhs_v],
                 };
-                let output = ran.eval_to_buf(self)?;
+                let output = self.in_ambient_scope(ambient_value, |ev| ran.eval_to_buf(ev))?;
                 let mut loc = self.loc.clone().unwrap_or_default();
                 let value = parse_expr(
                     &mut self.session,
@@ -1162,7 +1191,8 @@ impl Evaluator {
                         );
                     }
                     if result.read().immediate_eval() {
-                        let buf = rhs_v.eval_to_buf(self)?;
+                        let buf =
+                            self.in_ambient_scope(ambient_value, |ev| rhs_v.eval_to_buf(ev))?;
                         let frame = self.current_frame();
                         result.write().append_str(&self.session, &buf, frame)?;
                     } else {
@@ -1249,6 +1279,7 @@ impl Evaluator {
             stmt.orig_rhs.clone(),
             stmt.op,
             is_override,
+            false,
         )?;
         if needs_assign {
             var.write().assign_op = Some(stmt.op);
@@ -1584,11 +1615,15 @@ impl Evaluator {
     ) -> Result<()> {
         let modifiers = assignment.modifiers;
         for target in targets {
+            let fresh = !self.rule_vars.contains_key(target);
             let scope = self
                 .rule_vars
                 .entry(*target)
                 .or_insert_with(|| Arc::new(Vars::new()))
                 .clone();
+            if fresh && is_pattern_rule {
+                self.pattern_rule_var_order.push(*target);
+            }
 
             let name = if is_pattern_rule {
                 assignment.name.eval_to_buf(self)?
@@ -1599,8 +1634,19 @@ impl Evaluator {
             if name.is_empty() {
                 error_loc!(self, self.loc.as_ref(), "*** empty variable name.");
             }
-            self.current_scope = Some(scope);
             let var_sym = self.session.intern(name);
+            // Whether this `+=` has finished, read before the assignment lands.
+            // It has if it appended to a value this scope already settled: that
+            // value replaced whatever the target inherits, so appending again at
+            // build time would put the inherited one back. A run of `+=` with
+            // nothing but each other to build on is still only the tail of a
+            // value — it stays pending, and the build appends the whole run to
+            // what the target inherits.
+            let settled_in_scope = assignment.op == AssignOp::PlusEq
+                && scope
+                    .peek(var_sym)
+                    .is_some_and(|prev| prev.read().assign_op != Some(AssignOp::PlusEq));
+            self.current_scope = Some(scope);
             if var_sym == Symbol::KATI_READONLY {
                 self.mark_vars_readonly(&assignment.rhs)?;
             } else {
@@ -1610,10 +1656,15 @@ impl Evaluator {
                     assignment.orig_rhs.clone(),
                     assignment.op,
                     modifiers.directive.is_override,
+                    is_pattern_rule,
                 )?;
                 if needs_assign {
                     let mut readonly = false;
-                    rhs_var.write().assign_op = Some(assignment.op);
+                    rhs_var.write().assign_op = Some(if settled_in_scope {
+                        AssignOp::Eq
+                    } else {
+                        assignment.op
+                    });
                     self.current_scope.as_ref().unwrap().assign(
                         var_sym,
                         rhs_var.clone(),
