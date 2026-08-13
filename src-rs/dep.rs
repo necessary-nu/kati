@@ -2054,6 +2054,14 @@ impl<'a> DepBuilder<'a> {
             if let Some(metadata) = &mut node.grouped_double_action {
                 metadata.phony_inputs = phony_inputs;
             }
+            // `update_file_1`: a double-colon entry with no prerequisites at
+            // all is always out of date. Read after second expansion, because
+            // that is when GNU Make reaches the same test, and counting both
+            // kinds because it asks whether the entry declared any dependency
+            // rather than any it would compare timestamps against.
+            node.unconditional_double_colon = has_recipe
+                && node.actual_inputs.is_empty()
+                && node.actual_order_only_inputs.is_empty();
         }
         let vars = self.lookup_rule_vars(trigger);
         let mut scoped_vars = Vec::new();
@@ -2222,6 +2230,12 @@ impl<'a> DepBuilder<'a> {
                 node.actual_inputs.push(action_output);
                 node.deps.push((action_output, action.clone()));
             }
+            // `is_remakable` refuses a target that can never settle. The
+            // actions carry that property now, but the Makefile is looked up
+            // by its own name, so the join has to answer for the chain.
+            node.unconditional_double_colon = actions
+                .iter()
+                .any(|(_, action)| action.lock().unconditional_double_colon);
         }
         self.done.insert(output, join.clone());
         self.add_validations(output, &join, validations)?;
@@ -2664,11 +2678,17 @@ impl<'a> DepBuilder<'a> {
         if let Some(merger) = &picked_rule_info.merger {
             let grouped_double = {
                 let merger = merger.lock();
+                // Every `::` record is a rule of its own: GNU Make walks the
+                // chain in `update_file` and weighs each entry against the
+                // prerequisites that entry declared. Records only need to be
+                // told apart once there is more than one of them, so a lone
+                // `::` record keeps the single-node shape it already had.
                 (merger.is_double_colon
-                    && merger
-                        .rules
-                        .iter()
-                        .any(|rule| rule.is_grouped && rule.is_double_colon))
+                    && (merger.rules.len() > 1
+                        || merger
+                            .rules
+                            .iter()
+                            .any(|rule| rule.is_grouped && rule.is_double_colon)))
                 .then(|| (merger.rules.clone(), merger.validations.clone()))
             };
             if let Some((rules, validations)) = grouped_double {

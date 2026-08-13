@@ -841,12 +841,19 @@ impl<'a> NinjaGenerator<'a> {
                 validations: &validations,
                 always_dirty: node.is_phony || node.unconditional_double_colon,
                 deferred_freshness_outputs: &deferred_freshness_outputs,
-                deferred_freshness_always_dirty: node
-                    .grouped_double_action
-                    .as_ref()
-                    .map_or(node.is_phony || node.unconditional_double_colon, |action| {
-                        action.has_phony_member
-                    }),
+                // A completion join owns no members of its own, so it has no
+                // freshness of that kind to declare: it is dirty when one of
+                // the actions it joins is. It can still carry the chain's
+                // unconditional flag, which is about whether the target can
+                // ever settle, and reading that here would make the two sink
+                // encodings disagree over a value neither path uses.
+                deferred_freshness_always_dirty: !node.grouped_double_join
+                    && node
+                        .grouped_double_action
+                        .as_ref()
+                        .map_or(node.is_phony || node.unconditional_double_colon, |action| {
+                            action.has_phony_member
+                        }),
                 deferred_always_new_inputs: &deferred_always_new_inputs,
                 deferred_excluded_new_inputs: &deferred_excluded_new_inputs,
                 completion_join: node.grouped_double_join,
