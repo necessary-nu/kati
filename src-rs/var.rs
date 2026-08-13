@@ -155,6 +155,15 @@ impl Variable {
     pub fn definition(&self) -> &Option<Arc<Frame>> {
         &self.definition
     }
+    /// The expression a recursively expanded variable holds, which is what a
+    /// caller reasoning about what an expansion could reach has to walk. A
+    /// variable of any other flavour holds text rather than an expression.
+    pub fn recursive_definition(&self) -> Option<Arc<Value>> {
+        match &self.value {
+            InnerVar::Recursive { v, orig: _ } => Some(v.clone()),
+            _ => None,
+        }
+    }
     pub fn obsolete(&self) -> bool {
         self.obsolete.is_some()
     }
@@ -675,7 +684,12 @@ impl GlobalVars {
             if origin == VarOrigin::CommandLine && assigning == VarOrigin::File {
                 return Ok(());
             }
-            if origin == VarOrigin::Automatic {
+            // A Makefile assigning over `$@` is the unimplemented case. The
+            // front end re-arming its own automatic variables — which it does
+            // whenever it starts expanding recipes again, and it may do that
+            // more than once now that a recipe can be expanded as its edge is
+            // launched — is not an assignment at all.
+            if origin == VarOrigin::Automatic && assigning != VarOrigin::Automatic {
                 error!("overriding automatic variable is not implemented yet");
             }
         }

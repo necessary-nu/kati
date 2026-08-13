@@ -31,7 +31,7 @@ use crate::{
         Pattern, WordWriter, basename, dirname, find_end_of_line, trim_left_space, word_scanner,
     },
     symtab::{Interner, Symbol},
-    var::Variable,
+    var::{Variable, Vars},
 };
 
 pub(crate) const DEFERRED_NEW_INPUTS_REFERENCE: &[u8] = b"${KATI_NEW_INPUTS}";
@@ -143,7 +143,23 @@ impl AutoCommandVar {
             } => {
                 let mut seen: HashSet<Symbol> = HashSet::new();
 
-                if ev.avoid_io
+                if *timing == NewInputsTiming::Launch {
+                    // The recipe is being expanded at launch, so every
+                    // prerequisite has settled and the comparison GNU Make
+                    // makes here is the one the filesystem already answers.
+                    let mut ww = WordWriter::new(out);
+                    let target_age = ExecStatus::Timestamp(get_timestamp(
+                        &current_dep_node.recipe_output.as_bytes(names),
+                    )?);
+                    for ai in current_dep_node.actual_inputs.iter() {
+                        let ai_str = ai.as_bytes(names);
+                        if seen.insert(*ai)
+                            && ExecStatus::Timestamp(get_timestamp(&ai_str)?) > target_age
+                        {
+                            ww.write(&ai_str);
+                        }
+                    }
+                } else if ev.avoid_io
                     && (*timing == NewInputsTiming::SchedulerBoundary
                         || current_dep_node.grouped_double_action.is_some())
                 {
@@ -297,6 +313,144 @@ pub struct Command {
 /// `$(MAKE)` — parses to something else, which is exactly the set 4.4.1
 /// declines to classify. Function arguments are walked because the text
 /// inside them is text GNU Make scans too: `$(info $(MAKE))` is classified.
+/// Whether expanding this recipe could reach a `$(MAKE)` reference.
+///
+/// kati classifies a recursive line by what the expansion *did*: expanding a
+/// reference named `MAKE` inside a command records its value, and a line that
+/// invokes one of those values is compiled as a child graph rather than run.
+/// So the question a deferral has to answer before expanding anything is
+/// whether the expansion could record one at all — which is the recipe's own
+/// syntax tree, plus the syntax tree of every recursively expanded variable it
+/// can reach through it. A simply expanded variable holds text rather than a
+/// tree, and text cannot hold a reference, which is why the walk stops there
+/// and why kati's own classification stops there too.
+///
+/// Conservative wherever a name is not knowable without expanding: a computed
+/// reference, and the functions that reach a variable by a name they compute,
+/// all answer yes.
+pub fn expansion_can_reach_make(
+    value: &Value,
+    ev: &Evaluator,
+    rule_vars: Option<&Vars>,
+    seen: &mut HashSet<Symbol>,
+) -> bool {
+    match value {
+        Value::Literal(_, _) => false,
+        Value::SymRef(_, sym) => symbol_can_reach_make(*sym, ev, rule_vars, seen),
+        Value::List(_, values) => values
+            .iter()
+            .any(|value| expansion_can_reach_make(value, ev, rule_vars, seen)),
+        // The name is computed, so it can be `MAKE`.
+        Value::VarRef(_, _) => true,
+        Value::VarSubst {
+            loc: _,
+            name,
+            pat,
+            subst,
+        } => {
+            match name.as_ref() {
+                Value::Literal(_, literal) => {
+                    let Some(sym) = ev.session.symtab.peek_symbol(literal) else {
+                        return false;
+                    };
+                    if symbol_can_reach_make(sym, ev, rule_vars, seen) {
+                        return true;
+                    }
+                }
+                _ => return true,
+            }
+            expansion_can_reach_make(pat, ev, rule_vars, seen)
+                || expansion_can_reach_make(subst, ev, rule_vars, seen)
+        }
+        Value::Func { loc: _, fi, args } => {
+            // `call`, `value` and `eval` reach a variable by a name they are
+            // given rather than by one written here, so what they reach cannot
+            // be walked from this tree.
+            if matches!(fi.name, b"call" | b"value" | b"eval") {
+                return true;
+            }
+            args.iter()
+                .any(|arg| expansion_can_reach_make(arg, ev, rule_vars, seen))
+        }
+    }
+}
+
+/// Whether expanding a reference to `sym` could reach `$(MAKE)`.
+fn symbol_can_reach_make(
+    sym: Symbol,
+    ev: &Evaluator,
+    rule_vars: Option<&Vars>,
+    seen: &mut HashSet<Symbol>,
+) -> bool {
+    if sym.as_bytes(&ev.session).as_ref() == b"MAKE" {
+        return true;
+    }
+    if !seen.insert(sym) {
+        return false;
+    }
+    let bound = rule_vars
+        .and_then(|vars| vars.peek(sym))
+        .or_else(|| ev.session.globals.peek(sym));
+    let Some(bound) = bound else {
+        return false;
+    };
+    let Some(definition) = bound.read().recursive_definition() else {
+        return false;
+    };
+    expansion_can_reach_make(&definition, ev, rule_vars, seen)
+}
+
+/// Whether a recipe line as written can hold no command at all.
+///
+/// A recipe of nothing but whitespace has nothing to expand and nothing to
+/// run: GNU Make reads it as a target with an empty recipe, which is remade by
+/// doing nothing. Text is the only case that can be answered without expanding,
+/// and it is the case Makefiles write — `all:;` — so it is worth answering.
+pub fn is_blank_recipe_line(value: &Value) -> bool {
+    match value {
+        Value::Literal(_, text) => text.trim_ascii().is_empty(),
+        Value::List(_, values) => values.iter().all(|value| is_blank_recipe_line(value)),
+        _ => false,
+    }
+}
+
+/// Whether a recipe as written can reach the `$?` automatic variable.
+///
+/// Deliberately conservative in both directions a scan can be wrong about: a
+/// computed reference is counted, because its name is not knowable here, and
+/// the `D` and `F` variants are counted by name. A recipe this answers `true`
+/// for is expanded while the graph is constructed, so the scheduler binds the
+/// value and any `filter-out` around it is seen.
+pub fn references_new_inputs(value: &Value, names: &impl Interner) -> bool {
+    match value {
+        Value::Literal(_, _) => false,
+        Value::SymRef(_, sym) => {
+            matches!(sym.as_bytes(names).as_ref(), b"?" | b"?D" | b"?F")
+        }
+        Value::List(_, values) => values
+            .iter()
+            .any(|value| references_new_inputs(value, names)),
+        // A name computed at expansion time can be `?`, and nothing here can
+        // rule that out.
+        Value::VarRef(_, _) => true,
+        Value::VarSubst {
+            loc: _,
+            name,
+            pat,
+            subst,
+        } => {
+            references_new_inputs(name, names)
+                || references_new_inputs(pat, names)
+                || references_new_inputs(subst, names)
+        }
+        Value::Func {
+            loc: _,
+            fi: _,
+            args,
+        } => args.iter().any(|arg| references_new_inputs(arg, names)),
+    }
+}
+
 fn references_make(value: &Value, names: &impl Interner) -> bool {
     match value {
         Value::Literal(_, _) => false,

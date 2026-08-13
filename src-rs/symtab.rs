@@ -223,6 +223,16 @@ impl Symtab {
         sym
     }
 
+    /// The symbol `name` already has, without minting one for a name nothing
+    /// has used. A caller asking a question about a name — rather than
+    /// establishing one — must not grow the table to ask it.
+    pub fn peek_symbol(&self, name: &[u8]) -> Option<Symbol> {
+        if let [c] = name {
+            return Some(Symbol(NonZeroUsize::new(*c as usize).unwrap()));
+        }
+        self.index.get(name).copied()
+    }
+
     /// The bytes `sym` was interned from. Panics if `sym` came from a different
     /// interner and names a slot this one does not have.
     pub fn name(&self, sym: Symbol) -> Bytes {

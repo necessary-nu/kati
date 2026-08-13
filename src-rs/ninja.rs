@@ -38,10 +38,13 @@ use crate::io::{dump_int, dump_string, dump_systemtime, dump_usize, dump_vec_str
 use crate::strutil::{Pattern, basename, concat_dir, dirname, strip_ext, strip_ext_vec};
 use crate::{
     build_sink::{
-        BuildSink, NewInputsTiming, RuleId, ShellEvaluation, SinkCommand, SinkEdge, SinkPool,
-        SinkRule,
+        BuildSink, DeferredRecipeId, NewInputsTiming, RecipeExpansion, RuleId, ShellEvaluation,
+        SinkCommand, SinkEdge, SinkPool, SinkRule,
     },
-    command::{Command, CommandEvaluator},
+    command::{
+        Command, CommandEvaluator, expansion_can_reach_make, is_blank_recipe_line,
+        references_new_inputs,
+    },
     dep::{DepNode, NamedDepNode, is_buildable_target},
     eval::Evaluator,
     expr::Evaluable,
@@ -175,6 +178,153 @@ struct NinjaNode {
     rule_id: Option<RuleId>,
     deferred_new_inputs: bool,
     deferred_new_inputs_filter_out: Vec<Bytes>,
+    /// The recipe was left unexpanded for the sink to expand at launch, so
+    /// `commands` is empty because nothing has read it yet rather than because
+    /// the node has none.
+    deferred_recipe: bool,
+}
+
+/// One recipe left unexpanded, and everything the expansion will need that is
+/// not on the node itself.
+struct DeferredRecipe {
+    node: Arc<Mutex<DepNode>>,
+    /// What to print while the command runs when the recipe supplies no
+    /// description of its own and the node's own name is not addressable.
+    /// Decided while the graph is constructed, because it is a fact about the
+    /// graph rather than about the recipe.
+    description_fallback: Option<Bytes>,
+    shell: Bytes,
+}
+
+/// The recipes a [`RecipeExpansion::Launch`] sink asked to expand for itself.
+///
+/// Held by the destination for as long as it may still run one of them. The
+/// evaluator that produced them has to be held with it: a recipe is expanded
+/// in the session that read the Makefile, against the variables that session
+/// holds, which is what makes an expansion at launch the same expansion GNU
+/// Make would have done there.
+pub struct DeferredRecipes {
+    recipes: Vec<DeferredRecipe>,
+}
+
+/// One expanded recipe: what a [`SinkRule`] would have carried, had the text
+/// existed when the rule was declared.
+pub struct ExpandedRecipe {
+    /// The shell to run the script under, unescaped.
+    pub shell: Bytes,
+    /// The flags that make the shell take the script as an argument.
+    pub shell_flags: Bytes,
+    /// The assembled shell script.
+    pub script: Bytes,
+    /// What to print while the command runs, when something chose.
+    pub description: Option<Bytes>,
+    /// A nonzero status is an error Make was told to ignore.
+    pub ignore_errors: bool,
+}
+
+impl DeferredRecipes {
+    /// Whether anything was deferred at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.recipes.is_empty()
+    }
+
+    /// Expand one recipe into the command text that should run now.
+    ///
+    /// This is GNU Make's `new_job`: the whole recipe is expanded in one go,
+    /// immediately before the first line of it runs, so a line cannot observe
+    /// what an earlier line of the same recipe did, while it observes
+    /// everything every earlier recipe did.
+    ///
+    /// # Errors
+    ///
+    /// Whatever expanding the recipe rejects — an `$(error)`, an undefined
+    /// function, a `$(shell)` that could not be started. GNU Make reports
+    /// these only for a recipe it was about to run, and so does this.
+    pub fn expand(
+        &self,
+        ev: &mut Evaluator,
+        id: DeferredRecipeId,
+    ) -> Result<Option<ExpandedRecipe>> {
+        let Some(recipe) = self.recipes.get(id) else {
+            return Ok(None);
+        };
+        let mut ce = CommandEvaluator::new(
+            ev,
+            // The prerequisites are built and the timestamps on disk are the
+            // ones GNU Make compares, so `$?` is answered here rather than
+            // deferred to a scheduler that has already done its part.
+            NewInputsTiming::Launch,
+            ShellEvaluation::Expansion,
+        )?;
+        ce.ev.avoid_io = true;
+        let expanded = Self::expand_with(&mut ce, recipe);
+        ce.ev.avoid_io = false;
+        ce.ev.new_inputs_timing = NewInputsTiming::RecipeShell;
+        ce.ev.shell_evaluation = ShellEvaluation::RecipeShell;
+        ce.ev.deferred_new_inputs_filter_out.clear();
+        expanded.map(Some)
+    }
+
+    fn expand_with(
+        ce: &mut CommandEvaluator<'_>,
+        recipe: &DeferredRecipe,
+    ) -> Result<ExpandedRecipe> {
+        let (loc, output) = {
+            let node = recipe.node.lock();
+            (node.loc.clone(), node.output.as_bytes(&ce.ev.session))
+        };
+        let _frame = ce.ev.enter(
+            crate::eval::FrameType::Ninja,
+            output,
+            loc.unwrap_or_default(),
+        );
+        let commands = ce.eval(&recipe.node)?;
+        // The classification that decided this recipe could be deferred is
+        // made before anything is expanded, so it is checked here against what
+        // the expansion actually did. A recursive invocation reaching this
+        // point would be a nested Make process rather than a composed child
+        // graph, which is the one thing the compiler must never hand its
+        // executor.
+        if commands
+            .iter()
+            .any(|command| !command.recursive_make.is_empty() || command.uncomposable_recursion)
+        {
+            anyhow::bail!(
+                "recipe for {} reached a recursive Make invocation the compiler could not see before expanding it",
+                String::from_utf8_lossy(&recipe.node.lock().output.as_bytes(&ce.ev.session))
+            );
+        }
+        let recipe_output = recipe.node.lock().recipe_output.as_bytes(&ce.ev.session);
+        let mut description = None;
+        let mut script = BytesMut::new();
+        // A recipe every line of which expanded to nothing has no line to read
+        // flags from, and still has to reach the shell as the empty script it
+        // is: GNU Make runs nothing and counts the target as remade.
+        let shell_flags = if commands.is_empty() {
+            ce.ev.get_shell_flag(false)?
+        } else {
+            NinjaGenerator::script_shell_flags(&ce.ev.session.flags, &commands)
+        };
+        let ignore_errors = NinjaGenerator::gen_shell_script(
+            &ce.ev.session.flags,
+            &recipe_output,
+            &commands,
+            &shell_flags,
+            &mut script,
+            &mut description,
+        );
+        if description.is_none() {
+            description.clone_from(&recipe.description_fallback);
+        }
+        Ok(ExpandedRecipe {
+            shell: recipe.shell.clone(),
+            shell_flags,
+            script: script.freeze(),
+            description,
+            ignore_errors,
+        })
+    }
 }
 
 struct NinjaGenerator<'a> {
@@ -185,10 +335,12 @@ struct NinjaGenerator<'a> {
     used_envs: HashMap<Symbol, OsString>,
     nodes: Vec<NinjaNode>,
     phony_aliases: PhonyAliases,
+    recipe_expansion: RecipeExpansion,
+    deferred_recipes: Vec<DeferredRecipe>,
 }
 
 impl<'a> NinjaGenerator<'a> {
-    fn new(ce: CommandEvaluator<'a>) -> Result<Self> {
+    fn new(ce: CommandEvaluator<'a>, recipe_expansion: RecipeExpansion) -> Result<Self> {
         // Unescaped: whether these need escaping is a question about the
         // destination, so the answer belongs to whatever is on the far side of
         // the sink.
@@ -202,6 +354,43 @@ impl<'a> NinjaGenerator<'a> {
             used_envs: HashMap::new(),
             nodes: Vec::new(),
             phony_aliases: PhonyAliases::default(),
+            recipe_expansion,
+            deferred_recipes: Vec::new(),
+        })
+    }
+
+    /// Whether this node's recipe can be left for the destination to expand
+    /// when it runs it.
+    ///
+    /// Everything refused here is refused because the compiler itself has to
+    /// read the recipe's text before the graph is complete: a recursive
+    /// `$(MAKE)` line becomes a child graph, an automatic or declared depfile
+    /// rewrites the script and names a file on the rule, a grouped
+    /// double-colon action and a `$?` are values the scheduler binds against
+    /// an edge that has to declare them. The recipe as written is what decides
+    /// — the same classification GNU Make makes before it expands anything.
+    fn defers_recipe(&self, node: &DepNode) -> bool {
+        if self.recipe_expansion != RecipeExpansion::Launch || node.cmds.is_empty() {
+            return false;
+        }
+        // A recipe of nothing but whitespace is a target remade by doing
+        // nothing, and the graph says that with an edge that runs nothing.
+        // Deferring it would mint a rule for a command that will never exist.
+        if node.cmds.iter().all(|cmd| is_blank_recipe_line(cmd)) {
+            return false;
+        }
+        if node.depfile_var.is_some()
+            || self.ce.ev.session.flags.detect_depfiles
+            || node.grouped_double_action.is_some()
+            || node.grouped_double_join
+        {
+            return false;
+        }
+        let rule_vars = node.rule_vars.clone();
+        node.cmds.iter().all(|cmd| {
+            let mut seen = HashSet::new();
+            !expansion_can_reach_make(cmd, self.ce.ev, rule_vars.as_deref(), &mut seen)
+                && !references_new_inputs(cmd, &self.ce.ev.session)
         })
     }
 
@@ -275,13 +464,23 @@ impl<'a> NinjaGenerator<'a> {
             return Ok(());
         }
 
-        let commands = self.ce.eval(node)?;
+        // A deferred recipe is not read here at all. That is the whole of the
+        // difference: an up-to-date target's `$(shell)` never runs, its
+        // `$(error)` never fires, and its `$(wildcard)` is answered against
+        // the files that exist when the command is about to run rather than
+        // against the ones that existed before the build started.
+        let deferred_recipe = self.defers_recipe(&node.lock());
+        let commands = if deferred_recipe {
+            Vec::new()
+        } else {
+            self.ce.eval(node)?
+        };
         let deferred_new_inputs = self.ce.ev.new_inputs_timing
             == NewInputsTiming::SchedulerBoundary
             && *self.ce.found_new_inputs.lock();
         let deferred_new_inputs_filter_out =
             std::mem::take(&mut self.ce.ev.deferred_new_inputs_filter_out);
-        let rule_id = if commands.is_empty() {
+        let rule_id = if commands.is_empty() && !deferred_recipe {
             None
         } else {
             let id = self.rule_id;
@@ -295,6 +494,7 @@ impl<'a> NinjaGenerator<'a> {
             rule_id,
             deferred_new_inputs,
             deferred_new_inputs_filter_out,
+            deferred_recipe,
         });
 
         let deps = node.lock().deps.clone();
@@ -618,7 +818,41 @@ impl<'a> NinjaGenerator<'a> {
             return Ok(None);
         }
 
-        let rule_id = if nn.commands.is_empty() {
+        let rule_id = if nn.deferred_recipe {
+            let id = nn.rule_id.expect("a deferred recipe mints a rule");
+            let recipe_output_str = node.recipe_output.as_bytes(&self.ce.ev.session);
+            let description_fallback = (self.phony_aliases.resolve(node.output) != node.output)
+                .then(|| recipe_output_str.clone());
+            let deferred = self.deferred_recipes.len();
+            self.deferred_recipes.push(DeferredRecipe {
+                node: nn.node.clone(),
+                description_fallback,
+                shell: self.shell.clone(),
+            });
+            sink.declare_rule(
+                &self.ce.ev.session,
+                &SinkRule {
+                    id,
+                    shell: &self.shell,
+                    // Absent rather than empty: the recipe these come from has
+                    // not been read yet.
+                    shell_flags: b"",
+                    command: SinkCommand::Inline(b""),
+                    deferred_recipe: Some(deferred),
+                    subninjas: &[],
+                    contains_recursive: false,
+                    residual_command: None,
+                    residual_ignore_errors: false,
+                    description: None,
+                    depfile: None,
+                    restat: node.is_restat,
+                    ignore_errors: false,
+                    sandbox_disabled: self.ce.ev.session.flags.emit_sandbox_disabled,
+                    loc: node.loc.as_ref(),
+                },
+            )?;
+            Some(id)
+        } else if nn.commands.is_empty() {
             None
         } else {
             let id = nn.rule_id.unwrap();
@@ -746,6 +980,7 @@ impl<'a> NinjaGenerator<'a> {
                     } else {
                         SinkCommand::Inline(&script)
                     },
+                    deferred_recipe: None,
                     subninjas: &subninjas,
                     contains_recursive,
                     residual_command: (!residual_script.is_empty()).then_some(
@@ -1404,11 +1639,14 @@ pub fn generate_ninja(
     orig_args: &[u8],
     start_time: SystemTime,
 ) -> Result<()> {
-    let mut ng = NinjaGenerator::new(CommandEvaluator::new(
-        ev,
-        NewInputsTiming::RecipeShell,
-        ShellEvaluation::RecipeShell,
-    )?)?;
+    let mut ng = NinjaGenerator::new(
+        CommandEvaluator::new(
+            ev,
+            NewInputsTiming::RecipeShell,
+            ShellEvaluation::RecipeShell,
+        )?,
+        RecipeExpansion::Construction,
+    )?;
     ng.generate(nodes, orig_args, start_time)?;
     Ok(())
 }
@@ -1426,16 +1664,19 @@ pub fn emit_build(
     nodes: &Vec<NamedDepNode>,
     ev: &mut Evaluator,
     sink: &mut dyn BuildSink,
-) -> Result<()> {
+) -> Result<DeferredRecipes> {
     let new_inputs_timing = sink.new_inputs_timing();
     let shell_evaluation = sink.shell_evaluation();
-    let mut ng = NinjaGenerator::new(CommandEvaluator::new(
-        ev,
-        new_inputs_timing,
-        shell_evaluation,
-    )?)?;
+    let recipe_expansion = sink.recipe_expansion();
+    let mut ng = NinjaGenerator::new(
+        CommandEvaluator::new(ev, new_inputs_timing, shell_evaluation)?,
+        recipe_expansion,
+    )?;
     ng.populate_ninja_nodes(nodes)?;
-    ng.emit(sink)
+    ng.emit(sink)?;
+    Ok(DeferredRecipes {
+        recipes: std::mem::take(&mut ng.deferred_recipes),
+    })
 }
 
 #[cfg(test)]
@@ -1643,6 +1884,7 @@ mod tests {
                     shell: b"/bin/sh",
                     shell_flags: b"-c",
                     command,
+                    deferred_recipe: None,
                     subninjas: &[],
                     contains_recursive: false,
                     residual_command: None,

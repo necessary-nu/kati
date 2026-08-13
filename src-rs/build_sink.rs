@@ -70,7 +70,38 @@ pub enum NewInputsTiming {
     /// The destination computes `$?` after prerequisites settle and before it
     /// launches the edge.
     SchedulerBoundary,
+    /// The recipe is being expanded at the moment the destination launches it,
+    /// so every prerequisite has already been brought up to date and the
+    /// timestamps on disk are the ones GNU Make compares. The value is
+    /// computed here rather than deferred to anyone.
+    Launch,
 }
+
+/// When a recipe is expanded into the command text that will run.
+///
+/// GNU Make expands a recipe immediately before running it, and only if the
+/// target is out of date, so every evaluation-time effect the recipe carries —
+/// a `$(shell)`, an `$(info)`, an `$(error)`, what `$(wildcard)` can see —
+/// happens at that moment or never. A destination that has to hold command
+/// text before anything runs cannot have that, and a destination that runs the
+/// build itself can.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecipeExpansion {
+    /// Every reachable recipe is expanded while the graph is constructed. A
+    /// manifest holds command text, so a manifest writer needs the text before
+    /// any of it runs.
+    Construction,
+    /// A recipe the destination can hold unexpanded is left unexpanded, and the
+    /// destination expands it through [`DeferredRecipes`](crate::ninja::DeferredRecipes)
+    /// when it is about to run it. A recipe whose text the compiler itself
+    /// must read — a recursive `$(MAKE)` line, an automatic depfile, a `$?`
+    /// whose value the scheduler binds — is expanded at construction whatever
+    /// the destination asked for, because the graph's shape depends on it.
+    Launch,
+}
+
+/// Names a recipe left unexpanded for the destination to expand at launch.
+pub type DeferredRecipeId = usize;
 
 /// Who answers a `$(shell)` written inside a recipe.
 ///
@@ -145,7 +176,20 @@ pub struct SinkRule<'a> {
     /// The assembled shell script, as the shell should receive it. A `$` here
     /// is a `$` the shell will act on, never an escape belonging to some
     /// destination format.
+    ///
+    /// Empty when [`Self::deferred_recipe`] names one: there is no text yet,
+    /// because the recipe it comes from has not been expanded.
     pub command: SinkCommand<'a>,
+    /// The recipe this rule will run, still unexpanded, for a sink that asked
+    /// for [`RecipeExpansion::Launch`].
+    ///
+    /// `Some` means every command-derived field here — the script, the shell
+    /// flags, the description, the depfile, whether failure is ignored — is
+    /// absent rather than empty, and the sink must obtain them from
+    /// [`DeferredRecipes::expand`](crate::ninja::DeferredRecipes::expand)
+    /// before it runs the rule. Nothing else about the edge is deferred: its
+    /// shape is settled here as it always was.
+    pub deferred_recipe: Option<DeferredRecipeId>,
     /// Recursive `$(MAKE)` invocations extracted from the recipe in their
     /// written order. A graph sink compiles these as semantic subninjas rather
     /// than handing nested Make processes to its executor.
@@ -303,6 +347,17 @@ pub trait BuildSink {
     /// GNU Make does.
     fn shell_evaluation(&self) -> ShellEvaluation {
         ShellEvaluation::RecipeShell
+    }
+
+    /// When this sink wants a recipe turned into command text.
+    ///
+    /// A manifest writer needs all of it before any of it runs, because the
+    /// file it writes is the whole of what it produces. Ronin's direct graph
+    /// sink runs the build itself, so it can hold a recipe unexpanded and
+    /// expand it where GNU Make does: immediately before the command runs, and
+    /// not at all for a target that turns out to be up to date.
+    fn recipe_expansion(&self) -> RecipeExpansion {
+        RecipeExpansion::Construction
     }
 
     /// Called once, before anything else, with the pools kati declares.
