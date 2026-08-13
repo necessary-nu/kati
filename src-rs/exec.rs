@@ -63,19 +63,16 @@ struct Executor<'a> {
     ce: CommandEvaluator<'a>,
     done: HashMap<Symbol, ExecStatus>,
     shell: Bytes,
-    shellflag: &'static [u8],
     num_commands: u64,
 }
 
 impl<'a> Executor<'a> {
     fn new(ev: &'a mut Evaluator) -> Result<Self> {
         let shell = ev.get_shell()?;
-        let shellflag = ev.get_shell_flag();
         Ok(Executor {
             ce: CommandEvaluator::new(ev, NewInputsTiming::RecipeShell)?,
             done: HashMap::new(),
             shell,
-            shellflag,
             num_commands: 0,
         })
     }
@@ -172,7 +169,7 @@ impl<'a> Executor<'a> {
             if !self.ce.ev.session.flags.is_dry_run {
                 let (status, output) = run_command(
                     &self.shell,
-                    self.shellflag,
+                    &command.shell_flag,
                     &command.cmd,
                     RedirectStderr::Stdout,
                 )?;

@@ -195,6 +195,11 @@ const POSIX_VARIABLES: &[(&str, &str)] = &[
     ("FC", "fort77"),
     ("FFLAGS", "-O1"),
     ("SCCSGETFLAGS", "-s"),
+    // The one entry that is not a tool name: `.POSIX:` asks for a shell that
+    // stops a recipe line at its first failure, and `-e` is how that is said.
+    // A recipe line prefixed `-` takes it back again — see
+    // [`crate::eval::Evaluator::get_shell_flag`], which is where the two meet.
+    (".SHELLFLAGS", "-ec"),
     // Same value the ordinary catalogue holds, and installed again because
     // `.POSIX:` makes it simple where the catalogue made it recursive. Debian
     // patches this one to `-rvU`, asking `ar` for a non-deterministic archive;

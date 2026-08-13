@@ -2260,8 +2260,33 @@ impl Evaluator {
         self.eval_var(Symbol::SHELL)
     }
 
-    pub fn get_shell_flag(&self) -> &'static [u8] {
-        if self.is_posix { b"-ec" } else { b"-c" }
+    /// The flags one recipe line's shell is invoked with.
+    ///
+    /// `dash_prefixed` is whether the line was written with a leading `-`, and
+    /// nothing else: `-i` and `.IGNORE` also ignore a failure, but GNU Make
+    /// reads only `lines_flags` here (`job.c` hands
+    /// `cmds->lines_flags[command_line - 1]` to `construct_command_argv`), so
+    /// they leave `-e` in place. The difference shows: under `.POSIX:` a
+    /// recipe ignored by `.IGNORE` still stops at its first failing command,
+    /// while the same line prefixed `-` runs to the end.
+    ///
+    /// An explicit `.SHELLFLAGS` outranks all of it. `.POSIX:` installs `-ec`
+    /// as a *default*, so a Makefile that assigns the variable — before or
+    /// after `.POSIX:`, globally or for one target — keeps its own value and
+    /// gets no `-e` back.
+    pub fn get_shell_flag(&mut self, dash_prefixed: bool) -> Result<Bytes> {
+        let Some(var) = self.lookup_var(Symbol::SHELLFLAGS)? else {
+            return Ok(Bytes::new());
+        };
+        let is_default = var.read().origin() == VarOrigin::Default;
+        if self.is_posix && is_default {
+            return Ok(Bytes::from_static(if dash_prefixed {
+                b"-c"
+            } else {
+                b"-ec"
+            }));
+        }
+        var.read().eval_to_buf(self)
     }
 
     fn get_allow_rules(&mut self) -> Result<RulesAllowed> {

@@ -71,6 +71,7 @@ const WELL_KNOWN: &[&[u8]] = &[
     b".POSIX",
     b".SHELLSTATUS",
     b".RECIPEPREFIX",
+    b".SHELLFLAGS",
 ];
 
 /// Slot 0 is reserved and slots 1..=255 are the single-byte names.
@@ -105,6 +106,7 @@ impl Symbol {
     pub const POSIX: Symbol = Symbol::well_known(7);
     pub const SHELLSTATUS: Symbol = Symbol::well_known(8);
     pub const RECIPEPREFIX: Symbol = Symbol::well_known(9);
+    pub const SHELLFLAGS: Symbol = Symbol::well_known(10);
 
     /// The bytes this handle was interned from, as borrowed from `names`.
     // [spec:ronin:req:make.no-ambient-state]
@@ -304,6 +306,7 @@ mod tests {
             Symbol::POSIX,
             Symbol::SHELLSTATUS,
             Symbol::RECIPEPREFIX,
+            Symbol::SHELLFLAGS,
         ] {
             assert_eq!(a.name(sym), b.name(sym));
         }

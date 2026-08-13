@@ -718,10 +718,12 @@ fn shell_func_with(
 
     let loc = ev.loc.clone().unwrap_or_default();
     let shell = ev.get_shell()?;
-    let shellflag = ev.get_shell_flag();
+    // GNU Make passes no command flags here (`func_shell` hands
+    // `construct_command_argv` a zero), so `.POSIX:` keeps its `-e`.
+    let shellflag = ev.get_shell_flag(false)?;
 
     let (exit_code, output, fc) =
-        shell_func_impl(&ev.session, &shell, shellflag, &cmd, &loc, trailing)?;
+        shell_func_impl(&ev.session, &shell, &shellflag, &cmd, &loc, trailing)?;
     out.put_slice(&output);
     if should_store_command_result(&ev.session, &cmd) {
         ev.session.command_results.push(CommandResult {
@@ -731,7 +733,7 @@ fn shell_func_with(
                 CommandOp::Shell
             },
             shell,
-            shellflag: Bytes::from_static(shellflag),
+            shellflag,
             cmd,
             find: fc,
             result: output,
@@ -762,10 +764,12 @@ fn shell_no_rerun_func(
 
     let loc = ev.loc.clone().unwrap_or_default();
     let shell = ev.get_shell()?;
-    let shellflag = ev.get_shell_flag();
+    // GNU Make passes no command flags here (`func_shell` hands
+    // `construct_command_argv` a zero), so `.POSIX:` keeps its `-e`.
+    let shellflag = ev.get_shell_flag(false)?;
 
     let (exit_code, output, _) =
-        shell_func_impl(&ev.session, &shell, shellflag, &cmd, &loc, Trailing::Drop)?;
+        shell_func_impl(&ev.session, &shell, &shellflag, &cmd, &loc, Trailing::Drop)?;
     out.put_slice(&output);
     ev.session.shell_status = Some(exit_code);
     Ok(())

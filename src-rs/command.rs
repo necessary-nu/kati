@@ -247,6 +247,17 @@ pub struct Command {
     pub cmd: Bytes,
     pub echo: bool,
     pub ignore_error: bool,
+    /// Whether this line was written with a `-` prefix, as distinct from being
+    /// ignored because of `-i` or `.IGNORE`. GNU Make's `lines_flags`, and the
+    /// only one of the three that also reaches the shell's flags.
+    pub dash_prefixed: bool,
+    /// The flags this line's shell takes, chosen while the rule's own
+    /// variables were in scope so a target-specific `.SHELLFLAGS` is seen.
+    ///
+    /// Per line rather than per recipe because GNU Make decides it per line:
+    /// under `.POSIX:` a `-` prefix asks for a shell without `-e` while the
+    /// line beside it still gets one.
+    pub shell_flag: Bytes,
     pub force_no_subshell: bool,
     /// GNU Make's recursive-line classification, read from the recipe before
     /// it is expanded: the `+` prefix, or a `$(MAKE)`/`${MAKE}` reference.
@@ -549,17 +560,18 @@ impl<'a> CommandEvaluator<'a> {
             let make_values = self.ev.expanded_make_in_command.clone();
             let mut cmds = cmds_buf.clone();
             let mut global_echo = !self.ev.session.flags.is_silent_mode;
-            // `-i` is the `-` prefix asked for once instead of per line, so it
-            // starts each recipe where a leading `-` would have left it.
-            let mut global_ignore_error =
-                self.ev.session.flags.ignore_errors || node_ignores_errors;
+            // `-i` and `.IGNORE` say a failure does not count, which is what
+            // the `-` prefix says too — but only the prefix also relaxes the
+            // shell, so the two are carried separately and joined at the end.
+            let ignored_without_prefix = self.ev.session.flags.ignore_errors || node_ignores_errors;
+            let mut global_dash_prefixed = false;
             // The classification is read from the recipe as written, so it has
             // to be taken before anything is expanded away.
             let mut global_recursive_line = references_make(&v, &self.ev.session);
             cmds = parse_command_prefixes(
                 cmds,
                 &mut global_echo,
-                &mut global_ignore_error,
+                &mut global_dash_prefixed,
                 &mut global_recursive_line,
             );
             if cmds.is_empty() {
@@ -571,10 +583,10 @@ impl<'a> CommandEvaluator<'a> {
                 cmds = eol.rest;
 
                 let mut echo = global_echo;
-                let mut ignore_error = global_ignore_error;
+                let mut dash_prefixed = global_dash_prefixed;
                 let mut recursive_line = global_recursive_line;
                 cmd =
-                    parse_command_prefixes(cmd, &mut echo, &mut ignore_error, &mut recursive_line);
+                    parse_command_prefixes(cmd, &mut echo, &mut dash_prefixed, &mut recursive_line);
 
                 if !cmd.is_empty() {
                     let recursive_make: Vec<Bytes> = make_values
@@ -589,11 +601,14 @@ impl<'a> CommandEvaluator<'a> {
                     let uncomposable_recursion = recursive_line
                         && recursive_make.is_empty()
                         && make_values.iter().any(|make| spawns_make(&cmd, make));
+                    let shell_flag = self.ev.get_shell_flag(dash_prefixed)?;
                     result.push(Command {
                         output: n.lock().recipe_output,
                         cmd,
                         echo,
-                        ignore_error,
+                        ignore_error: ignored_without_prefix || dash_prefixed,
+                        dash_prefixed,
+                        shell_flag,
                         force_no_subshell: false,
                         recursive_line,
                         recursive_make,
@@ -604,6 +619,9 @@ impl<'a> CommandEvaluator<'a> {
         }
 
         if !self.ev.delayed_output_commands.is_empty() {
+            // Written by the front end rather than by the Makefile, so there is
+            // no `-` prefix to read and no line for one to be on.
+            let shell_flag = self.ev.get_shell_flag(false)?;
             let mut output_commands = Vec::new();
             let node = n.lock();
             for cmd in &self.ev.delayed_output_commands {
@@ -612,6 +630,8 @@ impl<'a> CommandEvaluator<'a> {
                     cmd: cmd.clone(),
                     echo: false,
                     ignore_error: false,
+                    dash_prefixed: false,
+                    shell_flag: shell_flag.clone(),
                     force_no_subshell: true,
                     recursive_line: false,
                     recursive_make: Vec::new(),

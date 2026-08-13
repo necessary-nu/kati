@@ -179,7 +179,6 @@ struct NinjaGenerator<'a> {
     done: HashSet<Symbol>,
     rule_id: RuleId,
     shell: Bytes,
-    shell_flags: Bytes,
     used_envs: HashMap<Symbol, OsString>,
     nodes: Vec<NinjaNode>,
     phony_aliases: PhonyAliases,
@@ -191,14 +190,12 @@ impl<'a> NinjaGenerator<'a> {
         // destination, so the answer belongs to whatever is on the far side of
         // the sink.
         let shell = ce.ev.get_shell()?;
-        let shell_flags = Bytes::from_static(ce.ev.get_shell_flag());
         ce.ev.avoid_io = true;
         Ok(Self {
             ce,
             done: HashSet::new(),
             rule_id: 0,
             shell,
-            shell_flags,
             used_envs: HashMap::new(),
             nodes: Vec::new(),
             phony_aliases: PhonyAliases::default(),
@@ -441,6 +438,32 @@ impl<'a> NinjaGenerator<'a> {
         Some(out_buf.freeze())
     }
 
+    /// The flags the whole fused script runs under.
+    ///
+    /// GNU Make invokes every recipe line separately, so each line's flags are
+    /// its own. A manifest has one invocation per recipe, so the line that
+    /// cannot bend governs: a line with no `-` prefix needs whatever `.POSIX:`
+    /// gave it, and the prefixed lines take the `-e` off again themselves —
+    /// which is the `set +e` in [`Self::gen_shell_script`]. When every line is
+    /// prefixed there is nothing to accommodate and the relaxed flags govern.
+    ///
+    /// `.ONESHELL` is the case where one invocation is not an approximation,
+    /// and GNU Make reads the first line's prefix for it.
+    fn script_shell_flags(flags: &Flags, commands: &[Command]) -> Bytes {
+        let Some(first) = commands.first() else {
+            return Bytes::new();
+        };
+        if flags.one_shell {
+            return first.shell_flag.clone();
+        }
+        commands
+            .iter()
+            .find(|c| !c.dash_prefixed)
+            .unwrap_or(first)
+            .shell_flag
+            .clone()
+    }
+
     /// Assemble the recipe into one shell script, and say what to print while
     /// it runs if the recipe itself said so.
     ///
@@ -454,6 +477,7 @@ impl<'a> NinjaGenerator<'a> {
         flags: &Flags,
         name: &Bytes,
         commands: &[Command],
+        script_flags: &[u8],
         cmd_buf: &mut BytesMut,
         description: &mut Option<Bytes>,
     ) -> bool {
@@ -500,6 +524,14 @@ impl<'a> NinjaGenerator<'a> {
             // instead of leaving before it, and the group keeps the `&&` chain
             // able to stop at a line whose failure counts.
             let mute = c.ignore_error && !flags.one_shell && !wholly_ignored;
+            // The script runs under flags this line did not ask for, which
+            // under `.POSIX:` means it asked for a shell without `-e`. Taking
+            // `-e` off again inside the line's own subshell gives the line the
+            // shell GNU Make would have given it and leaves the rest of the
+            // script strict. Only a `-` prefix can ask for this, and a
+            // prefixed line always has a subshell to put it in: the prefix
+            // makes `ignore_error` true, which `force_no_subshell` never is.
+            let relax = !flags.one_shell && c.shell_flag != script_flags;
 
             let mut fragment = BytesMut::new();
             if mute {
@@ -507,6 +539,9 @@ impl<'a> NinjaGenerator<'a> {
             }
             if needs_subshell {
                 fragment.put_u8(b'(');
+            }
+            if relax {
+                fragment.put_slice(b"set +e ; ");
             }
             fragment.put_slice(&translated);
             if needs_subshell {
@@ -587,10 +622,12 @@ impl<'a> NinjaGenerator<'a> {
             let mut description = None;
             let mut cmd_buf = BytesMut::new();
             let recipe_output_str = node.recipe_output.as_bytes(&self.ce.ev.session);
+            let script_flags = Self::script_shell_flags(&self.ce.ev.session.flags, &nn.commands);
             let ignore_errors = Self::gen_shell_script(
                 &self.ce.ev.session.flags,
                 &recipe_output_str,
                 &nn.commands,
+                &script_flags,
                 &mut cmd_buf,
                 &mut description,
             );
@@ -667,10 +704,13 @@ impl<'a> NinjaGenerator<'a> {
             };
             let mut residual_buf = BytesMut::new();
             let mut residual_description = None;
+            // The residual is a subset of the same recipe and reaches the same
+            // shell, so it is assembled against the flags that shell has.
             let residual_ignore_errors = Self::gen_shell_script(
                 &self.ce.ev.session.flags,
                 &recipe_output_str,
                 &residual_commands,
+                &script_flags,
                 &mut residual_buf,
                 &mut residual_description,
             );
@@ -697,7 +737,7 @@ impl<'a> NinjaGenerator<'a> {
                 &SinkRule {
                     id,
                     shell: &self.shell,
-                    shell_flags: &self.shell_flags,
+                    shell_flags: &script_flags,
                     command: if too_long_for_argv {
                         SinkCommand::ResponseFile(&script)
                     } else {
@@ -1493,32 +1533,52 @@ mod tests {
     /// The script and the ignore-errors flag `sink_node` would hand to a sink
     /// for a recipe whose lines are `(expansion, whether errors are ignored)`.
     fn recipe_script(lines: &[(&'static [u8], bool)]) -> (Bytes, bool) {
+        let posix: Vec<(&'static [u8], bool)> = lines
+            .iter()
+            .map(|(cmd, ignored)| (*cmd, *ignored))
+            .collect();
+        script_of(&posix, false).0
+    }
+
+    /// As [`recipe_script`], and additionally the flags the script runs under.
+    ///
+    /// `posix` says the recipe was read under `.POSIX:`, which is what makes a
+    /// `-` prefix ask for different flags than the line beside it.
+    fn script_of(lines: &[(&'static [u8], bool)], posix: bool) -> ((Bytes, bool), Bytes) {
         let mut names = Symtab::new();
         let output = names.intern(&b"out"[..]);
         let commands: Vec<Command> = lines
             .iter()
-            .map(|(cmd, ignore_error)| Command {
+            .map(|(cmd, dash_prefixed)| Command {
                 output,
                 cmd: Bytes::from_static(cmd),
                 echo: true,
-                ignore_error: *ignore_error,
+                ignore_error: *dash_prefixed,
+                dash_prefixed: *dash_prefixed,
+                shell_flag: Bytes::from_static(match (posix, dash_prefixed) {
+                    (true, false) => b"-ec",
+                    _ => b"-c",
+                }),
                 force_no_subshell: false,
                 recursive_line: false,
                 recursive_make: Vec::new(),
                 uncomposable_recursion: false,
             })
             .collect();
+        let flags = Flags::default();
+        let script_flags = NinjaGenerator::script_shell_flags(&flags, &commands);
         let mut cmd_buf = BytesMut::new();
         let mut description = None;
         let ignore_errors = NinjaGenerator::gen_shell_script(
-            &Flags::default(),
+            &flags,
             &Bytes::from_static(b"out"),
             &commands,
+            &script_flags,
             &mut cmd_buf,
             &mut description,
         );
         assert_eq!(description, None, "no Makefile echo, so no description");
-        (cmd_buf.freeze(), ignore_errors)
+        ((cmd_buf.freeze(), ignore_errors), script_flags)
     }
 
     /// The script for a one-line recipe whose errors are nobody's to ignore.
@@ -1714,6 +1774,43 @@ mod tests {
         let (script, ignore_errors) = recipe_script(&[(b"false", true), (b"exit 3", true)]);
         assert_eq!(script, Bytes::from_static(b"(false ) ; (exit 3 )"));
         assert!(ignore_errors);
+    }
+
+    /// GNU Make gives the prefixed line a shell without `-e` and the plain one
+    /// beside it a shell with it. One invocation cannot have both, so the
+    /// strict flags govern and the prefixed line takes `-e` back off inside
+    /// its own subshell, where it reaches nothing else.
+    #[test]
+    fn posix_relaxes_only_the_prefixed_line() {
+        let ((script, _), flags) = script_of(
+            &[(b"false ; echo body > out", true), (b"echo done", false)],
+            true,
+        );
+        assert_eq!(flags, Bytes::from_static(b"-ec"));
+        assert_eq!(
+            script,
+            Bytes::from_static(b"{ (set +e ; false ; echo body > out ) ; true ; } && (echo done )")
+        );
+    }
+
+    /// With no plain line to keep strict there is nothing to accommodate, so
+    /// the relaxed flags govern and no line has to undo them.
+    #[test]
+    fn posix_drops_errexit_for_a_wholly_prefixed_recipe() {
+        let ((script, ignore_errors), flags) =
+            script_of(&[(b"false ; echo body > out", true)], true);
+        assert_eq!(flags, Bytes::from_static(b"-c"));
+        assert_eq!(script, Bytes::from_static(b"(false ; echo body > out )"));
+        assert!(ignore_errors);
+    }
+
+    /// Without `.POSIX:` every line already wanted the same shell, so the
+    /// accommodation never appears and the script reads as it always did.
+    #[test]
+    fn a_plain_recipe_never_relaxes_a_line() {
+        let ((script, _), flags) = script_of(&[(b"false", true), (b"echo done", false)], false);
+        assert_eq!(flags, Bytes::from_static(b"-c"));
+        assert!(!script.windows(3).any(|w| w == b"set"), "{script:?}");
     }
 
     /// A manifest cannot say an edge is allowed to fail, so the writer says it

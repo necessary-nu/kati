@@ -530,6 +530,16 @@ impl GlobalVars {
             Symbol::RECIPEPREFIX,
             Variable::with_simple_string(Bytes::new(), VarOrigin::Default, None, None),
         );
+        // GNU Make binds this one in `main.c` rather than in the tool
+        // catalogue, and the difference is observable: `-R` withdraws the
+        // catalogue but leaves `.SHELLFLAGS` at `-c`, because a switch asking
+        // for a clean namespace is not asking for an unusable shell. Undefining
+        // it deliberately does leave the shell no flags, exactly as it does
+        // there.
+        vars.define(
+            Symbol::SHELLFLAGS,
+            Variable::with_simple_string(Bytes::from_static(b"-c"), VarOrigin::Default, None, None),
+        );
         vars.define(
             Symbol::VARIABLES,
             Variable::new_variable_names(b".VARIABLES", true),
