@@ -34,7 +34,7 @@ use anyhow::{Result, bail};
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
 
-use crate::dep::{NamedDepNode, make_dep};
+use crate::dep::{NamedDepNode, RegenerationRoot, make_dep};
 use crate::eval::{Evaluator, FrameType};
 use crate::expr::Value;
 use crate::file::Source;
@@ -78,7 +78,7 @@ pub struct Evaluated {
     /// manifest. Missing includes with no rule are not here at all, because
     /// GNU Make forgets an optional one it cannot remake and dies on a required
     /// one.
-    pub regeneration_nodes: Vec<NamedDepNode>,
+    pub regeneration_nodes: Vec<RegenerationRoot>,
 }
 
 /// The Makefile kati reads before the real one.
@@ -155,7 +155,7 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
     let makefile = ev.session.flags.makefile.clone().unwrap();
     // The Makefile the invocation named is the first one GNU Make tries to
     // remake, ahead of anything it goes on to include.
-    ev.note_read_makefile(Bytes::from(makefile.as_bytes().to_vec()));
+    ev.note_read_makefile(Bytes::from(makefile.as_bytes().to_vec()), true);
     let mut makefile_list = BytesMut::new();
     makefile_list.put_u8(b' ');
     makefile_list.put_slice(makefile.as_bytes());

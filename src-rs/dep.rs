@@ -28,7 +28,7 @@ use std::{
 
 use crate::{
     error_loc,
-    eval::{Evaluator, FrameType, MissingInclude},
+    eval::{Evaluator, FrameType, MissingInclude, ReadMakefile},
     expr::{Evaluable, Value},
     loc::Loc,
     log,
@@ -46,6 +46,17 @@ use crate::{
 };
 
 pub type NamedDepNode = (Symbol, Arc<Mutex<DepNode>>);
+
+/// One Makefile the read consulted that a rule says how to remake.
+///
+/// `required` is what `include` said and `-include` did not. It travels with
+/// the node because a frontend that builds these roots has to know which
+/// failures end the run: GNU Make abandons a build over a Makefile it cares
+/// about and says nothing at all about one it does not.
+pub struct RegenerationRoot {
+    pub node: NamedDepNode,
+    pub required: bool,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct DoubleActionId {
@@ -1001,9 +1012,9 @@ impl<'a> DepBuilder<'a> {
     fn build(
         &mut self,
         mut targets: Vec<Symbol>,
-        read_makefiles: &[Symbol],
+        read_makefiles: &[ReadMakefile],
         missing_includes: &[MissingInclude],
-    ) -> Result<(Vec<NamedDepNode>, Vec<NamedDepNode>)> {
+    ) -> Result<(Vec<NamedDepNode>, Vec<RegenerationRoot>)> {
         // Generated included Makefiles are compiler inputs rather than user
         // goals, and GNU Make remakes them before it picks a goal at all. Both
         // halves of that matter here: asking the graph for one must not change
@@ -1095,14 +1106,21 @@ impl<'a> DepBuilder<'a> {
     /// then dies naming the file as a target it cannot reach.
     fn plan_regeneration(
         &mut self,
-        read_makefiles: &[Symbol],
+        read_makefiles: &[ReadMakefile],
         missing_includes: &[MissingInclude],
-    ) -> Result<Vec<NamedDepNode>> {
+    ) -> Result<Vec<RegenerationRoot>> {
         let mut nodes = Vec::new();
-        for &makefile in read_makefiles {
+        for &ReadMakefile {
+            filename: makefile,
+            required,
+        } in read_makefiles
+        {
             let node = self.plan_root(makefile)?;
             if Self::is_remakable(&node) {
-                nodes.push((makefile, node));
+                nodes.push(RegenerationRoot {
+                    node: (makefile, node),
+                    required,
+                });
                 continue;
             }
             let Some(include) = missing_includes
@@ -1111,7 +1129,7 @@ impl<'a> DepBuilder<'a> {
             else {
                 continue;
             };
-            if !include.required {
+            if !required {
                 continue;
             }
             let name = include.filename.as_bytes(&self.ev.session);
@@ -3031,9 +3049,9 @@ impl<'a> DepBuilder<'a> {
 pub fn make_dep(
     ev: &mut Evaluator,
     targets: Vec<Symbol>,
-    read_makefiles: &[Symbol],
+    read_makefiles: &[ReadMakefile],
     missing_includes: &[MissingInclude],
-) -> Result<(Vec<NamedDepNode>, Vec<NamedDepNode>)> {
+) -> Result<(Vec<NamedDepNode>, Vec<RegenerationRoot>)> {
     let mut db = DepBuilder::new(ev)?;
     let _tr = ScopedTimeReporter::new(&db.ev.session, "make dep (build)");
     db.build(targets, read_makefiles, missing_includes)

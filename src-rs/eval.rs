@@ -658,6 +658,20 @@ struct IncludeGraph {
     include_stack: Vec<Arc<Frame>>,
 }
 
+/// One Makefile the read reached, and whether it had to be there.
+///
+/// `include` says the file must exist; `-include` and `sinclude` say it need
+/// not, and GNU Make carries that indifference into the rule that would have
+/// made it — read.c records the goaldep with `RM_DONTCARE`, and main.c reports
+/// `Failed to remake makefile` only for one it cares about. A file reached both
+/// ways is cared about, which is why a later required read raises this and no
+/// later optional one lowers it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadMakefile {
+    pub filename: Symbol,
+    pub required: bool,
+}
+
 /// An included Makefile that was absent while this source unit was evaluated.
 ///
 /// Evaluation continues so rules later in the Makefile can describe how to
@@ -809,7 +823,7 @@ pub struct Evaluator {
     /// plan Makefile remaking. It is not `MAKEFILE_LIST`: that variable is the
     /// Makefile's to read and to overwrite, and it never names a file the read
     /// could not open.
-    pub(crate) read_makefiles: Vec<Symbol>,
+    pub(crate) read_makefiles: Vec<ReadMakefile>,
 
     pub is_evaluating_command: bool,
     /// Whether expanding the current recipe referenced `MAKE`.
@@ -1850,7 +1864,7 @@ impl Evaluator {
         };
 
         let v = fname.slice_ref(trim_leading_curdir(fname));
-        self.note_read_makefile(v.clone());
+        self.note_read_makefile(v.clone(), required);
         if let Some(var_list) = self.lookup_var(Symbol::MAKEFILE_LIST)? {
             let frame = self.current_frame();
             var_list.write().append_str(&self.session, &v, frame)?;
@@ -1905,15 +1919,22 @@ impl Evaluator {
     ///
     /// The order is the order GNU Make attempts them in, and a file included
     /// twice is one target, so a repeat is dropped rather than appended.
-    pub(crate) fn note_read_makefile(&mut self, filename: Bytes) {
+    pub(crate) fn note_read_makefile(&mut self, filename: Bytes, required: bool) {
         let filename = self.session.intern(filename);
-        if !self.read_makefiles.contains(&filename) {
-            self.read_makefiles.push(filename);
+        if let Some(existing) = self
+            .read_makefiles
+            .iter_mut()
+            .find(|makefile| makefile.filename == filename)
+        {
+            existing.required |= required;
+            return;
         }
+        self.read_makefiles
+            .push(ReadMakefile { filename, required });
     }
 
     fn note_missing_include(&mut self, filename: Bytes, required: bool, loc: Loc) {
-        self.note_read_makefile(filename.clone());
+        self.note_read_makefile(filename.clone(), required);
         let filename = self.session.intern(filename);
         if let Some(existing) = self
             .missing_includes
