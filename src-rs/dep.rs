@@ -1045,6 +1045,37 @@ impl<'a> DepBuilder<'a> {
         }
     }
 
+    /// Take back the sweeping-up from every intermediate `.PRECIOUS` protects.
+    ///
+    /// Being intermediate and being deleted are two answers in GNU Make, and
+    /// `.PRECIOUS` gives only the second. A protected name is still intermediate
+    /// — its absence is still no reason to remake what reads it — and the file
+    /// the build leaves behind is simply not swept up afterwards. Saying it the
+    /// other way round would make `.PRECIOUS` on a `.INTERMEDIATE` name rebuild
+    /// a chain GNU Make leaves alone.
+    ///
+    /// Asked once the graph is planned rather than as each node is made,
+    /// because a pattern protects a name only from the moment the rule that
+    /// makes it has been chosen — the same reason
+    /// [`Self::mark_delete_on_error`] waits.
+    fn keep_precious_intermediates(&self) {
+        if self.precious.is_empty() && self.precious_patterns.is_empty() {
+            return;
+        }
+        let mut seen = HashSet::new();
+        for node in self.done.values() {
+            if !seen.insert(Arc::as_ptr(node)) {
+                continue;
+            }
+            let mut node = node.lock();
+            // The rule's target pattern speaks for the name the search matched
+            // it against, so it is read beside that name and no other.
+            if node.is_disposable && self.is_precious(node.recipe_output, node.output_pattern) {
+                node.is_disposable = false;
+            }
+        }
+    }
+
     /// Read the three targets that argue over which files are intermediate.
     ///
     /// In GNU Make's order, which is the order they veto each other in:
@@ -1242,6 +1273,7 @@ impl<'a> DepBuilder<'a> {
         }
         self.apply_wait_barriers();
         self.mark_delete_on_error();
+        self.keep_precious_intermediates();
         Ok((nodes, regeneration_nodes))
     }
 
