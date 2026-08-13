@@ -156,15 +156,15 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
     // The Makefile the invocation named is the first one GNU Make tries to
     // remake, ahead of anything it goes on to include.
     ev.note_read_makefile(Bytes::from(makefile.as_bytes().to_vec()), true);
-    let mut makefile_list = BytesMut::new();
-    makefile_list.put_u8(b' ');
-    makefile_list.put_slice(makefile.as_bytes());
+    // The name alone. `MAKEFILE_LIST` grows by `+=`, and the space that
+    // separates two names has nothing to separate while this is the first.
+    let makefile_list = Bytes::from(makefile.as_bytes().to_vec());
     let frame = ev.current_frame();
     let loc = ev.loc.clone();
     let makefile_list_sym = ev.session.intern("MAKEFILE_LIST");
     ev.session.set_global_var(
         makefile_list_sym,
-        Variable::with_simple_string(makefile_list.freeze(), VarOrigin::File, Some(frame), loc),
+        Variable::with_simple_string(makefile_list, VarOrigin::File, Some(frame), loc),
         false,
         None,
     )?;

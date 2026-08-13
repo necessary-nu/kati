@@ -1174,38 +1174,63 @@ impl Evaluator {
                             lhs.display(self)
                         );
                     }
-                    // `+=` reads what is in scope and defines the result where
-                    // an ordinary assignment would, which is why precedence is
-                    // decided on the copy rather than on what it was read
-                    // from. An automatic binding is the exception kati has
-                    // never implemented: GNU Make appends through it into the
-                    // file scope it shadows, and there is no way to spell that
-                    // while the binding is a replaced global. Appending in
-                    // place is what this did before the copy existed, and it
-                    // is the closer of the two — GNU Make does not refuse.
-                    if prev.read().origin() == VarOrigin::Automatic {
+                    // What `+=` has to paste on. A simple variable's value was
+                    // expanded when it was set, so the right-hand side is
+                    // expanded now to match it; a recursive one is appended to
+                    // unexpanded, so what counts is the text as written.
+                    // `V := x` with `V += $(EMPTY)` therefore has nothing to
+                    // append, while `V = x` with that same line appends the
+                    // reference and expands it later.
+                    let appended = if prev.read().immediate_eval() {
+                        Some(self.in_ambient_scope(ambient_value, |ev| rhs_v.eval_to_buf(ev))?)
+                    } else {
+                        None
+                    };
+                    let nothing_to_append = match &appended {
+                        Some(expanded) => expanded.is_empty(),
+                        None => orig_rhs.is_empty(),
+                    };
+                    if nothing_to_append {
+                        // Appending nothing is not an assignment at all. GNU
+                        // Make hands back the variable it looked up without
+                        // redefining it, so no separator arrives, and the
+                        // origin and location it already had are the ones it
+                        // keeps.
                         needs_assign = false;
-                        result = prev.clone();
+                        result = prev;
                     } else {
-                        result = prev.read().clone_for_assignment(
-                            origin,
-                            current_frame,
-                            self.loc.clone(),
-                        );
-                    }
-                    if result.read().immediate_eval() {
-                        let buf =
-                            self.in_ambient_scope(ambient_value, |ev| rhs_v.eval_to_buf(ev))?;
+                        // `+=` reads what is in scope and defines the result
+                        // where an ordinary assignment would, which is why
+                        // precedence is decided on the copy rather than on what
+                        // it was read from. An automatic binding is the
+                        // exception kati has never implemented: GNU Make
+                        // appends through it into the file scope it shadows,
+                        // and there is no way to spell that while the binding
+                        // is a replaced global. Appending in place is what this
+                        // did before the copy existed, and it is the closer of
+                        // the two — GNU Make does not refuse.
+                        if prev.read().origin() == VarOrigin::Automatic {
+                            needs_assign = false;
+                            result = prev.clone();
+                        } else {
+                            result = prev.read().clone_for_assignment(
+                                origin,
+                                current_frame,
+                                self.loc.clone(),
+                            );
+                        }
                         let frame = self.current_frame();
-                        result.write().append_str(&self.session, &buf, frame)?;
-                    } else {
-                        let frame = self.current_frame();
-                        result.write().append_var(
-                            &self.session,
-                            rhs_v,
-                            frame,
-                            self.loc.as_ref(),
-                        )?;
+                        if let Some(expanded) = appended {
+                            result.write().append_str(&self.session, &expanded, frame)?;
+                        } else {
+                            result.write().append_var(
+                                &self.session,
+                                rhs_v,
+                                &orig_rhs,
+                                frame,
+                                self.loc.as_ref(),
+                            )?;
+                        }
                     }
                 } else {
                     result = Variable::new_recursive(

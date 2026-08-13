@@ -99,6 +99,41 @@ pub enum InnerVar {
     VariableNames { name: Bytes, all: bool },
 }
 
+/// The pieces of a recursive value that `+=` has appended to, in order.
+///
+/// The space `+=` writes is a separator, so it belongs between two values and
+/// nowhere else. A variable whose text is empty has no left-hand value for it
+/// to separate, and takes the appended expression on its own.
+///
+/// GNU Make asks this of the text as written rather than of what the text
+/// expands to, which is why `V = $(EMPTY)` still counts as something to append
+/// to: `V += x` reads back as `$(EMPTY) x`, and expands with the space.
+fn appended_values(prev: Arc<Value>, prev_text: &Bytes, added: Arc<Value>) -> Vec<Arc<Value>> {
+    if prev_text.is_empty() {
+        return vec![prev, added];
+    }
+    vec![
+        prev,
+        Arc::new(Value::Literal(None, Bytes::from_static(b" "))),
+        added,
+    ]
+}
+
+/// The same join over the text those values were written as.
+///
+/// A recursive variable keeps its text beside its expression because `$(value)`
+/// reads it back, and because the next `+=` asks this of it in turn.
+fn appended_text(prev: &Bytes, added: &Bytes) -> Bytes {
+    if prev.is_empty() {
+        return added.clone();
+    }
+    let mut joined = Vec::with_capacity(prev.len() + 1 + added.len());
+    joined.extend_from_slice(prev);
+    joined.push(b' ');
+    joined.extend_from_slice(added);
+    Bytes::from(joined)
+}
+
 impl Variable {
     /// Replace only this variable's recursive expression.
     ///
@@ -225,10 +260,15 @@ impl Variable {
         variable.assign_op = None;
         Arc::new(RwLock::new(variable))
     }
+    /// Append an unexpanded expression, `+=` onto a recursive variable.
+    ///
+    /// `text` is that expression as it was written, which the variable keeps
+    /// alongside it and which decides where the separator goes.
     pub fn append_var(
         &mut self,
         ctx: &impl Context,
         v: Arc<Value>,
+        text: &Bytes,
         frame: Arc<Frame>,
         loc: Option<&Loc>,
     ) -> Result<()> {
@@ -236,15 +276,12 @@ impl Variable {
             InnerVar::Simple(_) => {
                 panic!("append_var should not be used when immediate_eval returns true")
             }
-            InnerVar::Recursive { v: prev, .. } => {
+            InnerVar::Recursive { v: prev, orig } => {
                 *prev = Arc::new(Value::List(
                     prev.loc(),
-                    vec![
-                        prev.clone(),
-                        Arc::new(Value::Literal(None, Bytes::from_static(b" "))),
-                        v,
-                    ],
+                    appended_values(prev.clone(), orig, v),
                 ));
+                *orig = appended_text(orig, text);
                 self.definition = Some(frame);
             }
             InnerVar::AutoCommand(sym, _) => {
@@ -260,6 +297,8 @@ impl Variable {
         }
         Ok(())
     }
+    /// Append text that needs no further expansion, `+=` onto a simple
+    /// variable and the way the reader grows `MAKEFILE_LIST`.
     pub fn append_str(
         &mut self,
         names: &impl Interner,
@@ -268,19 +307,19 @@ impl Variable {
     ) -> Result<()> {
         match &mut self.value {
             InnerVar::Simple(s) => {
-                s.push(b' ');
+                if !s.is_empty() {
+                    s.push(b' ');
+                }
                 s.extend_from_slice(buf);
                 self.definition = Some(frame);
             }
-            InnerVar::Recursive { v: prev, .. } => {
+            InnerVar::Recursive { v: prev, orig } => {
+                let added = Arc::new(Value::Literal(None, buf.clone()));
                 *prev = Arc::new(Value::List(
                     prev.loc(),
-                    vec![
-                        prev.clone(),
-                        Arc::new(Value::Literal(None, Bytes::from_static(b" "))),
-                        Arc::new(Value::Literal(None, buf.clone())),
-                    ],
+                    appended_values(prev.clone(), orig, added),
                 ));
+                *orig = appended_text(orig, buf);
                 self.definition = Some(frame);
             }
             InnerVar::AutoCommand(sym, _) => {
