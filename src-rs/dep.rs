@@ -134,6 +134,18 @@ pub struct DepNode {
     /// deletion, and a `.PHONY` name stands for no file to delete.
     pub delete_on_error_outputs: Vec<Symbol>,
     pub implicit_outputs: Vec<Symbol>,
+    /// The outputs among [`Self::implicit_outputs`] that this recipe makes only
+    /// on the way to making something else — GNU Make's `also_make`.
+    ///
+    /// A pattern rule spelling several target patterns is one recipe for all of
+    /// them, but GNU Make still decides each name's freshness from that name
+    /// alone: the peer of the target the search matched is entered as a target
+    /// of its own (`implicit.c` sets `is_target`), which keeps it out of the
+    /// intermediate sweep, and is otherwise only marked updated when the recipe
+    /// runs. So a peer nothing asked for neither forces the recipe by being
+    /// absent nor is swept up afterwards. A name that is later asked for in its
+    /// own right stops being one of these.
+    pub peer_outputs: Vec<Symbol>,
     pub actual_inputs: Vec<Symbol>,
     pub actual_order_only_inputs: Vec<Symbol>,
     pub actual_validations: Vec<Symbol>,
@@ -173,6 +185,7 @@ impl DepNode {
             is_disposable,
             delete_on_error_outputs: Vec::new(),
             implicit_outputs: Vec::new(),
+            peer_outputs: Vec::new(),
             actual_inputs: Vec::new(),
             actual_order_only_inputs: Vec::new(),
             actual_validations: Vec::new(),
@@ -2486,7 +2499,9 @@ impl<'a> DepBuilder<'a> {
                     self.precious.insert(sym);
                 }
                 self.done.insert(sym, n.clone());
-                n.lock().implicit_outputs.push(sym);
+                let mut node = n.lock();
+                node.implicit_outputs.push(sym);
+                node.peer_outputs.push(sym);
             }
             rule.output_patterns.clear();
             rule.output_patterns.push(matched);
@@ -2816,6 +2831,10 @@ impl<'a> DepBuilder<'a> {
         );
 
         if let Some(found) = self.done.get(&output) {
+            // Reaching a name in its own right is what stops it being a peer:
+            // GNU Make decides that name's freshness from that name, so its
+            // absence has to be able to make the recipe run again.
+            found.lock().peer_outputs.retain(|peer| *peer != output);
             return Ok(found.clone());
         }
 

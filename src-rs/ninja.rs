@@ -1034,6 +1034,7 @@ impl<'a> NinjaGenerator<'a> {
         let implicit_outputs = named(&node.implicit_outputs);
         let output = self.phony_aliases.resolve(node.output);
         let delete_on_error_outputs = named(&node.delete_on_error_outputs);
+        let peer_outputs = named(&node.peer_outputs);
         let deferred_freshness_outputs = if let Some(action) = &node.grouped_double_action {
             named(&action.members)
         } else if nn.deferred_new_inputs {
@@ -1103,6 +1104,7 @@ impl<'a> NinjaGenerator<'a> {
                 intermediate: node.is_intermediate,
                 disposable: node.is_disposable,
                 delete_on_error_outputs: &delete_on_error_outputs,
+                peer_outputs: &peer_outputs,
                 pool: pool.as_deref(),
                 tags: tags.as_deref(),
                 loc: node.loc.as_ref(),
@@ -1727,6 +1729,7 @@ mod tests {
                     intermediate: false,
                     disposable: false,
                     delete_on_error_outputs: &[],
+                    peer_outputs: &[],
                     pool: None,
                     tags: None,
                     loc: None,

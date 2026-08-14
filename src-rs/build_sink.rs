@@ -308,6 +308,19 @@ pub struct SinkEdge<'a> {
     /// ignores [`Self::intermediate`] and [`Self::disposable`], and a sink that
     /// runs the build is the one that answers for it.
     pub delete_on_error_outputs: &'a [Symbol],
+    /// The outputs among [`Self::implicit_outputs`] this recipe makes only on
+    /// the way to making something that was asked for — GNU Make's `also_make`.
+    ///
+    /// A pattern rule spelling several target patterns is one recipe for all of
+    /// them, and GNU Make still decides each of those names from that name
+    /// alone. So a peer nobody reached is neither a reason to run the recipe
+    /// when it is missing nor something the intermediate sweep may take: it is
+    /// written when the recipe runs and otherwise left alone.
+    ///
+    /// Nothing in a manifest says this, so the writer ignores it as it ignores
+    /// [`Self::intermediate`] and [`Self::disposable`], and a sink that runs the
+    /// build is the one that answers for it.
+    pub peer_outputs: &'a [Symbol],
     /// The pool that limits how many edges like this run at once, unescaped.
     pub pool: Option<&'a [u8]>,
     /// Opaque per-edge metadata from `.KATI_TAGS`, for consumers of the graph
