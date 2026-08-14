@@ -1105,6 +1105,14 @@ struct DepBuilder<'a> {
     /// The name the invocation's own preamble is read under, which is how a
     /// `.SUFFIXES` Make wrote is told apart from one a Makefile wrote.
     bootstrap_filename: Symbol,
+    extra_prereqs_var_name: Symbol,
+    /// What a global `.EXTRA_PREREQS` adds to every target of the read, as the
+    /// compared and order-only halves a `|` in the value separates.
+    ///
+    /// Expanded once the last Makefile is closed, because that is when GNU Make
+    /// reads it — so a value written in terms of a variable defined further down
+    /// the file still names what that variable finally held.
+    global_extra_prereqs: (Vec<Symbol>, Vec<Symbol>),
 
     /// The first target of the read that could stand for the Makefile as a
     /// whole, from before a goal could be named.
@@ -1192,6 +1200,7 @@ impl<'a> DepBuilder<'a> {
         let tags_var_name = ev.session.intern(".KATI_TAGS");
         let wait_sym = ev.session.intern(".WAIT");
         let bootstrap_filename = ev.session.intern("*bootstrap*");
+        let extra_prereqs_var_name = ev.session.intern(".EXTRA_PREREQS");
         let mut ret = Self {
             ev,
             rules: HashMap::new(),
@@ -1229,6 +1238,8 @@ impl<'a> DepBuilder<'a> {
             suffix_rules: HashMap::new(),
             suffixes: Vec::new(),
             bootstrap_filename,
+            extra_prereqs_var_name,
+            global_extra_prereqs: (Vec::new(), Vec::new()),
 
             first_rule: None,
             done: HashMap::new(),
@@ -1355,8 +1366,73 @@ impl<'a> DepBuilder<'a> {
                 .cloned();
         }
         self.read_suffix_list()?;
+        let global = self.ev.eval_var(self.extra_prereqs_var_name)?;
+        self.global_extra_prereqs = self.prerequisite_names(&global);
 
         Ok(())
+    }
+
+    /// One expanded prerequisite list, read into the names it declares and
+    /// split at the `|` that makes the rest order-only.
+    ///
+    /// GNU Make's `split_prereqs`, which is what reads this value: the same
+    /// reading a rule's own prerequisites get, so a leading `./` comes off, a
+    /// word holding a wildcard is matched where it was written, and a `|`
+    /// separates what must merely exist first from what is compared.
+    fn prerequisite_names(&mut self, text: &Bytes) -> (Vec<Symbol>, Vec<Symbol>) {
+        let (compared, order_only) = split_order_only(text);
+        let mut names = (Vec::new(), Vec::new());
+        for (half, into) in [(compared, &mut names.0), (order_only, &mut names.1)] {
+            for word in makefile_word_scanner(&half) {
+                let word = word.slice_ref(trim_leading_curdir(&word));
+                glob_word(&mut self.ev.session, word, into);
+            }
+        }
+        names
+    }
+
+    /// What `.EXTRA_PREREQS` adds to `output`: prerequisites built and compared
+    /// like any other, which appear in no automatic variable.
+    ///
+    /// GNU Make's `snap_file`. A target that has target-specific variables of
+    /// its own reads the value out of that set alone — so a target-specific
+    /// `.EXTRA_PREREQS` replaces the global one rather than adding to it, and,
+    /// because the lookup does not fall back, a target carrying *any* other
+    /// target-specific variable is left with no extra prerequisites at all.
+    /// That is GNU 4.4.1's behaviour rather than its documentation, and it is
+    /// what a Makefile written against it depends on.
+    ///
+    /// The global list reaches only names the read made targets: a file that is
+    /// merely a prerequisite of something is not given prerequisites of its own.
+    ///
+    /// A list that names the target itself would be a cycle, and GNU drops the
+    /// whole list rather than the one entry that closed it.
+    ///
+    /// The answer is the two halves a `|` in the value separates: compared, and
+    /// order-only.
+    fn extra_prerequisites(
+        &mut self,
+        output: Symbol,
+        is_target: bool,
+    ) -> Result<(Vec<Symbol>, Vec<Symbol>)> {
+        let extras = if let Some(vars) = self.lookup_rule_vars(output) {
+            let Some(var) = vars.lookup(
+                &mut self.ev.session.used_env_vars,
+                self.extra_prereqs_var_name,
+            ) else {
+                return Ok((Vec::new(), Vec::new()));
+            };
+            let text = var.read().eval_to_buf(self.ev)?;
+            self.prerequisite_names(&text)
+        } else if is_target {
+            self.global_extra_prereqs.clone()
+        } else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        if extras.0.contains(&output) || extras.1.contains(&output) {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        Ok(extras)
     }
 
     /// Settle `.SUFFIXES` as the read left it.
@@ -3184,13 +3260,17 @@ impl<'a> DepBuilder<'a> {
         unbind(private_scoped_vars);
         action.lock().rule_vars = scope;
 
+        // Each `::` record stands on its own, and what `.EXTRA_PREREQS` adds is
+        // required of every one of them — out of the automatic variables here
+        // as everywhere else, so it joins the graph rather than the inputs.
+        let (extra_compared, extra_order_only) = self.extra_prerequisites(trigger, true)?;
         let actual_inputs = action.lock().actual_inputs.clone();
-        for input in actual_inputs {
+        for input in actual_inputs.into_iter().chain(extra_compared) {
             let dependency = self.build_plan(input, Some(trigger))?;
             action.lock().deps.push((input, dependency));
         }
         let actual_order_only_inputs = action.lock().actual_order_only_inputs.clone();
-        for input in actual_order_only_inputs {
+        for input in actual_order_only_inputs.into_iter().chain(extra_order_only) {
             let dependency = self.build_plan(input, Some(trigger))?;
             action.lock().order_onlys.push((input, dependency));
         }
@@ -4310,6 +4390,17 @@ impl<'a> DepBuilder<'a> {
                 grouped_peer_order_only.extend(order_only);
             }
         }
+
+        // What `.EXTRA_PREREQS` adds is the same shape as a hidden peer: in the
+        // graph and in the freshness test, out of every automatic variable. It
+        // rides the same pass so VPATH and `.WAIT` reach it too, and it goes on
+        // the end because GNU Make appends it to what the rule already declared.
+        //
+        // Reaching here at all means a rule was picked, which is what makes the
+        // name a target and so eligible for the global list.
+        let (extra_compared, extra_order_only) = self.extra_prerequisites(output, true)?;
+        grouped_peer_inputs.extend(extra_compared);
+        grouped_peer_order_only.extend(extra_order_only);
 
         // VPATH applies to hidden peer dependencies too. Append them for one
         // pass, then split them away before automatic variables see the node.
