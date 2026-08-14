@@ -850,7 +850,7 @@ impl<'a> NinjaGenerator<'a> {
     /// here rather than in the sink because it is a fact about the Makefile.
     fn sink_node(&mut self, nn: &NinjaNode, sink: &mut dyn BuildSink) -> Result<Option<Symbol>> {
         let node = nn.node.lock();
-        if !is_buildable_target(&self.ce.ev.session, &node.output) {
+        if !is_buildable_target(&self.ce.ev.session, &node.output, node.has_rule) {
             return Ok(None);
         }
 

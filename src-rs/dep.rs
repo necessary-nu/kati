@@ -2567,6 +2567,24 @@ impl<'a> DepBuilder<'a> {
             return Ok(false);
         }
 
+        // POSIX says a suffix rule has no prerequisites, and GNU Make 4.4.1
+        // reads a suffix-named rule that has them two ways. Outside `.POSIX:`
+        // it keeps the old behaviour — the pair is converted and the written
+        // prerequisites are dropped on the way, with a warning saying so —
+        // and under `.POSIX:` it passes the pair over entirely, so the rule
+        // makes nothing but the file it literally names. Either way the file
+        // target survives, which is the half `is_buildable_target` answers.
+        if !rule.inputs.is_empty() || !rule.order_only_inputs.is_empty() {
+            if self.ev.is_posix() {
+                return Ok(false);
+            }
+            warn_loc!(
+                self.ev,
+                rule.cmd_loc.as_ref().or(Some(&rule.loc)),
+                "warning: ignoring prerequisites on suffix rule definition"
+            );
+        }
+
         let mut output = output.as_bytes(&self.ev.session);
         output.advance(1);
         let dot_index = memchr(b'.', &output).unwrap();
@@ -2581,6 +2599,7 @@ impl<'a> DepBuilder<'a> {
         r.output_patterns
             .push(self.ev.session.intern(output_pattern.freeze()));
         r.inputs.clear();
+        r.order_only_inputs.clear();
         r.prerequisite_names.clear();
         r.deferred_prerequisites = None;
         let input_sym = self.ev.session.intern(input_suffix);
@@ -4458,11 +4477,19 @@ pub fn is_directive_target(names: &impl Interner, output: &Symbol) -> bool {
         .any(|name| name.as_bytes() == &s[..])
 }
 
-/// Suffix rules are excluded deliberately. Emitted as an ordinary node, `.c.o`
+/// Whether this node belongs in the manifest, given whether anything gave it a
+/// recipe.
+///
+/// A suffix-shaped name is an ordinary file target, and being converted into a
+/// pattern rule as well does not stop it being one: GNU Make's
+/// `convert_to_pattern` reads the `.c.o` entry out of the file database and
+/// leaves it there, so `make .c.o` runs that rule and `make .baz.biz` runs
+/// that one. `has_rule` is what tells the two apart, because the exclusion is
+/// only ever needed for a suffix-shaped name nothing declared: emitted then, it
 /// is claimed by the built-in `%.o: %.c` with an empty stem and runs
 /// `cc -c -o .c.o` against no input, which is worse than refusing it.
-pub fn is_buildable_target(names: &impl Interner, output: &Symbol) -> bool {
-    !is_directive_target(names, output) && !is_suffix_rule(names, output)
+pub fn is_buildable_target(names: &impl Interner, output: &Symbol, has_rule: bool) -> bool {
+    !is_directive_target(names, output) && (has_rule || !is_suffix_rule(names, output))
 }
 
 #[cfg(test)]
@@ -4628,23 +4655,28 @@ mod tests {
         for name in [".1", ".x", "foo", "..", ".deps/file.Po"] {
             let sym = session.intern(name);
             assert!(
-                is_buildable_target(&session, &sym),
+                is_buildable_target(&session, &sym, false),
                 "{name} should be built"
             );
         }
-        for name in [
-            ".PHONY",
-            ".SUFFIXES",
-            ".KATI_RESTAT",
-            ".ONESHELL",
-            ".WAIT",
-            ".c.o",
-        ] {
+        for name in [".PHONY", ".SUFFIXES", ".KATI_RESTAT", ".ONESHELL", ".WAIT"] {
             let sym = session.intern(name);
             assert!(
-                !is_buildable_target(&session, &sym),
+                !is_buildable_target(&session, &sym, true),
                 "{name} should not be built"
             );
         }
+    }
+
+    /// A `.c.o:` rule names a file called `.c.o` as well as converting into a
+    /// pattern rule, and GNU Make builds that file when it is asked for. The
+    /// exclusion is only for the name nothing declared, which the built-in
+    /// `%.o: %.c` would otherwise claim with an empty stem.
+    #[test]
+    fn a_suffix_shaped_target_is_built_when_a_rule_reached_it() {
+        let mut session = Session::new();
+        let sym = session.intern(".c.o");
+        assert!(is_buildable_target(&session, &sym, true));
+        assert!(!is_buildable_target(&session, &sym, false));
     }
 }

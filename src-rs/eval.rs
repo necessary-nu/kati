@@ -2647,6 +2647,17 @@ impl Evaluator {
         self.eval_var(Symbol::SHELL)
     }
 
+    /// Whether the read saw `.POSIX:` as a target, which is GNU Make's
+    /// `posix_pedantic`.
+    ///
+    /// Read after the read has finished as well as during it: the switch is
+    /// latched by the target wherever it stands, and what it then governs
+    /// includes decisions — the suffix-rule conversion among them — that GNU
+    /// Make does not make until the last makefile is closed.
+    pub fn is_posix(&self) -> bool {
+        self.is_posix
+    }
+
     /// The flags one recipe line's shell is invoked with.
     ///
     /// `dash_prefixed` is whether the line was written with a leading `-`, and
