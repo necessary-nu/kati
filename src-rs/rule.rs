@@ -50,6 +50,16 @@ pub struct Rule {
     /// would expand to itself, and holding it back would hide it from the
     /// automatic variables a later list reads.
     pub deferred_prerequisites: Option<Bytes>,
+    /// Set once the implicit search has filled this rule's `%` in for the name
+    /// it matched, so nothing downstream substitutes into the result again.
+    ///
+    /// GNU Make's `pattern_search` builds the prerequisite names itself and
+    /// hands the file a finished chain, which is why a stem is substituted
+    /// exactly once however many `%` the pattern and the prerequisites hold
+    /// between them. A rule that still carries its pattern text — an explicit
+    /// or a static pattern rule — has not been through that search and is
+    /// substituted where it is read instead.
+    pub prerequisites_are_resolved: bool,
     pub cmds: Vec<Arc<Value>>,
     pub loc: Loc,
     pub cmd_loc: Option<Loc>,
@@ -69,6 +79,7 @@ impl Rule {
             expand_again: false,
             prerequisite_names: Vec::new(),
             deferred_prerequisites: None,
+            prerequisites_are_resolved: false,
             cmds: Vec::new(),
             loc,
             cmd_loc: None,

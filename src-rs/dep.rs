@@ -58,6 +58,18 @@ fn unbind(mut bindings: Vec<ScopedVar>) {
     while bindings.pop().is_some() {}
 }
 
+/// Hold a group of scope bindings for as long as the guard lives.
+///
+/// A bare `Vec<ScopedVar>` would drop front to back, which [`unbind`] explains
+/// is the wrong order; this routes the guard's own drop through it.
+struct Unbind(Vec<ScopedVar>);
+
+impl Drop for Unbind {
+    fn drop(&mut self) {
+        unbind(std::mem::take(&mut self.0));
+    }
+}
+
 /// One Makefile the read consulted that a rule says how to remake.
 ///
 /// `required` is what `include` said and `-include` did not. It travels with
@@ -397,6 +409,13 @@ fn apply_output_pattern(
 ) -> Vec<Symbol> {
     let mut ret = Vec::new();
     if inputs.is_empty() {
+        return ret;
+    }
+    // The implicit search fills a pattern rule's `%` in for the name it matched
+    // and hands back finished names. A `%` still standing in one of those is a
+    // literal the rule asked for, not a second placeholder.
+    if r.prerequisites_are_resolved {
+        ret.extend(inputs);
         return ret;
     }
     if !prerequisites_reach(session, r, output) {
@@ -1953,6 +1972,39 @@ impl<'a> DepBuilder<'a> {
         )
     }
 
+    /// Bind the `D` and `F` forms of one automatic variable, alongside a base
+    /// form bound in the same scope.
+    ///
+    /// GNU Make never computes these. `define_automatic_variables` writes them
+    /// once at startup as recursive variables holding a `dir` or `notdir`
+    /// expression over the base form, so they answer for whatever that form
+    /// holds at the moment they are read. Binding the same definitions here
+    /// keeps that property: they follow the base binding rather than freezing a
+    /// value taken beside it.
+    fn bind_path_forms(&mut self, scope: &Arc<Vars>, name: char) -> Result<Vec<ScopedVar>> {
+        let mut bound = Vec::with_capacity(2);
+        for (form, text) in [
+            ('D', format!("$(patsubst %/,%,$(dir ${name}))")),
+            ('F', format!("$(notdir ${name})")),
+        ] {
+            let sym = self.ev.session.intern(format!("{name}{form}"));
+            let text = Bytes::from(text);
+            let mut loc = self.ev.loc.clone().unwrap_or_default();
+            let value = crate::expr::parse_expr(
+                &mut self.ev.session,
+                &mut loc,
+                text.clone(),
+                crate::expr::ParseExprOpt::Normal,
+            )?;
+            bound.push(ScopedVar::new(
+                scope.clone(),
+                sym,
+                Variable::new_recursive(value, crate::var::VarOrigin::Automatic, None, None, text),
+            ));
+        }
+        Ok(bound)
+    }
+
     fn expand_deferred_prerequisites(
         &mut self,
         output: Symbol,
@@ -1988,16 +2040,24 @@ impl<'a> DepBuilder<'a> {
             self.joined(recorded_order_only, true),
         );
         let expanded = {
-            let _at = ScopedVar::new(
-                scope.clone(),
-                at,
-                automatic(output.as_bytes(&self.ev.session)),
-            );
-            let _star = stem.map(|s| ScopedVar::new(scope.clone(), star, automatic(s)));
-            let _less = ScopedVar::new(scope.clone(), less, automatic(first));
-            let _hat = ScopedVar::new(scope.clone(), hat, automatic(hat_value));
-            let _plus = ScopedVar::new(scope.clone(), plus, automatic(plus_value));
-            let _bar = ScopedVar::new(scope, bar, automatic(bar_value));
+            let mut bound = Vec::new();
+            let at_value = output.as_bytes(&self.ev.session);
+            bound.push(ScopedVar::new(scope.clone(), at, automatic(at_value)));
+            bound.extend(self.bind_path_forms(&scope, '@')?);
+            if let Some(stem) = stem {
+                bound.push(ScopedVar::new(scope.clone(), star, automatic(stem)));
+                bound.extend(self.bind_path_forms(&scope, '*')?);
+            }
+            bound.push(ScopedVar::new(scope.clone(), less, automatic(first)));
+            bound.extend(self.bind_path_forms(&scope, '<')?);
+            bound.push(ScopedVar::new(scope.clone(), hat, automatic(hat_value)));
+            bound.extend(self.bind_path_forms(&scope, '^')?);
+            bound.push(ScopedVar::new(scope.clone(), plus, automatic(plus_value)));
+            bound.extend(self.bind_path_forms(&scope, '+')?);
+            // `$|` keeps no D or F form: GNU Make reads `$(|D)` as an ordinary
+            // variable nobody defined, which is what the register site says too.
+            bound.push(ScopedVar::new(scope, bar, automatic(bar_value)));
+            let _bound = Unbind(bound);
             let mut expanded = Vec::with_capacity(texts.len());
             for text in texts {
                 let mut loc = self.ev.loc.clone().unwrap_or_default();
@@ -3209,6 +3269,7 @@ impl<'a> DepBuilder<'a> {
             rule.deferred_prerequisites = None;
             rule.inputs = inputs;
             rule.order_only_inputs = order_only_inputs;
+            rule.prerequisites_are_resolved = true;
         }
         if rule.output_patterns.len() > 1 {
             // A pattern rule with several target patterns is one recipe that
@@ -4230,6 +4291,25 @@ mod tests {
                 Bytes::from_static(b"|"),
                 Bytes::from_static(b"tail"),
             ]
+        );
+    }
+
+    /// Only the first `%` of each whitespace-separated segment stands for the
+    /// stem. GNU Make replaces one, skips to the next blank, and looks again, so
+    /// a percent that follows another inside the same segment is a literal.
+    #[test]
+    fn only_the_first_percent_of_a_segment_stands_for_the_stem() {
+        assert_eq!(
+            stem_references(&Bytes::from_static(b"$(wordlist 1, 99, %1%2%)")),
+            Bytes::from_static(b"$(wordlist 1, 99, $*1%2%)")
+        );
+        assert_eq!(
+            stem_references(&Bytes::from_static(b"$(wordlist 1, 99, %a %b)")),
+            Bytes::from_static(b"$(wordlist 1, 99, $*a $*b)")
+        );
+        assert_eq!(
+            stem_references(&Bytes::from_static(b"nopercent.c")),
+            Bytes::from_static(b"nopercent.c")
         );
     }
 
