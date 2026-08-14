@@ -1963,6 +1963,9 @@ impl Evaluator {
             if name.starts_with(b".") && !name.contains(&b'/') {
                 continue;
             }
+            if self.suffixes_reject_default_goal(&name) {
+                continue;
+            }
             let frame = self.current_frame();
             let loc = self.loc.clone();
             return self.session.set_global_var(
@@ -1973,6 +1976,43 @@ impl Evaluator {
             );
         }
         Ok(())
+    }
+
+    /// Whether `.SUFFIXES` as the read stands disqualifies this name from
+    /// becoming the default goal.
+    fn suffixes_reject_default_goal(&self, name: &[u8]) -> bool {
+        suffixes_reject_default_goal(name, &self.declared_suffixes())
+    }
+
+    /// The suffixes `.SUFFIXES` names as the read stands right now.
+    ///
+    /// GNU Make reads `suffix_file->deps` at the moment each target is
+    /// recorded, so a `.SUFFIXES:` line below the rule has not happened yet and
+    /// one above it has. Replayed from the rules read so far rather than
+    /// tracked, because the shape of the answer is the shape of the replay: a
+    /// bare `.SUFFIXES:` clears the list and every other one adds to whatever
+    /// survived, so only the order they were read in can say what is on it.
+    ///
+    /// The same replay `DepBuilder::read_suffix_list` does once the read is
+    /// over. It cannot serve here — the default goal is chosen during the read,
+    /// and by the time dependency analysis settles the list the answer is long
+    /// since given.
+    fn declared_suffixes(&self) -> Vec<Bytes> {
+        let mut declared: Vec<Symbol> = Vec::new();
+        for rule in &self.rules {
+            if !rule.outputs.contains(&Symbol::SUFFIXES) {
+                continue;
+            }
+            if rule.inputs.is_empty() {
+                declared.clear();
+            } else {
+                declared.extend(&rule.inputs);
+            }
+        }
+        declared
+            .iter()
+            .map(|suffix| suffix.as_bytes(&self.session))
+            .collect()
     }
 
     pub fn eval_command(&mut self, stmt: &CommandStmt) -> Result<()> {
@@ -2771,10 +2811,63 @@ impl Evaluator {
     }
 }
 
+/// Whether a declared suffix disqualifies `name` from becoming the default
+/// goal.
+///
+/// GNU Make's `check_specials` passes over a target whose name is exactly a
+/// declared suffix, and one whose name is two of them joined — and then
+/// considers the next target rather than stopping.
+///
+/// The first test is guarded by the suffix not beginning with a dot and the
+/// second is not, which is what makes the built-in list matter. Every built-in
+/// suffix is dotted, so on its own the list can only reject a name that begins
+/// with a dot and was rejected a line earlier anyway; it earns its keep in
+/// company. `foo.c` under `.SUFFIXES: foo` is `foo` followed by the built-in
+/// `.c` and is passed over, and under `-r` — where there is no built-in list to
+/// join to — the same target is chosen.
+///
+/// Both loops range over the whole list, so a suffix joined to itself counts.
+fn suffixes_reject_default_goal(name: &[u8], suffixes: &[Bytes]) -> bool {
+    for suffix in suffixes {
+        if !suffix.starts_with(b".") && name == suffix.as_ref() {
+            return true;
+        }
+        for first in suffixes {
+            if name
+                .strip_prefix(first.as_ref())
+                .is_some_and(|rest| rest == suffix.as_ref())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::var::VarOrigin;
+
+    /// The asymmetry between the two tests is the whole of this rule, and it is
+    /// invisible in any makefile that does not declare an undotted suffix.
+    #[test]
+    fn a_declared_suffix_rejects_a_default_goal_of_its_own_name_only_undotted() {
+        let undotted = [Bytes::from_static(b"foo")];
+        assert!(suffixes_reject_default_goal(b"foo", &undotted));
+        let dotted = [Bytes::from_static(b".foo")];
+        assert!(!suffixes_reject_default_goal(b".foo", &dotted));
+        // The two-suffix test has no such guard, which is what lets a dotted
+        // built-in reject in company with an undotted declaration.
+        let mixed = [Bytes::from_static(b"foo"), Bytes::from_static(b".c")];
+        assert!(suffixes_reject_default_goal(b"foo.c", &mixed));
+        assert!(!suffixes_reject_default_goal(b"foo.c", &undotted));
+        // Both loops range over the whole list, so a suffix joins to itself.
+        assert!(suffixes_reject_default_goal(b"foofoo", &undotted));
+        // And a name that is neither is left alone.
+        assert!(!suffixes_reject_default_goal(b"zed", &mixed));
+        assert!(!suffixes_reject_default_goal(b"foobar", &undotted));
+    }
 
     #[test]
     fn target_variable_definition_uses_gnu_make_scanning_rules() {

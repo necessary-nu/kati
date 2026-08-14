@@ -73,6 +73,7 @@ const WELL_KNOWN: &[&[u8]] = &[
     b".RECIPEPREFIX",
     b".SHELLFLAGS",
     b".DEFAULT_GOAL",
+    b".SUFFIXES",
 ];
 
 /// Slot 0 is reserved and slots 1..=255 are the single-byte names.
@@ -109,6 +110,7 @@ impl Symbol {
     pub const RECIPEPREFIX: Symbol = Symbol::well_known(9);
     pub const SHELLFLAGS: Symbol = Symbol::well_known(10);
     pub const DEFAULT_GOAL: Symbol = Symbol::well_known(11);
+    pub const SUFFIXES: Symbol = Symbol::well_known(12);
 
     /// The bytes this handle was interned from, as borrowed from `names`.
     // [spec:ronin:req:make.no-ambient-state]
