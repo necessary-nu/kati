@@ -146,21 +146,6 @@ impl Rule {
             .map(|pattern| pattern.slice_ref(trim_leading_curdir(&pattern)))
             .collect::<Vec<_>>();
         for target_pattern in patterns {
-            let pat = Pattern::new(target_pattern.clone());
-            let unmatched = self
-                .outputs
-                .iter()
-                .filter(|t| !pat.matches(&t.as_bytes(&*session)))
-                .copied()
-                .collect::<Vec<_>>();
-            for target in unmatched {
-                warn_loc!(
-                    session,
-                    Some(&self.loc),
-                    "target `{}' doesn't match the target pattern",
-                    target.display(&*session)
-                );
-            }
             self.output_patterns.push(session.intern(target_pattern));
         }
 
@@ -170,11 +155,33 @@ impl Rule {
         if self.output_patterns.len() > 1 {
             error_loc!(session, Some(&self.loc), "*** multiple target patterns.");
         }
-        if !is_pattern_rule(&self.output_patterns.first().unwrap().as_bytes(&*session)) {
+        let target_pattern = *self.output_patterns.first().unwrap();
+        if !is_pattern_rule(&target_pattern.as_bytes(&*session)) {
             error_loc!(
                 session,
                 Some(&self.loc),
                 "*** target pattern contains no '%'."
+            );
+        }
+
+        // Whether a target matches is asked only once the rule itself is known
+        // to be well formed. GNU Make settles the target pattern while parsing
+        // the line and tests each target against it later, in `record_files`,
+        // so a rule that names two patterns dies on that alone rather than
+        // first complaining that neither of them matched anything.
+        let pat = Pattern::new(target_pattern.as_bytes(&*session));
+        let unmatched = self
+            .outputs
+            .iter()
+            .filter(|t| !pat.matches(&t.as_bytes(&*session)))
+            .copied()
+            .collect::<Vec<_>>();
+        for target in unmatched {
+            warn_loc!(
+                session,
+                Some(&self.loc),
+                "target `{}' doesn't match the target pattern",
+                target.display(&*session)
             );
         }
         if self.expand_again && memchr(b'$', &prereq_patterns).is_some() {

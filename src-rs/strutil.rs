@@ -243,7 +243,15 @@ impl Pattern {
     }
 
     fn match_impl(&self, str: &[u8], percent_index: usize) -> bool {
-        str.starts_with(&self.pat[..percent_index]) && str.ends_with(&self.pat[percent_index + 1..])
+        let suffix = &self.pat[percent_index + 1..];
+        // The two literal halves have to fit side by side without overlapping,
+        // which is the length test GNU Make's `pattern_matches` makes before it
+        // compares either half. Without it `a%a` claims to match `a` — both
+        // halves find the same byte — and the stem that reading leaves is
+        // shorter than nothing.
+        str.len() >= percent_index + suffix.len()
+            && str.starts_with(&self.pat[..percent_index])
+            && str.ends_with(suffix)
     }
 
     pub fn stem<'a>(&self, str: &'a [u8]) -> &'a [u8] {
@@ -251,7 +259,11 @@ impl Pattern {
             return &[];
         }
         if let Some(percent_index) = self.percent_index {
-            return &str[percent_index..(str.len() - self.pat.len() + 1 + percent_index)];
+            // A match leaves `str` at least as long as the pattern's literal
+            // halves, so the subtraction comes last: an empty stem — `.o` under
+            // `%.o` — is one byte shorter than the pattern and would take the
+            // length below zero if the pattern were taken off first.
+            return &str[percent_index..(str.len() + 1 + percent_index - self.pat.len())];
         }
         &[]
     }

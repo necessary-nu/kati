@@ -134,7 +134,16 @@ impl AutoCommandVar {
             AutoCommand::Star => {
                 if let Some(output_pattern) = &current_dep_node.output_pattern {
                     let pat = Pattern::new(output_pattern.as_bytes(names));
-                    out.put_slice(pat.stem(&current_dep_node.recipe_output.as_bytes(names)))
+                    // GNU Make sets the stem by substituting the target into a
+                    // bare `%` rather than by reading the match out, and the
+                    // two answers part company for a static pattern rule's
+                    // target that missed the pattern: substitution leaves a
+                    // name it could not match alone, so `$*` is the whole
+                    // target rather than the empty string a non-match reads as.
+                    out.put_slice(&pat.append_subst(
+                        &current_dep_node.recipe_output.as_bytes(names),
+                        &Bytes::from_static(b"%"),
+                    ));
                 }
             }
             AutoCommand::Question {

@@ -294,6 +294,24 @@ fn implicit_prerequisite_words(source: &Bytes) -> impl Iterator<Item = Bytes> + 
     })
 }
 
+/// Whether a rule's prerequisites reach `output` at all.
+///
+/// A static pattern rule records its prerequisites per target, and GNU Make
+/// records them only for the targets the target pattern matched: `record_files`
+/// reaches the copy under an `else` to the mismatch diagnostic, so a target
+/// that missed the pattern keeps the recipe and gets a stem but is left with an
+/// empty prerequisite chain. Deferred prerequisites are that same chain held
+/// back for `.SECONDEXPANSION:`, so they are dropped on the same terms.
+fn prerequisites_reach(session: &Session, r: &Rule, output: Symbol) -> bool {
+    if r.is_suffix_rule {
+        return true;
+    }
+    let Some(pattern) = r.output_patterns.first() else {
+        return true;
+    };
+    Pattern::new(pattern.as_bytes(session)).matches(&output.as_bytes(session))
+}
+
 fn apply_output_pattern(
     session: &mut Session,
     r: &Rule,
@@ -302,6 +320,9 @@ fn apply_output_pattern(
 ) -> Vec<Symbol> {
     let mut ret = Vec::new();
     if inputs.is_empty() {
+        return ret;
+    }
+    if !prerequisites_reach(session, r, output) {
         return ret;
     }
     if r.is_suffix_rule {
@@ -1750,11 +1771,16 @@ impl<'a> DepBuilder<'a> {
     /// read and before it reads what they declare, so a `.PHONY` written under
     /// `.SECONDEXPANSION` still declares something.
     fn declared_by(&mut self, target: Symbol, rule: &Rule) -> Result<Vec<Symbol>> {
-        let Some(text) = &rule.deferred_prerequisites.clone() else {
+        let Some(text) = rule
+            .deferred_prerequisites
+            .as_ref()
+            .filter(|_| prerequisites_reach(&self.ev.session, rule, target))
+            .cloned()
+        else {
             return Ok(Vec::new());
         };
         let (mut inputs, order_only) =
-            self.expand_prerequisites_again(target, None, (&[], &[]), text)?;
+            self.expand_prerequisites_again(target, None, (&[], &[]), &text)?;
         inputs.extend(order_only);
         Ok(inputs)
     }
@@ -2160,7 +2186,11 @@ impl<'a> DepBuilder<'a> {
         self.next_double_action_creation += 1;
         self.done.insert(graph_output, action.clone());
 
-        if let Some(text) = &rule.deferred_prerequisites {
+        if let Some(text) = rule
+            .deferred_prerequisites
+            .as_ref()
+            .filter(|_| prerequisites_reach(&self.ev.session, &rule, trigger))
+        {
             let trigger_text = trigger.as_bytes(&self.ev.session);
             let stem = self.stem_of(&rule, &trigger_text);
             let recorded = {
@@ -2904,7 +2934,10 @@ impl<'a> DepBuilder<'a> {
                 let deferred = merger
                     .rules
                     .iter()
-                    .filter(|rule| rule.deferred_prerequisites.is_some())
+                    .filter(|rule| {
+                        rule.deferred_prerequisites.is_some()
+                            && prerequisites_reach(&self.ev.session, rule, output)
+                    })
                     .map(|rule| {
                         (
                             rule.deferred_prerequisites.clone().unwrap(),
@@ -3009,7 +3042,11 @@ impl<'a> DepBuilder<'a> {
                 peer_output,
                 &rule.order_only_inputs,
             ));
-            if let Some(text) = &rule.deferred_prerequisites {
+            if let Some(text) = rule
+                .deferred_prerequisites
+                .as_ref()
+                .filter(|_| prerequisites_reach(&self.ev.session, &rule, peer_output))
+            {
                 let peer_text = peer_output.as_bytes(&self.ev.session);
                 let stem = self.stem_of(&rule, &peer_text);
                 let recorded = self.recorded_prerequisites(peer_output);
