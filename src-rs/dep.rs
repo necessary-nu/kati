@@ -3384,6 +3384,33 @@ impl<'a> DepBuilder<'a> {
             || self.ev.goals.contains(&name)
     }
 
+    /// The names a matched pattern rule's prerequisites stand for, with each
+    /// paired with whether it came from the pattern rather than being written
+    /// out in full.
+    ///
+    /// A prerequisite may hold shell wildcards, and GNU Make expands them here
+    /// rather than where the rule was read: `parse_file_seq` globs the
+    /// substituted name, so `%.t*` is looked up as `a.t*` and can stand for
+    /// several files at once. A pattern that matches nothing is kept as it was
+    /// written, which is what `GLOB_NOMATCH` falls through to when the search
+    /// has not asked for existing names only.
+    fn resolved_prerequisites(
+        &mut self,
+        prerequisites: &[Symbol],
+        matched_at: &PatternMatch,
+    ) -> Vec<(Symbol, bool)> {
+        let mut resolved = Vec::with_capacity(prerequisites.len());
+        for prerequisite in prerequisites {
+            let text = prerequisite.as_bytes(&self.ev.session);
+            let from_pattern = text.contains(&b'%');
+            let name = matched_at.prerequisite(&text);
+            let mut named = Vec::new();
+            glob_word(&mut self.ev.session, name, &mut named);
+            resolved.extend(named.into_iter().map(|name| (name, from_pattern)));
+        }
+        resolved
+    }
+
     fn can_pick_implicit_rule(
         &mut self,
         rule: &Arc<Rule>,
@@ -3403,16 +3430,7 @@ impl<'a> DepBuilder<'a> {
             // A deferred list is one string until it is expanded, so
             // which word the `%` was in is no longer knowable.
             Some((inputs, _)) => inputs.iter().map(|input| (*input, false)).collect(),
-            None => rule
-                .inputs
-                .iter()
-                .map(|input| {
-                    let text = input.as_bytes(&self.ev.session);
-                    let from_pattern = text.contains(&b'%');
-                    let buf = matched_at.prerequisite(&text);
-                    (self.ev.session.intern(buf), from_pattern)
-                })
-                .collect(),
+            None => self.resolved_prerequisites(&rule.inputs, &matched_at),
         };
         let resolved_inputs: Vec<Symbol> = inputs.iter().map(|(input, _)| *input).collect();
         let Some(invented) = self.while_rule_in_use(rule, |builder| {
@@ -3439,15 +3457,9 @@ impl<'a> DepBuilder<'a> {
                 rule.order_only_inputs = order_only_inputs;
             }
             None => {
+                let order_only = self.resolved_prerequisites(&rule.order_only_inputs, &matched_at);
                 rule.inputs = resolved_inputs;
-                rule.order_only_inputs = rule
-                    .order_only_inputs
-                    .iter()
-                    .map(|input| {
-                        let buf = matched_at.prerequisite(&input.as_bytes(&self.ev.session));
-                        self.ev.session.intern(buf)
-                    })
-                    .collect();
+                rule.order_only_inputs = order_only.into_iter().map(|(input, _)| input).collect();
             }
         }
         rule.prerequisites_are_resolved = true;
