@@ -592,6 +592,14 @@ fn shell_func_impl(
 ) -> Result<(i32, Bytes, Option<FindCommand>)> {
     log!("ShellFunc: {:?}", cmd);
 
+    // GNU Make bumps `command_count` when it reaps the child, which is before
+    // anything else can be expanded, so noting it here rather than after the
+    // command is the same moment as far as a makefile can tell. The find
+    // emulator returns without starting a child, and still counts: GNU ran a
+    // command there, and a `find` that wrote something through a `-exec` is
+    // not what the emulator claims to answer.
+    session.note_command_ran();
+
     if session.flags.use_find_emulator
         && let Some(fc) = crate::find::parse(session, cmd)?
         && let Some(out) = crate::find::find(session, cmd, &fc, loc)?
@@ -1238,6 +1246,11 @@ fn file_write_func(
             );
         }
     }
+
+    // A directory just gained a file, or one of its files changed. GNU Make
+    // counts the write as a command for this reason and nothing else — see
+    // `func_file`, which bumps `command_count` with a comment saying so.
+    ev.session.note_command_ran();
 
     if rerun && should_store_command_result(&ev.session, filename.as_bytes()) {
         let loc = ev.loc.clone().unwrap_or_default();

@@ -177,6 +177,9 @@ impl<'a> Executor<'a> {
                     &command.cmd,
                     RedirectStderr::Stdout,
                 )?;
+                // The command was waited for, so whatever it did to the
+                // filesystem is what the next recipe's expansion has to see.
+                self.ce.ev.session.note_command_ran();
                 print!("{}", String::from_utf8_lossy(&output));
                 if !status.success() {
                     if command.ignore_error {

@@ -122,27 +122,118 @@ pub fn run_command(
 
 pub type GlobResults = Arc<Result<Vec<Bytes>, std::io::Error>>;
 
-/// Glob results memoised for one session. Owned by [`crate::session::Session`].
-// [spec:ronin:req:make.no-ambient-state]
-pub type GlobCache = Mutex<HashMap<Bytes, GlobResults>>;
+/// One pattern's answers, and the epoch the latest of them was read in.
+struct GlobEntry {
+    /// The epoch [`GlobCache::current`] was read in. An entry read in an
+    /// earlier epoch has to be read again before it can be believed.
+    epoch: u64,
+    current: GlobResults,
+    /// What the pattern answered the first time the session asked it, kept for
+    /// the regeneration stamp: a check runs before any of the makefile's own
+    /// commands do, so the answer it can compare against is the one the read
+    /// started from rather than the one a command left behind.
+    first: GlobResults,
+}
 
-pub fn glob(cache: &GlobCache, pat: Bytes) -> GlobResults {
-    let mut cache = cache.lock();
-    if let Some(entry) = cache.get(&pat) {
-        return entry.clone();
-    }
-    let glob = Arc::new(
-        if pat.contains(&b'?') || pat.contains(&b'*') || pat.contains(&b'[') || pat.contains(&b'\\')
+/// Glob results memoised for one session. Owned by [`crate::session::Session`].
+///
+/// GNU Make caches directory contents the same way, in `dir.c`, and keeps that
+/// cache honest with a counter: `find_directory` believes what it read only
+/// while `command_count` still holds the value it read at, and every command
+/// Make runs bumps that counter. A makefile can only change the filesystem by
+/// running a command — `$(shell)`, `$(file >)`, or a recipe — so the cache is
+/// invisible to a makefile even though it saves the reads.
+///
+/// [`invalidate`](Self::invalidate) is that counter, and the epoch on an entry
+/// is the counter value it was read at.
+// [spec:ronin:req:make.no-ambient-state]
+#[derive(Default)]
+pub struct GlobCache {
+    inner: Mutex<GlobCacheInner>,
+}
+
+#[derive(Default)]
+struct GlobCacheInner {
+    epoch: u64,
+    entries: HashMap<Bytes, GlobEntry>,
+}
+
+impl GlobCache {
+    /// Glob `pat`, reading the filesystem only when nothing has run since the
+    /// last time this pattern was read.
+    pub fn glob(&self, pat: Bytes) -> GlobResults {
+        let mut inner = self.inner.lock();
+        let epoch = inner.epoch;
+        if let Some(entry) = inner.entries.get(&pat)
+            && entry.epoch == epoch
         {
-            libc_glob(&pat)
-        } else if let Err(err) = std::fs::metadata(<OsStr as OsStrExt>::from_bytes(&pat)) {
-            Err(err)
-        } else {
-            Ok(vec![pat.clone()])
-        },
-    );
-    cache.insert(pat, glob.clone());
-    glob
+            return entry.current.clone();
+        }
+        let glob = Arc::new(
+            if pat.contains(&b'?')
+                || pat.contains(&b'*')
+                || pat.contains(&b'[')
+                || pat.contains(&b'\\')
+            {
+                libc_glob(&pat)
+            } else if let Err(err) = std::fs::metadata(<OsStr as OsStrExt>::from_bytes(&pat)) {
+                Err(err)
+            } else {
+                Ok(vec![pat.clone()])
+            },
+        );
+        match inner.entries.get_mut(&pat) {
+            Some(entry) => {
+                entry.epoch = epoch;
+                entry.current = glob.clone();
+            }
+            None => {
+                inner.entries.insert(
+                    pat,
+                    GlobEntry {
+                        epoch,
+                        current: glob.clone(),
+                        first: glob.clone(),
+                    },
+                );
+            }
+        }
+        glob
+    }
+
+    /// Note that a command ran, so anything read before it is now hearsay.
+    ///
+    /// This is GNU Make's `++command_count`: the whole cache ages at once
+    /// rather than the one directory the command is guessed to have touched,
+    /// because a command can touch anything.
+    pub fn invalidate(&self) {
+        self.inner.lock().epoch += 1;
+    }
+
+    /// Forget everything, including what was recorded for the stamp.
+    pub fn clear(&self) {
+        let mut inner = self.inner.lock();
+        inner.entries.clear();
+        inner.epoch = 0;
+    }
+
+    /// Whether the session has globbed anything yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().entries.is_empty()
+    }
+
+    /// Every pattern the session globbed, with the answer it first gave, for
+    /// the regeneration stamp to check a later filesystem against.
+    #[must_use]
+    pub fn recorded(&self) -> Vec<(Bytes, GlobResults)> {
+        self.inner
+            .lock()
+            .entries
+            .iter()
+            .map(|(pat, entry)| (pat.clone(), entry.first.clone()))
+            .collect()
+    }
 }
 
 // Use libc glob over the `glob` crate, to maintain compatibility.
@@ -190,4 +281,114 @@ pub fn fnmatch(pattern: &CString, string: &[u8], flags: i32) -> bool {
     // SAFETY: This is a relatively simple C func, both CStrings are inputs
     // and only need to last through the function call.
     unsafe { libc::fnmatch(pattern.as_ptr(), string.as_ptr(), flags) == 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory of this test's own, so one test's files are never another's
+    /// glob results. Removed again when the test that made it ends. Named for
+    /// the test rather than counted, because a counter would be exactly the
+    /// process-wide mutable state this crate keeps on the session instead.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(test: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("kati-glob-cache-{}-{test}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("a scratch directory");
+            Self(path)
+        }
+
+        fn pattern(&self, of: &str) -> Bytes {
+            Bytes::from(self.0.join(of).into_os_string().into_encoded_bytes())
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn names(results: &GlobResults) -> Vec<Bytes> {
+        results
+            .as_ref()
+            .as_ref()
+            .expect("a readable directory")
+            .clone()
+    }
+
+    /// A pattern is answered from what was already read until something runs,
+    /// and read again once something has. GNU Make's `dir.c` is the same rule
+    /// against `command_count`, and it is what makes a `$(shell)` between two
+    /// wildcards enough for the second to find what the first could not.
+    #[test]
+    fn a_pattern_is_reread_only_after_a_command() {
+        let scratch = Scratch::new("reread-after-command");
+        let pattern = scratch.pattern("*.probe");
+        let cache = GlobCache::default();
+        assert!(names(&cache.glob(pattern.clone())).is_empty());
+
+        let made = scratch.0.join("made.probe");
+        std::fs::write(&made, "x").expect("writing the probe");
+        assert!(
+            names(&cache.glob(pattern.clone())).is_empty(),
+            "nothing has run, so what was read still stands"
+        );
+
+        cache.invalidate();
+        assert_eq!(
+            names(&cache.glob(pattern.clone())),
+            vec![scratch.pattern("made.probe")]
+        );
+
+        std::fs::remove_file(&made).expect("removing the probe");
+        cache.invalidate();
+        assert!(names(&cache.glob(pattern)).is_empty());
+    }
+
+    /// A name that is not a pattern ages the same way, so `$(wildcard f)` and
+    /// `$(wildcard *)` answer the same filesystem as each other.
+    #[test]
+    fn a_plain_name_is_reread_after_a_command_too() {
+        let scratch = Scratch::new("plain-name");
+        let name = scratch.pattern("named");
+        let cache = GlobCache::default();
+        assert!(cache.glob(name.clone()).is_err());
+
+        std::fs::write(scratch.0.join("named"), "x").expect("writing the file");
+        cache.invalidate();
+        assert_eq!(names(&cache.glob(name)), vec![scratch.pattern("named")]);
+    }
+
+    /// The regeneration stamp records the answer the read started from rather
+    /// than the one a command left behind, because the check that reads the
+    /// stamp back runs before any of the makefile's commands do.
+    #[test]
+    fn the_stamp_records_the_first_answer() {
+        let scratch = Scratch::new("first-answer");
+        let pattern = scratch.pattern("*.probe");
+        let cache = GlobCache::default();
+        assert!(cache.is_empty());
+        cache.glob(pattern.clone());
+        assert!(!cache.is_empty());
+
+        std::fs::write(scratch.0.join("made.probe"), "x").expect("writing the probe");
+        cache.invalidate();
+        assert_eq!(names(&cache.glob(pattern.clone())).len(), 1);
+
+        let recorded = cache.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, pattern);
+        assert!(
+            names(&recorded[0].1).is_empty(),
+            "the stamp keeps what the pattern answered before anything ran"
+        );
+
+        cache.clear();
+        assert!(cache.is_empty());
+    }
 }

@@ -224,13 +224,24 @@ impl Session {
         self.used_undefined_vars.insert(sym);
     }
 
-    /// Glob `pat`, memoising the result for the rest of the session.
+    /// Glob `pat`, memoising the result until something runs.
     pub fn glob(&self, pat: Bytes) -> GlobResults {
-        crate::fileutil::glob(&self.glob_cache, pat)
+        self.glob_cache.glob(pat)
+    }
+
+    /// Note that a command ran, so what the filesystem said before it did is
+    /// no longer what it says.
+    ///
+    /// GNU Make counts commands for exactly this — `dir.c` believes a
+    /// directory it read only while `command_count` is unchanged — and every
+    /// way a makefile has of changing the filesystem is a command, so calling
+    /// this wherever one runs is the whole of the coherence rule.
+    pub fn note_command_ran(&self) {
+        self.glob_cache.invalidate();
     }
 
     pub fn clear_glob_cache(&self) {
-        self.glob_cache.lock().clear();
+        self.glob_cache.clear();
     }
 
     /// The find emulator, built on first use.
@@ -330,7 +341,7 @@ mod tests {
         assert!(fresh.used_env_vars.is_empty());
         assert!(fresh.used_undefined_vars.is_empty());
         assert!(fresh.command_results.is_empty());
-        assert!(fresh.glob_cache.lock().is_empty());
+        assert!(fresh.glob_cache.is_empty());
         assert!(fresh.shell_status.is_none());
         assert!(fresh.peek_global_var(a_only).is_none());
     }

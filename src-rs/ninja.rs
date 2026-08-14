@@ -249,6 +249,11 @@ impl DeferredRecipes {
         let Some(recipe) = self.recipes.get(id) else {
             return Ok(None);
         };
+        // Every recipe that reached this one ran and was waited for, which in
+        // GNU Make is what ages the directory cache. Expanding a recipe is
+        // therefore the one place in a build where a `$(wildcard)` has to look
+        // again, and the reason it sees what the recipes before it made.
+        ev.session.note_command_ran();
         let mut ce = CommandEvaluator::new(
             ev,
             // The prerequisites are built and the timestamps on disk are the
@@ -1251,18 +1256,17 @@ impl<'a> NinjaGenerator<'a> {
                 dump_string(&mut out, value.as_bytes())?;
             }
 
-            let globs = self.ce.ev.session.glob_cache.lock();
-            let globs: Vec<(&Bytes, &crate::fileutil::GlobResults)> = globs
-                .iter()
-                .filter_map(|(key, files)| {
-                    if files.is_err() {
-                        return None;
-                    }
-                    Some((key, files))
-                })
+            let globs: Vec<(Bytes, crate::fileutil::GlobResults)> = self
+                .ce
+                .ev
+                .session
+                .glob_cache
+                .recorded()
+                .into_iter()
+                .filter(|(_, files)| files.is_ok())
                 .collect();
             dump_usize(&mut out, globs.len())?;
-            for (key, files) in globs.iter() {
+            for (key, files) in &globs {
                 dump_string(&mut out, key)?;
                 let Ok(files) = files.as_ref() else { continue };
                 dump_vec_string(&mut out, files)?;
