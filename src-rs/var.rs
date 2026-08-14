@@ -55,6 +55,43 @@ pub enum VarOrigin {
     Automatic,
 }
 
+/// What an `export` or `unexport` directive said about one variable.
+///
+/// GNU Make's `enum variable_export`, kept on the variable rather than in a
+/// side table because that is where its lifetime belongs: a target-specific
+/// binding carries its own answer, and reassigning a name the environment
+/// supplied leaves the attribute the import set.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
+pub enum VarExport {
+    /// No directive named it, so whether it is exported is decided by its
+    /// origin and by whether a bare `export` is in force.
+    #[default]
+    Default,
+    /// `export NAME` — always.
+    Export,
+    /// `unexport NAME` — never.
+    NoExport,
+}
+
+/// Whether a name can reach a child's environment without being named by an
+/// `export` directive.
+///
+/// GNU Make computes this once per variable: a leading letter or underscore,
+/// then letters, digits and underscores. A name that fails it is still
+/// exported when a directive names it outright — the filter exists to keep a
+/// bare `export` from putting a name no shell can read into every child.
+#[must_use]
+pub fn is_exportable_name(name: &[u8]) -> bool {
+    let Some((first, rest)) = name.split_first() else {
+        return false;
+    };
+    if *first != b'_' && !first.is_ascii_alphabetic() {
+        return false;
+    }
+    rest.iter()
+        .all(|byte| *byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
 pub fn get_origin_str(origin: VarOrigin) -> &'static str {
     match origin {
         VarOrigin::Default => "default",
@@ -82,6 +119,8 @@ pub struct Variable {
     /// `private`: reachable from the scope that defined it and from nothing
     /// that reaches that scope through a parent.
     pub is_private: bool,
+    /// What an `export` or `unexport` directive said about this binding.
+    pub export: VarExport,
     pub deprecated: Option<Arc<String>>,
     obsolete: Option<Arc<String>>,
 
@@ -399,6 +438,7 @@ impl Variable {
             assign_op: None,
             readonly: false,
             is_private: false,
+            export: VarExport::Default,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -419,6 +459,7 @@ impl Variable {
             assign_op: None,
             readonly: false,
             is_private: false,
+            export: VarExport::Default,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -441,6 +482,7 @@ impl Variable {
             assign_op: None,
             readonly: false,
             is_private: false,
+            export: VarExport::Default,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -462,6 +504,7 @@ impl Variable {
             assign_op: None,
             readonly: false,
             is_private: false,
+            export: VarExport::Default,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -477,6 +520,7 @@ impl Variable {
             assign_op: None,
             readonly: false,
             is_private: false,
+            export: VarExport::Default,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -492,6 +536,7 @@ impl Variable {
             assign_op: Some(AssignOp::ColonEq),
             readonly: true,
             is_private: false,
+            export: VarExport::Default,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -507,6 +552,7 @@ impl Variable {
             assign_op: Some(AssignOp::ColonEq),
             readonly: true,
             is_private: false,
+            export: VarExport::Default,
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
@@ -692,6 +738,7 @@ impl GlobalVars {
             if origin == VarOrigin::Automatic && assigning != VarOrigin::Automatic {
                 error!("overriding automatic variable is not implemented yet");
             }
+            carry_export_attribute(orig, &var);
         }
         *entry = Some(var);
         Ok(())
@@ -748,6 +795,22 @@ impl GlobalVars {
     }
 }
 
+/// Keep what an `export` or `unexport` directive said about a name that is
+/// being redefined.
+///
+/// GNU Make redefines a variable by overwriting its value, origin and flavour
+/// in place, and the export attribute is not among the fields it touches — so
+/// `export V` followed by `V = two` still exports, and so does an environment
+/// variable a makefile replaced. A redefinition that carries an answer of its
+/// own, as `unexport V = x` does, keeps that one.
+fn carry_export_attribute(previous: &Var, replacement: &Var) {
+    if replacement.read().export != VarExport::Default {
+        return;
+    }
+    let inherited = previous.read().export;
+    replacement.write().export = inherited;
+}
+
 pub struct Vars(pub Mutex<HashMap<Symbol, Var>>);
 
 impl Default for Vars {
@@ -800,6 +863,7 @@ impl Vars {
                 }
                 _ => {}
             }
+            carry_export_attribute(orig, &var);
             *orig = var;
         } else {
             vars.insert(sym, var);

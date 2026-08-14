@@ -59,10 +59,19 @@ pub fn get_timestamp(filename: &[u8]) -> Result<Option<SystemTime>> {
         .map_err(|err| crate::io_failure(Path::new(filename), &err))
 }
 
+/// Run one command and read back what it wrote.
+///
+/// `environment` is what Make's export set says about the child: a name bound
+/// to `Some` bytes is set, and one bound to `None` is removed from what this
+/// process would otherwise pass on. It is a delta rather than a whole
+/// environment because that is what Make computes — a variable the makefile
+/// never touched reaches the child as the bytes this process was started with,
+/// unexpanded.
 pub fn run_command(
     shell: &[u8],
     shellflag: &[u8],
     cmd: &Bytes,
+    environment: &[(Bytes, Option<Bytes>)],
     redirect_stderr: RedirectStderr,
 ) -> Result<(ExitStatus, Vec<u8>)> {
     let mut cmd_with_shell;
@@ -93,6 +102,13 @@ pub fn run_command(
 
     let mut cmd = Command::new(args[0]);
     cmd.args(&args[1..]);
+    for (name, value) in environment {
+        let name = <OsStr as OsStrExt>::from_bytes(name);
+        match value {
+            Some(value) => cmd.env(name, <OsStr as OsStrExt>::from_bytes(value)),
+            None => cmd.env_remove(name),
+        };
+    }
 
     let (mut reader, writer) = os_pipe::pipe()?;
     match redirect_stderr {

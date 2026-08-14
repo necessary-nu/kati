@@ -35,6 +35,7 @@ use crate::{
         trim_right_space, trim_space,
     },
     symtab::Symbol,
+    var::VarExport,
     warn_loc,
 };
 
@@ -629,12 +630,22 @@ impl<'a> Parser<'a> {
     }
 
     fn is_in_export(&self) -> bool {
-        self.current_directive.is_some_and(|d| d.export)
+        self.current_directive
+            .is_some_and(|d| d.export != VarExport::Default)
+    }
+
+    /// Whether the `export`/`unexport` word this line is nested inside was the
+    /// exporting one, so a `private` or `override` in between reaches the same
+    /// answer the outer word gave.
+    fn nested_export_polarity(&self) -> bool {
+        self.current_directive
+            .is_some_and(|d| d.export == VarExport::Export)
     }
 
     fn create_export(&mut self, line: &Bytes, is_export: bool) -> Result<()> {
         let loc = self.loc.clone();
         let mut mutable_loc = loc.clone();
+        let is_bare = trim_space(line).is_empty();
         let expr = parse_expr(
             self.session,
             &mut mutable_loc,
@@ -643,7 +654,7 @@ impl<'a> Parser<'a> {
         )?;
         self.out_stmts
             .lock()
-            .push(ExportStmt::new(loc, expr, is_export));
+            .push(ExportStmt::new(loc, expr, is_export, is_bare));
         Ok(())
     }
 
@@ -655,7 +666,8 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         if self.is_in_export() {
-            self.create_export(&line, true)?;
+            let polarity = self.nested_export_polarity();
+            self.create_export(&line, polarity)?;
         }
         self.parse_rule_or_assign(line)
     }
@@ -670,24 +682,45 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         if self.is_in_export() {
-            self.create_export(&line, true)?;
+            let polarity = self.nested_export_polarity();
+            self.create_export(&line, polarity)?;
         }
         self.parse_rule_or_assign(line)
     }
 
     fn parse_export(&mut self, line: Bytes) -> Result<()> {
+        self.parse_export_directive(line, true)
+    }
+
+    /// `export` and `unexport`, which differ only in the answer they record.
+    ///
+    /// GNU Make looks for a variable definition on the line before it looks
+    /// for a directive, so `unexport NAME = value` defines `NAME` and marks it
+    /// withheld exactly as `export NAME = value` defines and marks it. The
+    /// list-of-names directive is what is left when no definition is there.
+    fn parse_export_directive(&mut self, line: Bytes, is_export: bool) -> Result<()> {
         let mut current_directive = self.current_directive.unwrap_or_default();
-        current_directive.export = true;
+        current_directive.export = if is_export {
+            VarExport::Export
+        } else {
+            VarExport::NoExport
+        };
         self.current_directive = Some(current_directive);
         if self.handle_assign_directive(&line)? {
             return Ok(());
         }
-        self.create_export(&line, true)?;
+        // A definition carries the answer itself. Recording a directive for it
+        // too would name the variable before the definition runs, which GNU
+        // Make never does — and `export V ?= x` would then find `V` already
+        // defined and assign nothing.
+        if !is_variable_definition(&line) {
+            self.create_export(&line, is_export)?;
+        }
         self.parse_rule_or_assign(line)
     }
 
-    fn parse_unexport(&mut self, line: &Bytes) -> Result<()> {
-        self.create_export(line, false)
+    fn parse_unexport(&mut self, line: Bytes) -> Result<()> {
+        self.parse_export_directive(line, false)
     }
 
     /// `vpath pattern dirs`, `vpath pattern`, or bare `vpath`.
@@ -761,7 +794,7 @@ impl<'a> Parser<'a> {
             b"override" if !starts_assignment(&rest) => self.parse_override(rest)?,
             b"export" if !starts_assignment(&rest) => self.parse_export(rest)?,
             b"private" if !starts_assignment(&rest) => self.parse_private(rest)?,
-            b"unexport" => self.parse_unexport(&rest)?,
+            b"unexport" => self.parse_unexport(rest)?,
             b"undefine" if !starts_assignment(&rest) => self.parse_undefine(rest)?,
             b"vpath" => self.parse_vpath(rest)?,
             _ => return Ok(false),
@@ -836,6 +869,31 @@ fn parse_buf_no_stats_impl(
 
 /// Whether an assignment operator comes first, which makes the word before it a
 /// variable name rather than a directive: `undefine = x` defines `undefine`.
+/// Whether this line defines a variable, which is what GNU Make asks before it
+/// asks whether the line is a directive.
+///
+/// The same question [`Parser::parse_rule_or_assign`] answers by dispatching,
+/// asked without dispatching, so a caller can tell which of the two a line
+/// carrying an `export` word in front of it turned out to be.
+fn is_variable_definition(line: &[u8]) -> bool {
+    let Some(sep) = find_outside_paren(line, b":=;") else {
+        return false;
+    };
+    let rest = &line[sep..];
+    let name_end = if rest.starts_with(b"=") {
+        sep
+    } else if rest.starts_with(b":") {
+        let colons = rest.iter().take_while(|byte| **byte == b':').count();
+        if !(1..=3).contains(&colons) || rest.get(colons) != Some(&b'=') {
+            return false;
+        }
+        sep + colons
+    } else {
+        return false;
+    };
+    name_end == 0 || is_variable_name(parse_assign_statement(line, name_end).lhs)
+}
+
 fn starts_assignment(rest: &[u8]) -> bool {
     [b"=".as_slice(), b":=", b"::=", b":::=", b"+=", b"?=", b"!="]
         .iter()
@@ -868,17 +926,16 @@ pub(crate) fn is_variable_name(name: &[u8]) -> bool {
 ///
 /// The last word is the name however it is spelled, so `a: private = 1` assigns
 /// to `private` rather than declaring one. `export`, `unexport` and `override`
-/// are keywords in this position too and are taken off the name; what they mean
-/// for a target-specific variable is not this.
+/// are keywords in this position too and are taken off the name.
 pub fn take_assign_modifiers(name: &[u8]) -> (&[u8], AssignModifiers) {
     let mut name = name;
     let mut modifiers = AssignModifiers::default();
     while let Some(end) = memchr2(b' ', b'\t', name) {
         match &name[..end] {
             b"private" => modifiers.directive.is_private = true,
-            b"export" => modifiers.directive.export = true,
+            b"export" => modifiers.directive.export = VarExport::Export,
             b"override" => modifiers.directive.is_override = true,
-            b"unexport" => {}
+            b"unexport" => modifiers.directive.export = VarExport::NoExport,
             _ => break,
         }
         modifiers.words += 1;

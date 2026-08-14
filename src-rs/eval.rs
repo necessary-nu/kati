@@ -45,7 +45,7 @@ use crate::strutil::{
     trim_leading_curdir, trim_left_space, trim_right_space, word_scanner,
 };
 use crate::symtab::{Interner, Symbol, Symtab};
-use crate::var::{Var, VarOrigin, Variable, Vars};
+use crate::var::{Var, VarExport, VarOrigin, Variable, Vars};
 use crate::{collect_stats_with_slow_report, error_loc, log, warn_loc};
 
 pub enum RulesAllowed {
@@ -460,9 +460,9 @@ fn scan_rule_assignment(text: &[u8]) -> Option<ScannedRuleAssignment> {
             .map_or(text.len(), |end| at + end);
         match &text[at..end] {
             b"private" => modifiers.directive.is_private = true,
-            b"export" => modifiers.directive.export = true,
+            b"export" => modifiers.directive.export = VarExport::Export,
             b"override" => modifiers.directive.is_override = true,
-            b"unexport" => {}
+            b"unexport" => modifiers.directive.export = VarExport::NoExport,
             _ => return None,
         }
         modifiers.words += 1;
@@ -777,7 +777,6 @@ pub struct Evaluator {
     /// wins is decided by which was written first; a `HashMap` alone cannot say.
     pub pattern_rule_var_order: Vec<Symbol>,
     pub rules: Vec<Rule>,
-    pub exports: HashMap<Symbol, bool>,
     symbols_for_eval: HashSet<Symbol>,
 
     rule_state: RuleState,
@@ -786,6 +785,18 @@ pub struct Evaluator {
     /// property of the Makefile.
     second_expansion: bool,
     pub current_scope: Option<Arc<Vars>>,
+    /// How many `$(shell)` environments are being built right now.
+    ///
+    /// GNU Make's `env_recursion`. An exported variable whose value contains a
+    /// `$(shell)` asks for its own value to answer the call that produces it,
+    /// because answering the call means building an environment and the
+    /// variable is in it. While this is nonzero that circle is broken rather
+    /// than reported.
+    environment_recursion: usize,
+    /// Names whose expansion was answered from the invocation's environment
+    /// instead of being entered, innermost last, so finishing one does not
+    /// clear the guard belonging to the expansion it was nested inside.
+    environment_substituted: Vec<Symbol>,
 
     pub loc: Option<Loc>,
     is_bootstrap: bool,
@@ -946,7 +957,6 @@ impl Evaluator {
             rule_vars: HashMap::new(),
             pattern_rule_var_order: Vec::new(),
             rules: Vec::new(),
-            exports: HashMap::new(),
             symbols_for_eval: HashSet::new(),
 
             rule_state: RuleState::None,
@@ -976,6 +986,8 @@ impl Evaluator {
 
             is_posix: false,
 
+            environment_recursion: 0,
+            environment_substituted: Vec::new(),
             export_allowed: ExportAllowed::Allowed,
 
             profiled_files: Vec::new(),
@@ -1326,6 +1338,15 @@ impl Evaluator {
 
         if is_private {
             var.write().is_private = true;
+        }
+        // `export NAME = value` and `unexport NAME = value` are one definition
+        // carrying one answer, which is why the answer lands on the variable
+        // the definition produced rather than on the name.
+        if let Some(directive) = stmt.directive
+            && directive.export != VarExport::Default
+        {
+            var.write().export = directive.export;
+            self.check_export_allowed(lhs, directive.export == VarExport::Export)?;
         }
         if stmt.is_final {
             var.write().readonly = true
@@ -1715,6 +1736,12 @@ impl Evaluator {
                 }
                 if modifiers.directive.is_private {
                     rhs_var.write().is_private = true;
+                }
+                // A target-specific `export` reaches this target's recipe and
+                // every recipe that reaches it as a prerequisite, because the
+                // binding it marks is the one those scopes inherit.
+                if modifiers.directive.export != VarExport::Default {
+                    rhs_var.write().export = modifiers.directive.export;
                 }
                 if assignment.is_final {
                     rhs_var.write().readonly = true;
@@ -2230,6 +2257,15 @@ impl Evaluator {
         self.loc = Some(stmt.loc());
         self.rule_state = RuleState::None;
 
+        // A directive that named nothing speaks for every variable. GNU Make
+        // writes the same flag `.EXPORT_ALL_VARIABLES` writes, and writes it
+        // here while the makefile is being read, so the last bare directive
+        // wins over the ones before it — and the target, read after the whole
+        // makefile is, wins over all of them.
+        if stmt.is_bare {
+            self.session.flags.export_all_variables = stmt.is_export;
+            return Ok(());
+        }
         let exports = stmt.expr.eval_to_buf(self)?;
         for tok in word_scanner(&exports) {
             let equal_index = memchr(b'=', tok);
@@ -2247,26 +2283,58 @@ impl Evaluator {
                 lhs = tok;
             }
             let sym = self.session.intern(exports.slice_ref(lhs));
-            self.exports.insert(sym, stmt.is_export);
-
-            let prefix = if stmt.is_export { "" } else { "un" };
-            match &self.export_allowed {
-                ExportAllowed::Allowed => {}
-                ExportAllowed::Error(msg) => error_loc!(
-                    self,
-                    self.loc.as_ref(),
-                    "*** {}: {prefix}export is obsolete{msg}.",
-                    sym.display(self)
-                ),
-                ExportAllowed::Warning(msg) => warn_loc!(
-                    self,
-                    self.loc.as_ref(),
-                    "{}: {prefix}export has been deprecated{msg}.",
-                    sym.display(self)
-                ),
-            }
+            self.mark_exported(sym, stmt.is_export)?;
+            self.check_export_allowed(sym, stmt.is_export)?;
         }
         Ok(())
+    }
+
+    /// Report an `export` a `$(KATI_deprecate_export)` or
+    /// `$(KATI_obsolete_export)` earlier in the read asked to hear about.
+    ///
+    /// Every way of saying it is one of these, so this is asked wherever the
+    /// attribute is set rather than only where the directive spells out a list
+    /// of names — `export NAME := value` is an export like any other.
+    fn check_export_allowed(&mut self, name: Symbol, is_export: bool) -> Result<()> {
+        let prefix = if is_export { "" } else { "un" };
+        match &self.export_allowed {
+            ExportAllowed::Allowed => {}
+            ExportAllowed::Error(msg) => error_loc!(
+                self,
+                self.loc.as_ref(),
+                "*** {}: {prefix}export is obsolete{msg}.",
+                name.display(self)
+            ),
+            ExportAllowed::Warning(msg) => warn_loc!(
+                self,
+                self.loc.as_ref(),
+                "{}: {prefix}export has been deprecated{msg}.",
+                name.display(self)
+            ),
+        }
+        Ok(())
+    }
+
+    /// Record what an `export NAME` or `unexport NAME` directive said.
+    ///
+    /// GNU Make looks the name up and, finding nothing, defines it as an empty
+    /// file-origin variable so there is something to hang the answer on. That
+    /// is observable through `$(origin)`, so it happens here too.
+    fn mark_exported(&mut self, name: Symbol, is_export: bool) -> Result<()> {
+        let attribute = if is_export {
+            VarExport::Export
+        } else {
+            VarExport::NoExport
+        };
+        if let Some(var) = self.session.peek_global_var(name) {
+            var.write().export = attribute;
+            return Ok(());
+        }
+        let frame = Some(self.current_frame());
+        let var =
+            Variable::with_simple_string(Bytes::new(), VarOrigin::File, frame, self.loc.clone());
+        var.write().export = attribute;
+        self.session.set_global_var(name, var, false, None)
     }
 
     pub fn lookup_var_global(&mut self, name: Symbol) -> Option<Var> {
@@ -2352,6 +2420,15 @@ impl Evaluator {
     pub fn lookup_var_for_eval(&mut self, name: Symbol) -> Result<Option<Var>> {
         if let Some(var) = self.lookup_var(name)? {
             if self.symbols_for_eval.contains(&name) {
+                // A variable waiting on itself is an error, except while a
+                // `$(shell)`'s environment is being built: there it is what an
+                // exported variable holding a `$(shell)` unavoidably does, and
+                // GNU Make answers it with the bytes the invocation carried
+                // rather than refusing the makefile.
+                if self.environment_recursion > 0 {
+                    self.environment_substituted.push(name);
+                    return Ok(Some(self.inherited_binding(name)));
+                }
                 let loc = var.read().loc().clone();
                 error_loc!(
                     self,
@@ -2367,7 +2444,61 @@ impl Evaluator {
     }
 
     pub fn var_eval_complete(&mut self, name: Symbol) {
+        if let Some(position) = self
+            .environment_substituted
+            .iter()
+            .rposition(|substituted| *substituted == name)
+        {
+            self.environment_substituted.remove(position);
+            return;
+        }
         self.symbols_for_eval.remove(&name);
+    }
+
+    /// What this name held in the environment the invocation was started with,
+    /// as a binding an expansion can read.
+    fn inherited_binding(&mut self, name: Symbol) -> Var {
+        let inherited = crate::export::invocation_value(self, &name.as_bytes(&self.session))
+            .map(Bytes::from)
+            .unwrap_or_default();
+        Variable::with_simple_string(inherited, VarOrigin::Environment, None, None)
+    }
+
+    /// Expand one exported variable's value for a child's environment, under
+    /// GNU Make's `env_recursion` guard when the child is a `$(shell)`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever expanding the value rejects.
+    pub(crate) fn expand_for_environment(
+        &mut self,
+        name: Symbol,
+        var: &Var,
+        guarded: bool,
+    ) -> Result<Bytes> {
+        if guarded && self.symbols_for_eval.contains(&name) {
+            return Ok(self
+                .inherited_binding(name)
+                .read()
+                .string(&self.session)?
+                .into_owned()
+                .into());
+        }
+        let entered = self.symbols_for_eval.insert(name);
+        if guarded {
+            self.environment_recursion += 1;
+        }
+        let value = var
+            .read()
+            .eval_to_buf_mut(self)
+            .map(bytes::BytesMut::freeze);
+        if guarded {
+            self.environment_recursion -= 1;
+        }
+        if entered {
+            self.symbols_for_eval.remove(&name);
+        }
+        value
     }
 
     pub fn lookup_var(&mut self, name: Symbol) -> Result<Option<Var>> {
@@ -2626,7 +2757,7 @@ mod tests {
         );
         assert_eq!(assignment.modifiers.words, 3);
         assert!(assignment.modifiers.directive.is_private);
-        assert!(assignment.modifiers.directive.export);
+        assert_eq!(assignment.modifiers.directive.export, VarExport::Export);
         assert!(assignment.modifiers.directive.is_override);
 
         let assignment = scan_rule_assignment(b"private = value").unwrap();

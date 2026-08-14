@@ -53,7 +53,10 @@ pub enum AssignOp {
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct AssignDirective {
     pub is_override: bool,
-    pub export: bool,
+    /// What an `export` or `unexport` word in front of the name said, which
+    /// GNU Make reads as a modifier of the definition rather than as a
+    /// directive of its own.
+    pub export: crate::var::VarExport,
     /// `private`: the variable is defined, and withheld from every scope that
     /// reaches this one through a parent.
     pub is_private: bool,
@@ -328,6 +331,13 @@ pub struct ExportStmt {
 
     pub expr: Arc<Value>,
     pub is_export: bool,
+    /// The directive named nothing at all, so it speaks for every variable
+    /// rather than for a list of them.
+    ///
+    /// Read from the line as written, before any expansion: GNU Make decides
+    /// this on the unexpanded text, so `export $(EMPTY)` names an empty list —
+    /// and exports nothing — where a bare `export` exports everything.
+    pub is_bare: bool,
 }
 
 impl Statement for ExportStmt {
@@ -353,12 +363,13 @@ impl Debug for ExportStmt {
 }
 
 impl ExportStmt {
-    pub fn new(loc: Loc, expr: Arc<Value>, is_export: bool) -> Arc<ExportStmt> {
+    pub fn new(loc: Loc, expr: Arc<Value>, is_export: bool, is_bare: bool) -> Arc<ExportStmt> {
         Arc::new(ExportStmt {
             loc,
             orig: Bytes::new(),
             expr,
             is_export,
+            is_bare,
         })
     }
 }

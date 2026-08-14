@@ -52,6 +52,7 @@ pub mod dep;
 pub mod eval;
 pub mod evaluate;
 pub mod exec;
+pub mod export;
 pub mod expr;
 pub mod file;
 pub mod file_cache;

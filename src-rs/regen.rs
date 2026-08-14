@@ -428,6 +428,10 @@ impl StampChecker {
             sr.shell.as_bytes(),
             sr.shellflag.as_bytes(),
             &cmd,
+            // Replaying a recorded `$(shell)` to see whether it still answers
+            // the same thing happens without an evaluation to ask for a scope,
+            // in the environment this check was started in.
+            &[],
             crate::fileutil::RedirectStderr::DevNull,
         )?;
         let output = format_for_command_substitution(output);

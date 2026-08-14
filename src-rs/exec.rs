@@ -175,6 +175,9 @@ impl<'a> Executor<'a> {
                     &self.shell,
                     &command.shell_flag,
                     &command.cmd,
+                    // This executor applied the exported set to its own
+                    // environment before the first recipe started.
+                    &[],
                     RedirectStderr::Stdout,
                 )?;
                 // The command was waited for, so whatever it did to the

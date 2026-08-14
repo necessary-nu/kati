@@ -587,6 +587,7 @@ fn shell_func_impl(
     shell: &[u8],
     shellflag: &[u8],
     cmd: &Bytes,
+    environment: &[(Bytes, Option<Bytes>)],
     loc: &Loc,
     trailing: Trailing,
 ) -> Result<(i32, Bytes, Option<FindCommand>)> {
@@ -608,7 +609,7 @@ fn shell_func_impl(
     }
 
     collect_stats_with_slow_report!(session, "func shell time", OsStr::from_bytes(cmd));
-    let (status, output) = run_command(shell, shellflag, cmd, RedirectStderr::None)?;
+    let (status, output) = run_command(shell, shellflag, cmd, environment, RedirectStderr::None)?;
     let output = Bytes::from(match trailing {
         Trailing::Drop => format_for_command_substitution(output),
         Trailing::Fold => format_for_shell_assignment(output),
@@ -742,9 +743,26 @@ fn shell_func_with(
     // GNU Make passes no command flags here (`func_shell` hands
     // `construct_command_argv` a zero), so `.POSIX:` keeps its `-e`.
     let shellflag = ev.get_shell_flag(false)?;
+    let current_scope = ev.current_scope.clone();
 
-    let (exit_code, output, fc) =
-        shell_func_impl(&ev.session, &shell, &shellflag, &cmd, &loc, trailing)?;
+    // GNU Make's `func_shell` builds the child's environment with
+    // `target_environment (NULL, 0)`, whose NULL means the variable sets that
+    // are current here rather than none at all — so a recipe-time `$(shell)`
+    // sees that target's exports and a read-time one sees the globals.
+    let environment = crate::export::exported_environment(
+        ev,
+        current_scope.as_deref(),
+        crate::export::ChildKind::Expansion,
+    )?;
+    let (exit_code, output, fc) = shell_func_impl(
+        &ev.session,
+        &shell,
+        &shellflag,
+        &cmd,
+        &environment,
+        &loc,
+        trailing,
+    )?;
     out.put_slice(&output);
     if should_store_command_result(&ev.session, &cmd) {
         ev.session.command_results.push(CommandResult {
@@ -788,9 +806,22 @@ fn shell_no_rerun_func(
     // GNU Make passes no command flags here (`func_shell` hands
     // `construct_command_argv` a zero), so `.POSIX:` keeps its `-e`.
     let shellflag = ev.get_shell_flag(false)?;
+    let current_scope = ev.current_scope.clone();
 
-    let (exit_code, output, _) =
-        shell_func_impl(&ev.session, &shell, &shellflag, &cmd, &loc, Trailing::Drop)?;
+    let environment = crate::export::exported_environment(
+        ev,
+        current_scope.as_deref(),
+        crate::export::ChildKind::Expansion,
+    )?;
+    let (exit_code, output, _) = shell_func_impl(
+        &ev.session,
+        &shell,
+        &shellflag,
+        &cmd,
+        &environment,
+        &loc,
+        Trailing::Drop,
+    )?;
     out.put_slice(&output);
     ev.session.shell_status = Some(exit_code);
     Ok(())

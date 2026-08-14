@@ -180,6 +180,16 @@ pub struct SinkRule<'a> {
     /// Empty when [`Self::deferred_recipe`] names one: there is no text yet,
     /// because the recipe it comes from has not been expanded.
     pub command: SinkCommand<'a>,
+    /// What this target's own scope changes about the environment its recipe
+    /// runs in, over the export set the whole compilation unit agreed on.
+    ///
+    /// A name bound to `Some` bytes is set and one bound to `None` is removed.
+    /// Empty for all but a target carrying an `export` of its own, which is
+    /// why a sink may treat it as the exception rather than the rule.
+    ///
+    /// Absent when [`Self::deferred_recipe`] names one: the scope is read as
+    /// the recipe is expanded, and arrives with it.
+    pub recipe_environment: &'a [crate::export::EnvironmentChange],
     /// The recipe this rule will run, still unexpanded, for a sink that asked
     /// for [`RecipeExpansion::Launch`].
     ///

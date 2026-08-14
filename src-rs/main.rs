@@ -39,7 +39,6 @@ use kati::regen::needs_regen;
 use kati::regen_dump::stamp_dump_main;
 
 use kati::eval::FrameType;
-use kati::expr::Evaluable;
 use kati::loc::Loc;
 
 use kati::session::Session;
@@ -95,31 +94,30 @@ fn run(session: Session, orig_args: OsString) -> Result<i32> {
         return Ok(0);
     }
 
-    for (name, export) in ev.exports.clone() {
-        if export {
-            let value = if let Some(v) = ev.lookup_var(name)? {
-                v.read().eval_to_buf(&mut ev)?
-            } else {
-                Bytes::new()
-            };
-            log!(
-                "setenv({}, {})",
-                name.display(&ev.session),
-                String::from_utf8_lossy(&value)
-            );
-            let name_bytes = name.as_bytes(&ev.session);
-            // SAFETY: we're single threaded here. If that changes, we could pass the
-            // expected environment to the children explicitly.
-            unsafe {
-                std::env::set_var(OsStr::from_bytes(&name_bytes), OsStr::from_bytes(&value));
+    // This executor runs recipes as children of this process, so the exported
+    // set is applied to this process's own environment once, before any of them
+    // starts. Target-specific exports belong to a scope this loop does not
+    // have; the graph sinks that can express one carry it per edge instead.
+    for (name, value) in
+        kati::export::exported_environment(&mut ev, None, kati::export::ChildKind::Recipe)?
+    {
+        let name = OsStr::from_bytes(&name);
+        match value {
+            Some(value) => {
+                log!("setenv({name:?}, {})", String::from_utf8_lossy(&value));
+                // SAFETY: we're single threaded here. If that changes, we could pass the
+                // expected environment to the children explicitly.
+                unsafe {
+                    std::env::set_var(name, OsStr::from_bytes(&value));
+                }
             }
-        } else {
-            log!("unsetenv({})", name.display(&ev.session));
-            let name_bytes = name.as_bytes(&ev.session);
-            // SAFETY: we're single threaded here. If that changes, we could pass the
-            // expected environment to the children explicitly.
-            unsafe {
-                std::env::remove_var(OsStr::from_bytes(&name_bytes));
+            None => {
+                log!("unsetenv({name:?})");
+                // SAFETY: we're single threaded here. If that changes, we could pass the
+                // expected environment to the children explicitly.
+                unsafe {
+                    std::env::remove_var(name);
+                }
             }
         }
     }

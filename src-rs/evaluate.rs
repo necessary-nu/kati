@@ -43,7 +43,7 @@ use crate::session::Session;
 use crate::stmt::Stmt;
 use crate::symtab::{Symbol, join_symbols};
 use crate::timeutil::ScopedTimeReporter;
-use crate::var::{VarOrigin, Variable};
+use crate::var::{VarExport, VarOrigin, Variable};
 use crate::{error_loc, log};
 
 /// The GNU Make features this evaluator actually has, in `.FEATURES`' spelling.
@@ -186,12 +186,20 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
         let val = Arc::new(Value::Literal(None, v.clone()));
         let frame = ev.current_frame();
         let sym = ev.session.intern(k.as_bytes().to_vec());
-        ev.session.set_global_var(
-            sym,
-            Variable::new_recursive(val, origin, Some(frame), None, v),
-            false,
-            None,
-        )?;
+        let var = Variable::new_recursive(val, origin, Some(frame), None, v);
+        // Everything culled from the environment is exported by default, and
+        // GNU Make records that on the variable rather than deriving it from
+        // the origin — which is why a makefile that replaces the name keeps
+        // handing it to its children, and why `SHELL` never is: POSIX says a
+        // makefile's SHELL must not change the one subprocesses are given, so
+        // the import marks it withheld and the invocation's own value is what
+        // reaches them.
+        var.write().export = if k.as_bytes() == b"SHELL" {
+            VarExport::NoExport
+        } else {
+            VarExport::Export
+        };
+        ev.session.set_global_var(sym, var, false, None)?;
     }
     Ok(())
 }
