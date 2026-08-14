@@ -312,6 +312,40 @@ fn prerequisites_reach(session: &Session, r: &Rule, output: Symbol) -> bool {
     Pattern::new(pattern.as_bytes(session)).matches(&output.as_bytes(session))
 }
 
+/// The directories a search path names.
+///
+/// A search path is a list of directories rather than of strings, so a lone `.`
+/// says nothing and a trailing slash is not part of a directory's name — GNU
+/// Make's `construct_vpath_list` drops both, and `gpath_search` then compares
+/// what is left byte for byte against the directory a name was found in.
+fn search_path(value: &Bytes) -> Vec<Bytes> {
+    crate::strutil::word_scanner(value)
+        .flat_map(|word| word.split(|byte| *byte == b':'))
+        .filter(|directory| !directory.is_empty())
+        .map(|directory| {
+            let mut directory = value.slice_ref(directory);
+            if directory.len() > 1 && directory.ends_with(b"/") {
+                directory.truncate(directory.len() - 1);
+            }
+            directory
+        })
+        .filter(|directory| directory.as_ref() != b".")
+        .collect()
+}
+
+/// The directory a search joined to `name` to arrive at `found`.
+///
+/// Measured off the end rather than by looking for the last slash in the found
+/// path, which is how GNU Make measures it: what a search path is asked about
+/// is the entry it looked in, so a name carrying a directory of its own is
+/// answered by that entry alone and not by the whole prefix the join produced.
+fn search_directory<'a>(found: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    found
+        .len()
+        .checked_sub(name.len() + 1)
+        .map(|end| &found[..end])
+}
+
 fn apply_output_pattern(
     session: &mut Session,
     r: &Rule,
@@ -849,6 +883,22 @@ struct DepBuilder<'a> {
     depfile_var_name: Symbol,
     /// `VPATH`, the variable form of the directory search.
     vpath_var_name: Symbol,
+    /// `GPATH`, which says that a directory the search looks in is also a
+    /// directory a target found there is remade in.
+    gpath_var_name: Symbol,
+    /// The directories `GPATH` names, as GNU Make's `construct_vpath_list`
+    /// leaves them.
+    ///
+    /// Read once, when the whole read has finished, because that is when
+    /// `build_vpath_lists` reads them and nothing after it can change them.
+    gpaths: Vec<Bytes>,
+    /// The name a target renamed into its `GPATH` directory was written as.
+    ///
+    /// GNU Make's `rename_file` moves the file object rather than copying a
+    /// string, so the rule the Makefile declared for the written name goes on
+    /// making the found path. Kati keys rules by name, so the found path needs
+    /// a way back to the name that carries its rule.
+    gpath_origin: HashMap<Symbol, Symbol>,
     implicit_outputs_var_name: Symbol,
     ninja_pool_var_name: Symbol,
     validations_var_name: Symbol,
@@ -877,6 +927,7 @@ impl<'a> DepBuilder<'a> {
         pattern_var_order.sort_by_key(|(_, pattern)| pattern.as_bytes().len());
         let depfile_var_name = ev.session.intern(".KATI_DEPFILE");
         let vpath_var_name = ev.session.intern("VPATH");
+        let gpath_var_name = ev.session.intern("GPATH");
         let implicit_outputs_var_name = ev.session.intern(".KATI_IMPLICIT_OUTPUTS");
         let ninja_pool_var_name = ev.session.intern(".KATI_NINJA_POOL");
         let validations_var_name = ev.session.intern(".KATI_VALIDATIONS");
@@ -923,6 +974,9 @@ impl<'a> DepBuilder<'a> {
             precious_patterns: HashSet::new(),
             depfile_var_name,
             vpath_var_name,
+            gpath_var_name,
+            gpaths: Vec::new(),
+            gpath_origin: HashMap::new(),
             implicit_outputs_var_name,
             ninja_pool_var_name,
             validations_var_name,
@@ -937,8 +991,24 @@ impl<'a> DepBuilder<'a> {
         }
 
         ret.handle_special_targets()?;
+        ret.gpaths = ret.gpath_directories()?;
 
         Ok(ret)
+    }
+
+    /// The directories `GPATH` names.
+    ///
+    /// GNU Make expands `$(strip $(GPATH))` once the read has finished, which
+    /// is where this is read, and parses the answer as a search path.
+    fn gpath_directories(&mut self) -> Result<Vec<Bytes>> {
+        Ok(search_path(&self.ev.eval_var(self.gpath_var_name)?))
+    }
+
+    /// Whether `GPATH` names the directory the search found `found` in.
+    fn gpath_holds(&self, found: &[u8], name: &[u8]) -> bool {
+        !self.gpaths.is_empty()
+            && search_directory(found, name)
+                .is_some_and(|directory| self.gpaths.iter().any(|gpath| gpath == directory))
     }
 
     fn handle_special_targets(&mut self) -> Result<()> {
@@ -1333,6 +1403,14 @@ impl<'a> DepBuilder<'a> {
 
         // TODO: LogStats?
 
+        // A goal is a file like any other, so `GPATH` reaches it too: one found
+        // in a directory `GPATH` names is asked for, and remade, under the path
+        // the search returned. The goals are what the graph is aimed at, so the
+        // rename has to reach them before they are read as that.
+        let targets = targets
+            .into_iter()
+            .map(|target| self.at_gpath(target))
+            .collect::<Vec<_>>();
         self.ev.goals.clone_from(&targets);
         let mut nodes = Vec::new();
         for target in targets {
@@ -1701,30 +1779,69 @@ impl<'a> DepBuilder<'a> {
     /// Resolved first and interned after, because finding the file needs the
     /// session to read and naming the result needs it to write.
     fn at_vpaths(&mut self, inputs: Vec<Symbol>) -> Vec<Symbol> {
-        let mut resolved = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            match self.at_vpath(input) {
-                Some(found) => resolved.push(self.ev.session.intern(found)),
-                None => resolved.push(input),
-            }
-        }
-        resolved
+        inputs
+            .into_iter()
+            .map(|input| self.at_found_name(input))
+            .collect()
     }
 
-    /// Where one prerequisite was found, if it had to be looked for.
+    /// One name, replaced by where the directory search found it.
+    fn at_found_name(&mut self, name: Symbol) -> Symbol {
+        match self.at_vpath(name) {
+            Some((found, kept_by_gpath)) => self.take_found_name(name, found, kept_by_gpath),
+            None => name,
+        }
+    }
+
+    /// One name, replaced by where the search found it only when `GPATH` says
+    /// that is where it belongs.
     ///
-    /// A prerequisite with a rule of its own is left alone: it is going to be
+    /// For a caller that reaches a name directly rather than through the rule
+    /// that wanted it, and so has no prerequisite of its own to rewrite.
+    fn at_gpath(&mut self, name: Symbol) -> Symbol {
+        match self.at_vpath(name) {
+            Some((found, true)) => self.take_found_name(name, found, true),
+            _ => name,
+        }
+    }
+
+    /// Take the search's answer for `name`.
+    ///
+    /// A rename `GPATH` made is remembered, so that the rule declared for the
+    /// name as written can be found again under the path it moved to.
+    fn take_found_name(&mut self, name: Symbol, found: Bytes, kept_by_gpath: bool) -> Symbol {
+        let found = self.ev.session.intern(found);
+        if kept_by_gpath {
+            self.gpath_origin.insert(found, name);
+        }
+        found
+    }
+
+    /// Where one name was found, if it had to be looked for, and whether
+    /// `GPATH` is what kept the answer.
+    ///
+    /// A name with a rule of its own is normally left alone: it is going to be
     /// built here, so where an older copy of it might be lying is not a
-    /// question worth asking.
-    fn at_vpath(&self, input: Symbol) -> Option<Bytes> {
-        if self.rules.contains_key(&input) || self.phony.contains(&input) {
+    /// question worth asking. `GPATH` is the answer to that question anyway —
+    /// it says the directory the search looked in is where the name belongs, so
+    /// GNU Make renames the file to the found path before it asks anything else
+    /// about it and remakes it there.
+    fn at_vpath(&self, input: Symbol) -> Option<(Bytes, bool)> {
+        if self.phony.contains(&input) {
             return None;
         }
         let name = input.as_bytes(&self.ev.session);
         if std::fs::exists(OsStr::from_bytes(&name)).is_ok_and(|found| found) {
             return None;
         }
-        self.vpath_of(input)
+        let found = self.vpath_of(input)?;
+        if self.gpath_holds(&found, &name) {
+            return Some((found, true));
+        }
+        if self.rules.contains_key(&input) {
+            return None;
+        }
+        Some((found, false))
     }
 
     /// Where a prerequisite actually is, when it is not where it was named.
@@ -2077,11 +2194,26 @@ impl<'a> DepBuilder<'a> {
     }
 
     fn lookup_rule_merger(&self, o: Symbol) -> Option<Arc<Mutex<RuleMerger>>> {
-        self.rules.get(&o).cloned()
+        self.rules
+            .get(&o)
+            .or_else(|| self.rules.get(&self.written_as(o)))
+            .cloned()
     }
 
     fn lookup_rule_vars(&self, o: Symbol) -> Option<Arc<Vars>> {
-        self.rule_vars.get(&o).cloned()
+        self.rule_vars
+            .get(&o)
+            .or_else(|| self.rule_vars.get(&self.written_as(o)))
+            .cloned()
+    }
+
+    /// The name a target's rule and its own variables were declared under.
+    ///
+    /// GNU Make renames one file object, so what was declared for the name as
+    /// written arrives at the path `GPATH` kept it at rather than being looked
+    /// up again. Every other name is declared under itself.
+    fn written_as(&self, o: Symbol) -> Symbol {
+        self.gpath_origin.get(&o).copied().unwrap_or(o)
     }
 
     /// Every pattern scope that applies to `output`, weakest first, in GNU
@@ -3496,6 +3628,39 @@ mod tests {
                 Bytes::from_static(b"tail"),
             ]
         );
+    }
+
+    #[test]
+    fn a_search_path_is_a_list_of_directories() {
+        assert_eq!(
+            search_path(&Bytes::from_static(b" build:. other/ ../up:: ")),
+            vec![
+                Bytes::from_static(b"build"),
+                Bytes::from_static(b"other"),
+                Bytes::from_static(b"../up"),
+            ]
+        );
+        // A lone slash is a directory and keeps its only byte.
+        assert_eq!(
+            search_path(&Bytes::from_static(b"/")),
+            vec![Bytes::from_static(b"/")]
+        );
+        assert!(search_path(&Bytes::from_static(b"  ")).is_empty());
+    }
+
+    #[test]
+    fn a_search_directory_is_what_was_joined_to_the_name() {
+        assert_eq!(
+            search_directory(b"build/out.o", b"out.o"),
+            Some(&b"build"[..])
+        );
+        // The name's own directory belongs to the name, not to the entry.
+        assert_eq!(
+            search_directory(b"build/sub/out.o", b"sub/out.o"),
+            Some(&b"build"[..])
+        );
+        // A path shorter than the name it was made from cannot have one.
+        assert_eq!(search_directory(b"out.o", b"out.o"), None);
     }
 
     #[test]
