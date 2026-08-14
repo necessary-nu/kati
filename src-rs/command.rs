@@ -185,7 +185,12 @@ impl AutoCommandVar {
                 }
             }
             AutoCommand::Star => {
-                if let Some(output_pattern) = &current_dep_node.output_pattern {
+                // The implicit search records what its match read, because a
+                // search that held a directory aside leaves a stem the pattern
+                // and the target name cannot be made to yield between them.
+                if let Some(stem) = &current_dep_node.stem {
+                    out.put_slice(&stem.as_bytes(names));
+                } else if let Some(output_pattern) = &current_dep_node.output_pattern {
                     let pat = Pattern::new(output_pattern.as_bytes(names));
                     // GNU Make sets the stem by substituting the target into a
                     // bare `%` rather than by reading the match out, and the

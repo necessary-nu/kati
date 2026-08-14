@@ -16,7 +16,7 @@ limitations under the License.
 
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use memchr::memchr;
+use memchr::{memchr, memrchr};
 use parking_lot::Mutex;
 use std::{
     collections::{HashMap, HashSet},
@@ -37,7 +37,7 @@ use crate::{
     stmt::AssignOp,
     strutil::{
         Pattern, WordWriter, get_ext, is_space_byte, makefile_word_scanner, strip_ext,
-        trim_leading_curdir, word_scanner,
+        substitute_stem, trim_leading_curdir, word_scanner,
     },
     symtab::{Interner, Symbol},
     timeutil::ScopedTimeReporter,
@@ -209,6 +209,16 @@ pub struct DepNode {
     pub ninja_pool_var: Option<Var>,
     pub tags_var: Option<Var>,
     pub output_pattern: Option<Symbol>,
+    /// What `%` stood for, as the implicit search read it.
+    ///
+    /// GNU Make computes the stem inside `pattern_search` and hands it to
+    /// `set_file_variables`, so `$*` reads back what the match found rather
+    /// than a second reading of the pattern. The two part company whenever the
+    /// search held a directory aside: `b%.x` matching `lib/bye.x` leaves
+    /// `lib/ye`, which no substitution into the pattern can produce. Recorded
+    /// only by that search; an explicit or static pattern rule leaves it None
+    /// and `$*` is read off the pattern as before.
+    pub stem: Option<Symbol>,
     pub loc: Option<Loc>,
 }
 
@@ -249,6 +259,7 @@ impl DepNode {
             ninja_pool_var: None,
             tags_var: None,
             output_pattern: None,
+            stem: None,
             loc: None,
         }))
     }
@@ -265,21 +276,31 @@ fn replace_suffix(session: &mut Session, s: Symbol, newsuf: &Symbol) -> Symbol {
     session.intern(r.freeze())
 }
 
-/// Rewrite a deferred prerequisite's `%` to `$*` ahead of the second
-/// expansion, the first one of each whitespace-separated token as GNU Make
-/// does. Substituting the stem itself would expand it a third time, which is
-/// wrong for a stem containing `$`.
-fn stem_references(text: &Bytes) -> Bytes {
+/// Rewrite a deferred prerequisite's `%` to a reference standing for the stem
+/// ahead of the second expansion, the first one of each whitespace-separated
+/// token as GNU Make does. Substituting the stem itself would expand it a third
+/// time, which is wrong for a stem containing `$`.
+///
+/// Which reference depends on whether the search is holding a directory aside.
+/// `$*` is the whole stem; `$(*F)` is what is left once the directory that is
+/// about to go in front of this prerequisite is taken off. The returned flag
+/// says whether any `%` was replaced, because a word that named no stem takes
+/// no directory either — GNU Make's `add_dir` is set on the same branch that
+/// writes the reference.
+fn stem_references(text: &Bytes, hold_directory: bool) -> (Bytes, bool) {
     if memchr(b'%', text).is_none() {
-        return text.clone();
+        return (text.clone(), false);
     }
+    let reference: &[u8] = if hold_directory { b"$(*F)" } else { b"$*" };
     let mut ret = BytesMut::with_capacity(text.len() + 8);
     let mut substituted = false;
+    let mut any = false;
     for &c in text.iter() {
         match c {
             b'%' if !substituted => {
-                ret.put_slice(b"$*");
+                ret.put_slice(reference);
                 substituted = true;
+                any = true;
             }
             _ => {
                 if c.is_ascii_whitespace() {
@@ -289,7 +310,7 @@ fn stem_references(text: &Bytes) -> Bytes {
             }
         }
     }
-    ret.freeze()
+    (ret.freeze(), any)
 }
 
 /// Split the retained prerequisite text of an implicit pattern rule the way
@@ -439,6 +460,84 @@ fn apply_output_pattern(
         ret.push(session.intern(buf));
     }
     ret
+}
+
+/// How an implicit rule's target pattern matched the name being made.
+///
+/// GNU Make's `pattern_search` will not match a pattern against a name carrying
+/// a directory when the pattern carries none of its own. It matches the file
+/// part alone and holds the directory aside, under the flag it calls
+/// `check_lastslash`, which is set from the target pattern and the target name
+/// and takes no notice of the prerequisites. The directory comes back in
+/// exactly two places — in front of every prerequisite the rule fills a `%`
+/// into, and in front of the stem `$*` reads — so it is kept beside the stem
+/// here rather than folded into it.
+///
+/// The split decides which rules apply and not only what they read: `l%.x` does
+/// not match `lib/bye.x`, because `l` has to match the start of `bye.x`, while
+/// `b%.x` does, leaving a stem of `lib/ye`.
+///
+/// Only the implicit search works this way. A static pattern rule substitutes
+/// the whole stem where the `%` stands however many directories it names, which
+/// is why this is not a property of [`Pattern`] itself.
+#[derive(Clone)]
+struct PatternMatch {
+    /// The directory the matched name carried, empty when the pattern carried
+    /// one of its own or the name had none.
+    directory: Bytes,
+    /// What `%` stood for, with `directory` already taken off the front.
+    stem: Bytes,
+}
+
+impl PatternMatch {
+    /// How `pattern` matches `output`, or `None` when it does not.
+    fn of(pattern: &Pattern, output: &Bytes) -> Option<Self> {
+        let path_len = directory_length(output);
+        let hold_directory = path_len > 0 && !pattern.as_bytes().contains(&b'/');
+        let matched = if hold_directory {
+            output.slice(path_len..)
+        } else {
+            output.clone()
+        };
+        if !pattern.matches(&matched) {
+            return None;
+        }
+        Some(Self {
+            directory: if hold_directory {
+                output.slice(..path_len)
+            } else {
+                Bytes::new()
+            },
+            stem: matched.slice_ref(pattern.stem(&matched)),
+        })
+    }
+
+    /// The whole of what `%` stood for: what `$*` reads, and what the search
+    /// measures a candidate's specificity by.
+    fn whole_stem(&self) -> Bytes {
+        if self.directory.is_empty() {
+            return self.stem.clone();
+        }
+        let mut ret = BytesMut::with_capacity(self.directory.len() + self.stem.len());
+        ret.put_slice(&self.directory);
+        ret.put_slice(&self.stem);
+        ret.freeze()
+    }
+
+    /// The name one prerequisite of the matched rule stands for.
+    fn prerequisite(&self, prerequisite: &Bytes) -> Bytes {
+        substitute_stem(prerequisite, &self.directory, &self.stem)
+    }
+}
+
+/// How much of `name` is the directory it sits in, including the slash.
+///
+/// A trailing slash belongs to the last directory's own name rather than
+/// separating it from anything, which is why GNU Make looks for the last slash
+/// in all but the final byte: `foo/bar/` is `bar/` in `foo/`, not nothing in
+/// `foo/bar/`.
+fn directory_length(name: &[u8]) -> usize {
+    memrchr(b'/', &name[..name.len().saturating_sub(1)]).map_or(0, |at| at + 1)
 }
 
 /// One target pattern of one pattern rule, as the search considers it.
@@ -1950,7 +2049,13 @@ impl<'a> DepBuilder<'a> {
         prerequisites: (&[Symbol], &[Symbol]),
         text: &Bytes,
     ) -> Result<(Vec<Symbol>, Vec<Symbol>)> {
-        self.expand_deferred_prerequisites(output, stem, prerequisites, vec![text.clone()])
+        // A static pattern rule's match holds no directory aside: `%` stands
+        // for the whole of what it matched, directories and all.
+        let matched = stem.map(|stem| PatternMatch {
+            directory: Bytes::new(),
+            stem,
+        });
+        self.expand_deferred_prerequisites(output, matched, prerequisites, vec![text.clone()])
     }
 
     /// An implicit pattern rule expands each raw prerequisite word
@@ -1960,13 +2065,13 @@ impl<'a> DepBuilder<'a> {
     fn expand_pattern_prerequisites_again(
         &mut self,
         output: Symbol,
-        stem: Bytes,
+        matched_at: PatternMatch,
         prerequisites: (&[Symbol], &[Symbol]),
         text: &Bytes,
     ) -> Result<(Vec<Symbol>, Vec<Symbol>)> {
         self.expand_deferred_prerequisites(
             output,
-            Some(stem),
+            Some(matched_at),
             prerequisites,
             implicit_prerequisite_words(text).collect(),
         )
@@ -2008,7 +2113,7 @@ impl<'a> DepBuilder<'a> {
     fn expand_deferred_prerequisites(
         &mut self,
         output: Symbol,
-        stem: Option<Bytes>,
+        matched: Option<PatternMatch>,
         prerequisites: (&[Symbol], &[Symbol]),
         texts: Vec<Bytes>,
     ) -> Result<(Vec<Symbol>, Vec<Symbol>)> {
@@ -2022,12 +2127,18 @@ impl<'a> DepBuilder<'a> {
             Variable::with_simple_string(s, crate::var::VarOrigin::Automatic, None, None)
         };
         let scope = self.cur_rule_vars.clone().unwrap_or_default();
-        let texts = match &stem {
+        let directory = matched
+            .as_ref()
+            .map(|matched| matched.directory.clone())
+            .unwrap_or_default();
+        // Paired with each text: whether it named the stem, and so whether the
+        // held-aside directory goes in front of what it expands to.
+        let texts: Vec<(Bytes, bool)> = match &matched {
             Some(_) => texts
                 .into_iter()
-                .map(|text| stem_references(&text))
-                .collect::<Vec<_>>(),
-            None => texts,
+                .map(|text| stem_references(&text, !directory.is_empty()))
+                .collect(),
+            None => texts.into_iter().map(|text| (text, false)).collect(),
         };
         let (recorded, recorded_order_only) = prerequisites;
         let first = recorded
@@ -2044,7 +2155,8 @@ impl<'a> DepBuilder<'a> {
             let at_value = output.as_bytes(&self.ev.session);
             bound.push(ScopedVar::new(scope.clone(), at, automatic(at_value)));
             bound.extend(self.bind_path_forms(&scope, '@')?);
-            if let Some(stem) = stem {
+            if let Some(matched) = &matched {
+                let stem = matched.whole_stem();
                 bound.push(ScopedVar::new(scope.clone(), star, automatic(stem)));
                 bound.extend(self.bind_path_forms(&scope, '*')?);
             }
@@ -2059,7 +2171,7 @@ impl<'a> DepBuilder<'a> {
             bound.push(ScopedVar::new(scope, bar, automatic(bar_value)));
             let _bound = Unbind(bound);
             let mut expanded = Vec::with_capacity(texts.len());
-            for text in texts {
+            for (text, add_directory) in texts {
                 let mut loc = self.ev.loc.clone().unwrap_or_default();
                 let expr = crate::expr::parse_expr(
                     &mut self.ev.session,
@@ -2067,7 +2179,7 @@ impl<'a> DepBuilder<'a> {
                     text,
                     crate::expr::ParseExprOpt::Normal,
                 )?;
-                expanded.push(expr.eval_to_buf(self.ev)?);
+                expanded.push((expr.eval_to_buf(self.ev)?, add_directory));
             }
             expanded
         };
@@ -2075,7 +2187,7 @@ impl<'a> DepBuilder<'a> {
         let mut inputs = Vec::new();
         let mut order_only_inputs = Vec::new();
         let mut order_only = false;
-        for expanded_word in expanded {
+        for (expanded_word, add_directory) in expanded {
             let (before, after) = if order_only {
                 (Bytes::new(), expanded_word)
             } else {
@@ -2086,7 +2198,24 @@ impl<'a> DepBuilder<'a> {
             for (text, into) in [(before, &mut inputs), (after, &mut order_only_inputs)] {
                 for word in makefile_word_scanner(&text) {
                     let word = word.slice_ref(trim_leading_curdir(&word));
-                    glob_word(&mut self.ev.session, word, into);
+                    if !add_directory {
+                        glob_word(&mut self.ev.session, word, into);
+                        continue;
+                    }
+                    // GNU Make hands the directory to `parse_file_seq` as a
+                    // prefix, which puts it on each name the sequence yields —
+                    // after any globbing rather than before it, so the pattern
+                    // is matched where the rule was written and the answer is
+                    // then read one directory down.
+                    let mut named = Vec::new();
+                    glob_word(&mut self.ev.session, word, &mut named);
+                    for name in named {
+                        let name = name.as_bytes(&self.ev.session);
+                        let mut buf = BytesMut::with_capacity(directory.len() + name.len());
+                        buf.put_slice(&directory);
+                        buf.put_slice(&name);
+                        into.push(self.ev.session.intern(buf.freeze()));
+                    }
                 }
             }
         }
@@ -3024,8 +3153,7 @@ impl<'a> DepBuilder<'a> {
         rule: &Rule,
         candidate_order: usize,
         output: Symbol,
-        pat: &Pattern,
-        output_str: &Bytes,
+        matched_at: &PatternMatch,
     ) -> Result<Option<(Vec<Symbol>, Vec<Symbol>)>> {
         let Some(text) = rule.deferred_prerequisites.clone() else {
             return Ok(None);
@@ -3034,11 +3162,10 @@ impl<'a> DepBuilder<'a> {
         if let Some(found) = self.expanded.get(&key) {
             return Ok(Some(found.clone()));
         }
-        let stem = Bytes::copy_from_slice(pat.stem(output_str));
         let (recorded, recorded_order_only) = self.recorded_prerequisites(output);
         let expanded = self.expand_pattern_prerequisites_again(
             output,
-            stem,
+            matched_at.clone(),
             (&recorded, &recorded_order_only),
             &text,
         )?;
@@ -3077,7 +3204,7 @@ impl<'a> DepBuilder<'a> {
         // every search, so measuring inside the comparison would take the
         // pattern apart again for each of them at every comparison.
         let mut matched: Vec<(usize, usize, ImplicitCandidate)> = Vec::new();
-        for candidate in self.implicit_rules.get(output_str) {
+        for candidate in self.candidate_pool(output_str) {
             // A cancelled rule — prerequisites, no recipe — and one a search
             // further out is already working through are both passed over
             // before they can be read as a match at all.
@@ -3089,14 +3216,17 @@ impl<'a> DepBuilder<'a> {
             }
             let pattern = candidate.pattern.as_bytes(&self.ev.session);
             let pat = Pattern::new(pattern.clone());
-            if !pat.matches(output_str) {
+            let Some(matched_at) = PatternMatch::of(&pat, output_str) else {
                 continue;
-            }
+            };
             specific_rule_matched |= pattern.as_ref() != b"%";
             if candidate.rule.cmds.is_empty() {
                 continue;
             }
-            let stem = pat.stem(output_str).len();
+            // The directory the match held aside counts towards specificity:
+            // `tryrules` records `stemlen + pathlen` and sorts on that, so a
+            // rule is measured by the whole of what its `%` stood for.
+            let stem = matched_at.directory.len() + matched_at.stem.len();
             let order = candidate.order;
             matched.push((stem, order, candidate));
         }
@@ -3110,6 +3240,32 @@ impl<'a> DepBuilder<'a> {
             .into_iter()
             .map(|(_, _, candidate)| candidate)
             .collect()
+    }
+
+    /// The rules the index offers for a name, including those whose pattern is
+    /// written for a bare name and can therefore only match the file part.
+    ///
+    /// The index is keyed by the literal text a pattern starts with, so `b%.x`
+    /// is filed under `b` and a walk for `lib/bye.x` never reaches it. GNU Make
+    /// keeps no index and compares every pattern rule to the name both ways
+    /// round, so the file part has to be asked about separately here. A pattern
+    /// starting with `%` answers to both names and is offered once.
+    fn candidate_pool(&self, output_str: &Bytes) -> Vec<ImplicitCandidate> {
+        let mut pool = self.implicit_rules.get(output_str);
+        let path_len = directory_length(output_str);
+        if path_len == 0 {
+            return pool;
+        }
+        let mut seen: HashSet<(usize, Symbol)> = pool
+            .iter()
+            .map(|candidate| (Self::rule_id(&candidate.rule), candidate.pattern))
+            .collect();
+        for candidate in self.implicit_rules.get(&output_str[path_len..]) {
+            if seen.insert((Self::rule_id(&candidate.rule), candidate.pattern)) {
+                pool.push(candidate);
+            }
+        }
+        pool
     }
 
     /// Run `body` with `rule` marked as one a search further out is working
@@ -3239,8 +3395,10 @@ impl<'a> DepBuilder<'a> {
     ) -> Result<Option<Arc<Rule>>> {
         let output_str = output.as_bytes(&self.ev.session);
         let pat = Pattern::new(matched.as_bytes(&self.ev.session));
-        let deferred =
-            self.expanded_pattern_inputs(rule, candidate_order, output, &pat, &output_str)?;
+        let Some(matched_at) = PatternMatch::of(&pat, &output_str) else {
+            return Ok(None);
+        };
+        let deferred = self.expanded_pattern_inputs(rule, candidate_order, output, &matched_at)?;
         let inputs: Vec<(Symbol, bool)> = match &deferred {
             // A deferred list is one string until it is expanded, so
             // which word the `%` was in is no longer knowable.
@@ -3251,11 +3409,12 @@ impl<'a> DepBuilder<'a> {
                 .map(|input| {
                     let text = input.as_bytes(&self.ev.session);
                     let from_pattern = text.contains(&b'%');
-                    let buf = pat.append_subst(&output_str, &text);
+                    let buf = matched_at.prerequisite(&text);
                     (self.ev.session.intern(buf), from_pattern)
                 })
                 .collect(),
         };
+        let resolved_inputs: Vec<Symbol> = inputs.iter().map(|(input, _)| *input).collect();
         let Some(invented) = self.while_rule_in_use(rule, |builder| {
             builder.implicit_prerequisites_reachable(inputs, pass)
         })?
@@ -3264,13 +3423,34 @@ impl<'a> DepBuilder<'a> {
         };
         self.intermediates.extend(invented);
 
+        // What the match read, kept for `$*`: with a directory held aside the
+        // stem is not recoverable from the pattern and the name alone.
+        let stem = matched_at.whole_stem();
+        n.lock().stem = Some(self.ev.session.intern(stem));
+
+        // Either way the names are final now: the search has filled the `%` in
+        // and put back the directory it held aside, so nothing downstream gets
+        // to substitute into them a second time.
         let mut rule = rule.as_ref().clone();
-        if let Some((inputs, order_only_inputs)) = deferred {
-            rule.deferred_prerequisites = None;
-            rule.inputs = inputs;
-            rule.order_only_inputs = order_only_inputs;
-            rule.prerequisites_are_resolved = true;
+        match deferred {
+            Some((inputs, order_only_inputs)) => {
+                rule.deferred_prerequisites = None;
+                rule.inputs = inputs;
+                rule.order_only_inputs = order_only_inputs;
+            }
+            None => {
+                rule.inputs = resolved_inputs;
+                rule.order_only_inputs = rule
+                    .order_only_inputs
+                    .iter()
+                    .map(|input| {
+                        let buf = matched_at.prerequisite(&input.as_bytes(&self.ev.session));
+                        self.ev.session.intern(buf)
+                    })
+                    .collect();
+            }
         }
+        rule.prerequisites_are_resolved = true;
         if rule.output_patterns.len() > 1 {
             // A pattern rule with several target patterns is one recipe that
             // makes all of them, so the rest are this node's outputs — unless
@@ -3366,23 +3546,21 @@ impl<'a> DepBuilder<'a> {
                 continue;
             }
             let pat = Pattern::new(candidate.pattern.as_bytes(&self.ev.session));
-            let inputs = match self.expanded_pattern_inputs(
-                &rule,
-                candidate.order,
-                output,
-                &pat,
-                &output_str,
-            )? {
-                Some((inputs, _)) => inputs,
-                None => rule
-                    .inputs
-                    .iter()
-                    .map(|input| {
-                        let buf = pat.append_subst(&output_str, &input.as_bytes(&self.ev.session));
-                        self.ev.session.intern(buf)
-                    })
-                    .collect(),
+            let Some(matched_at) = PatternMatch::of(&pat, &output_str) else {
+                continue;
             };
+            let inputs =
+                match self.expanded_pattern_inputs(&rule, candidate.order, output, &matched_at)? {
+                    Some((inputs, _)) => inputs,
+                    None => rule
+                        .inputs
+                        .iter()
+                        .map(|input| {
+                            let buf = matched_at.prerequisite(&input.as_bytes(&self.ev.session));
+                            self.ev.session.intern(buf)
+                        })
+                        .collect(),
+                };
             // The same terminal restriction, one level in. A terminal rule is
             // never offered the pass that invents its prerequisites, so it can
             // serve as a link in a chain only when what it reads is there.
@@ -4300,17 +4478,87 @@ mod tests {
     #[test]
     fn only_the_first_percent_of_a_segment_stands_for_the_stem() {
         assert_eq!(
-            stem_references(&Bytes::from_static(b"$(wordlist 1, 99, %1%2%)")),
-            Bytes::from_static(b"$(wordlist 1, 99, $*1%2%)")
+            stem_references(&Bytes::from_static(b"$(wordlist 1, 99, %1%2%)"), false),
+            (Bytes::from_static(b"$(wordlist 1, 99, $*1%2%)"), true)
         );
         assert_eq!(
-            stem_references(&Bytes::from_static(b"$(wordlist 1, 99, %a %b)")),
-            Bytes::from_static(b"$(wordlist 1, 99, $*a $*b)")
+            stem_references(&Bytes::from_static(b"$(wordlist 1, 99, %a %b)"), false),
+            (Bytes::from_static(b"$(wordlist 1, 99, $*a $*b)"), true)
+        );
+        // Holding a directory aside means the stem reference is the file part
+        // of it, because the directory is added back once, in front.
+        assert_eq!(
+            stem_references(&Bytes::from_static(b"6%"), true),
+            (Bytes::from_static(b"6$(*F)"), true)
+        );
+        // A word naming no stem takes no directory either.
+        assert_eq!(
+            stem_references(&Bytes::from_static(b"nopercent.c"), true),
+            (Bytes::from_static(b"nopercent.c"), false)
+        );
+    }
+
+    /// A pattern carrying no directory of its own is matched against the file
+    /// part of the name, and what it matched is read back with the directory in
+    /// front of it.
+    #[test]
+    fn a_pattern_without_a_directory_matches_the_file_part() {
+        let matched = |pattern: &'static [u8], output: &'static [u8]| {
+            PatternMatch::of(
+                &Pattern::new(Bytes::from_static(pattern)),
+                &Bytes::from_static(output),
+            )
+        };
+
+        let found = matched(b"%.x", b"lib/bye.x").expect("a match");
+        assert_eq!(found.directory, Bytes::from_static(b"lib/"));
+        assert_eq!(found.stem, Bytes::from_static(b"bye"));
+        assert_eq!(found.whole_stem(), Bytes::from_static(b"lib/bye"));
+        assert_eq!(
+            found.prerequisite(&Bytes::from_static(b"6%")),
+            Bytes::from_static(b"lib/6bye")
+        );
+        // The prerequisite's own directory is not special, and one naming no
+        // stem is left exactly as it was written.
+        assert_eq!(
+            found.prerequisite(&Bytes::from_static(b"sub/%.c")),
+            Bytes::from_static(b"lib/sub/bye.c")
         );
         assert_eq!(
-            stem_references(&Bytes::from_static(b"nopercent.c")),
+            found.prerequisite(&Bytes::from_static(b"nopercent.c")),
             Bytes::from_static(b"nopercent.c")
         );
+
+        // The literal before the `%` has to match the file part, not the whole
+        // name: `l` is the start of `lib/` but not of `bye.x`.
+        assert!(matched(b"l%.x", b"lib/bye.x").is_none());
+        let found = matched(b"b%.x", b"lib/bye.x").expect("a match");
+        assert_eq!(found.whole_stem(), Bytes::from_static(b"lib/ye"));
+
+        // A pattern carrying a slash is matched whole and holds nothing aside.
+        let found = matched(b"lib/%.x", b"lib/bye.x").expect("a match");
+        assert!(found.directory.is_empty());
+        assert_eq!(found.whole_stem(), Bytes::from_static(b"bye"));
+        assert_eq!(
+            found.prerequisite(&Bytes::from_static(b"6%")),
+            Bytes::from_static(b"6bye")
+        );
+
+        // A name with no directory leaves the pattern reading it whole.
+        let found = matched(b"%.x", b"bye.x").expect("a match");
+        assert!(found.directory.is_empty());
+        assert_eq!(found.whole_stem(), Bytes::from_static(b"bye"));
+    }
+
+    /// A trailing slash names the directory rather than separating it from
+    /// anything, so it is not where the split happens.
+    #[test]
+    fn a_trailing_slash_belongs_to_the_directory_it_names() {
+        assert_eq!(directory_length(b"foo/bar/"), 4);
+        assert_eq!(directory_length(b"foo/bar"), 4);
+        assert_eq!(directory_length(b"bar"), 0);
+        assert_eq!(directory_length(b""), 0);
+        assert_eq!(directory_length(b"/"), 0);
     }
 
     #[test]

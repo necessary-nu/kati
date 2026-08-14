@@ -310,6 +310,33 @@ impl Pattern {
     }
 }
 
+/// Fill the first `%` of a pattern rule's prerequisite with `stem`, behind
+/// `directory`.
+///
+/// The stem and the directory arrive separately rather than being measured off
+/// a pattern because GNU Make's implicit search keeps them apart: a rule
+/// written for bare names that matched a name carrying a directory holds that
+/// directory aside, substitutes what is left of the stem, and puts the
+/// directory in front of the whole prerequisite — `lib/6bye` out of `6%`, never
+/// `6lib/bye`.
+///
+/// A prerequisite with no `%` names one file whatever the search matched, so it
+/// takes neither the stem nor the directory. That asymmetry is GNU Make's:
+/// `pattern_search` writes the directory prefix only on the branch that found a
+/// percent to replace.
+pub fn substitute_stem(prerequisite: &Bytes, directory: &[u8], stem: &[u8]) -> Bytes {
+    let (prerequisite, percent) = find_percent(prerequisite.clone());
+    let Some(at) = percent else {
+        return prerequisite;
+    };
+    let mut ret = BytesMut::with_capacity(directory.len() + prerequisite.len() + stem.len());
+    ret.put_slice(directory);
+    ret.put_slice(&prerequisite[..at]);
+    ret.put_slice(stem);
+    ret.put_slice(&prerequisite[at + 1..]);
+    ret.freeze()
+}
+
 pub fn no_line_break(s: Cow<str>) -> Cow<str> {
     if !s.contains('\n') {
         return s;
