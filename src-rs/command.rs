@@ -880,7 +880,6 @@ mod tests {
     use crate::expr::{ParseExprOpt, parse_expr};
     use crate::loc::Loc;
     use crate::session::Session;
-    use crate::symtab::Interner;
     use bytes::Bytes;
     use parking_lot::Mutex;
     use std::sync::Arc;

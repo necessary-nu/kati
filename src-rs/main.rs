@@ -139,15 +139,15 @@ fn run(session: Session, orig_args: OsString) -> Result<i32> {
 }
 
 fn find_first_makefile(session: &mut Session) {
-    if session.flags.makefile.is_some() {
+    if !session.flags.makefiles.is_empty() {
         return;
     }
     if std::fs::exists("GNUMakefile").unwrap_or(false) {
-        session.flags.makefile = Some(OsString::from("GNUMakefile"));
+        session.flags.makefiles.push(OsString::from("GNUMakefile"));
     } else if !cfg!(target_os = "macos") && std::fs::exists("makefile").unwrap_or(false) {
-        session.flags.makefile = Some(OsString::from("makefile"));
+        session.flags.makefiles.push(OsString::from("makefile"));
     } else if std::fs::exists("Makefile").unwrap_or(false) {
-        session.flags.makefile = Some(OsString::from("Makefile"));
+        session.flags.makefiles.push(OsString::from("Makefile"));
     }
 }
 
@@ -241,7 +241,7 @@ fn main() {
         .collect::<Vec<OsString>>()
         .join(OsStr::new(" "));
     find_first_makefile(&mut session);
-    if session.flags.makefile.is_none() {
+    if session.flags.makefiles.is_empty() {
         eprintln!(
             "{}*** No targets specified and no makefile found.  Stop.",
             kati::diagnostic_prefix(&session)

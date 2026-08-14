@@ -124,7 +124,15 @@ pub struct Flags {
     pub ignore_dirty_pattern: Option<crate::strutil::Pattern>,
     pub no_ignore_dirty_pattern: Option<crate::strutil::Pattern>,
     pub ignore_optional_include_pattern: Option<crate::strutil::Pattern>,
-    pub makefile: Option<OsString>,
+    /// The Makefiles the invocation named, in the order it named them.
+    ///
+    /// GNU Make reads every `-f` argument, one after another, as though the
+    /// files had been concatenated — so this is a list, and the order carries
+    /// meaning beyond the reading: variables a file assigns are in scope for
+    /// the ones after it, a later rule for the same target overrides an
+    /// earlier one, and the default goal comes from the first file that
+    /// declares an eligible target rather than the last.
+    pub makefiles: Vec<OsString>,
     pub ninja_dir: Option<OsString>,
     pub ninja_suffix: OsString,
     pub working_dir: Option<OsString>, // -C <dir>
@@ -246,7 +254,7 @@ impl Flags {
             let mut should_propagate = true;
             match arg.as_bytes() {
                 b"-f" => {
-                    flags.makefile = iter.next();
+                    flags.makefiles.extend(iter.next());
                     should_propagate = false;
                 }
                 b"-c" => flags.is_syntax_check_only = true,
@@ -425,7 +433,29 @@ mod tests {
                 .collect(),
             &mut symtab,
         );
-        assert_eq!(flags.makefile.clone().unwrap(), "main.mk");
+        assert_eq!(flags.makefiles, vec![OsString::from("main.mk")]);
+    }
+
+    /// Every `-f` names a Makefile to read, and the order they were written in
+    /// is the order they are read in.
+    #[test]
+    fn every_file_argument_is_kept_in_order() {
+        let mut symtab = Symtab::new();
+        let flags = Flags::from_args(
+            vec!["test", "-f", "one.mk", "-f", "two.mk", "-f", "one.mk"]
+                .into_iter()
+                .map(|s| s.into())
+                .collect(),
+            &mut symtab,
+        );
+        assert_eq!(
+            flags.makefiles,
+            vec![
+                OsString::from("one.mk"),
+                OsString::from("two.mk"),
+                OsString::from("one.mk"),
+            ]
+        );
     }
 
     #[test]

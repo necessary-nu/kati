@@ -1492,11 +1492,13 @@ impl<'a> DepBuilder<'a> {
             }
             let name = include.filename.as_bytes(&self.ev.session);
             let name = String::from_utf8_lossy(&name).into_owned();
-            warn_loc!(
-                self.ev,
-                Some(&include.loc),
-                "{name}: No such file or directory"
-            );
+            // A Makefile the command line named carries no location, because no
+            // `include` line asked for it. GNU Make reports that one where it
+            // failed to open, so the read has already said so and only the
+            // refusal is left.
+            if let Some(loc) = &include.loc {
+                warn_loc!(self.ev, Some(loc), "{name}: No such file or directory");
+            }
             error_loc!(self.ev, None, "*** No rule to make target '{name}'.");
         }
         Ok(nodes)

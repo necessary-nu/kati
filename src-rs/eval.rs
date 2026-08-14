@@ -688,8 +688,10 @@ pub struct MissingInclude {
     /// Whether the directive was `include` rather than `-include` or
     /// `sinclude`, and therefore whether failing to remake it is fatal.
     pub required: bool,
-    /// Where the directive was read, for the diagnostic that names it.
-    pub loc: Loc,
+    /// Where the directive was read, for the diagnostic that names it. Absent
+    /// for a Makefile the command line named, which no line of any Makefile
+    /// asked for and which GNU Make therefore reports under its own name.
+    pub loc: Option<Loc>,
 }
 
 impl IncludeGraph {
@@ -2076,19 +2078,7 @@ impl Evaluator {
 
         let v = fname.slice_ref(trim_leading_curdir(fname));
         self.note_read_makefile(v.clone(), required);
-        if let Some(var_list) = self.lookup_var(Symbol::MAKEFILE_LIST)? {
-            let frame = self.current_frame();
-            var_list.write().append_str(&self.session, &v, frame)?;
-        } else {
-            let frame = self.current_frame();
-            let loc = self.loc.clone();
-            self.session.set_global_var(
-                Symbol::MAKEFILE_LIST,
-                Variable::with_simple_string(v, VarOrigin::File, Some(frame), loc),
-                false,
-                None,
-            )?;
-        }
+        self.note_makefile_list(v)?;
         let stmts = mk.stmts.lock().clone();
         for stmt in stmts {
             log!("{stmt:?}");
@@ -2126,6 +2116,28 @@ impl Evaluator {
         pat
     }
 
+    /// Add a Makefile that opened to `MAKEFILE_LIST`, as GNU Make does.
+    ///
+    /// The name goes on immediately before the file's statements run, so a
+    /// Makefile reading the variable sees itself as the last entry. A file
+    /// named twice is listed twice, because the variable records the reads and
+    /// not the set of files: the same name reached the evaluator twice.
+    pub(crate) fn note_makefile_list(&mut self, name: Bytes) -> Result<()> {
+        if let Some(var_list) = self.lookup_var(Symbol::MAKEFILE_LIST)? {
+            let frame = self.current_frame();
+            var_list.write().append_str(&self.session, &name, frame)?;
+            return Ok(());
+        }
+        let frame = self.current_frame();
+        let loc = self.loc.clone();
+        self.session.set_global_var(
+            Symbol::MAKEFILE_LIST,
+            Variable::with_simple_string(name, VarOrigin::File, Some(frame), loc),
+            false,
+            None,
+        )
+    }
+
     /// Record that the read reached this Makefile, so remaking can consider it.
     ///
     /// The order is the order GNU Make attempts them in, and a file included
@@ -2144,7 +2156,12 @@ impl Evaluator {
             .push(ReadMakefile { filename, required });
     }
 
-    fn note_missing_include(&mut self, filename: Bytes, required: bool, loc: Loc) {
+    pub(crate) fn note_missing_include(
+        &mut self,
+        filename: Bytes,
+        required: bool,
+        loc: Option<Loc>,
+    ) {
         self.note_read_makefile(filename.clone(), required);
         let filename = self.session.intern(filename);
         if let Some(existing) = self
@@ -2189,7 +2206,7 @@ impl Evaluator {
                 Ok(files) => files.is_empty(),
             };
             if missing {
-                self.note_missing_include(pat, stmt.should_exist, stmt.loc());
+                self.note_missing_include(pat, stmt.should_exist, Some(stmt.loc()));
                 continue;
             }
             let Ok(files) = files.as_ref() else {

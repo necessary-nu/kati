@@ -30,7 +30,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
 
@@ -44,7 +44,7 @@ use crate::stmt::Stmt;
 use crate::symtab::{Symbol, join_symbols};
 use crate::timeutil::ScopedTimeReporter;
 use crate::var::{VarExport, VarOrigin, Variable};
-use crate::{error_loc, log};
+use crate::{error_loc, log, warn_loc};
 
 /// The GNU Make features this evaluator actually has, in `.FEATURES`' spelling.
 ///
@@ -150,21 +150,59 @@ fn read_bootstrap_makefile(
     crate::parser::parse_buf(session, &bootstrap.freeze(), Loc { filename, line: 0 })
 }
 
+/// Read one Makefile the command line named, into the session already open.
+///
+/// A Makefile that is not there is not the end of the read: GNU Make says so
+/// where it failed to open the file, goes on to the ones after it, and only
+/// then treats the missing name as a target it must reach — which is a rule a
+/// later Makefile is still allowed to supply.
+fn read_named_makefile(ev: &mut Evaluator, makefile: &OsStr) -> Result<()> {
+    let name = Bytes::from(makefile.as_bytes().to_vec());
+    let _file_frame = ev.enter(FrameType::Parse, name.clone(), Loc::default());
+    let mk = match ev.session.get_makefile(makefile)? {
+        Source::Read(mk) => mk,
+        Source::Absent => {
+            warn_loc!(
+                ev,
+                None,
+                "{}: No such file or directory",
+                makefile.to_string_lossy()
+            );
+            ev.note_missing_include(name, true, None);
+            return Ok(());
+        }
+        // No `include` asked for this one, so there is no line to point
+        // at; the diagnostic still has to say which file and why.
+        Source::Unreadable(err) => error_loc!(
+            ev,
+            None,
+            "*** {}: {}",
+            makefile.to_string_lossy(),
+            crate::strerror(&err)
+        ),
+    };
+    ev.note_read_makefile(name.clone(), true);
+    ev.note_makefile_list(name)?;
+    let stmts = mk.stmts.lock().clone();
+    for stmt in stmts {
+        log!("{stmt:?}");
+        stmt.eval(ev)?;
+    }
+    Ok(())
+}
+
 /// Seed the evaluator with `MAKEFILE_LIST` and the process environment.
 fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
-    let makefile = ev.session.flags.makefile.clone().unwrap();
-    // The Makefile the invocation named is the first one GNU Make tries to
-    // remake, ahead of anything it goes on to include.
-    ev.note_read_makefile(Bytes::from(makefile.as_bytes().to_vec()), true);
-    // The name alone. `MAKEFILE_LIST` grows by `+=`, and the space that
-    // separates two names has nothing to separate while this is the first.
-    let makefile_list = Bytes::from(makefile.as_bytes().to_vec());
+    // Empty, and grown a name at a time as each Makefile opens. GNU Make binds
+    // it before it reads anything so that a Makefile asking `$(origin
+    // MAKEFILE_LIST)` is told `file`, and so that the first name to arrive has
+    // somewhere to be appended.
     let frame = ev.current_frame();
     let loc = ev.loc.clone();
     let makefile_list_sym = ev.session.intern("MAKEFILE_LIST");
     ev.session.set_global_var(
         makefile_list_sym,
-        Variable::with_simple_string(makefile_list, VarOrigin::File, Some(frame), loc),
+        Variable::with_simple_string(Bytes::new(), VarOrigin::File, Some(frame), loc),
         false,
         None,
     )?;
@@ -370,29 +408,13 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
         );
         let _tr = ScopedTimeReporter::new(&ev.session, "eval time");
 
-        let makefile = ev.session.flags.makefile.clone().unwrap();
-        let _file_frame = ev.enter(
-            FrameType::Parse,
-            Bytes::from(makefile.as_bytes().to_vec()),
-            Loc::default(),
-        );
-        let mk = match ev.session.get_makefile(&makefile)? {
-            Source::Read(mk) => mk,
-            Source::Absent => bail!("makefile not found"),
-            // No `include` asked for this one, so there is no line to point
-            // at; the diagnostic still has to say which file and why.
-            Source::Unreadable(err) => error_loc!(
-                &ev,
-                None,
-                "*** {}: {}",
-                makefile.to_string_lossy(),
-                crate::strerror(&err)
-            ),
-        };
-        let stmts = mk.stmts.lock().clone();
-        for stmt in stmts {
-            log!("{stmt:?}");
-            stmt.eval(&mut ev)?;
+        // Every Makefile the invocation named, in the order it named them —
+        // which GNU Make reads as though they had been concatenated. Reading
+        // them in one session is what makes an earlier file's variables visible
+        // to a later one and leaves the default goal with the first file that
+        // declared a target.
+        for makefile in ev.session.flags.makefiles.clone() {
+            read_named_makefile(&mut ev, &makefile)?;
         }
     }
 

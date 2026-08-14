@@ -229,7 +229,15 @@ fn color_error_log(
 
 fn color_warn_log(ctx: &impl crate::session::Context, loc: Option<&crate::loc::Loc>, msg: String) {
     let Some(loc) = loc else {
-        eprintln!("{msg}");
+        // With no file and line to lead with, GNU Make leads with its own name,
+        // exactly as it does for a fatal raised from nowhere in particular.
+        // Empty is kati's own binary, which has never led with anything.
+        let program = &ctx.flags().program_name;
+        if program.is_empty() {
+            eprintln!("{msg}");
+        } else {
+            eprintln!("{program}: {msg}");
+        }
         return;
     };
     let loc = loc.display(ctx);
