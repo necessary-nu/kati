@@ -265,22 +265,62 @@ fn sort_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
     Ok(())
 }
 
-fn get_numeric_value_for_func(buf: &[u8]) -> Result<usize> {
-    let s = std::str::from_utf8(trim_left_space(buf))?;
-    Ok(s.parse::<usize>()?)
+/// GNU Make's `parse_numeric`: whitespace either side, an optional sign, and
+/// digits, read as the `long long` the index functions go on to compare.
+///
+/// The three ways it can fail are three different diagnostics, and telling them
+/// apart is the point. A value that is all digits but too large to be an index
+/// is *out of range* rather than non-numeric, and GNU Make refuses the makefile
+/// rather than reading it as an index no list could have — which would answer
+/// with the empty string and let a build run that should have stopped.
+///
+/// `what` names the argument and the function, and is the whole of the message
+/// up to the colon, because GNU builds these diagnostics the same way.
+fn parse_numeric(text: &[u8], what: &str, ev: &mut Evaluator) -> Result<i64> {
+    let trimmed = trim_space(text);
+    if trimmed.is_empty() {
+        error_loc!(ev, ev.loc.as_ref(), "*** {what}: empty value.");
+    }
+    let negative = trimmed[0] == b'-';
+    let digits = &trimmed[usize::from(negative || trimmed[0] == b'+')..];
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        error_loc!(
+            ev,
+            ev.loc.as_ref(),
+            "*** {what}: '{}'.",
+            String::from_utf8_lossy(text)
+        );
+    }
+    // `strtoll` reports an overflow in either direction as ERANGE, so the
+    // accumulation is signed and checked rather than taken as a magnitude:
+    // that way the most negative value is not itself an overflow.
+    let mut value: i64 = 0;
+    for byte in digits {
+        let digit = i64::from(byte - b'0');
+        let stepped = value.checked_mul(10).and_then(|scaled| {
+            if negative {
+                scaled.checked_sub(digit)
+            } else {
+                scaled.checked_add(digit)
+            }
+        });
+        let Some(stepped) = stepped else {
+            error_loc!(
+                ev,
+                ev.loc.as_ref(),
+                "*** {what}: '{}' out of range.",
+                String::from_utf8_lossy(text)
+            );
+        };
+        value = stepped;
+    }
+    Ok(value)
 }
 
 fn word_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
     let n_str = args[0].eval_to_buf(ev)?;
-    let Ok(mut n) = get_numeric_value_for_func(&n_str) else {
-        error_loc!(
-            ev,
-            ev.loc.as_ref(),
-            "*** non-numeric first argument to `word' function: '{}'.",
-            String::from_utf8_lossy(&n_str)
-        );
-    };
-    if n == 0 {
+    let mut n = parse_numeric(&n_str, "invalid first argument to `word' function", ev)?;
+    if n < 1 {
         error_loc!(
             ev,
             ev.loc.as_ref(),
@@ -300,37 +340,25 @@ fn word_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
 }
 
 fn wordlist_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
+    let bad_first = "invalid first argument to `wordlist' function";
+    let bad_second = "invalid second argument to `wordlist' function";
     let s_str = args[0].eval_to_buf(ev)?;
-    let Ok(si) = get_numeric_value_for_func(&s_str) else {
-        error_loc!(
-            ev,
-            ev.loc.as_ref(),
-            "*** non-numeric first argument to `wordlist' function: '{}'.",
-            String::from_utf8_lossy(&s_str)
-        );
-    };
-    if si == 0 {
-        error_loc!(
-            ev,
-            ev.loc.as_ref(),
-            "*** invalid first argument to `wordlist' function: {}`",
-            String::from_utf8_lossy(&s_str)
-        );
+    let si = parse_numeric(&s_str, bad_first, ev)?;
+    if si < 1 {
+        // The value as read, not as written: GNU prints the number it parsed,
+        // so `$(wordlist 000,…)` is refused as '0'.
+        error_loc!(ev, ev.loc.as_ref(), "*** {bad_first}: '{si}'.");
     }
 
     let e_str = args[1].eval_to_buf(ev)?;
-    let Ok(ei) = get_numeric_value_for_func(&e_str) else {
-        error_loc!(
-            ev,
-            ev.loc.as_ref(),
-            "*** non-numeric second argument to `wordlist' function: '{}'.",
-            String::from_utf8_lossy(&e_str)
-        );
-    };
+    let ei = parse_numeric(&e_str, bad_second, ev)?;
+    if ei < 0 {
+        error_loc!(ev, ev.loc.as_ref(), "*** {bad_second}: '{ei}'.");
+    }
 
     let text = args[2].eval_to_buf(ev)?;
     let mut ww = WordWriter::new(out);
-    let mut i = 0;
+    let mut i: i64 = 0;
     for tok in word_scanner(&text) {
         i += 1;
         if si <= i {
@@ -2220,6 +2248,97 @@ mod tests {
             message.contains("non-numeric second argument to `intcmp' function: empty value."),
             "{message}"
         );
+    }
+
+    /// An index that is all digits but too large to be one is refused as out of
+    /// range, which is a different rejection from a non-numeric one and the only
+    /// one of the group that used to be let through: reading it as an index no
+    /// list can have answers with the empty string and runs a build GNU Make
+    /// stopped.
+    #[test]
+    fn word_refuses_an_index_out_of_range() {
+        let mut ev = Evaluator::new(Session::new());
+        let (result, _) = eval_with(&mut ev, "$(word 9999999999999999999,a b c)");
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains(
+                "invalid first argument to `word' function: '9999999999999999999' out of range."
+            ),
+            "{message}"
+        );
+
+        // An index that merely runs off the end of the list is not an error.
+        let (result, out) = eval_with(&mut ev, "$(word 4294967296,a b c)");
+        result.unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// The three ways a numeric argument can be unreadable are three
+    /// diagnostics, and a sign or surrounding space is not one of them.
+    #[test]
+    fn word_tells_its_numeric_refusals_apart() {
+        let mut ev = Evaluator::new(Session::new());
+        for (expression, expected) in [
+            (
+                "$(word abc,a b c)",
+                "invalid first argument to `word' function: 'abc'.",
+            ),
+            (
+                "$(word ,a b c)",
+                "invalid first argument to `word' function: empty value.",
+            ),
+            (
+                "$(word 0,a b c)",
+                "first argument to `word' function must be greater than 0.",
+            ),
+            (
+                "$(word -1,a b c)",
+                "first argument to `word' function must be greater than 0.",
+            ),
+        ] {
+            let (result, _) = eval_with(&mut ev, expression);
+            let message = result.unwrap_err().to_string();
+            assert!(message.contains(expected), "{expression}: {message}");
+        }
+
+        // GNU strips whitespace either side and takes a leading sign.
+        for expression in ["$(word  3 ,a b c)", "$(word +3,a b c)", "$(word 03,a b c)"] {
+            let (result, out) = eval_with(&mut ev, expression);
+            result.unwrap();
+            assert_eq!(out.as_ref(), b"c", "{expression}");
+        }
+    }
+
+    /// `$(wordlist)` refuses a start below one and a stop below zero, and names
+    /// the number it read rather than the text it was written as.
+    #[test]
+    fn wordlist_refuses_indices_outside_its_range() {
+        let mut ev = Evaluator::new(Session::new());
+        for (expression, expected) in [
+            (
+                "$(wordlist 000,3,a b c)",
+                "invalid first argument to `wordlist' function: '0'.",
+            ),
+            (
+                "$(wordlist 2,-1,a b c)",
+                "invalid second argument to `wordlist' function: '-1'.",
+            ),
+            (
+                "$(wordlist 2,9999999999999999999,a b c)",
+                "invalid second argument to `wordlist' function: '9999999999999999999' out of range.",
+            ),
+        ] {
+            let (result, _) = eval_with(&mut ev, expression);
+            let message = result.unwrap_err().to_string();
+            assert!(message.contains(expected), "{expression}: {message}");
+        }
+
+        // A stop of zero, and a stop below the start, are empty rather than errors.
+        for expression in ["$(wordlist 2,0,a b c)", "$(wordlist 3,2,a b c)"] {
+            let (result, out) = eval_with(&mut ev, expression);
+            result.unwrap();
+            assert!(out.is_empty(), "{expression}");
+        }
     }
 
     /// A builtin reached through `$(call)` answers to the same argument count
