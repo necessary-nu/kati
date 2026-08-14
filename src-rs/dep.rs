@@ -559,6 +559,12 @@ fn pattern_rule_holds_suffix_rule(
         && pattern_rule_targets_match(suffix_rule, existing)
 }
 
+/// A suffix without the dot it is written with, which is how the map of suffix
+/// rules is keyed.
+fn undotted(suffix: &Bytes) -> Bytes {
+    suffix.slice(usize::from(suffix.starts_with(b"."))..)
+}
+
 fn is_suffix_rule(names: &impl Interner, output: &Symbol) -> bool {
     if !is_special_target(names, output) {
         return false;
@@ -867,6 +873,55 @@ struct DepBuilder<'a> {
     expanded: HashMap<(usize, Symbol), (Vec<Symbol>, Vec<Symbol>)>,
     /// Cycle guard for the recursive implicit rule search.
     chaining: HashSet<Symbol>,
+    /// The pattern rules a search further out is already working through.
+    ///
+    /// GNU Make marks a rule `in_use` while it decides whether the
+    /// prerequisites that rule would need can be had, and `pattern_search`
+    /// passes over a marked rule: no rule may be a link in the chain that
+    /// supplies its own prerequisite. With a catalogue of rules that chain into
+    /// one another this is what bounds the search rather than merely tidying
+    /// it, and it is the "Avoiding implicit rule recursion" its `-d` reports.
+    rules_in_use: HashSet<usize>,
+    /// Whether the search just run passed over a rule for a prerequisite the
+    /// Makefile writes down somewhere.
+    ///
+    /// GNU Make's `found_compat_rule`, and it is a local of `pattern_search`
+    /// rather than a fact about the graph: each search saves the outer value,
+    /// clears it, and puts it back. Only a search that set it is retried taking
+    /// written-down names on trust — which matters for more than fidelity,
+    /// since with a catalogue of chaining rules an unconditional retry doubles
+    /// the work at every level of a search that is already six deep.
+    found_compat_rule: bool,
+    /// Names a chain search has already proven nothing can make.
+    ///
+    /// GNU Make's `file_impossible`, and it is what keeps the search from
+    /// being exponential: every rule in the catalogue proposes a prerequisite,
+    /// each of those proposes its own, and without a memory of the failures the
+    /// same subtree is walked once per road into it. A name the Makefile writes
+    /// down is never marked, because the compatibility pass has to be free to
+    /// take it on trust later.
+    ///
+    /// Recorded against the shallowest depth the failure was reached at, which
+    /// GNU Make has no need of: its search has no depth limit, so a failure is
+    /// a failure. Here a name that ran out of budget at depth five says nothing
+    /// about the same name at depth one, and the recorded depth is what tells
+    /// the two apart — a later search may reuse the answer only from at least
+    /// as deep, where it has no more budget than the search that proved it.
+    impossible: HashMap<Symbol, usize>,
+    /// Whether the last chain search stopped because the cycle guard cut it
+    /// short rather than because the rules ran out.
+    ///
+    /// A failure reached that way is about the road taken to the name, not
+    /// about the name, so it must not be remembered at any depth.
+    chain_truncated: bool,
+    /// Whether each name asked about is there, asked once.
+    ///
+    /// The search asks the same question thousands of times over — every rule
+    /// in the catalogue proposes a prerequisite, and the chain proposes each of
+    /// theirs — and nothing between the first Makefile closing and the graph
+    /// being finished can change the answer. GNU Make answers from `struct
+    /// file` and a directory read it keeps; this is the same bargain.
+    exists_cache: HashMap<Symbol, bool>,
     /// Names the search invented to complete a chain, which the Makefile
     /// therefore never says.
     intermediates: HashSet<Symbol>,
@@ -893,6 +948,17 @@ struct DepBuilder<'a> {
     /// The recipe `.DEFAULT` offers for a target with no rule of its own.
     default_rule: Option<Arc<Rule>>,
     suffix_rules: SuffixRuleMap,
+    /// `.SUFFIXES` as the whole read left it, in the order it was written.
+    ///
+    /// GNU Make derives every suffix rule from this list once the last Makefile
+    /// is closed, so it decides which rules exist rather than merely filtering
+    /// them: a bare `.SUFFIXES:` withdraws the built-in catalogue's suffix half
+    /// and a later line puts back whichever pairs it names. The entries keep
+    /// their leading dot, because that is how the pair's name is spelled.
+    suffixes: Vec<Bytes>,
+    /// The name the invocation's own preamble is read under, which is how a
+    /// `.SUFFIXES` Make wrote is told apart from one a Makefile wrote.
+    bootstrap_filename: Symbol,
 
     /// The first target of the read that could stand for the Makefile as a
     /// whole, from before a goal could be named.
@@ -976,6 +1042,7 @@ impl<'a> DepBuilder<'a> {
         let validations_var_name = ev.session.intern(".KATI_VALIDATIONS");
         let tags_var_name = ev.session.intern(".KATI_TAGS");
         let wait_sym = ev.session.intern(".WAIT");
+        let bootstrap_filename = ev.session.intern("*bootstrap*");
         let mut ret = Self {
             ev,
             rules: HashMap::new(),
@@ -994,6 +1061,11 @@ impl<'a> DepBuilder<'a> {
             implicit_rule_order: 0,
             expanded: HashMap::new(),
             chaining: HashSet::new(),
+            rules_in_use: HashSet::new(),
+            found_compat_rule: false,
+            impossible: HashMap::new(),
+            chain_truncated: false,
+            exists_cache: HashMap::new(),
             intermediates: HashSet::new(),
             declared_intermediate: HashSet::new(),
             secondary: HashSet::new(),
@@ -1006,6 +1078,8 @@ impl<'a> DepBuilder<'a> {
             wait_barriers: Vec::new(),
             default_rule: None,
             suffix_rules: HashMap::new(),
+            suffixes: Vec::new(),
+            bootstrap_filename,
 
             first_rule: None,
             done: HashMap::new(),
@@ -1034,6 +1108,7 @@ impl<'a> DepBuilder<'a> {
         }
 
         ret.handle_special_targets()?;
+        ret.install_builtin_rules()?;
         ret.gpaths = ret.gpath_directories()?;
 
         // The rules are this builder's now. Anything the evaluator records from
@@ -1129,13 +1204,23 @@ impl<'a> DepBuilder<'a> {
                 .filter(|rule| !rule.cmds.is_empty())
                 .cloned();
         }
-        // In order, because `.SUFFIXES:` clears the list and a later one adds
-        // to what is left. Merging them first loses the clear.
+        self.read_suffix_list()?;
+
+        Ok(())
+    }
+
+    /// Settle `.SUFFIXES` as the read left it.
+    ///
+    /// In order, because `.SUFFIXES:` clears the list and a later one adds to
+    /// what is left. Merging them first loses the clear.
+    fn read_suffix_list(&mut self) -> Result<()> {
         let suffixes = self.ev.session.intern(".SUFFIXES");
+        let mut declared: Vec<Symbol> = Vec::new();
+        let mut written_by_makefile = false;
         if let Some(merger) = self.rules.get(&suffixes).cloned() {
-            let mut declared: Vec<Symbol> = Vec::new();
             let rules = merger.lock().rules.clone();
             for rule in &rules {
+                written_by_makefile |= rule.loc.filename != self.bootstrap_filename;
                 let mut inputs = rule.inputs.clone();
                 inputs.extend(self.declared_by(suffixes, rule)?);
                 if inputs.is_empty() {
@@ -1144,13 +1229,24 @@ impl<'a> DepBuilder<'a> {
                     declared.extend(inputs);
                 }
             }
-            if declared.is_empty() {
-                self.suffix_rules.clear();
-            } else {
-                self.keep_only_declared_suffix_rules(&declared);
-            }
         }
-
+        // A `-r` that only a Makefile's own `MAKEFLAGS` asked for arrives after
+        // the list is already there, so GNU Make takes the list away at the end
+        // of the read — but only while it is still the list Make itself set.
+        // Naming `.SUFFIXES` at all, even to add to it, makes the list the
+        // Makefile's, and a Makefile's list survives its own `-r`.
+        if self.ev.session.flags.no_builtin_rules && !written_by_makefile {
+            declared.clear();
+        }
+        self.suffixes = declared
+            .iter()
+            .map(|suffix| suffix.as_bytes(&self.ev.session))
+            .collect();
+        if declared.is_empty() {
+            self.suffix_rules.clear();
+        } else {
+            self.keep_only_declared_suffix_rules(&declared);
+        }
         Ok(())
     }
 
@@ -1355,10 +1451,7 @@ impl<'a> DepBuilder<'a> {
     fn keep_only_declared_suffix_rules(&mut self, declared: &[Symbol]) {
         let declared = declared
             .iter()
-            .map(|s| {
-                let name = s.as_bytes(&self.ev.session);
-                name.slice(usize::from(name.starts_with(b"."))..)
-            })
+            .map(|s| undotted(&s.as_bytes(&self.ev.session)))
             .collect::<HashSet<_>>();
         let names = &self.ev.session;
         self.suffix_rules.retain(|output_suffix, rules| {
@@ -1368,6 +1461,200 @@ impl<'a> DepBuilder<'a> {
             rules.retain(|rule| declared.contains(&rule.inputs[0].as_bytes(names)));
             !rules.is_empty()
         });
+    }
+
+    /// Turn `.SUFFIXES` into rules, and add the rules that were always
+    /// patterns.
+    ///
+    /// GNU Make's `convert_to_pattern` followed by
+    /// `install_default_implicit_rules`, in their place: after the last
+    /// Makefile has closed. Doing it here rather than before the read is what
+    /// makes a Makefile's own `%.out: %` outrank the built-in of that name
+    /// instead of colliding with it, and it is why a `-r` that only a
+    /// Makefile's `MAKEFLAGS` asked for still has the whole catalogue to
+    /// withhold.
+    fn install_builtin_rules(&mut self) -> Result<()> {
+        let withheld = self.ev.session.flags.no_builtin_rules;
+        for source in self.suffixes.clone() {
+            self.install_suffix_disqualifier(&source)?;
+            self.install_null_suffix_rule(&source, withheld)?;
+        }
+        if !withheld {
+            self.install_builtin_suffix_pairs()?;
+        }
+        // A written pattern rule keeps any name a suffix rule would have taken,
+        // and the built-in pairs have only just arrived, so the comparison runs
+        // again now that they are all known.
+        self.discard_suffix_rules_a_pattern_rule_holds();
+        self.order_suffix_rules_by_suffix_list();
+        if !withheld {
+            self.install_default_pattern_rules()?;
+        }
+        Ok(())
+    }
+
+    /// The rule a suffix has by being a suffix: `%.c:`, with no prerequisites
+    /// and no recipe.
+    ///
+    /// It can make nothing and is never used to. Its whole effect is that a
+    /// name ending in a declared suffix has now been matched by a rule that is
+    /// not a bare `%`, which withdraws every match-anything rule from that
+    /// search — see [`DepBuilder::ordered_candidates`]. It is not withheld by
+    /// `-r`, because it comes from the suffix list rather than from the
+    /// catalogue: a Makefile that declares a suffix under `-r` gets it.
+    fn install_suffix_disqualifier(&mut self, suffix: &Bytes) -> Result<()> {
+        let loc = crate::builtin_rules::builtin_loc(&mut self.ev.session);
+        let mut rule = Rule::new(loc, false, false);
+        rule.output_patterns.push(self.suffix_pattern(suffix));
+        self.populate_implicit_rule(Arc::new(rule), false)
+    }
+
+    /// The rule that makes a program out of one source file: `%: %.c`.
+    ///
+    /// GNU Make writes it as a suffix rule with one suffix, and it is the half
+    /// of the catalogue `all: hello` beside `hello.c` rests on. A Makefile's
+    /// own `.c:` recipe is converted the same way and is not withheld by `-r`,
+    /// which withholds only the recipes the catalogue supplied.
+    fn install_null_suffix_rule(&mut self, suffix: &Bytes, withheld: bool) -> Result<()> {
+        let name = self.ev.session.intern(suffix.clone());
+        let written = self
+            .lookup_rule_merger(name)
+            .and_then(|merger| merger.lock().primary_rule.clone());
+        let (loc, cmd_loc, cmds) = match written {
+            Some(rule) => (rule.loc.clone(), rule.cmd_loc.clone(), rule.cmds.clone()),
+            None if withheld => return Ok(()),
+            None => {
+                let Some(recipe) = crate::builtin_rules::suffix_recipe(suffix) else {
+                    return Ok(());
+                };
+                let loc = crate::builtin_rules::builtin_loc(&mut self.ev.session);
+                let cmds = crate::builtin_rules::recipe_lines(&mut self.ev.session, recipe)?;
+                (loc, None, cmds)
+            }
+        };
+        let mut rule = Rule::new(loc, false, false);
+        rule.cmd_loc = cmd_loc;
+        rule.output_patterns.push(self.ev.session.intern("%"));
+        let input = self.suffix_pattern(suffix);
+        rule.inputs.push(input);
+        rule.prerequisite_names.push(input);
+        rule.cmds = cmds;
+        self.populate_implicit_rule(Arc::new(rule), false)
+    }
+
+    /// The catalogue's compile rules, for whichever pairs the suffix list
+    /// activates: `.c.o` becomes `%.o: %.c`.
+    ///
+    /// GNU Make writes every declared suffix against every other and looks each
+    /// name up as a file. The same set is reached by reading the table and
+    /// asking whether both halves of each name are declared, which is the same
+    /// question with eleven hundred names that were never there left unasked.
+    /// Which pair wins for a target is settled afterwards by
+    /// [`DepBuilder::order_suffix_rules_by_suffix_list`], so the order this
+    /// walks in is not the order they are tried in.
+    ///
+    /// A pair a Makefile gave a recipe to is already converted and is left
+    /// alone: the catalogue's recipe is only ever written onto a name that has
+    /// none.
+    fn install_builtin_suffix_pairs(&mut self) -> Result<()> {
+        for (name, recipe) in crate::builtin_rules::DEFAULT_SUFFIX_RULES {
+            let Some((source, target)) = self.declared_suffix_pair(name) else {
+                continue;
+            };
+            let written = self.ev.session.intern(name.as_bytes().to_vec());
+            if self
+                .lookup_rule_merger(written)
+                .is_some_and(|merger| merger.lock().primary_rule.is_some())
+            {
+                continue;
+            }
+            let loc = crate::builtin_rules::builtin_loc(&mut self.ev.session);
+            let mut rule = Rule::new(loc, false, false);
+            rule.outputs.push(written);
+            rule.output_patterns.push(self.suffix_pattern(&target));
+            let input = self.ev.session.intern(undotted(&source));
+            rule.inputs.push(input);
+            rule.prerequisite_names.push(input);
+            rule.is_suffix_rule = true;
+            rule.cmds = crate::builtin_rules::recipe_lines(&mut self.ev.session, recipe)?;
+            self.suffix_rules
+                .entry(undotted(&target))
+                .or_default()
+                .push(Arc::new(rule));
+        }
+        Ok(())
+    }
+
+    /// A suffix-rule name read as the two declared suffixes it is written from,
+    /// if both of them are on the list.
+    fn declared_suffix_pair(&self, name: &str) -> Option<(Bytes, Bytes)> {
+        for source in &self.suffixes {
+            let Some(rest) = name.as_bytes().strip_prefix(source.as_ref()) else {
+                continue;
+            };
+            if rest.is_empty() {
+                continue;
+            }
+            if let Some(target) = self.suffixes.iter().find(|target| target.as_ref() == rest) {
+                return Some((source.clone(), target.clone()));
+            }
+        }
+        None
+    }
+
+    /// Put the rules that make one suffix into the order GNU Make tries them.
+    ///
+    /// `convert_to_pattern` walks `.SUFFIXES` in its written order and installs
+    /// each rule it derives at the end of one chain, so which source a target
+    /// is made from when several are there is decided by where that source sits
+    /// on the list — `.c` before `.cc` is why `foo.o` comes from `foo.c`. The
+    /// sort is stable, so two rules with the same source suffix keep the order
+    /// population left them in, which is the later definition first.
+    fn order_suffix_rules_by_suffix_list(&mut self) {
+        let order = self.suffixes.iter().map(undotted).collect::<Vec<_>>();
+        let names = &self.ev.session;
+        for rules in self.suffix_rules.values_mut() {
+            rules.sort_by_key(|rule| {
+                let source = rule.inputs[0].as_bytes(names);
+                order
+                    .iter()
+                    .position(|suffix| *suffix == source)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+    }
+
+    /// The rules `default.c` writes as patterns rather than as suffixes, and
+    /// then the terminal ones.
+    ///
+    /// Installed last, and each only if no rule of that identity is already
+    /// there, which is `new_pattern_rule`'s override left off: a Makefile that
+    /// wrote `%.out: %` — with a recipe or without one — keeps the name.
+    fn install_default_pattern_rules(&mut self) -> Result<()> {
+        for (terminal, table) in [
+            (false, crate::builtin_rules::DEFAULT_PATTERN_RULES),
+            (true, crate::builtin_rules::DEFAULT_TERMINAL_RULES),
+        ] {
+            for (target, prerequisites, recipe) in table {
+                let rule = crate::builtin_rules::pattern_rule(
+                    &mut self.ev.session,
+                    target,
+                    prerequisites,
+                    recipe,
+                    terminal,
+                )?;
+                self.populate_implicit_rule(Arc::new(rule), false)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `.c` written as the pattern that matches a name ending in it.
+    fn suffix_pattern(&mut self, suffix: &Bytes) -> Symbol {
+        let mut pattern = BytesMut::with_capacity(suffix.len() + 1);
+        pattern.put_u8(b'%');
+        pattern.put_slice(suffix);
+        self.ev.session.intern(pattern.freeze())
     }
 
     /// The goal an invocation that named none builds.
@@ -1558,12 +1845,17 @@ impl<'a> DepBuilder<'a> {
         node.has_rule && !node.is_phony && !node.unconditional_double_colon
     }
 
-    fn exists(&self, target: Symbol) -> bool {
-        self.rules.contains_key(&target)
+    fn exists(&mut self, target: Symbol) -> bool {
+        if let Some(answer) = self.exists_cache.get(&target) {
+            return *answer;
+        }
+        let answer = self.rules.contains_key(&target)
             || self.phony.contains(&target)
             || std::fs::exists(OsStr::from_bytes(&target.as_bytes(&self.ev.session)))
                 .is_ok_and(|v| v)
-            || self.vpath_of(target).is_some()
+            || self.vpath_of(target).is_some();
+        self.exists_cache.insert(target, answer);
+        answer
     }
 
     /// Replace each prerequisite with where the directory search found it.
@@ -2002,7 +2294,7 @@ impl<'a> DepBuilder<'a> {
             }
             let rule = Arc::new(rule);
             if rule.outputs.is_empty() {
-                self.populate_implicit_rule(rule)?;
+                self.populate_implicit_rule(rule, true)?;
             } else {
                 self.populate_explicit_rule(rule)?;
             }
@@ -2200,12 +2492,22 @@ impl<'a> DepBuilder<'a> {
         i == b"RCS/%,v" || i == b"RCS/%" || i == b"%,v" || i == b"s.%" || i == b"SCCS/s.%"
     }
 
-    fn populate_implicit_rule(&mut self, rule: Arc<Rule>) -> Result<()> {
+    /// Record a pattern rule, as GNU Make's `new_pattern_rule` does.
+    ///
+    /// `override_existing` is that function's second argument. A rule read from
+    /// a Makefile displaces one already holding its identity, so a later
+    /// definition wins; a rule from the built-in catalogue does not, and is
+    /// thrown away instead — which is how a Makefile keeps a name the catalogue
+    /// would otherwise have taken, whether or not it gave that name a recipe.
+    fn populate_implicit_rule(&mut self, rule: Arc<Rule>, override_existing: bool) -> Result<()> {
         if let Some(index) = self
             .implicit_rule_defs
             .iter()
             .position(|existing| replaces_pattern_rule(&rule, existing))
         {
+            if !override_existing {
+                return Ok(());
+            }
             let existing = self.implicit_rule_defs.remove(index);
             self.implicit_rules.remove_rule(&existing);
         }
@@ -2700,17 +3002,155 @@ impl<'a> DepBuilder<'a> {
     /// It also settles what such a rule does to targets reached some other way:
     /// nothing. Its prerequisites are not added to anything, because a rule the
     /// search never collects contributes neither recipe nor prerequisite.
+    ///
+    /// One recipe-less rule is still read for something. A rule with neither a
+    /// recipe nor prerequisites — which is what every declared suffix has, and
+    /// what a Makefile writes as a bare `%.tex:` — records that this name was
+    /// matched by a pattern that does not match every name. GNU Make's
+    /// `specific_rule_matched` then strikes out every non-terminal rule whose
+    /// target is a bare `%`, wherever it sits in the order. That is why the
+    /// built-in link rules do not claim a `foo.o` the way they claim a `foo`.
     fn ordered_candidates(&self, output_str: &Bytes) -> Vec<ImplicitCandidate> {
-        let mut candidates = self.implicit_rules.get(output_str);
-        candidates.retain(|candidate| {
-            !candidate.rule.cmds.is_empty()
-                && Pattern::new(candidate.pattern.as_bytes(&self.ev.session)).matches(output_str)
-        });
-        candidates.sort_by_key(|candidate| {
-            let pat = Pattern::new(candidate.pattern.as_bytes(&self.ev.session));
-            (pat.stem(output_str).len(), candidate.order)
-        });
-        candidates
+        let mut specific_rule_matched = false;
+        // The stem length each candidate leaves, measured while its pattern is
+        // in hand. The catalogue puts every match-anything rule in front of
+        // every search, so measuring inside the comparison would take the
+        // pattern apart again for each of them at every comparison.
+        let mut matched: Vec<(usize, usize, ImplicitCandidate)> = Vec::new();
+        for candidate in self.implicit_rules.get(output_str) {
+            // A cancelled rule — prerequisites, no recipe — and one a search
+            // further out is already working through are both passed over
+            // before they can be read as a match at all.
+            if candidate.rule.cmds.is_empty() && Self::has_prerequisites(&candidate.rule) {
+                continue;
+            }
+            if self.rules_in_use.contains(&Self::rule_id(&candidate.rule)) {
+                continue;
+            }
+            let pattern = candidate.pattern.as_bytes(&self.ev.session);
+            let pat = Pattern::new(pattern.clone());
+            if !pat.matches(output_str) {
+                continue;
+            }
+            specific_rule_matched |= pattern.as_ref() != b"%";
+            if candidate.rule.cmds.is_empty() {
+                continue;
+            }
+            let stem = pat.stem(output_str).len();
+            let order = candidate.order;
+            matched.push((stem, order, candidate));
+        }
+        if specific_rule_matched {
+            matched.retain(|(_, _, candidate)| {
+                candidate.rule.is_double_colon || !self.matches_anything(&candidate.rule)
+            });
+        }
+        matched.sort_by_key(|(stem, order, _)| (*stem, *order));
+        matched
+            .into_iter()
+            .map(|(_, _, candidate)| candidate)
+            .collect()
+    }
+
+    /// Run `body` with `rule` marked as one a search further out is working
+    /// through, which is GNU Make's `rule->in_use` around the prerequisite loop
+    /// of `pattern_search`.
+    ///
+    /// The mark is taken off however `body` leaves — a rule that failed is
+    /// available to the next search, and only the searches nested inside this
+    /// one are meant to pass over it.
+    fn while_rule_in_use<T>(
+        &mut self,
+        rule: &Arc<Rule>,
+        body: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let id = Self::rule_id(rule);
+        let marked = self.rules_in_use.insert(id);
+        let outcome = body(self);
+        if marked {
+            self.rules_in_use.remove(&id);
+        }
+        outcome
+    }
+
+    /// Whether every prerequisite this rule would need can be had, and which of
+    /// them the search would be inventing.
+    ///
+    /// `None` is the rule failing. An empty list is it applying with nothing
+    /// invented.
+    fn implicit_prerequisites_reachable(
+        &mut self,
+        inputs: Vec<(Symbol, bool)>,
+        pass: SearchPass,
+    ) -> Result<Option<Vec<Symbol>>> {
+        let mut invented = Vec::new();
+        for (sym, from_pattern) in inputs {
+            // A name an earlier search proved nothing can make fails this rule
+            // outright, on either pass: the answer cannot have changed.
+            if self.proven_impossible(sym, 0) {
+                return Ok(None);
+            }
+            if self.exists(sym) {
+                continue;
+            }
+            // The compatibility pass takes a prerequisite the Makefile merely
+            // names. It runs after everything else has failed, so the name is
+            // not invented and never becomes an intermediate: the search did
+            // not make it up, it read it.
+            if self.is_written_down(sym) {
+                if pass.compat {
+                    continue;
+                }
+                // A name that is known but not promised is what makes a
+                // compatibility pass worth running at all. Noted here and not
+                // acted on: this rule may still apply by making the name.
+                self.found_compat_rule = true;
+            }
+            if !(pass.chaining && self.intermediate_reachable(sym, 0, pass.compat)?) {
+                return Ok(None);
+            }
+            if from_pattern && !self.mentioned.contains(&sym) {
+                invented.push(sym);
+            }
+        }
+        Ok(Some(invented))
+    }
+
+    /// Whether an implicit chain could make this name, remembering a failure
+    /// that was the rules' answer rather than the search's own limits.
+    ///
+    /// GNU Make marks the name where it gives up on making it an intermediate,
+    /// and every later search rejects a rule that asks for it without walking
+    /// the subtree again. A name the Makefile writes down is left unmarked, so
+    /// that a compatibility pass can still take it on trust.
+    fn intermediate_reachable(&mut self, name: Symbol, depth: usize, compat: bool) -> Result<bool> {
+        if self.proven_impossible(name, depth) {
+            return Ok(false);
+        }
+        let outer_truncated = std::mem::replace(&mut self.chain_truncated, false);
+        let reachable = self.can_be_made_implicitly(name, depth, compat)?;
+        let conclusive = !self.chain_truncated;
+        self.chain_truncated |= outer_truncated;
+        if !reachable && conclusive && !self.is_written_down(name) {
+            let shallowest = self.impossible.entry(name).or_insert(depth);
+            *shallowest = (*shallowest).min(depth);
+        }
+        Ok(reachable)
+    }
+
+    /// Whether a search with no more budget than this one already failed on
+    /// this name.
+    fn proven_impossible(&self, name: Symbol, depth: usize) -> bool {
+        self.impossible
+            .get(&name)
+            .is_some_and(|shallowest| *shallowest <= depth)
+    }
+
+    /// Whether the rule was written with prerequisites, however they are held.
+    fn has_prerequisites(rule: &Rule) -> bool {
+        !rule.inputs.is_empty()
+            || !rule.order_only_inputs.is_empty()
+            || rule.deferred_prerequisites.is_some()
     }
 
     /// Whether the Makefile has written this name down anywhere at all.
@@ -2730,7 +3170,7 @@ impl<'a> DepBuilder<'a> {
 
     fn can_pick_implicit_rule(
         &mut self,
-        rule: &Rule,
+        rule: &Arc<Rule>,
         matched: Symbol,
         candidate_order: usize,
         output: Symbol,
@@ -2756,28 +3196,15 @@ impl<'a> DepBuilder<'a> {
                 })
                 .collect(),
         };
-        let mut invented = Vec::new();
-        for (sym, from_pattern) in inputs {
-            if self.exists(sym) {
-                continue;
-            }
-            // The compatibility pass takes a prerequisite the Makefile merely
-            // names. It runs after everything else has failed, so the name is
-            // not invented and never becomes an intermediate: the search did
-            // not make it up, it read it.
-            if pass.compat && self.is_written_down(sym) {
-                continue;
-            }
-            if !(pass.chaining && self.can_be_made_implicitly(sym, 0, pass.compat)?) {
-                return Ok(None);
-            }
-            if from_pattern && !self.mentioned.contains(&sym) {
-                invented.push(sym);
-            }
-        }
+        let Some(invented) = self.while_rule_in_use(rule, |builder| {
+            builder.implicit_prerequisites_reachable(inputs, pass)
+        })?
+        else {
+            return Ok(None);
+        };
         self.intermediates.extend(invented);
 
-        let mut rule = rule.clone();
+        let mut rule = rule.as_ref().clone();
         if let Some((inputs, order_only_inputs)) = deferred {
             rule.deferred_prerequisites = None;
             rule.inputs = inputs;
@@ -2842,20 +3269,23 @@ impl<'a> DepBuilder<'a> {
         depth: usize,
         compat: bool,
     ) -> Result<bool> {
-        if depth >= MAX_IMPLICIT_CHAIN || !self.chaining.insert(output) {
+        if depth >= MAX_IMPLICIT_CHAIN {
             return Ok(false);
         }
-        // One recursion is one whole search, so it runs the compatibility pass
-        // of its own once its strict pass has failed — unless the search that
-        // reached it is already the compatibility pass, which it inherits.
-        let passes: &[bool] = if compat { &[true] } else { &[false, true] };
-        let mut answer = Ok(false);
-        for compat in passes {
-            answer = self.implicit_chain_exists(output, depth, *compat);
-            if !matches!(answer, Ok(false)) {
-                break;
-            }
+        if !self.chaining.insert(output) {
+            self.chain_truncated = true;
+            return Ok(false);
         }
+        // One recursion is one whole search, so it runs a compatibility pass of
+        // its own once its strict pass has failed and passed over a rule for a
+        // written-down name — unless the search that reached it is already the
+        // compatibility pass, which it inherits.
+        let outer_compat = std::mem::replace(&mut self.found_compat_rule, false);
+        let mut answer = self.implicit_chain_exists(output, depth, compat);
+        if matches!(answer, Ok(false)) && !compat && self.found_compat_rule {
+            answer = self.implicit_chain_exists(output, depth, true);
+        }
+        self.found_compat_rule = outer_compat;
         self.chaining.remove(&output);
         answer
     }
@@ -2892,17 +3322,31 @@ impl<'a> DepBuilder<'a> {
                     })
                     .collect(),
             };
-            let mut ok = true;
-            for i in inputs {
-                if self.exists(i) || (compat && self.is_written_down(i)) {
-                    continue;
+            // The same terminal restriction, one level in. A terminal rule is
+            // never offered the pass that invents its prerequisites, so it can
+            // serve as a link in a chain only when what it reads is there.
+            let terminal = rule.is_double_colon;
+            let reachable = self.while_rule_in_use(&rule, |builder| {
+                for i in inputs {
+                    if builder.proven_impossible(i, depth + 1) {
+                        return Ok(false);
+                    }
+                    if builder.exists(i) {
+                        continue;
+                    }
+                    if builder.is_written_down(i) {
+                        if compat {
+                            continue;
+                        }
+                        builder.found_compat_rule = true;
+                    }
+                    if terminal || !builder.intermediate_reachable(i, depth + 1, compat)? {
+                        return Ok(false);
+                    }
                 }
-                if !self.can_be_made_implicitly(i, depth + 1, compat)? {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
+                Ok(true)
+            })?;
+            if reachable {
                 return Ok(true);
             }
         }
@@ -2917,11 +3361,26 @@ impl<'a> DepBuilder<'a> {
             return Ok(false);
         };
         for irule in &found {
+            if self.rules_in_use.contains(&Self::rule_id(irule)) {
+                continue;
+            }
             let input = replace_suffix(&mut self.ev.session, output, &irule.inputs[0]);
-            if self.exists(input)
-                || (compat && self.is_written_down(input))
-                || self.can_be_made_implicitly(input, depth + 1, compat)?
-            {
+            let reachable = self.while_rule_in_use(irule, |builder| {
+                if builder.proven_impossible(input, depth + 1) {
+                    return Ok(false);
+                }
+                if builder.exists(input) {
+                    return Ok(true);
+                }
+                if builder.is_written_down(input) {
+                    if compat {
+                        return Ok(true);
+                    }
+                    builder.found_compat_rule = true;
+                }
+                builder.intermediate_reachable(input, depth + 1, compat)
+            })?;
+            if reachable {
                 return Ok(true);
             }
         }
@@ -2961,11 +3420,30 @@ impl<'a> DepBuilder<'a> {
         // Steps 5 then 6, over the same rules, and then both again taking a
         // written-down prerequisite on trust. Each pass runs out over every
         // candidate before the next one begins; `SearchPass` says why.
-        for pass in SearchPass::all() {
-            if let Some(picked) =
-                self.pick_pattern_rule(output, n, &rule_merger, &patterns, &vars, pass)?
-            {
-                return Ok(Some(picked));
+        //
+        // Not for a phony name. GNU Make's `remake.c` asks for an implicit rule
+        // only where `!file->phony`, and it matters as soon as there are
+        // built-in rules to find: `%: %.c` matches every name there is, so an
+        // `all` declared `.PHONY` beside an `all.c` would otherwise acquire a
+        // recipe that links a program nobody asked for.
+        if !self.phony.contains(&output) {
+            let outer_compat = std::mem::replace(&mut self.found_compat_rule, false);
+            let mut picked = None;
+            for pass in SearchPass::all() {
+                // The passes that take a name on trust are a retry of the whole
+                // search, and GNU Make retries only a search that passed over a
+                // rule for such a name.
+                if pass.compat && !self.found_compat_rule {
+                    break;
+                }
+                picked = self.pick_pattern_rule(output, n, &rule_merger, &patterns, &vars, pass)?;
+                if picked.is_some() {
+                    break;
+                }
+            }
+            self.found_compat_rule = outer_compat;
+            if picked.is_some() {
+                return Ok(picked);
             }
         }
 
@@ -2978,7 +3456,8 @@ impl<'a> DepBuilder<'a> {
         }
         // Make's step 7, and the last thing it tries. Only for a target with no
         // rule at all that is not already there.
-        let default_rule = self.default_rule.clone().filter(|_| !self.exists(output));
+        let already_there = self.exists(output);
+        let default_rule = self.default_rule.clone().filter(|_| !already_there);
         Ok(default_rule.map(|rule| PickedRuleInfo {
             merger: None,
             pattern_rule: Some(rule),
@@ -3094,6 +3573,16 @@ impl<'a> DepBuilder<'a> {
     ) -> Result<Option<PickedRuleInfo>> {
         let candidates = self.ordered_candidates(&output.as_bytes(&self.ev.session));
         for candidate in candidates {
+            // A terminal rule is not offered the pass that invents what it
+            // needs. GNU Make rejects one outright while it is looking to make
+            // intermediate files, which is what "terminal" means: the rule
+            // applies to what is already there. The catalogue's RCS and SCCS
+            // rules are the reason it has to hold — each of them matches every
+            // name, so a `foo` allowed to invent `foo,v` would then be allowed
+            // to invent `foo,v,v` for it, without end.
+            if pass.chaining && candidate.rule.is_double_colon {
+                continue;
+            }
             let Some(pattern_rule) = self.can_pick_implicit_rule(
                 &candidate.rule,
                 candidate.pattern,
@@ -3128,9 +3617,23 @@ impl<'a> DepBuilder<'a> {
 
         for irule in &found {
             assert!(irule.inputs.len() == 1);
+            if self.rules_in_use.contains(&Self::rule_id(irule)) {
+                continue;
+            }
             let input = replace_suffix(&mut self.ev.session, output, &irule.inputs[0]);
-            if !self.exists(input) && !(pass.compat && self.is_written_down(input)) {
-                if !(pass.chaining && self.can_be_made_implicitly(input, 0, pass.compat)?) {
+            if self.proven_impossible(input, 0) {
+                continue;
+            }
+            let mut taken_on_trust = false;
+            if !self.exists(input) && self.is_written_down(input) {
+                taken_on_trust = pass.compat;
+                self.found_compat_rule |= !pass.compat;
+            }
+            if !self.exists(input) && !taken_on_trust {
+                let reachable = self.while_rule_in_use(irule, |builder| {
+                    Ok(pass.chaining && builder.intermediate_reachable(input, 0, pass.compat)?)
+                })?;
+                if !reachable {
                     continue;
                 }
                 if !self.mentioned.contains(&input) {

@@ -213,7 +213,7 @@ const POSIX_VARIABLES: &[(&str, &str)] = &[
 /// the bottom of it: anything the environment, the command line, an `override`
 /// or the Makefile itself has already said outranks a default and keeps its
 /// value. Another default does not, which is how `.POSIX:` replaces `CC`.
-fn claimable(session: &mut Session, name: &str) -> Option<Symbol> {
+pub(crate) fn claimable(session: &mut Session, name: &str) -> Option<Symbol> {
     let sym = session.intern(name.as_bytes().to_vec());
     match session.peek_global_var(sym) {
         Some(existing) if existing.read().origin() != VarOrigin::Default => None,

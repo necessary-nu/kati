@@ -120,16 +120,16 @@ fn read_bootstrap_makefile(
     bootstrap.put_slice(b"SHELL=/bin/sh\n");
     // TODO: Add more builtin vars.
 
+    // GNU Make's `set_default_suffixes`, which is the whole of the built-in
+    // rule catalogue that has to be in scope while a Makefile is read: the
+    // rules themselves are derived from this list once the read is over, so
+    // that a Makefile's `.SUFFIXES:` decides which of them exist. The manual's
+    // catalogue of rules disagrees with `src/default.c`, and `default.c` is the
+    // one that runs — see [`crate::builtin_rules`].
     if !session.flags.no_builtin_rules {
-        // http://www.gnu.org/software/make/manual/make.html#Catalogue-of-Rules
-        // The document above is actually not correct. See default.c:
-        // http://git.savannah.gnu.org/cgit/make.git/tree/default.c?id=4.1
-        bootstrap.put_slice(b".SUFFIXES: .o .c .cc\n");
-        bootstrap.put_slice(b".c.o:\n");
-        bootstrap.put_slice(b"\t$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c -o $@ $<\n");
-        bootstrap.put_slice(b".cc.o:\n");
-        bootstrap.put_slice(b"\t$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c -o $@ $<\n");
-        // TODO: Add more builtin rules.
+        bootstrap.put_slice(b".SUFFIXES: ");
+        bootstrap.put_slice(crate::builtin_rules::default_suffix_list().as_bytes());
+        bootstrap.put_u8(b'\n');
     }
     if session.flags.generate_ninja {
         bootstrap.put_slice(format!("MAKE?=make -j{}\n", session.flags.num_jobs.max(1)).as_bytes());
@@ -364,6 +364,8 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
     if catalogue_installed {
         crate::builtins::install_default_variables(&mut ev.session)?;
     }
+    let rules_installed = !ev.session.flags.no_builtin_rules;
+    crate::builtin_rules::install_suffixes_variable(&mut ev.session, !rules_installed);
 
     install_default_goal(&mut ev)?;
 
@@ -424,6 +426,13 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
     // `default`, and the recipe that runs afterwards expands to nothing.
     if catalogue_installed && ev.session.flags.no_builtin_variables {
         crate::builtins::undefine_default_variables(&mut ev.session);
+    }
+    // The rules go the same way, and the list they are derived from goes with
+    // them. Dependency analysis takes `.SUFFIXES` away where it can see whether
+    // the Makefile wrote a list of its own; `SUFFIXES` is the readable half and
+    // is emptied here.
+    if rules_installed && ev.session.flags.no_builtin_rules {
+        crate::builtin_rules::install_suffixes_variable(&mut ev.session, true);
     }
 
     if let Some(filename) = ev.session.flags.dump_include_graph.clone() {
