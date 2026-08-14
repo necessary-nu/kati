@@ -852,6 +852,16 @@ pub struct Evaluator {
     /// Makefiles it has to remake to those, and those are not goals.
     pub goals: Vec<Symbol>,
 
+    /// Whether the rules have been taken out of this evaluator and turned into
+    /// a graph, so that recording another one could no longer change anything.
+    ///
+    /// GNU Make's `snapped_deps`, and it means the same thing there: once
+    /// `snap_deps` has resolved the rules it read into files, an `$(eval)`
+    /// reached afterwards — from a recipe, or from a second expansion — may
+    /// still assign variables but may not record a rule, and one that tries is
+    /// fatal rather than quietly ineffective (Savannah bug #12124).
+    pub(crate) rules_snapped: bool,
+
     pub is_evaluating_command: bool,
     /// Whether expanding the current recipe referenced `MAKE`.
     ///
@@ -996,6 +1006,7 @@ impl Evaluator {
             read_makefiles: Vec::new(),
             goals: Vec::new(),
 
+            rules_snapped: false,
             is_evaluating_command: false,
             expanded_make_in_command: Vec::new(),
         }
@@ -1214,23 +1225,16 @@ impl Evaluator {
                         // `+=` reads what is in scope and defines the result
                         // where an ordinary assignment would, which is why
                         // precedence is decided on the copy rather than on what
-                        // it was read from. An automatic binding is the
-                        // exception kati has never implemented: GNU Make
-                        // appends through it into the file scope it shadows,
-                        // and there is no way to spell that while the binding
-                        // is a replaced global. Appending in place is what this
-                        // did before the copy existed, and it is the closer of
-                        // the two — GNU Make does not refuse.
-                        if prev.read().origin() == VarOrigin::Automatic {
-                            needs_assign = false;
-                            result = prev.clone();
-                        } else {
-                            result = prev.read().clone_for_assignment(
-                                origin,
-                                current_frame,
-                                self.loc.clone(),
-                            );
-                        }
+                        // it was read from. A `foreach` or `call` binding is
+                        // read through exactly like anything else: GNU Make
+                        // pastes onto the loop word and defines the answer in
+                        // the global set the binding is standing in front of,
+                        // which is where the copy goes too.
+                        result = prev.read().clone_for_assignment(
+                            origin,
+                            current_frame,
+                            self.loc.clone(),
+                        );
                         let frame = self.current_frame();
                         if let Some(expanded) = appended {
                             result.write().append_str(&self.session, &expanded, frame)?;
@@ -1662,7 +1666,28 @@ impl Evaluator {
         Ok(())
     }
 
+    /// Read `tgt: VAR = value`, expanding both halves in `tgt`'s own scope and
+    /// putting back whatever scope that interrupted.
+    ///
+    /// Ordinarily it interrupts nothing, because a rule is read between
+    /// statements rather than inside one. A recipe's `$(eval tgt: VAR = value)`
+    /// is the exception: it arrives while the recipe's own target scope is
+    /// installed, and dropping that scope instead of restoring it would leave
+    /// every later line of the recipe reading globals where GNU Make still
+    /// reads the target's variables.
     fn eval_rule_specific_assign(
+        &mut self,
+        targets: &[Symbol],
+        assignment: RuleAssignment,
+        is_pattern_rule: bool,
+    ) -> Result<()> {
+        let interrupted = self.current_scope.take();
+        let result = self.record_rule_specific_assign(targets, assignment, is_pattern_rule);
+        self.current_scope = interrupted;
+        result
+    }
+
+    fn record_rule_specific_assign(
         &mut self,
         targets: &[Symbol],
         assignment: RuleAssignment,
@@ -1802,6 +1827,20 @@ impl Evaluator {
         };
         if let Some(assignment) = self.parse_rule_assignment(candidate, literal_command.as_ref())? {
             return self.eval_rule_specific_assign(&targets, assignment, is_pattern_rule);
+        }
+
+        // Past this point the line is a rule, and a rule read after the graph
+        // was compiled has nowhere to go. GNU Make refuses it here for the same
+        // reason and in the same place — this is `record_files`' first act, and
+        // it comes after the target-specific assignment above, which is why
+        // `$(eval all: LOCAL = x)` in a recipe is accepted while
+        // `$(eval all: extra)` is not.
+        if self.rules_snapped {
+            error_loc!(
+                self,
+                self.loc.as_ref(),
+                "*** prerequisites cannot be defined in recipes."
+            );
         }
 
         let scan_expanded_command = !rest.is_empty();
@@ -2660,6 +2699,12 @@ impl Evaluator {
     /// unwinding out of `f` does not restore, unlike `Drop`; evaluation reports
     /// every failure it is meant to survive as an `Err`, and the session a
     /// panic would corrupt does not outlive it.
+    ///
+    /// "Whatever the symbol was bound to before" is a slot rather than a value:
+    /// an assignment written inside the body, which can only reach the session
+    /// through `$(eval)`, is a write to the global binding and lands in that
+    /// slot without disturbing what the body reads. See
+    /// [`crate::var::GlobalVars::bind`].
     // [spec:ronin:req:make.no-ambient-state]
     pub fn with_bound<T>(
         &mut self,
@@ -2667,9 +2712,9 @@ impl Evaluator {
         var: Var,
         f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
-        let orig = self.session.globals.replace(sym, Some(var));
+        self.session.globals.bind(sym, var);
         let result = f(self);
-        self.session.globals.replace(sym, orig);
+        self.session.globals.unbind();
         result
     }
 
@@ -2682,13 +2727,13 @@ impl Evaluator {
         bindings: Vec<(Symbol, Var)>,
         f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
-        let mut saved = Vec::with_capacity(bindings.len());
+        let count = bindings.len();
         for (sym, var) in bindings {
-            saved.push((sym, self.session.globals.replace(sym, Some(var))));
+            self.session.globals.bind(sym, var);
         }
         let result = f(self);
-        for (sym, orig) in saved.into_iter().rev() {
-            self.session.globals.replace(sym, orig);
+        for _ in 0..count {
+            self.session.globals.unbind();
         }
         result
     }
@@ -2939,5 +2984,76 @@ mod tests {
         let bound = ev.session.peek_global_var(kept).unwrap();
         assert_eq!(string_of(&ev.session, bound), "outer");
         assert!(ev.session.peek_global_var(absent).is_none());
+    }
+
+    fn from_file(value: &'static [u8]) -> Var {
+        Variable::with_simple_string(Bytes::from_static(value), VarOrigin::File, None, None)
+    }
+
+    /// An assignment written inside a binding's body is a write to the global
+    /// binding: the body goes on reading the bound value, and the assignment is
+    /// what the name means once the binding unwinds.
+    #[test]
+    fn test_assignment_under_a_binding_lands_outside_it() {
+        let mut ev = Evaluator::new(Session::new());
+        let sym = ev.session.intern("KATI_TEST_BINDING_LANDING");
+        ev.session.globals.replace(sym, Some(from_file(b"outer")));
+
+        ev.with_bound(sym, automatic(b"loop-word"), |ev| {
+            ev.session
+                .set_global_var(sym, from_file(b"assigned"), false, None)?;
+            let read = ev.session.peek_global_var(sym).unwrap();
+            assert_eq!(string_of(&ev.session, read.clone()), "loop-word");
+            assert_eq!(read.read().origin(), VarOrigin::Automatic);
+            Ok(())
+        })
+        .unwrap();
+
+        let after = ev.session.peek_global_var(sym).unwrap();
+        assert_eq!(string_of(&ev.session, after.clone()), "assigned");
+        assert_eq!(after.read().origin(), VarOrigin::File);
+    }
+
+    /// Two bindings of one name, and the assignment still reaches past both:
+    /// the slot the *outermost* binding saved is the global one.
+    #[test]
+    fn test_assignment_under_nested_bindings_reaches_the_global() {
+        let mut ev = Evaluator::new(Session::new());
+        let sym = ev.session.intern("KATI_TEST_BINDING_NESTED");
+        ev.session.globals.replace(sym, Some(from_file(b"outer")));
+
+        ev.with_bound(sym, automatic(b"first"), |ev| {
+            ev.with_bound(sym, automatic(b"second"), |ev| {
+                ev.session
+                    .set_global_var(sym, from_file(b"assigned"), false, None)
+            })?;
+            // The inner binding unwinds to the outer binding, not to the write.
+            let read = ev.session.peek_global_var(sym).unwrap();
+            assert_eq!(string_of(&ev.session, read), "first");
+            Ok(())
+        })
+        .unwrap();
+
+        let after = ev.session.peek_global_var(sym).unwrap();
+        assert_eq!(string_of(&ev.session, after), "assigned");
+    }
+
+    /// `undefine` reaches the same slot an assignment does, so it withdraws
+    /// what the name meant outside the binding without disturbing the binding.
+    #[test]
+    fn test_undefine_under_a_binding_withdraws_the_global() {
+        let mut ev = Evaluator::new(Session::new());
+        let sym = ev.session.intern("KATI_TEST_BINDING_UNDEFINE");
+        ev.session.globals.replace(sym, Some(from_file(b"outer")));
+
+        ev.with_bound(sym, automatic(b"loop-word"), |ev| {
+            ev.session.undefine_global_var(sym, false)?;
+            let read = ev.session.peek_global_var(sym).unwrap();
+            assert_eq!(string_of(&ev.session, read), "loop-word");
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(ev.session.peek_global_var(sym).is_none());
     }
 }

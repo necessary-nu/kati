@@ -993,6 +993,13 @@ impl<'a> DepBuilder<'a> {
         ret.handle_special_targets()?;
         ret.gpaths = ret.gpath_directories()?;
 
+        // The rules are this builder's now. Anything the evaluator records from
+        // here on — a recipe's `$(eval)`, a second expansion's — is a rule the
+        // graph will never see, so the evaluator has to refuse it rather than
+        // accept it and describe a different build. GNU Make raises
+        // `snapped_deps` at the same point, at the end of `snap_deps`.
+        ret.ev.rules_snapped = true;
+
         Ok(ret)
     }
 

@@ -619,6 +619,33 @@ pub struct GlobalVars {
     /// Indexed by [`Symbol::index`]. Sparse: most interned names never become
     /// global variables.
     vars: Vec<Option<Var>>,
+    /// The local bindings `foreach`, `call` and `let` have pushed, innermost
+    /// last, each holding what its name meant just outside it.
+    ///
+    /// GNU Make gives those constructs a variable set of their own, pushed in
+    /// front of the global set for the duration of the body. Reads walk the
+    /// chain and find the binding; writes do not — `do_variable_definition`
+    /// hands `define_variable_in_set` a null set for everything except a
+    /// target-specific assignment, and a null set means the global one. So an
+    /// `$(eval v = x)` written inside `$(foreach v,...)` leaves `$(v)` reading
+    /// the loop word for the rest of the loop and takes effect once the loop
+    /// has unwound.
+    ///
+    /// One table with a saved slot per binding says the same thing, as long as
+    /// an assignment reaches the slot the *outermost* binding of that name
+    /// saved: that slot is where the global value went, and every inner
+    /// binding's saved slot holds another automatic value rather than the
+    /// global one.
+    bindings: Vec<Binding>,
+}
+
+/// One name bound by a `foreach`, `call` or `let` for the extent of its body.
+struct Binding {
+    sym: Symbol,
+    /// What `sym` meant outside this binding. For the outermost binding of a
+    /// name that is the global value, which is what an assignment written
+    /// inside the body has to reach.
+    shadowed: Option<Var>,
 }
 
 impl Default for GlobalVars {
@@ -630,7 +657,10 @@ impl Default for GlobalVars {
 impl GlobalVars {
     /// An empty scope. No interner is needed to make one.
     pub fn new() -> Self {
-        Self { vars: Vec::new() }
+        Self {
+            vars: Vec::new(),
+            bindings: Vec::new(),
+        }
     }
 
     /// A scope carrying the bindings kati defines before any makefile is read.
@@ -686,6 +716,40 @@ impl GlobalVars {
         std::mem::replace(&mut self.vars[idx], var)
     }
 
+    /// Bind `sym` to `var` for the extent of a `foreach`, `call` or `let` body,
+    /// shadowing whatever it means outside.
+    ///
+    /// Undone by [`Self::unbind`], which every binding needs exactly one of.
+    pub fn bind(&mut self, sym: Symbol, var: Var) {
+        let shadowed = self.replace(sym, Some(var));
+        self.bindings.push(Binding { sym, shadowed });
+    }
+
+    /// Undo the innermost binding, restoring the name to what it meant outside
+    /// it — or to whatever an assignment written inside the body put there.
+    pub fn unbind(&mut self) {
+        let Some(binding) = self.bindings.pop() else {
+            return;
+        };
+        self.replace(binding.sym, binding.shadowed);
+    }
+
+    /// The slot a write to `sym` belongs in: the global one.
+    ///
+    /// While a local binding of that name is in force the global slot is the
+    /// one the outermost such binding saved, and the visible entry is the
+    /// binding, which a write must leave alone. See [`Self::bindings`].
+    fn writable_slot(&mut self, sym: Symbol) -> &mut Option<Var> {
+        if let Some(outermost) = self.bindings.iter().position(|binding| binding.sym == sym) {
+            return &mut self.bindings[outermost].shadowed;
+        }
+        let idx = sym.index();
+        if idx >= self.vars.len() {
+            self.vars.resize(idx + 1, None);
+        }
+        self.vars.get_mut(idx).unwrap()
+    }
+
     /// Assign to `sym` under GNU Make's readonly and origin precedence rules,
     /// which can decline the assignment silently.
     pub fn assign(
@@ -696,11 +760,7 @@ impl GlobalVars {
         is_override: bool,
         readonly: Option<&mut bool>,
     ) -> Result<()> {
-        let idx = sym.index();
-        if idx >= self.vars.len() {
-            self.vars.resize(idx + 1, None);
-        }
-        let entry = self.vars.get_mut(idx).unwrap();
+        let entry = self.writable_slot(sym);
         if let Some(orig) = entry {
             if orig.read().readonly {
                 if let Some(readonly) = readonly {
@@ -734,7 +794,10 @@ impl GlobalVars {
             // front end re-arming its own automatic variables — which it does
             // whenever it starts expanding recipes again, and it may do that
             // more than once now that a recipe can be expanded as its edge is
-            // launched — is not an assignment at all.
+            // launched — is not an assignment at all. Neither is assigning over
+            // a loop or parameter name: that write never reaches the binding,
+            // because [`Self::writable_slot`] sent it to the global slot the
+            // binding is standing in front of.
             if origin == VarOrigin::Automatic && assigning != VarOrigin::Automatic {
                 error!("overriding automatic variable is not implemented yet");
             }
@@ -749,13 +812,19 @@ impl GlobalVars {
     /// A makefile's `undefine` reaches the environment and its own assignments
     /// and stops there; `override undefine` reaches what the command line and
     /// `override` set as well. An automatic variable is out of reach of both.
+    ///
+    /// It reaches the global binding and no other: GNU Make's `undefine`
+    /// directive is `undefine_variable_global`, so an `undefine` written inside
+    /// a `foreach` body withdraws what the name meant outside the loop while
+    /// the loop word goes on being what `$(v)` reads.
     pub fn undefine(
         &mut self,
         names: &impl Interner,
         sym: Symbol,
         is_override: bool,
     ) -> Result<()> {
-        let Some(var) = self.peek(sym) else {
+        let slot = self.writable_slot(sym);
+        let Some(var) = slot.clone() else {
             return Ok(());
         };
         let (readonly, origin) = {
@@ -776,7 +845,7 @@ impl GlobalVars {
             _ => true,
         };
         if outranks {
-            self.replace(sym, None);
+            *self.writable_slot(sym) = None;
         }
         Ok(())
     }
