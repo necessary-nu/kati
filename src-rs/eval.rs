@@ -27,7 +27,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use memchr::memchr;
 use parking_lot::Mutex;
 
-use crate::build_sink::{NewInputsTiming, ShellEvaluation};
+use crate::build_sink::{FileEvaluation, NewInputsTiming, ShellEvaluation};
 use crate::expr::{Evaluable, ParseExprOpt, Value, parse_expr};
 use crate::file::Source;
 use crate::flags::Flags;
@@ -814,6 +814,9 @@ pub struct Evaluator {
     pub(crate) new_inputs_timing: NewInputsTiming,
     /// Who the selected destination lets answer a `$(shell)` in a recipe.
     pub(crate) shell_evaluation: ShellEvaluation,
+    /// Whether the selected destination performs a `$(file ...)` in a recipe
+    /// or refuses it.
+    pub(crate) file_evaluation: FileEvaluation,
     /// `filter-out` patterns applied to the deferred `$?` marker while the
     /// current recipe is expanded.
     pub(crate) deferred_new_inputs_filter_out: Vec<Bytes>,
@@ -992,6 +995,7 @@ impl Evaluator {
             avoid_io: false,
             new_inputs_timing: NewInputsTiming::RecipeShell,
             shell_evaluation: ShellEvaluation::RecipeShell,
+            file_evaluation: FileEvaluation::Refused,
             deferred_new_inputs_filter_out: Vec::new(),
             eval_depth: 0,
             delayed_output_commands: Vec::new(),
@@ -2681,6 +2685,19 @@ impl Evaluator {
     /// asked for GNU Make's answer.
     pub fn defers_shell_to_the_recipe(&self) -> bool {
         self.avoid_io && self.shell_evaluation == ShellEvaluation::RecipeShell
+    }
+
+    /// Whether a `$(file ...)` reached from here has to be refused.
+    ///
+    /// The same split as [`Self::defers_shell_to_the_recipe`], with the other
+    /// answer: a file operation cannot be written into the recipe for the
+    /// shell to perform, because a read has to hand its result back to the
+    /// expansion that asked for it. So a destination that cannot perform it
+    /// now refuses it, and only a recipe being compiled for a manifest is such
+    /// a destination — outside a recipe the operation is GNU Make's own, and a
+    /// destination that runs the build performs it where GNU Make does.
+    pub fn refuses_file_operations(&self) -> bool {
+        self.avoid_io && self.file_evaluation == FileEvaluation::Refused
     }
 
     pub fn get_shell(&mut self) -> Result<Bytes> {

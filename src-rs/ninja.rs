@@ -39,8 +39,8 @@ use crate::io::{dump_int, dump_string, dump_systemtime, dump_usize, dump_vec_str
 use crate::strutil::{Pattern, basename, concat_dir, dirname, strip_ext, strip_ext_vec};
 use crate::{
     build_sink::{
-        BuildSink, DeferredRecipeId, NewInputsTiming, RecipeExpansion, RuleId, ShellEvaluation,
-        SinkCommand, SinkEdge, SinkPool, SinkRule,
+        BuildSink, DeferredRecipeId, FileEvaluation, NewInputsTiming, RecipeExpansion, RuleId,
+        ShellEvaluation, SinkCommand, SinkEdge, SinkPool, SinkRule,
     },
     command::{
         Command, CommandEvaluator, expansion_can_reach_make, is_blank_recipe_line,
@@ -206,6 +206,10 @@ struct DeferredRecipe {
 /// Make would have done there.
 pub struct DeferredRecipes {
     recipes: Vec<DeferredRecipe>,
+    /// What the destination that asked for these answered about `$(file ...)`,
+    /// carried here because a launch expansion happens long after the sink
+    /// that chose it has been put down.
+    file_evaluation: FileEvaluation,
 }
 
 /// One expanded recipe: what a [`SinkRule`] would have carried, had the text
@@ -265,12 +269,14 @@ impl DeferredRecipes {
             // deferred to a scheduler that has already done its part.
             NewInputsTiming::Launch,
             ShellEvaluation::Expansion,
+            self.file_evaluation,
         )?;
         ce.ev.avoid_io = true;
         let expanded = Self::expand_with(&mut ce, recipe);
         ce.ev.avoid_io = false;
         ce.ev.new_inputs_timing = NewInputsTiming::RecipeShell;
         ce.ev.shell_evaluation = ShellEvaluation::RecipeShell;
+        ce.ev.file_evaluation = FileEvaluation::Refused;
         ce.ev.deferred_new_inputs_filter_out.clear();
         expanded.map(Some)
     }
@@ -1375,6 +1381,7 @@ impl Drop for NinjaGenerator<'_> {
         self.ce.ev.avoid_io = false;
         self.ce.ev.new_inputs_timing = NewInputsTiming::RecipeShell;
         self.ce.ev.shell_evaluation = ShellEvaluation::RecipeShell;
+        self.ce.ev.file_evaluation = FileEvaluation::Refused;
         self.ce.ev.deferred_new_inputs_filter_out.clear();
     }
 }
@@ -1705,6 +1712,7 @@ pub fn generate_ninja(
             ev,
             NewInputsTiming::RecipeShell,
             ShellEvaluation::RecipeShell,
+            FileEvaluation::Refused,
         )?,
         RecipeExpansion::Construction,
     )?;
@@ -1728,15 +1736,17 @@ pub fn emit_build(
 ) -> Result<DeferredRecipes> {
     let new_inputs_timing = sink.new_inputs_timing();
     let shell_evaluation = sink.shell_evaluation();
+    let file_evaluation = sink.file_evaluation();
     let recipe_expansion = sink.recipe_expansion();
     let mut ng = NinjaGenerator::new(
-        CommandEvaluator::new(ev, new_inputs_timing, shell_evaluation)?,
+        CommandEvaluator::new(ev, new_inputs_timing, shell_evaluation, file_evaluation)?,
         recipe_expansion,
     )?;
     ng.populate_ninja_nodes(nodes)?;
     ng.emit(sink)?;
     Ok(DeferredRecipes {
         recipes: std::mem::take(&mut ng.deferred_recipes),
+        file_evaluation,
     })
 }
 

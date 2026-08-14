@@ -121,6 +121,27 @@ pub enum ShellEvaluation {
     Expansion,
 }
 
+/// Who performs a `$(file ...)` written inside a recipe.
+///
+/// GNU Make always performs it itself, while it expands the recipe: a read
+/// answers from the file as it stands at that moment, and a write happens
+/// before the first line of the recipe runs. kati refused both outright,
+/// because its destination is a manifest — the expansion that would do the
+/// work happens while the manifest is written, which is a different run of a
+/// different build, and the answer it produced would be frozen into a file
+/// that outlives it. That refusal is the manifest writer's, not the
+/// evaluator's: a destination that runs the build itself expands the recipe
+/// where GNU Make expands it, and can do exactly what GNU Make does there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileEvaluation {
+    /// Refused wherever a rule can reach it, which is kati's own behaviour and
+    /// what a manifest writer keeps.
+    Refused,
+    /// Performed while the recipe is expanded, which is GNU Make's
+    /// `func_file`.
+    Expansion,
+}
+
 /// A pool kati declares for itself.
 ///
 /// Pools kati only *refers* to — the ones `.KATI_NINJA_POOL` and
@@ -370,6 +391,17 @@ pub trait BuildSink {
     /// GNU Make does.
     fn shell_evaluation(&self) -> ShellEvaluation {
         ShellEvaluation::RecipeShell
+    }
+
+    /// Who performs a `$(file ...)` written inside a recipe.
+    ///
+    /// A manifest writer refuses it, because the operation would be performed
+    /// while the manifest is written rather than while the build runs: a write
+    /// would land on the wrong day, and a read would answer from a tree the
+    /// build has not made yet. Ronin's direct graph sink runs the build
+    /// itself, so it performs it where GNU Make performs it.
+    fn file_evaluation(&self) -> FileEvaluation {
+        FileEvaluation::Refused
     }
 
     /// When this sink wants a recipe turned into command text.

@@ -19,7 +19,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt::Debug,
     fs::File,
-    io::Write,
+    io::{Read, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
         process::ExitStatusExt,
@@ -1210,8 +1210,12 @@ fn file_read_func(
     // A file that is not there reads as nothing, which is `$(file <)`'s own
     // rule and not a failure. Anything else the system refuses is one, and it
     // is reported at the line that asked for the file.
-    let mut buf = match std::fs::read(filename) {
-        Ok(buf) => buf,
+    //
+    // Opening and reading are kept apart because GNU Make reports them apart,
+    // and a directory is where that shows: opening one succeeds and reading it
+    // does not, so `$(file < adir)` fails as a `read:` rather than an `open:`.
+    let mut file = match File::open(filename) {
+        Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             if should_store_command_result(&ev.session, filename.as_bytes()) {
                 let loc = ev.loc.clone().unwrap_or_default();
@@ -1235,8 +1239,27 @@ fn file_read_func(
             crate::strerror(&err)
         ),
     };
-    if buf.ends_with(b"\n") {
+    let mut buf = Vec::new();
+    if let Err(err) = file.read_to_end(&mut buf) {
+        error_loc!(
+            ev,
+            ev.loc.as_ref(),
+            "*** read: {}: {}.",
+            filename.to_string_lossy(),
+            crate::strerror(&err)
+        );
+    }
+    // One trailing newline goes, and no more: what is removed is the line
+    // terminator the file's last line carries, not the blank lines before it.
+    // A carriage return goes with it, so a file written with CRLF endings
+    // reads back as its last line rather than as that line plus a stray `\r`.
+    // GNU Make's `func_file`:
+    // `if (n && o[-1] == '\n') o -= 1 + (n > 1 && o[-2] == '\r');`
+    if buf.last() == Some(&b'\n') {
         buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
     }
     let buf = Bytes::from(buf);
 
@@ -1318,7 +1341,11 @@ fn file_func_impl(
     out: &mut dyn BufMut,
     rerun: bool,
 ) -> Result<()> {
-    if ev.avoid_io {
+    // GNU Make performs this wherever it is written, a recipe included. Only a
+    // destination that cannot — one compiling the recipe into a manifest some
+    // later run will execute — refuses, and the refusal is that destination's
+    // rather than this function's.
+    if ev.refuses_file_operations() {
         error_loc!(
             ev,
             ev.loc.as_ref(),
@@ -1892,23 +1919,77 @@ pub fn get_func_info(name: &[u8]) -> Option<&'static FuncInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build_sink::ShellEvaluation;
+    use crate::build_sink::{FileEvaluation, ShellEvaluation};
     use crate::expr::{ParseExprOpt, parse_expr};
     use crate::symtab::Symbol;
 
     /// Evaluate a Make expression with a fresh evaluator, returning both the
     /// result and whatever the expression managed to write before failing.
     fn eval_with(ev: &mut Evaluator, src: &'static str) -> (Result<()>, Bytes) {
+        eval_source(ev, Bytes::from_static(src.as_bytes()))
+    }
+
+    /// The same, for an expression assembled at run time — a path under this
+    /// test's own directory, which cannot be a literal.
+    fn eval_source(ev: &mut Evaluator, src: Bytes) -> (Result<()>, Bytes) {
         let expr = parse_expr(
             &mut ev.session,
             &mut Loc::default(),
-            Bytes::from_static(src.as_bytes()),
+            src,
             ParseExprOpt::Normal,
         )
         .unwrap();
         let mut out = BytesMut::new();
         let result = expr.eval(ev, &mut out);
         (result, out.freeze())
+    }
+
+    /// A directory of this test's own, so one test's files are never another's.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(test: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("kati-file-func-{}-{test}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("a scratch directory");
+            Self(path)
+        }
+
+        /// Write `contents` to `name` and answer the path to it.
+        fn holding(&self, name: &str, contents: &[u8]) -> String {
+            let path = self.0.join(name);
+            std::fs::write(&path, contents).expect("a file to read back");
+            path.to_str().expect("a UTF-8 scratch path").to_owned()
+        }
+
+        fn path(&self, name: &str) -> String {
+            self.0
+                .join(name)
+                .to_str()
+                .expect("a UTF-8 scratch path")
+                .to_owned()
+        }
+
+        fn read(&self, name: &str) -> Vec<u8> {
+            std::fs::read(self.0.join(name)).expect("a written file")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// An evaluator expanding a recipe for a destination that runs the build
+    /// itself: the position GNU Make is in when it expands a recipe.
+    fn expanding_a_recipe_that_runs_here() -> Evaluator {
+        let mut ev = Evaluator::new(Session::new());
+        ev.avoid_io = true;
+        ev.shell_evaluation = ShellEvaluation::Expansion;
+        ev.file_evaluation = FileEvaluation::Expansion;
+        ev
     }
 
     fn simple(value: &'static [u8]) -> crate::var::Var {
@@ -2157,5 +2238,140 @@ mod tests {
         let (result, out) = eval_with(&mut ev, "$(call filter)");
         result.unwrap();
         assert!(out.is_empty());
+    }
+
+    /// A destination that runs the build itself performs a recipe's
+    /// `$(file <)` where GNU Make performs it, and hands the contents back to
+    /// the expansion that asked for them.
+    ///
+    /// This is the Linux kernel's shape, reduced: `read-file` in
+    /// `scripts/Kbuild.include` is `$(subst $(newline),$(space),$(file < $1))`,
+    /// and it reaches a recipe through a recursively expanded `KERNELRELEASE`.
+    /// A read cannot be written into the recipe for its shell to answer, the
+    /// way `$(shell)` can, because its result has to compose with the Make
+    /// functions around it — which is why the refusal below has to be the
+    /// destination's rather than this function's.
+    #[test]
+    fn a_recipe_file_read_is_performed_when_expansion_answers() {
+        let scratch = Scratch::new("recipe-read");
+        let path = scratch.holding("kernel.release", b"6.18.2-necessary\n");
+        let mut ev = expanding_a_recipe_that_runs_here();
+
+        let (result, out) = eval_source(&mut ev, Bytes::from(format!("[$(file < {path})]")));
+
+        result.unwrap();
+        assert_eq!(out, "[6.18.2-necessary]");
+    }
+
+    /// The other destination is a manifest, which will be executed by another
+    /// program on another day. Reading then would answer from a tree that is
+    /// not the one the build will run against, and writing then would put the
+    /// file on disk while the manifest is being written, so the whole function
+    /// is refused where a rule can reach it.
+    #[test]
+    fn a_recipe_file_operation_is_refused_when_a_manifest_runs() {
+        let scratch = Scratch::new("manifest-refusal");
+        let path = scratch.holding("kernel.release", b"6.18.2-necessary\n");
+        let mut ev = Evaluator::new(Session::new());
+        ev.avoid_io = true;
+
+        let (result, _) = eval_source(&mut ev, Bytes::from(format!("$(file < {path})")));
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("$(file ...) is not supported in rules."),
+            "{message}"
+        );
+
+        let written = scratch.path("written");
+        let (result, _) = eval_source(&mut ev, Bytes::from(format!("$(file > {written},text)")));
+        assert!(result.is_err());
+        assert!(!std::path::Path::new(&written).exists());
+    }
+
+    /// Outside a recipe there is no destination to ask: `$(file ...)` is
+    /// GNU Make's own, and kati has always performed it there.
+    #[test]
+    fn a_file_operation_outside_a_recipe_is_performed_whatever_the_destination() {
+        let scratch = Scratch::new("outside-a-recipe");
+        let path = scratch.holding("contents", b"answered\n");
+        let mut ev = Evaluator::new(Session::new());
+
+        let (result, out) = eval_source(&mut ev, Bytes::from(format!("$(file < {path})")));
+
+        result.unwrap();
+        assert_eq!(out, "answered");
+    }
+
+    /// GNU Make's `func_file` removes one trailing newline and no more, and
+    /// takes a carriage return with it so a CRLF file reads back as its last
+    /// line. A file that is not there reads as nothing and is not an error.
+    #[test]
+    fn a_file_read_removes_one_trailing_line_terminator() {
+        let scratch = Scratch::new("trailing-newline");
+        let mut ev = Evaluator::new(Session::new());
+        for (contents, expected) in [
+            (b"a\n".as_slice(), "a"),
+            (b"a\n\n".as_slice(), "a\n"),
+            (b"a\n\n\n".as_slice(), "a\n\n"),
+            (b"a".as_slice(), "a"),
+            (b"a\r\n".as_slice(), "a"),
+            (b"a\r\n\r\n".as_slice(), "a\r\n"),
+            (b"\n".as_slice(), ""),
+            (b"".as_slice(), ""),
+        ] {
+            let path = scratch.holding("contents", contents);
+            let (result, out) = eval_source(&mut ev, Bytes::from(format!("$(file < {path})")));
+            result.unwrap();
+            assert_eq!(out, expected, "reading {contents:?}");
+        }
+
+        let absent = scratch.path("absent");
+        let (result, out) = eval_source(&mut ev, Bytes::from(format!("$(file < {absent})")));
+        result.unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// A directory opens and does not read, so GNU Make reports it against the
+    /// read rather than the open. Reporting both the same way would name the
+    /// wrong operation for the one case where they differ.
+    #[test]
+    fn a_file_read_of_a_directory_fails_at_the_read() {
+        let scratch = Scratch::new("directory");
+        let mut ev = Evaluator::new(Session::new());
+
+        let path = scratch.path("");
+        let (result, _) = eval_source(&mut ev, Bytes::from(format!("$(file < {path})")));
+
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("*** read: "), "{message}");
+        assert!(message.contains("Is a directory."), "{message}");
+    }
+
+    /// A recipe's `$(file >)` writes while the recipe is expanded, and the
+    /// directory it changed is one a `$(wildcard)` later in the same expansion
+    /// has to look at again — which is what GNU Make's `++command_count` in
+    /// `func_file` is for.
+    #[test]
+    fn a_recipe_file_write_is_seen_by_a_later_wildcard() {
+        let scratch = Scratch::new("write-then-wildcard");
+        let pattern = scratch.path("*.written");
+        let written = scratch.path("made.written");
+        let mut ev = expanding_a_recipe_that_runs_here();
+
+        let (result, before) = eval_source(&mut ev, Bytes::from(format!("$(wildcard {pattern})")));
+        result.unwrap();
+        assert!(before.is_empty());
+
+        let (result, out) = eval_source(
+            &mut ev,
+            Bytes::from(format!("$(file > {written},contents)")),
+        );
+        result.unwrap();
+        assert!(out.is_empty());
+        assert_eq!(scratch.read("made.written"), b"contents\n");
+
+        let (result, after) = eval_source(&mut ev, Bytes::from(format!("$(wildcard {pattern})")));
+        result.unwrap();
+        assert_eq!(after, written.as_str());
     }
 }

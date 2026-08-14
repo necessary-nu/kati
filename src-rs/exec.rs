@@ -24,7 +24,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 
 use crate::{
-    build_sink::{NewInputsTiming, ShellEvaluation},
+    build_sink::{FileEvaluation, NewInputsTiming, ShellEvaluation},
     command::CommandEvaluator,
     dep::{DepNode, NamedDepNode},
     error, error_loc,
@@ -74,6 +74,9 @@ impl<'a> Executor<'a> {
                 ev,
                 NewInputsTiming::RecipeShell,
                 ShellEvaluation::Expansion,
+                // kati's own executor runs the build in this process, so it
+                // performs a recipe's file operations where GNU Make does.
+                FileEvaluation::Expansion,
             )?,
             done: HashMap::new(),
             shell,
