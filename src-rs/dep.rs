@@ -103,6 +103,34 @@ pub struct GroupedDoubleAction {
 /// name visited is new. The deepest chain in GNU Make's suite is three.
 const MAX_IMPLICIT_CHAIN: usize = 6;
 
+/// The directories `library_search` looks in once the working directory and
+/// the `vpath` search have both come up empty, in the order it looks.
+///
+/// GNU Make's `dirs[]` in `remake.c`: `/lib`, `/usr/lib`, and then whatever
+/// `--libdir` the build was configured with, which for a default prefix is
+/// `/usr/local/lib`. Compiled in there and compiled in here for the same
+/// reason — it is where libraries are, not something a makefile chooses.
+const SYSTEM_LIBRARY_DIRECTORIES: &[&str] = &["/lib", "/usr/lib", "/usr/local/lib"];
+
+/// Where in the search order an answer came from, so answers found for
+/// different `.LIBPATTERNS` elements can be weighed against each other.
+///
+/// The derived order is the semantics: every `vpath` answer outranks every
+/// system-directory one, which is what GNU Make arranges by starting the
+/// system directories' indices above every `vpath` index there could be.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum LibraryRank {
+    Vpath(VpathRank),
+    System(usize),
+}
+
+/// Which `vpath` entry answered, and which of its directories.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct VpathRank {
+    entry: usize,
+    directory: usize,
+}
+
 /// Which of GNU Make's passes over the pattern rules is running.
 ///
 /// `pattern_search` walks the same candidates up to four times, relaxing one
@@ -1110,6 +1138,8 @@ struct DepBuilder<'a> {
     depfile_var_name: Symbol,
     /// `VPATH`, the variable form of the directory search.
     vpath_var_name: Symbol,
+    /// `.LIBPATTERNS`, which says how a `-lNAME` prerequisite is spelt on disk.
+    libpatterns_var_name: Symbol,
     /// `GPATH`, which says that a directory the search looks in is also a
     /// directory a target found there is remade in.
     gpath_var_name: Symbol,
@@ -1154,6 +1184,7 @@ impl<'a> DepBuilder<'a> {
         pattern_var_order.sort_by_key(|(_, pattern)| pattern.as_bytes().len());
         let depfile_var_name = ev.session.intern(".KATI_DEPFILE");
         let vpath_var_name = ev.session.intern("VPATH");
+        let libpatterns_var_name = ev.session.intern(".LIBPATTERNS");
         let gpath_var_name = ev.session.intern("GPATH");
         let implicit_outputs_var_name = ev.session.intern(".KATI_IMPLICIT_OUTPUTS");
         let ninja_pool_var_name = ev.session.intern(".KATI_NINJA_POOL");
@@ -1209,6 +1240,7 @@ impl<'a> DepBuilder<'a> {
             precious_patterns: HashSet::new(),
             depfile_var_name,
             vpath_var_name,
+            libpatterns_var_name,
             gpath_var_name,
             gpaths: Vec::new(),
             gpath_origin: HashMap::new(),
@@ -1988,13 +2020,22 @@ impl<'a> DepBuilder<'a> {
     /// built here, so where an older copy of it might be lying is not a
     /// question worth asking.
     fn resolve_vpaths(&mut self, n: &Arc<Mutex<DepNode>>) {
-        if self.ev.session.vpaths.is_empty() && self.vpath_variable().is_empty() {
-            return;
-        }
         let (inputs, order_only) = {
             let n = n.lock();
             (n.actual_inputs.clone(), n.actual_order_only_inputs.clone())
         };
+        // The `-lNAME` search is the last resort of the same search and runs
+        // whether or not anything wrote a `vpath`, so the way out has to ask
+        // about both before it takes it.
+        if self.ev.session.vpaths.is_empty()
+            && self.vpath_variable().is_empty()
+            && !inputs
+                .iter()
+                .chain(&order_only)
+                .any(|input| input.as_bytes(&self.ev.session).starts_with(b"-l"))
+        {
+            return;
+        }
         let inputs = self.at_vpaths(inputs);
         let order_only = self.at_vpaths(order_only);
         let mut n = n.lock();
@@ -2322,8 +2363,113 @@ impl<'a> DepBuilder<'a> {
     fn at_found_name(&mut self, name: Symbol) -> Symbol {
         match self.at_vpath(name) {
             Some((found, kept_by_gpath)) => self.take_found_name(name, found, kept_by_gpath),
+            None => self.at_library(name),
+        }
+    }
+
+    /// One `-lNAME` prerequisite, replaced by the library it refers to.
+    ///
+    /// GNU Make reaches `library_search` from `f_mtime`, as the last resort
+    /// after the ordinary directory search has failed — so `-lfoo` is a file
+    /// name whenever a file of that name is there, and a linker-style library
+    /// reference only when it is not.
+    ///
+    /// Deliberately not conditioned on the name having a rule, which is where
+    /// this parts company with the `vpath` search above it: `f_mtime` asks
+    /// about the file before anything asks about the rule, so a `-lfoo:` rule
+    /// written beside a `libfoo.a` on disk does not stop the search. GNU Make
+    /// renames the file to what the search found and finds it current there,
+    /// and moving the prerequisite to the found name is the same answer — the
+    /// recipe does not run and `$^` reads the library. A search that finds
+    /// nothing leaves the name as written, and then the rule does make it.
+    fn at_library(&mut self, name: Symbol) -> Symbol {
+        let reference = name.as_bytes(&self.ev.session);
+        if !reference.starts_with(b"-l") || self.phony.contains(&name) {
+            return name;
+        }
+        if std::fs::exists(OsStr::from_bytes(&reference)).is_ok_and(|found| found) {
+            return name;
+        }
+        match self.library_search(&reference) {
+            Some(found) => self.ev.session.intern(found),
             None => name,
         }
+    }
+
+    /// Where the library `-lNAME` refers to actually is, if anywhere.
+    ///
+    /// GNU Make's `library_search`. Each whitespace-separated element of
+    /// `.LIBPATTERNS` says how a library of that name might be spelt; the
+    /// wildcard takes NAME, and an element with no wildcard is warned about and
+    /// passed over rather than taken literally.
+    ///
+    /// Every element is tried rather than the first that hits, because the
+    /// answer is the *earliest* one any of them reaches — the linker-compatible
+    /// behaviour the comment in `remake.c` asks for. Earliest means: a hit in
+    /// the working directory beats everything and ends the search where it
+    /// stands; otherwise the earliest `vpath` entry wins, whichever element
+    /// reached it; and the compiled-in system directories rank behind every
+    /// `vpath` entry, in their own order. Ties go to the earlier element.
+    ///
+    /// Only files that already exist are found. A pattern naming a target the
+    /// makefile could make is not a match, so `-lfoo` under
+    /// `.LIBPATTERNS = made_%.a` beside a `made_foo.a:` rule is refused rather
+    /// than built.
+    fn library_search(&mut self, reference: &[u8]) -> Option<Bytes> {
+        let name = &reference[b"-l".len()..];
+        let mut best: Option<(LibraryRank, Bytes)> = None;
+        for element in self.libpatterns() {
+            let Some(candidate) = Pattern::new(element.clone()).substitute(name) else {
+                warn_loc!(
+                    self.ev,
+                    None,
+                    ".LIBPATTERNS element `{}' is not a pattern",
+                    String::from_utf8_lossy(&element)
+                );
+                continue;
+            };
+            if std::fs::exists(OsStr::from_bytes(&candidate)).is_ok_and(|found| found) {
+                return Some(candidate);
+            }
+            if let Some((found, rank)) = self.vpath_search(&candidate) {
+                Self::keep_earlier(&mut best, LibraryRank::Vpath(rank), found);
+            }
+            for (index, directory) in SYSTEM_LIBRARY_DIRECTORIES.iter().enumerate() {
+                let mut path = BytesMut::from(directory.as_bytes());
+                path.put_u8(b'/');
+                path.put_slice(&candidate);
+                let path = path.freeze();
+                if std::fs::exists(OsStr::from_bytes(&path)).is_ok_and(|found| found) {
+                    Self::keep_earlier(&mut best, LibraryRank::System(index), path);
+                }
+            }
+        }
+        best.map(|(_, path)| path)
+    }
+
+    /// Record a candidate only when it beats the one already held, so an
+    /// equally ranked answer from a later `.LIBPATTERNS` element loses.
+    fn keep_earlier(best: &mut Option<(LibraryRank, Bytes)>, rank: LibraryRank, path: Bytes) {
+        if best.as_ref().is_none_or(|(held, _)| rank < *held) {
+            *best = Some((rank, path));
+        }
+    }
+
+    /// `.LIBPATTERNS`, expanded and split into elements.
+    ///
+    /// Expanded here rather than read as text, because GNU Make expands it at
+    /// search time: a recursive value follows an assignment made anywhere in
+    /// the read, including after the rule that names the library.
+    fn libpatterns(&mut self) -> Vec<Bytes> {
+        let Some(var) = self.ev.session.peek_global_var(self.libpatterns_var_name) else {
+            return Vec::new();
+        };
+        let Ok(value) = var.read().eval_to_buf(self.ev) else {
+            return Vec::new();
+        };
+        word_scanner(&value)
+            .map(|element| value.slice_ref(element))
+            .collect()
     }
 
     /// One name, replaced by where the search found it only when `GPATH` says
@@ -2387,32 +2533,55 @@ impl<'a> DepBuilder<'a> {
     /// directive and so is read here rather than recorded.
     fn vpath_of(&self, target: Symbol) -> Option<Bytes> {
         let name = target.as_bytes(&self.ev.session);
+        Some(self.vpath_search(&name)?.0)
+    }
+
+    /// The same search, over a name rather than a symbol, reporting how early
+    /// in the search order the answer came from.
+    ///
+    /// The rank is GNU Make's `vpath_index` and `path_index`, and it exists for
+    /// `library_search`: that caller runs the search once per `.LIBPATTERNS`
+    /// element and has to weigh the answers against each other, where the
+    /// earliest `vpath` entry wins whichever element reached it. A name is a
+    /// symbol only once it is a target, and a library candidate is a name the
+    /// search invented, so this half takes bytes.
+    fn vpath_search(&self, name: &[u8]) -> Option<(Bytes, VpathRank)> {
         if name.is_empty() || self.ev.session.vpaths.is_empty() && self.vpath_variable().is_empty()
         {
             return None;
         }
-        let matched = self
-            .ev
-            .session
-            .vpaths
-            .iter()
-            .filter(|(pattern, _)| pattern.matches(&name))
-            .flat_map(|(_, directories)| directories.iter().cloned())
-            .collect::<Vec<_>>();
-        let directories = if matched.is_empty() {
-            self.vpath_variable()
-        } else {
-            matched
-        };
-        for directory in directories {
+        let mut matched_any = false;
+        for (entry, (pattern, directories)) in self.ev.session.vpaths.iter().enumerate() {
+            if !pattern.matches(name) {
+                continue;
+            }
+            matched_any = true;
+            if let Some((found, directory)) = Self::first_directory_holding(directories, name) {
+                return Some((found, VpathRank { entry, directory }));
+            }
+        }
+        if matched_any {
+            return None;
+        }
+        // `VPATH` is a variable rather than a directive and so is read here
+        // rather than recorded. It is searched after every `vpath` entry, which
+        // is where its rank puts it.
+        let (found, directory) = Self::first_directory_holding(&self.vpath_variable(), name)?;
+        let entry = self.ev.session.vpaths.len();
+        Some((found, VpathRank { entry, directory }))
+    }
+
+    /// The first of `directories` that holds `name`, and which one it was.
+    fn first_directory_holding(directories: &[Bytes], name: &[u8]) -> Option<(Bytes, usize)> {
+        for (index, directory) in directories.iter().enumerate() {
             let mut candidate = BytesMut::from(directory.as_ref());
             if !candidate.ends_with(b"/") {
                 candidate.put_u8(b'/');
             }
-            candidate.put_slice(&name);
+            candidate.put_slice(name);
             let candidate = candidate.freeze();
             if std::fs::exists(OsStr::from_bytes(&candidate)).is_ok_and(|found| found) {
-                return Some(candidate);
+                return Some((candidate, index));
             }
         }
         None
@@ -4631,6 +4800,72 @@ mod tests {
         );
         // A path shorter than the name it was made from cannot have one.
         assert_eq!(search_directory(b"out.o", b"out.o"), None);
+    }
+
+    /// GNU Make ranks the system directories by starting their indices above
+    /// every `vpath` index there could be, so every vpath answer outranks every
+    /// system-directory one. Here that is the enum's declaration order, which
+    /// nothing else in the file would notice going wrong.
+    #[test]
+    fn every_vpath_library_answer_outranks_every_system_one() {
+        let latest_vpath = LibraryRank::Vpath(VpathRank {
+            entry: usize::MAX,
+            directory: usize::MAX,
+        });
+        let earliest_system = LibraryRank::System(0);
+        assert!(latest_vpath < earliest_system);
+        // Within a vpath answer the entry decides first and the directory
+        // inside it second, which is what `-l2` in GNU Make's own suite turns
+        // on: two answers from one entry, settled by which directory held one.
+        let first_entry_last_directory = LibraryRank::Vpath(VpathRank {
+            entry: 0,
+            directory: usize::MAX,
+        });
+        let second_entry_first_directory = LibraryRank::Vpath(VpathRank {
+            entry: 1,
+            directory: 0,
+        });
+        assert!(first_entry_last_directory < second_entry_first_directory);
+        assert!(
+            LibraryRank::Vpath(VpathRank {
+                entry: 3,
+                directory: 0
+            }) < LibraryRank::Vpath(VpathRank {
+                entry: 3,
+                directory: 1
+            })
+        );
+        assert!(LibraryRank::System(0) < LibraryRank::System(1));
+    }
+
+    /// The earlier `.LIBPATTERNS` element keeps an equally ranked answer, which
+    /// is the strict `<` in GNU Make's two comparisons rather than a `<=`.
+    #[test]
+    fn an_equally_ranked_library_answer_does_not_displace_the_one_held() {
+        let mut best = None;
+        DepBuilder::keep_earlier(
+            &mut best,
+            LibraryRank::System(1),
+            Bytes::from_static(b"first"),
+        );
+        DepBuilder::keep_earlier(
+            &mut best,
+            LibraryRank::System(1),
+            Bytes::from_static(b"second"),
+        );
+        assert_eq!(
+            best.as_ref().map(|(_, path)| path.clone()).unwrap(),
+            "first"
+        );
+        DepBuilder::keep_earlier(
+            &mut best,
+            LibraryRank::System(0),
+            Bytes::from_static(b"earlier"),
+        );
+        assert_eq!(
+            best.as_ref().map(|(_, path)| path.clone()).unwrap(),
+            "earlier"
+        );
     }
 
     #[test]

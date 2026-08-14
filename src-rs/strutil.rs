@@ -254,6 +254,21 @@ impl Pattern {
             && str.ends_with(suffix)
     }
 
+    /// The pattern with `text` written where its wildcard is, or `None` when
+    /// it has no wildcard to write into.
+    ///
+    /// The other direction from [`Pattern::stem`]: this is what GNU Make's
+    /// `library_search` does to each `.LIBPATTERNS` element, and the `None` is
+    /// the element it warns about and passes over.
+    pub fn substitute(&self, text: &[u8]) -> Option<Bytes> {
+        let percent_index = self.percent_index?;
+        let mut out = BytesMut::with_capacity(self.pat.len() + text.len());
+        out.put_slice(&self.pat[..percent_index]);
+        out.put_slice(text);
+        out.put_slice(&self.pat[percent_index + 1..]);
+        Some(out.freeze())
+    }
+
     pub fn stem<'a>(&self, str: &'a [u8]) -> &'a [u8] {
         if !self.matches(str) {
             return &[];
