@@ -440,13 +440,46 @@ fn pattern_rule_prerequisites_match(rule: &Rule, existing: &Rule) -> bool {
 /// reverse does not. Replacement happens while the rule list is populated, so
 /// the new rule moves to the end of that list before any target is searched.
 fn replaces_pattern_rule(rule: &Rule, existing: &Rule) -> bool {
-    pattern_rule_prerequisites_match(rule, existing)
-        && rule.output_patterns.iter().any(|target| {
-            existing
-                .output_patterns
-                .iter()
-                .all(|existing_target| existing_target == target)
-        })
+    pattern_rule_prerequisites_match(rule, existing) && pattern_rule_targets_match(rule, existing)
+}
+
+/// The target half of that comparison, on its own because the suffix-rule path
+/// asks the same question of a prerequisite it has to spell out first.
+fn pattern_rule_targets_match(rule: &Rule, existing: &Rule) -> bool {
+    rule.output_patterns.iter().any(|target| {
+        existing
+            .output_patterns
+            .iter()
+            .all(|existing_target| existing_target == target)
+    })
+}
+
+/// Whether a written pattern rule already holds the identity a suffix rule
+/// would take.
+///
+/// GNU Make turns suffix rules into pattern rules once every makefile has been
+/// read, and installs each one with `new_pattern_rule`'s override off: a rule
+/// already written with that target and those prerequisites keeps the identity
+/// and the suffix-derived one is thrown away. That is the other direction of
+/// the same comparison, and it is how a recipe-less `%.tex: %.w` cancels
+/// `.w.tex:` — the rule the search would otherwise have used never arrives.
+fn pattern_rule_holds_suffix_rule(
+    names: &impl Interner,
+    existing: &Rule,
+    suffix_rule: &Rule,
+) -> bool {
+    let [input] = suffix_rule.inputs.as_slice() else {
+        return false;
+    };
+    let [prerequisite] = existing.prerequisite_names.as_slice() else {
+        return false;
+    };
+    let input = input.as_bytes(names);
+    let mut written = BytesMut::with_capacity(input.len() + 2);
+    written.put_slice(b"%.");
+    written.put_slice(&input);
+    prerequisite.as_bytes(names) == written.freeze()
+        && pattern_rule_targets_match(suffix_rule, existing)
 }
 
 fn is_suffix_rule(names: &impl Interner, output: &Symbol) -> bool {
@@ -1805,6 +1838,7 @@ impl<'a> DepBuilder<'a> {
                 self.populate_explicit_rule(rule)?;
             }
         }
+        self.discard_suffix_rules_a_pattern_rule_holds();
         for rules in self.suffix_rules.values_mut() {
             rules.reverse();
         }
@@ -1874,6 +1908,15 @@ impl<'a> DepBuilder<'a> {
             );
         }
 
+        if rule.cmds.is_empty() {
+            // `convert_to_pattern` looks the suffix pair's name up as a file and
+            // passes over one with no recipe, so a recipe-less `.w.tex:` never
+            // becomes a rule that could make anything. Writing one beside a
+            // `.w.tex:` that does have a recipe therefore withdraws nothing:
+            // the recipe is what was converted, and it is still there.
+            return Ok(false);
+        }
+
         let mut output = output.as_bytes(&self.ev.session);
         output.advance(1);
         let dot_index = memchr(b'.', &output).unwrap();
@@ -1899,6 +1942,26 @@ impl<'a> DepBuilder<'a> {
             .or_default()
             .push(Arc::new(r));
         Ok(true)
+    }
+
+    /// Throw away every suffix rule a written pattern rule already speaks for,
+    /// once all of them are known. GNU Make converts suffix rules after the
+    /// last makefile is read, so which side of a pattern rule one was written
+    /// on never decides this.
+    fn discard_suffix_rules_a_pattern_rule_holds(&mut self) {
+        if self.implicit_rule_defs.is_empty() {
+            return;
+        }
+        let names = &self.ev.session;
+        let written = &self.implicit_rule_defs;
+        self.suffix_rules.retain(|_, rules| {
+            rules.retain(|rule| {
+                !written
+                    .iter()
+                    .any(|existing| pattern_rule_holds_suffix_rule(names, existing, rule))
+            });
+            !rules.is_empty()
+        });
     }
 
     fn populate_explicit_rule(&mut self, rule: Arc<Rule>) -> Result<()> {
@@ -2445,10 +2508,19 @@ impl<'a> DepBuilder<'a> {
     /// length: the most specific rule is tried first and a tie is settled by
     /// which was written first. Population has already removed any rule that a
     /// later definition replaced.
+    ///
+    /// A rule with no recipe is never collected. That is the other half of how
+    /// a redeclaration cancels: the replacement leaves the recipe-less rule
+    /// holding the identity, and the search then refuses to consider it, so the
+    /// target has no rule at all rather than one that makes it out of nothing.
+    /// It also settles what such a rule does to targets reached some other way:
+    /// nothing. Its prerequisites are not added to anything, because a rule the
+    /// search never collects contributes neither recipe nor prerequisite.
     fn ordered_candidates(&self, output_str: &Bytes) -> Vec<ImplicitCandidate> {
         let mut candidates = self.implicit_rules.get(output_str);
         candidates.retain(|candidate| {
-            Pattern::new(candidate.pattern.as_bytes(&self.ev.session)).matches(output_str)
+            !candidate.rule.cmds.is_empty()
+                && Pattern::new(candidate.pattern.as_bytes(&self.ev.session)).matches(output_str)
         });
         candidates.sort_by_key(|candidate| {
             let pat = Pattern::new(candidate.pattern.as_bytes(&self.ev.session));
@@ -2573,7 +2645,7 @@ impl<'a> DepBuilder<'a> {
             let rule = candidate.rule;
             // Make's step 6a: a non-terminal match-anything rule is not allowed
             // to make an intermediate.
-            if rule.cmds.is_empty() || (!rule.is_double_colon && self.matches_anything(&rule)) {
+            if !rule.is_double_colon && self.matches_anything(&rule) {
                 continue;
             }
             let pat = Pattern::new(candidate.pattern.as_bytes(&self.ev.session));
