@@ -543,6 +543,19 @@ fn value_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> 
     let Some(var) = ev.lookup_var(sym)? else {
         return Ok(());
     };
+    // An automatic variable keeps no text for the reader to have stored, so
+    // what `value` reads back has to come from how GNU Make defined it. The `D`
+    // and `F` forms were defined from an expression and read back as that
+    // expression; a base form was defined as a simple variable holding the
+    // computed name, which is what evaluating it here produces.
+    let automatic = var.read().autocommand();
+    if let Some(automatic) = automatic {
+        match automatic.definition() {
+            Some(text) => out.put_slice(&text),
+            None => automatic.eval(ev, out)?,
+        }
+        return Ok(());
+    }
     out.put_slice(&var.read().string(&ev.session)?);
     Ok(())
 }

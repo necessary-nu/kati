@@ -66,7 +66,60 @@ enum AutoCommandVariant {
     F,
 }
 
+impl AutoCommand {
+    /// The character GNU Make names this automatic variable with.
+    fn name_char(&self) -> char {
+        match self {
+            AutoCommand::At => '@',
+            AutoCommand::Less => '<',
+            AutoCommand::Hat => '^',
+            AutoCommand::Plus => '+',
+            AutoCommand::Bar => '|',
+            AutoCommand::Star => '*',
+            AutoCommand::Question { .. } => '?',
+            AutoCommand::NotImplemented => '%',
+        }
+    }
+}
+
 impl AutoCommandVar {
+    /// The makefile text GNU Make defined this automatic variable with, for the
+    /// forms that were defined from text at all.
+    ///
+    /// The two kinds of automatic variable are not built the same way, and
+    /// `$(value)` is where the difference becomes visible. GNU Make sets the
+    /// base forms per file in `set_file_variables`, as simple variables whose
+    /// value is the computed name, so there is no unexpanded text behind them
+    /// and `$(value @)` reads back exactly what `$@` expands to — `None` here,
+    /// leaving the caller to evaluate.
+    ///
+    /// The `D` and `F` forms are not computed at all. `define_automatic_variables`
+    /// defines them once, at startup, as recursive variables whose text is a
+    /// `dir`/`notdir` expression over the base form (`src/variable.c`). Reading
+    /// one back therefore yields that expression rather than a directory or a
+    /// file name: `$(value @D)` is `$(patsubst %/,%,$(dir $@))`, whatever the
+    /// current target happens to be.
+    pub fn definition(&self) -> Option<Bytes> {
+        let base = self.typ.name_char();
+        match self.variant {
+            AutoCommandVariant::None => None,
+            AutoCommandVariant::D => Some(Bytes::from(format!("$(patsubst %/,%,$(dir ${base}))"))),
+            AutoCommandVariant::F => Some(Bytes::from(format!("$(notdir ${base})"))),
+        }
+    }
+
+    /// How `$(flavor)` names this automatic variable.
+    ///
+    /// The same split: a base form was defined as a simple variable holding the
+    /// computed name, and a `D`/`F` form as a recursive one holding the
+    /// expression that computes it.
+    pub fn flavor(&self) -> &'static str {
+        match self.variant {
+            AutoCommandVariant::None => "simple",
+            AutoCommandVariant::D | AutoCommandVariant::F => "recursive",
+        }
+    }
+
     pub fn eval(&self, ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
         match self.variant {
             AutoCommandVariant::None => self.eval_impl(ev, out)?,
@@ -821,11 +874,78 @@ impl<'a> CommandEvaluator<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{invokes_make, references_make, spawns_make};
+    use super::{
+        AutoCommand, AutoCommandVar, AutoCommandVariant, invokes_make, references_make, spawns_make,
+    };
     use crate::expr::{ParseExprOpt, parse_expr};
     use crate::loc::Loc;
     use crate::session::Session;
+    use crate::symtab::Interner;
     use bytes::Bytes;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    /// An automatic variable named `c`, in the form the `variant` selects.
+    fn automatic(typ: AutoCommand, variant: AutoCommandVariant) -> AutoCommandVar {
+        let mut session = Session::new();
+        let sym = session.intern(typ.name_char().to_string());
+        AutoCommandVar {
+            typ,
+            sym,
+            variant,
+            current_dep_node: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// GNU Make builds the two kinds of automatic variable differently, and
+    /// `$(value)` is where that becomes visible. A base form is set per file to
+    /// the name just computed, so there is no text behind it to read back. A
+    /// `D` or `F` form was defined once from a `dir`/`notdir` expression over
+    /// the base form, and reading it back yields that expression.
+    ///
+    /// Probed against GNU Make 4.4.1, in a recipe for a target `sub/a.o`:
+    /// `$(value @)` is `sub/a.o` while `$(value @D)` is
+    /// `$(patsubst %/,%,$(dir $@))` and `$(value @F)` is `$(notdir $@)`.
+    #[test]
+    fn only_the_path_forms_of_an_automatic_variable_have_a_definition() {
+        let base = automatic(AutoCommand::At, AutoCommandVariant::None);
+        assert_eq!(base.definition(), None);
+        assert_eq!(base.flavor(), "simple");
+
+        let directory = automatic(AutoCommand::At, AutoCommandVariant::D);
+        assert_eq!(
+            directory.definition().unwrap(),
+            "$(patsubst %/,%,$(dir $@))"
+        );
+        assert_eq!(directory.flavor(), "recursive");
+
+        let file = automatic(AutoCommand::At, AutoCommandVariant::F);
+        assert_eq!(file.definition().unwrap(), "$(notdir $@)");
+        assert_eq!(file.flavor(), "recursive");
+    }
+
+    /// The expression names whichever base form the `D` or `F` was derived
+    /// from, so every automatic variable that has one reads back its own.
+    #[test]
+    fn a_path_form_reads_back_the_base_form_it_was_derived_from() {
+        for (typ, base) in [
+            (AutoCommand::Less, '<'),
+            (AutoCommand::Hat, '^'),
+            (AutoCommand::Plus, '+'),
+            (AutoCommand::Star, '*'),
+        ] {
+            assert_eq!(
+                automatic(typ.clone(), AutoCommandVariant::D)
+                    .definition()
+                    .unwrap(),
+                format!("$(patsubst %/,%,$(dir ${base}))")
+            );
+            assert_eq!(
+                automatic(typ, AutoCommandVariant::F).definition().unwrap(),
+                format!("$(notdir ${base})")
+            );
+        }
+    }
 
     #[test]
     fn make_must_occupy_the_invoked_command_position() {

@@ -213,7 +213,7 @@ impl Variable {
         match &self.value {
             InnerVar::Simple(_) => "simple",
             InnerVar::Recursive { .. } => "recursive",
-            InnerVar::AutoCommand(_, _) => "undefined",
+            InnerVar::AutoCommand(_, a) => a.flavor(),
             InnerVar::ShellStatus => "simple",
             InnerVar::VariableNames { .. } => "kati_variable_names",
         }
@@ -410,13 +410,37 @@ impl Variable {
         }
         Ok(())
     }
+    /// The automatic-variable command behind this variable, when that is what
+    /// it holds.
+    ///
+    /// Handed out by value because reading an automatic variable evaluates it,
+    /// and evaluation reaches back into the variable table: keeping the
+    /// variable's own lock held across that would be a deadlock waiting for the
+    /// right makefile.
+    pub fn autocommand(&self) -> Option<AutoCommandVar> {
+        match &self.value {
+            InnerVar::AutoCommand(_, a) => Some(a.clone()),
+            _ => None,
+        }
+    }
+
     pub fn string(&self, session: &Session) -> Result<Cow<'_, [u8]>> {
         Ok(match &self.value {
             InnerVar::Simple(s) => Cow::Borrowed(s.as_slice()),
             InnerVar::Recursive { v: _, orig } => Cow::Borrowed(orig),
-            InnerVar::AutoCommand(sym, _) => {
-                error!("$(value {}) is not implemented yet", sym.display(session));
-            }
+            // An automatic variable's text is not stored: the `D` and `F` forms
+            // know the expression they were defined from, and the base forms
+            // have to be evaluated against the rule in hand. Both need the
+            // caller to go through [`Self::autocommand`]; `$(value)` does.
+            InnerVar::AutoCommand(sym, a) => match a.definition() {
+                Some(text) => Cow::Owned(text.to_vec()),
+                None => {
+                    error!(
+                        "reading ${} needs the rule it belongs to",
+                        sym.display(session)
+                    );
+                }
+            },
             InnerVar::ShellStatus => Cow::Owned(if let Some(status) = session.shell_status {
                 status.to_string().as_bytes().to_vec()
             } else {

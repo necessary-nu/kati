@@ -1,5 +1,3 @@
-# TODO: Fix.
-
 test:
 	echo $(value @)
 	echo '$(value @D)'
