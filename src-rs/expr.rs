@@ -220,6 +220,53 @@ fn should_handle_comments(opt: ParseExprOpt) -> bool {
     !matches!(opt, ParseExprOpt::Define | ParseExprOpt::Command)
 }
 
+/// How GNU Make's `collapse_continuations` (misc.c) reads the run of
+/// backslashes at the start of `text`.
+///
+/// The run escapes the newline that ends it only when it is odd, and each pair
+/// of backslashes in it quotes itself down to one: `a\\\` before a newline is a
+/// literal backslash and a continuation, while `a\\` before one is two literal
+/// backslashes and the end of the line.
+///
+/// `Some((kept, consumed))` says how many of the run's backslashes survive into
+/// the value, and how much of `text` the fold takes — the whole run and the
+/// newline after it. `None` says this run does not continue the line, so it is
+/// value text like any other.
+fn continuation_fold(text: &[u8]) -> Option<(usize, usize)> {
+    let run = text.iter().take_while(|byte| **byte == b'\\').count();
+    if run % 2 == 0 {
+        return None;
+    }
+    let newline = match text[run..] {
+        [b'\r', b'\n', ..] => 2,
+        [b'\r' | b'\n', ..] => 1,
+        _ => return None,
+    };
+    Some((run / 2, run + newline))
+}
+
+/// Advance past everything a fold absorbs into its single space: the blanks on
+/// the far side of the newline, and any further continuation those blanks lead
+/// to.
+///
+/// GNU Make writes one space per folded newline but first discards the blanks
+/// it has already written, so a run of continuations separated by nothing but
+/// blanks comes out as one space however long it is. A continuation whose run
+/// leaves a backslash behind ends the absorbing, because that backslash is
+/// value text that has to be written before the next space.
+fn skip_folded(loc: &mut Loc, s: &[u8], mut at: usize) -> usize {
+    loop {
+        while matches!(s.get(at), Some(b' ' | b'\t')) {
+            at += 1;
+        }
+        let Some((0, consumed)) = continuation_fold(&s[at..]) else {
+            return at;
+        };
+        loc.line += 1;
+        at += consumed;
+    }
+}
+
 fn skip_spaces(loc: &mut Loc, s: &[u8], terms: &[u8]) -> usize {
     let mut i = 0;
     while i < s.len() {
@@ -557,8 +604,22 @@ pub fn parse_expr_impl_ext(
                 continue;
             }
 
+            // GNU Make folds the continuation before it reads the reference, so
+            // the name this `$` takes is whatever the fold left beside it: the
+            // space the newline became, or the first of the backslashes the run
+            // kept. A recipe is the exception, because there the continuation is
+            // the shell's and Make hands it over unfolded.
+            let folded = (opt != ParseExprOpt::Command)
+                .then(|| continuation_fold(&remaining[1..]))
+                .flatten();
+            let named = match folded {
+                Some((0, _)) => b' ',
+                Some(_) => b'\\',
+                None => remaining[1],
+            };
+
             if let Some(terms) = terms
-                && terms[terms_ignored..].contains(&remaining[1])
+                && terms[terms_ignored..].contains(&named)
             {
                 let val = Arc::new(Value::Literal(None, Bytes::from_static(b"$")));
                 if list.is_empty() {
@@ -566,6 +627,22 @@ pub fn parse_expr_impl_ext(
                 }
                 list.push(val);
                 return Ok((i + 1, Arc::new(Value::List(Some(item_loc), list))));
+            }
+
+            if let Some((kept, consumed)) = folded {
+                loc.line += 1;
+                let name = if kept == 0 { &b" "[..] } else { &b"\\"[..] };
+                let sym = session.intern(Bytes::from_static(name));
+                list.push(Arc::new(Value::SymRef(item_loc, sym)));
+                // The reference took the first backslash the run kept. The rest
+                // of them, and the space the newline became, are value text.
+                if kept > 0 {
+                    list.push(Arc::new(Value::Literal(None, s.slice(i + 2..i + 1 + kept))));
+                    list.push(Arc::new(Value::Literal(None, Bytes::from_static(b" "))));
+                }
+                i = skip_folded(loc, &s, i + 1 + consumed);
+                b = i;
+                continue;
             }
 
             let (n, v) = parse_dollar(session, loc, s.slice(i..), end_paren)?;
@@ -600,6 +677,32 @@ pub fn parse_expr_impl_ext(
         }
 
         if c == b'\\' && i + 1 < s.len() && opt != ParseExprOpt::Command {
+            if let Some((kept, consumed)) = continuation_fold(remaining) {
+                loc.line += 1;
+                if let Some(terms) = terms
+                    && terms.contains(&b' ')
+                {
+                    break;
+                }
+                // Half the run stays, so the literal reaches into it. The
+                // blanks written before it go only when none of it does: GNU
+                // Make discards what it has already written back to the last
+                // byte that is not a blank, and a backslash is not one.
+                let literal_end = i + kept;
+                if literal_end > b {
+                    let text = &s[b..literal_end];
+                    let text = if kept == 0 {
+                        trim_right_space(text)
+                    } else {
+                        text
+                    };
+                    list.push(Arc::new(Value::Literal(None, s.slice_ref(text))));
+                }
+                list.push(Arc::new(Value::Literal(None, Bytes::from_static(b" "))));
+                i = skip_folded(loc, &s, i + consumed);
+                b = i;
+                continue;
+            }
             let n = remaining[1];
             if n == b'\\' {
                 i += 2;
@@ -611,41 +714,6 @@ pub fn parse_expr_impl_ext(
                 b = i;
                 i += 1;
                 continue;
-            }
-            if n == b'\r' || n == b'\n' {
-                loc.line += 1;
-                if let Some(terms) = terms
-                    && terms.contains(&b' ')
-                {
-                    break;
-                }
-                if i > b {
-                    list.push(Arc::new(Value::Literal(
-                        None,
-                        s.slice_ref(trim_right_space(&s[b..i])),
-                    )));
-                }
-                list.push(Arc::new(Value::Literal(None, Bytes::from_static(b" "))));
-                // Skip the current escaped newline
-                i += 2;
-                if n == b'\r' && i < s.len() && s[i] == b'\n' {
-                    i += 1;
-                }
-                // Then continue skipping escaped newlines, spaces, and tabs
-                while i < s.len() {
-                    let t = &s[i..];
-                    if t.starts_with(b"\\\r") || t.starts_with(b"\\\n") {
-                        loc.line += 1;
-                        i += 2;
-                        continue;
-                    }
-                    if !(t[0] == b' ' || t[0] == b'\t') {
-                        break;
-                    }
-                    i += 1;
-                }
-                b = i;
-                i -= 1;
             }
         }
 
@@ -681,6 +749,89 @@ pub fn parse_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a value parses to, as the bytes a literal-only expansion produces.
+    fn literal_text(source: &'static [u8], opt: ParseExprOpt) -> String {
+        let mut session = Session::new();
+        let value = parse_expr(
+            &mut session,
+            &mut Loc::default(),
+            Bytes::from_static(source),
+            opt,
+        )
+        .expect("a parsed value");
+        let mut out = Vec::new();
+        fn walk(value: &Value, out: &mut Vec<u8>) {
+            match value {
+                Value::Literal(_, text) => out.extend_from_slice(text),
+                Value::List(_, list) => list.iter().for_each(|v| walk(v, out)),
+                // A reference to an unset variable is empty, and every name
+                // these cases produce is one nothing ever assigns.
+                _ => {}
+            }
+        }
+        walk(&value, &mut out);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn an_odd_backslash_run_before_a_newline_keeps_half_of_itself() {
+        assert_eq!(continuation_fold(b"\\\nx"), Some((0, 2)));
+        assert_eq!(continuation_fold(b"\\\\\\\nx"), Some((1, 4)));
+        assert_eq!(continuation_fold(b"\\\\\\\\\\\nx"), Some((2, 6)));
+        assert_eq!(continuation_fold(b"\\\r\nx"), Some((0, 3)));
+    }
+
+    #[test]
+    fn an_even_backslash_run_does_not_continue_the_line() {
+        assert_eq!(continuation_fold(b"\\\\\nx"), None);
+        assert_eq!(continuation_fold(b"\\\\\\\\\nx"), None);
+        assert_eq!(continuation_fold(b"\\x"), None);
+        assert_eq!(continuation_fold(b"\\"), None);
+        assert_eq!(continuation_fold(b"x\\\n"), None);
+    }
+
+    #[test]
+    fn a_continuation_becomes_one_space_however_much_it_spans() {
+        assert_eq!(literal_text(b"a\\\n  b", ParseExprOpt::Normal), "a b");
+        assert_eq!(literal_text(b"a   \\\n\t\tb", ParseExprOpt::Normal), "a b");
+        assert_eq!(literal_text(b"a\\\n\\\n  b", ParseExprOpt::Normal), "a b");
+        assert_eq!(literal_text(b"a\\\\\\\n  b", ParseExprOpt::Normal), "a\\ b");
+        assert_eq!(
+            literal_text(b"a\\\n  \\\\\\\nb", ParseExprOpt::Normal),
+            "a \\ b"
+        );
+    }
+
+    #[test]
+    fn a_dollar_before_a_continuation_names_what_the_fold_leaves() {
+        // The fold puts a space beside the `$`, so the reference is to the
+        // variable whose name is a space, and nothing is left between the two
+        // halves of the value.
+        assert_eq!(literal_text(b"x$\\\n  y", ParseExprOpt::Normal), "xy");
+        assert_eq!(literal_text(b"x$\\\n  y", ParseExprOpt::Define), "xy");
+        // With backslashes surviving the fold it is the first of them that is
+        // named, and the rest of them and the space are value text.
+        assert_eq!(literal_text(b"x$\\\\\\\n  y", ParseExprOpt::Normal), "x y");
+        assert_eq!(
+            literal_text(b"x$\\\\\\\\\\\n  y", ParseExprOpt::Normal),
+            "x\\ y"
+        );
+    }
+
+    #[test]
+    fn a_recipe_hands_its_continuation_to_the_shell() {
+        assert_eq!(
+            literal_text(b"echo a\\\nb", ParseExprOpt::Command),
+            "echo a\\\nb"
+        );
+        // `$\` in a recipe is a reference to the variable named `\`, and the
+        // newline behind it stays where it is rather than folding away.
+        assert_eq!(
+            literal_text(b"echo x$\\\ny", ParseExprOpt::Command),
+            "echo x\ny"
+        );
+    }
 
     #[test]
     fn test_parse_expr() {

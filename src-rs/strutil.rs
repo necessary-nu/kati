@@ -545,6 +545,40 @@ pub fn find_end_of_line(buf: &Bytes) -> EndOfLine {
     }
 }
 
+/// Discard the recipe prefix that follows a newline, which is what GNU Make's
+/// `start_job_command` (job.c) does before a recipe line reaches the shell.
+///
+/// A recipe keeps its backslash-newlines, because inside one the continuation
+/// belongs to the shell rather than to Make. What Make still owns is the prefix
+/// character that marked the continued line as recipe text, and it takes
+/// exactly one of them: a second prefix, or any other whitespace behind the
+/// first, is part of the command.
+///
+/// Nothing is copied when there is nothing to remove, which is the common case:
+/// most recipes are one line long.
+pub fn strip_recipe_prefix_continuations(source: Bytes, prefix: u8) -> Bytes {
+    let mut output: Option<BytesMut> = None;
+    let mut copied = 0usize;
+    let mut at = 0usize;
+    while let Some(found) = memchr(b'\n', &source[at..]) {
+        at += found + 1;
+        if source.get(at) != Some(&prefix) {
+            continue;
+        }
+        let output = output.get_or_insert_with(|| BytesMut::with_capacity(source.len()));
+        output.put_slice(&source[copied..at]);
+        at += 1;
+        copied = at;
+    }
+    match output {
+        Some(mut output) => {
+            output.put_slice(&source[copied..]);
+            output.freeze()
+        }
+        None => source,
+    }
+}
+
 pub fn trim_leading_curdir(mut s: &[u8]) -> &[u8] {
     while s.starts_with(b"./") {
         s = &s[2..];
@@ -688,6 +722,30 @@ mod test {
 
         let ss = word_scanner(b" a  b").collect::<Vec<&[u8]>>();
         assert_eq!(ss, vec![b"a", b"b"]);
+    }
+
+    #[test]
+    fn a_recipe_loses_one_prefix_from_each_continued_line() {
+        let strip = |text: &'static [u8], prefix| {
+            String::from_utf8_lossy(&strip_recipe_prefix_continuations(
+                Bytes::from_static(text),
+                prefix,
+            ))
+            .into_owned()
+        };
+        assert_eq!(strip(b"echo a\\\n\tb", b'\t'), "echo a\\\nb");
+        // One prefix, and only the prefix: the whitespace behind it is the
+        // command's own, and so is whitespace the prefix never introduced.
+        assert_eq!(strip(b"echo a\\\n\t\tb", b'\t'), "echo a\\\n\tb");
+        assert_eq!(strip(b"echo a\\\n\t  b", b'\t'), "echo a\\\n  b");
+        assert_eq!(strip(b"echo a\\\n  \tb", b'\t'), "echo a\\\n  \tb");
+        assert_eq!(strip(b"echo a\\\nb", b'\t'), "echo a\\\nb");
+        // Every continued line, not just the first.
+        assert_eq!(strip(b"a\\\n\tb\\\n\tc", b'\t'), "a\\\nb\\\nc");
+        // The prefix is whatever `.RECIPEPREFIX` made it, and a tab is then
+        // ordinary text.
+        assert_eq!(strip(b"echo a\\\n>b", b'>'), "echo a\\\nb");
+        assert_eq!(strip(b"echo a\\\n\tb", b'>'), "echo a\\\n\tb");
     }
 
     #[test]

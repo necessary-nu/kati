@@ -31,7 +31,8 @@ use crate::{
         IfStmt, IncludeStmt, RuleStmt, Stmt, UndefineStmt, VpathStmt,
     },
     strutil::{
-        find_end_of_line, find_outside_paren, trim_left_space, trim_right_space, trim_space,
+        find_end_of_line, find_outside_paren, strip_recipe_prefix_continuations, trim_left_space,
+        trim_right_space, trim_space,
     },
     symtab::Symbol,
     warn_loc,
@@ -173,12 +174,11 @@ impl<'a> Parser<'a> {
         if line.first() == Some(&self.cmd_prefix) && self.after_rule {
             let loc = self.loc.clone();
             let mut mutable_loc = self.loc.clone();
-            let expr = parse_expr(
-                self.session,
-                &mut mutable_loc,
-                line.slice(1..),
-                ParseExprOpt::Command,
-            )?;
+            // The line the prefix opened may have been continued, and every
+            // line it was continued onto carries the prefix too. Only the first
+            // one is this slice; the rest are still inside it.
+            let body = strip_recipe_prefix_continuations(line.slice(1..), self.cmd_prefix);
+            let expr = parse_expr(self.session, &mut mutable_loc, body, ParseExprOpt::Command)?;
             self.out_stmts
                 .lock()
                 .push(CommandStmt::new(loc, line, expr));
@@ -250,7 +250,7 @@ impl<'a> Parser<'a> {
         self.after_rule = true;
         self.out_stmts
             .lock()
-            .push(RuleStmt::new(self.loc.clone(), line));
+            .push(RuleStmt::new(self.loc.clone(), line, self.cmd_prefix));
         Ok(())
     }
 

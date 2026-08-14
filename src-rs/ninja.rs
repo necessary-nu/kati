@@ -545,9 +545,18 @@ impl<'a> NinjaGenerator<'a> {
                         while inp.len() > 1 && inp[0] != b'\n' {
                             inp.advance(1);
                         }
-                    } else {
-                        cmd_buf.put_u8(c);
+                        // The comment ran to the end of its line and took the
+                        // newline with it, and it took the backslash that
+                        // continued the line into it too — a backslash inside a
+                        // comment is comment text. What follows therefore reads
+                        // as the start of a line: a `#` there opens another
+                        // comment rather than being a word of this one.
+                        prev_backslash = false;
+                        prev_char = b'\n';
+                        inp.advance(1);
+                        continue;
                     }
+                    cmd_buf.put_u8(c);
                 }
                 b'\'' | b'"' | b'`' => {
                     if let Some(q) = quote {

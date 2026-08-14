@@ -77,6 +77,12 @@ pub enum CondOp {
 pub struct RuleStmt {
     loc: Loc,
     orig: Bytes,
+
+    /// The character that marked recipe text when this line was read, which is
+    /// `.RECIPEPREFIX` as it stood there rather than as it ends up. A recipe
+    /// written after a literal `;` on this line is continued with lines that
+    /// carry it, and it has to come off them when the recipe runs.
+    pub recipe_prefix: u8,
 }
 
 impl Statement for RuleStmt {
@@ -100,8 +106,12 @@ impl Debug for RuleStmt {
 }
 
 impl RuleStmt {
-    pub fn new(loc: Loc, orig: Bytes) -> Arc<RuleStmt> {
-        Arc::new(RuleStmt { loc, orig })
+    pub fn new(loc: Loc, orig: Bytes, recipe_prefix: u8) -> Arc<RuleStmt> {
+        Arc::new(RuleStmt {
+            loc,
+            orig,
+            recipe_prefix,
+        })
     }
 }
 

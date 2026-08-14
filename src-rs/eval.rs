@@ -41,8 +41,8 @@ use crate::stmt::{
     RuleStmt, Statement, UndefineStmt, VpathStmt,
 };
 use crate::strutil::{
-    Pattern, is_space_byte, makefile_word_scanner, trim_leading_curdir, trim_left_space,
-    trim_right_space, word_scanner,
+    Pattern, is_space_byte, makefile_word_scanner, strip_recipe_prefix_continuations,
+    trim_leading_curdir, trim_left_space, trim_right_space, word_scanner,
 };
 use crate::symtab::{Interner, Symbol, Symtab};
 use crate::var::{Var, VarOrigin, Variable, Vars};
@@ -1599,8 +1599,14 @@ impl Evaluator {
         parse_expr(&mut self.session, &mut loc, suffix, ParseExprOpt::Define)?.eval_to_buf(self)
     }
 
-    fn parse_rule_command(&mut self, source: Bytes) -> Result<Arc<Value>> {
+    /// A recipe written on the rule's own line, after a `;`.
+    ///
+    /// It is continued the same way a recipe line is, onto lines that carry the
+    /// recipe prefix, so the prefix comes off them here for the same reason it
+    /// comes off a recipe line's continuations.
+    fn parse_rule_command(&mut self, source: Bytes, recipe_prefix: u8) -> Result<Arc<Value>> {
         let source = source.slice_ref(trim_left_space(&source));
+        let source = strip_recipe_prefix_continuations(source, recipe_prefix);
         let mut loc = self.loc.clone().unwrap_or_default();
         parse_expr(&mut self.session, &mut loc, source, ParseExprOpt::Command)
     }
@@ -1778,15 +1784,16 @@ impl Evaluator {
         let mut prerequisites = Vec::with_capacity(after_targets.len() + expanded_rest.len());
         prerequisites.extend_from_slice(&after_targets);
         prerequisites.extend_from_slice(&expanded_rest);
+        let recipe_prefix = stmt.recipe_prefix;
         let command = if let Some(command) = literal_command {
-            Some(self.parse_rule_command(command)?)
+            Some(self.parse_rule_command(command, recipe_prefix)?)
         } else if let Some(command) = expanded_command {
-            Some(self.parse_rule_command(command)?)
+            Some(self.parse_rule_command(command, recipe_prefix)?)
         } else if scan_expanded_command {
             if let Some(semicolon) = find_char_unquote(&mut prerequisites, b';') {
                 let command = Bytes::from(prerequisites.split_off(semicolon + 1));
                 prerequisites.truncate(semicolon);
-                Some(self.parse_rule_command(command)?)
+                Some(self.parse_rule_command(command, recipe_prefix)?)
             } else {
                 None
             }
