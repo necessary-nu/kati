@@ -91,6 +91,49 @@ pub struct GroupedDoubleAction {
 /// name visited is new. The deepest chain in GNU Make's suite is three.
 const MAX_IMPLICIT_CHAIN: usize = 6;
 
+/// Which of GNU Make's passes over the pattern rules is running.
+///
+/// `pattern_search` walks the same candidates up to four times, relaxing one
+/// question about a missing prerequisite each time. `chaining` is its
+/// `intermed_ok`: whether a prerequisite may be invented by a search of its
+/// own. `compat` is its `allow_compat_rules`: whether a prerequisite the
+/// Makefile merely writes down somewhere may be taken on trust without being
+/// found or made at all.
+///
+/// The passes are ordered rather than combined because the order is the
+/// answer: a rule whose prerequisites are really there beats one whose would
+/// have to be invented, and both beat one that is only reached by taking a
+/// name on trust — however far up the candidate list the loser sits.
+#[derive(Clone, Copy)]
+struct SearchPass {
+    chaining: bool,
+    compat: bool,
+}
+
+impl SearchPass {
+    /// Every pass, in the order GNU Make runs them.
+    fn all() -> [Self; 4] {
+        [
+            Self {
+                chaining: false,
+                compat: false,
+            },
+            Self {
+                chaining: true,
+                compat: false,
+            },
+            Self {
+                chaining: false,
+                compat: true,
+            },
+            Self {
+                chaining: true,
+                compat: true,
+            },
+        ]
+    }
+}
+
 #[derive(Debug)]
 pub struct DepNode {
     /// The graph edge's primary output. An exact grouped action uses a private
@@ -2670,6 +2713,21 @@ impl<'a> DepBuilder<'a> {
         candidates
     }
 
+    /// Whether the Makefile has written this name down anywhere at all.
+    ///
+    /// GNU Make's `pattern_search` asks `lookup_file`, which answers for any
+    /// name that reached the file database: a target of a rule, a prerequisite
+    /// of one, a goal, or a name carrying target-specific variables. It is a
+    /// far weaker claim than "ought to exist" — the name is not promised, it is
+    /// merely known — and it is what the compatibility pass runs on.
+    fn is_written_down(&self, name: Symbol) -> bool {
+        self.rules.contains_key(&name)
+            || self.mentioned.contains(&name)
+            || self.phony.contains(&name)
+            || self.rule_vars.contains_key(&name)
+            || self.ev.goals.contains(&name)
+    }
+
     fn can_pick_implicit_rule(
         &mut self,
         rule: &Rule,
@@ -2677,7 +2735,7 @@ impl<'a> DepBuilder<'a> {
         candidate_order: usize,
         output: Symbol,
         n: Arc<Mutex<DepNode>>,
-        chaining: bool,
+        pass: SearchPass,
     ) -> Result<Option<Arc<Rule>>> {
         let output_str = output.as_bytes(&self.ev.session);
         let pat = Pattern::new(matched.as_bytes(&self.ev.session));
@@ -2703,7 +2761,14 @@ impl<'a> DepBuilder<'a> {
             if self.exists(sym) {
                 continue;
             }
-            if !(chaining && self.can_be_made_implicitly(sym, 0)?) {
+            // The compatibility pass takes a prerequisite the Makefile merely
+            // names. It runs after everything else has failed, so the name is
+            // not invented and never becomes an intermediate: the search did
+            // not make it up, it read it.
+            if pass.compat && self.is_written_down(sym) {
+                continue;
+            }
+            if !(pass.chaining && self.can_be_made_implicitly(sym, 0, pass.compat)?) {
                 return Ok(None);
             }
             if from_pattern && !self.mentioned.contains(&sym) {
@@ -2771,16 +2836,36 @@ impl<'a> DepBuilder<'a> {
     /// Step 6 of GNU Make's implicit rule search: whether an implicit rule could
     /// make this. Nothing is built here — build_plan descends into the
     /// prerequisite anyway, and the search one level down succeeds normally.
-    fn can_be_made_implicitly(&mut self, output: Symbol, depth: usize) -> Result<bool> {
+    fn can_be_made_implicitly(
+        &mut self,
+        output: Symbol,
+        depth: usize,
+        compat: bool,
+    ) -> Result<bool> {
         if depth >= MAX_IMPLICIT_CHAIN || !self.chaining.insert(output) {
             return Ok(false);
         }
-        let answer = self.implicit_chain_exists(output, depth);
+        // One recursion is one whole search, so it runs the compatibility pass
+        // of its own once its strict pass has failed — unless the search that
+        // reached it is already the compatibility pass, which it inherits.
+        let passes: &[bool] = if compat { &[true] } else { &[false, true] };
+        let mut answer = Ok(false);
+        for compat in passes {
+            answer = self.implicit_chain_exists(output, depth, *compat);
+            if !matches!(answer, Ok(false)) {
+                break;
+            }
+        }
         self.chaining.remove(&output);
         answer
     }
 
-    fn implicit_chain_exists(&mut self, output: Symbol, depth: usize) -> Result<bool> {
+    fn implicit_chain_exists(
+        &mut self,
+        output: Symbol,
+        depth: usize,
+        compat: bool,
+    ) -> Result<bool> {
         let output_str = output.as_bytes(&self.ev.session);
         for candidate in self.ordered_candidates(&output_str) {
             let rule = candidate.rule;
@@ -2809,7 +2894,10 @@ impl<'a> DepBuilder<'a> {
             };
             let mut ok = true;
             for i in inputs {
-                if !self.exists(i) && !self.can_be_made_implicitly(i, depth + 1)? {
+                if self.exists(i) || (compat && self.is_written_down(i)) {
+                    continue;
+                }
+                if !self.can_be_made_implicitly(i, depth + 1, compat)? {
                     ok = false;
                     break;
                 }
@@ -2830,7 +2918,10 @@ impl<'a> DepBuilder<'a> {
         };
         for irule in &found {
             let input = replace_suffix(&mut self.ev.session, output, &irule.inputs[0]);
-            if self.exists(input) || self.can_be_made_implicitly(input, depth + 1)? {
+            if self.exists(input)
+                || (compat && self.is_written_down(input))
+                || self.can_be_made_implicitly(input, depth + 1, compat)?
+            {
                 return Ok(true);
             }
         }
@@ -2867,12 +2958,12 @@ impl<'a> DepBuilder<'a> {
             }));
         }
 
-        // Steps 5 then 6, over the same rules. The first pass must finish
-        // first: a rule whose prerequisites exist beats one whose would have to
-        // be invented, however far down the list it is.
-        for chaining in [false, true] {
+        // Steps 5 then 6, over the same rules, and then both again taking a
+        // written-down prerequisite on trust. Each pass runs out over every
+        // candidate before the next one begins; `SearchPass` says why.
+        for pass in SearchPass::all() {
             if let Some(picked) =
-                self.pick_pattern_rule(output, n, &rule_merger, &patterns, &vars, chaining)?
+                self.pick_pattern_rule(output, n, &rule_merger, &patterns, &vars, pass)?
             {
                 return Ok(Some(picked));
             }
@@ -2999,7 +3090,7 @@ impl<'a> DepBuilder<'a> {
         rule_merger: &Option<Arc<Mutex<RuleMerger>>>,
         patterns: &[Arc<Vars>],
         vars: &Option<Arc<Vars>>,
-        chaining: bool,
+        pass: SearchPass,
     ) -> Result<Option<PickedRuleInfo>> {
         let candidates = self.ordered_candidates(&output.as_bytes(&self.ev.session));
         for candidate in candidates {
@@ -3009,7 +3100,7 @@ impl<'a> DepBuilder<'a> {
                 candidate.order,
                 output,
                 n.clone(),
-                chaining,
+                pass,
             )?
             else {
                 continue;
@@ -3038,8 +3129,8 @@ impl<'a> DepBuilder<'a> {
         for irule in &found {
             assert!(irule.inputs.len() == 1);
             let input = replace_suffix(&mut self.ev.session, output, &irule.inputs[0]);
-            if !self.exists(input) {
-                if !(chaining && self.can_be_made_implicitly(input, 0)?) {
+            if !self.exists(input) && !(pass.compat && self.is_written_down(input)) {
+                if !(pass.chaining && self.can_be_made_implicitly(input, 0, pass.compat)?) {
                     continue;
                 }
                 if !self.mentioned.contains(&input) {
