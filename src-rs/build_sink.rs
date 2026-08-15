@@ -325,20 +325,33 @@ pub struct SinkEdge<'a> {
     /// The build should delete this output once it has finished with it, which
     /// is every intermediate but a `.SECONDARY` one and a goal.
     pub disposable: bool,
-    /// The outputs a failed recipe must not leave behind, which is what
-    /// `.DELETE_ON_ERROR` asks for. Empty means keep whatever the recipe wrote.
+    /// The outputs a stopped recipe may be made to give back.
     ///
     /// The names rather than a flag, because the exclusions are per output and
     /// not per edge: `.PRECIOUS` protects one member of a grouped record while
-    /// its peers still go. Which of them the failed recipe actually touched is
-    /// the running build's question and not this one's, so every eligible name
-    /// is listed and the sink compares timestamps.
+    /// its peers still go, and a `.PHONY` name stands for no file at all. Which
+    /// of them the stopped recipe actually touched is the running build's
+    /// question and not this one's, so every eligible name is listed and the
+    /// sink compares timestamps.
+    ///
+    /// Listed whatever the Makefile said about `.DELETE_ON_ERROR`, which is
+    /// [`Self::delete_on_error`] and only one of the two reasons to ask for
+    /// them. An empty list from a Makefile means there is nothing here to take
+    /// back; a manifest says nothing at all and the sink may tell the two
+    /// apart, because Ninja withdraws everything a cut-short command wrote.
     ///
     /// Nothing in a manifest says this — Ninja has no notion of an output the
     /// build withdraws when the command fails — so the writer ignores it, as it
     /// ignores [`Self::intermediate`] and [`Self::disposable`], and a sink that
     /// runs the build is the one that answers for it.
-    pub delete_on_error_outputs: &'a [Symbol],
+    pub withdrawable_outputs: &'a [Symbol],
+    /// Whether an ordinary failure is reason enough to withdraw them.
+    ///
+    /// GNU Make asks `exit_sig != 0 || delete_on_error`: a recipe killed by a
+    /// signal is cleaned up after whatever the Makefile said, and this is the
+    /// other reason. Read per Makefile unit, so a recursive Make that declares
+    /// `.DELETE_ON_ERROR` does not answer for the parent that did not.
+    pub delete_on_error: bool,
     /// The outputs among [`Self::implicit_outputs`] this recipe makes only on
     /// the way to making something that was asked for — GNU Make's `also_make`.
     ///

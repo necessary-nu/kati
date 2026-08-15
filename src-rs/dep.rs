@@ -347,13 +347,24 @@ pub struct DepNode {
     /// The build deletes this file once it has finished with it, which every
     /// intermediate but a `.SECONDARY` one and a goal is.
     pub is_disposable: bool,
-    /// The outputs of this action a failed recipe leaves half-made, which
-    /// `.DELETE_ON_ERROR` says must not be left behind.
+    /// The outputs of this action a stopped recipe may be made to give back.
     ///
-    /// Empty unless the Makefile declared `.DELETE_ON_ERROR`, and then only the
-    /// outputs that survive the exclusions: `.PRECIOUS` protects a name from
-    /// deletion, and a `.PHONY` name stands for no file to delete.
-    pub delete_on_error_outputs: Vec<Symbol>,
+    /// Every output the action writes, less the ones GNU Make's `delete_target`
+    /// refuses to touch whatever stopped the recipe: `.PRECIOUS` protects a
+    /// name from deletion, and a `.PHONY` name stands for no file to delete.
+    ///
+    /// Listed whether or not the Makefile said `.DELETE_ON_ERROR`, because that
+    /// switch is one of two independent reasons to take these names back and
+    /// not the reason they are eligible. The other is a recipe that died by a
+    /// signal, which GNU Make cleans up after unconditionally
+    /// (`job.c`: `if (exit_sig != 0 || delete_on_error)`).
+    pub withdrawable_outputs: Vec<Symbol>,
+    /// Whether an ordinary failure is reason enough to withdraw them.
+    ///
+    /// `.DELETE_ON_ERROR` is read per Makefile unit, so a recursive Make that
+    /// declares it does not speak for the parent that did not, and the answer
+    /// rides with the action rather than with the build.
+    pub delete_on_error: bool,
     pub implicit_outputs: Vec<Symbol>,
     /// The outputs among [`Self::implicit_outputs`] that this recipe makes only
     /// on the way to making something else — GNU Make's `also_make`.
@@ -424,7 +435,8 @@ impl DepNode {
             is_ignore_error,
             is_intermediate,
             is_disposable,
-            delete_on_error_outputs: Vec::new(),
+            withdrawable_outputs: Vec::new(),
+            delete_on_error: false,
             implicit_outputs: Vec::new(),
             peer_outputs: Vec::new(),
             pattern_group: false,
@@ -1664,8 +1676,8 @@ impl<'a> DepBuilder<'a> {
             || output_pattern.is_some_and(|pattern| self.precious_patterns.contains(&pattern))
     }
 
-    /// Record which of each action's outputs a failed recipe must not leave
-    /// behind.
+    /// Record which of each action's outputs a stopped recipe may give back,
+    /// and whether an ordinary failure is reason enough to ask.
     ///
     /// Asked once the whole graph is planned rather than as each node is built,
     /// because an action's outputs are not all known when it is: a grouped
@@ -1673,12 +1685,13 @@ impl<'a> DepBuilder<'a> {
     /// later, and a name protected by a pattern acquires that protection when
     /// the rule that makes it is chosen.
     ///
+    /// The list is recorded whatever `.DELETE_ON_ERROR` said, because a recipe
+    /// killed by a signal is taken back without it. The switch travels beside
+    /// the list as its own answer rather than as the reason the list exists.
+    ///
     /// A node with no recipe is skipped: nothing can fail, so nothing is
     /// half-made.
-    fn mark_delete_on_error(&self) {
-        if !self.delete_on_error {
-            return;
-        }
+    fn mark_withdrawable_outputs(&self) {
         let mut seen = HashSet::new();
         let nodes = self
             .done
@@ -1708,7 +1721,8 @@ impl<'a> DepBuilder<'a> {
                     .flatten();
                 !self.phony.contains(output) && !self.is_precious(*output, pattern)
             });
-            node.delete_on_error_outputs = outputs;
+            node.withdrawable_outputs = outputs;
+            node.delete_on_error = self.delete_on_error;
         }
     }
 
@@ -1724,7 +1738,7 @@ impl<'a> DepBuilder<'a> {
     /// Asked once the graph is planned rather than as each node is made,
     /// because a pattern protects a name only from the moment the rule that
     /// makes it has been chosen — the same reason
-    /// [`Self::mark_delete_on_error`] waits.
+    /// [`Self::mark_withdrawable_outputs`] waits.
     fn keep_precious_intermediates(&self) {
         if self.precious.is_empty() && self.precious_patterns.is_empty() {
             return;
@@ -2159,7 +2173,7 @@ impl<'a> DepBuilder<'a> {
             nodes.push((target, self.plan_root(target)?));
         }
         self.apply_wait_barriers();
-        self.mark_delete_on_error();
+        self.mark_withdrawable_outputs();
         self.keep_precious_intermediates();
         Ok(nodes)
     }

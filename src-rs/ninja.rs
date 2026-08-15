@@ -1117,7 +1117,7 @@ impl<'a> NinjaGenerator<'a> {
         let validations = symbols(&node.validations);
         let implicit_outputs = named(&node.implicit_outputs);
         let output = self.phony_aliases.resolve(node.output);
-        let delete_on_error_outputs = named(&node.delete_on_error_outputs);
+        let withdrawable_outputs = named(&node.withdrawable_outputs);
         let peer_outputs = named(&node.peer_outputs);
         let deferred_freshness_outputs = if let Some(action) = &node.grouped_double_action {
             named(&action.members)
@@ -1187,7 +1187,8 @@ impl<'a> NinjaGenerator<'a> {
                 completion_join: node.grouped_double_join,
                 intermediate: node.is_intermediate,
                 disposable: node.is_disposable,
-                delete_on_error_outputs: &delete_on_error_outputs,
+                withdrawable_outputs: &withdrawable_outputs,
+                delete_on_error: node.delete_on_error,
                 peer_outputs: &peer_outputs,
                 pool: pool.as_deref(),
                 tags: tags.as_deref(),
@@ -1599,6 +1600,14 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
             (None, command) => *command,
         };
 
+        // Every one of these runs in place of the shell the build starts for
+        // it. GNU Make waits on the recipe's own shell, so a recipe a signal
+        // killed is a signalled child and Make can see that it was; a launcher
+        // that stayed alive to report the death would report `128 + signal` and
+        // exit normally, which is what a recipe that ran `exit 143` looks like
+        // too. `exec` leaves one process where Make has one. It goes before the
+        // environment prefix because `env` replaces itself with what it runs,
+        // so from there on there is nothing left to replace.
         match command {
             // The script is the file, so the only layer between these bytes
             // and the shell is ninja's own.
@@ -1607,6 +1616,7 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
                 write!(self.out, " rspfile_content = ")?;
                 self.out.write_all(&escape_ninja_value(script))?;
                 write!(self.out, "\n command = ")?;
+                self.out.write_all(b"exec ")?;
                 self.out
                     .write_all(&escape_ninja(&environment_prefix(rule.recipe_environment)))?;
                 self.out.write_all(&escape_ninja(rule.shell))?;
@@ -1619,7 +1629,7 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
             // it. A `$` the Makefile meant for the shell is therefore written
             // `\$$`: `\$` once ninja is done, `$` once the shell is.
             SinkCommand::Inline(script) => {
-                self.out.write_all(b" command = ")?;
+                self.out.write_all(b" command = exec ")?;
                 self.out
                     .write_all(&escape_ninja(&environment_prefix(rule.recipe_environment)))?;
                 self.out.write_all(&escape_ninja(rule.shell))?;
@@ -1830,7 +1840,8 @@ mod tests {
                     completion_join: false,
                     intermediate: false,
                     disposable: false,
-                    delete_on_error_outputs: &[],
+                    withdrawable_outputs: &[],
+                    delete_on_error: false,
                     peer_outputs: &[],
                     pool: None,
                     tags: None,
@@ -2081,9 +2092,9 @@ mod tests {
         // Inline: escaped for the shell ninja starts, then for ninja itself.
         let manifest = declare_rule_for(SinkCommand::Inline(&script), None);
         let evaluated = ninja_unescape(binding(&manifest, "command").as_bytes());
-        assert_eq!(evaluated, b"/bin/sh -c \"echo \\$PATH\"");
+        assert_eq!(evaluated, b"exec /bin/sh -c \"echo \\$PATH\"");
         let quoted = evaluated
-            .strip_prefix(b"/bin/sh -c \"")
+            .strip_prefix(b"exec /bin/sh -c \"")
             .and_then(|v| v.strip_suffix(b"\""))
             .unwrap();
         assert_eq!(shell_unquote(quoted), script);
@@ -2200,7 +2211,7 @@ mod tests {
     fn the_manifest_writer_discards_an_ignored_status_itself() {
         let manifest = declare_rule_of(SinkCommand::Inline(b"( false )"), None, true);
         let evaluated = ninja_unescape(binding(&manifest, "command").as_bytes());
-        assert_eq!(evaluated, b"/bin/sh -c \"( ( false ) ) ; true\"");
+        assert_eq!(evaluated, b"exec /bin/sh -c \"( ( false ) ) ; true\"");
 
         let manifest = declare_rule_of(SinkCommand::ResponseFile(b"( false )"), None, true);
         assert_eq!(
