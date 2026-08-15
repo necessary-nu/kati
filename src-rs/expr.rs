@@ -94,8 +94,8 @@ impl Evaluable for Value {
                 let sym = *sym;
                 let is_make =
                     ev.is_evaluating_command && sym.as_bytes(&ev.session).as_ref() == b"MAKE";
-                if let Some(v) = ev.lookup_var_for_eval(sym)? {
-                    let v = v.read();
+                if let Some(var) = ev.lookup_var_for_eval(sym)? {
+                    let v = var.read();
                     v.used(ev, &sym)?;
                     if is_make {
                         let expanded = v.eval_to_buf(ev)?;
@@ -106,7 +106,8 @@ impl Evaluable for Value {
                     }
                     let loc = ev.loc.clone();
                     v.check_current_referencing_file(&ev.session, &loc, sym)?;
-                    ev.var_eval_complete(sym);
+                    drop(v);
+                    ev.var_eval_complete(&var);
                 }
             }
             Value::VarRef(_, var) => {
@@ -116,8 +117,8 @@ impl Evaluable for Value {
                 let sym = ev.session.intern(name);
                 let is_make =
                     ev.is_evaluating_command && sym.as_bytes(&ev.session).as_ref() == b"MAKE";
-                if let Some(v) = ev.lookup_var_for_eval(sym)? {
-                    let v = v.read();
+                if let Some(var) = ev.lookup_var_for_eval(sym)? {
+                    let v = var.read();
                     v.used(ev, &sym)?;
                     if is_make {
                         let expanded = v.eval_to_buf(ev)?;
@@ -128,7 +129,8 @@ impl Evaluable for Value {
                     }
                     let loc = ev.loc.clone();
                     v.check_current_referencing_file(&ev.session, &loc, sym)?;
-                    ev.var_eval_complete(sym);
+                    drop(v);
+                    ev.var_eval_complete(&var);
                 }
             }
             Value::VarSubst {

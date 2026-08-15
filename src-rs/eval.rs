@@ -762,6 +762,14 @@ impl IncludeGraph {
     }
 }
 
+/// Which variable this is, as against which name it answers to.
+///
+/// Two bindings of one name are two variables, and the recursion guard is a
+/// question about the variable, so it needs the thing rather than the name.
+fn var_identity(var: &Var) -> usize {
+    Arc::as_ptr(var) as *const () as usize
+}
+
 /// Make evaluation, over a session it owns.
 ///
 /// Every diagnostic raised during evaluation renders a symbol or a location, so
@@ -779,7 +787,20 @@ pub struct Evaluator {
     /// wins is decided by which was written first; a `HashMap` alone cannot say.
     pub pattern_rule_var_order: Vec<Symbol>,
     pub rules: Vec<Rule>,
-    symbols_for_eval: HashSet<Symbol>,
+    /// The variables an expansion is currently inside, by identity.
+    ///
+    /// GNU Make marks the `struct variable` it is expanding (`v->expanding` in
+    /// expand.c recursively_expand_for_file) rather than the name it was
+    /// reached by, which is what makes a shadowing binding readable from inside
+    /// the expansion of the name it shadows: `$(foreach y,z,$ydef)` in `y`'s
+    /// own value reads the loop's `y`, a different variable that nothing is
+    /// expanding. A name is the wrong key for the same question, because a
+    /// binding and the variable it stands in front of share one.
+    ///
+    /// Each entry is a `Var`'s address, which is stable and unique for as long
+    /// as it is marked: whatever put it here holds the `Arc` until it takes it
+    /// out again.
+    expanding_vars: HashSet<usize>,
 
     rule_state: RuleState,
     /// Whether `.SECONDEXPANSION` has been read yet. It applies only to rules
@@ -795,11 +816,6 @@ pub struct Evaluator {
     /// variable is in it. While this is nonzero that circle is broken rather
     /// than reported.
     environment_recursion: usize,
-    /// Names whose expansion was answered from the invocation's environment
-    /// instead of being entered, innermost last, so finishing one does not
-    /// clear the guard belonging to the expansion it was nested inside.
-    environment_substituted: Vec<Symbol>,
-
     pub loc: Option<Loc>,
     is_bootstrap: bool,
     is_commandline: bool,
@@ -972,7 +988,7 @@ impl Evaluator {
             rule_vars: HashMap::new(),
             pattern_rule_var_order: Vec::new(),
             rules: Vec::new(),
-            symbols_for_eval: HashSet::new(),
+            expanding_vars: HashSet::new(),
 
             rule_state: RuleState::None,
             second_expansion: false,
@@ -1003,7 +1019,6 @@ impl Evaluator {
             is_posix: false,
 
             environment_recursion: 0,
-            environment_substituted: Vec::new(),
             export_allowed: ExportAllowed::Allowed,
 
             profiled_files: Vec::new(),
@@ -2519,14 +2534,15 @@ impl Evaluator {
 
     pub fn lookup_var_for_eval(&mut self, name: Symbol) -> Result<Option<Var>> {
         if let Some(var) = self.lookup_var(name)? {
-            if self.symbols_for_eval.contains(&name) {
+            if self.expanding_vars.contains(&var_identity(&var)) {
                 // A variable waiting on itself is an error, except while a
                 // `$(shell)`'s environment is being built: there it is what an
                 // exported variable holding a `$(shell)` unavoidably does, and
                 // GNU Make answers it with the bytes the invocation carried
                 // rather than refusing the makefile.
                 if self.environment_recursion > 0 {
-                    self.environment_substituted.push(name);
+                    // A binding of its own, so finishing it takes nothing out
+                    // that the expansion it is nested inside put in.
                     return Ok(Some(self.inherited_binding(name)));
                 }
                 let loc = var.read().loc().clone();
@@ -2537,22 +2553,18 @@ impl Evaluator {
                     name.display(self)
                 );
             }
-            self.symbols_for_eval.insert(name);
+            self.expanding_vars.insert(var_identity(&var));
             return Ok(Some(var));
         }
         Ok(None)
     }
 
-    pub fn var_eval_complete(&mut self, name: Symbol) {
-        if let Some(position) = self
-            .environment_substituted
-            .iter()
-            .rposition(|substituted| *substituted == name)
-        {
-            self.environment_substituted.remove(position);
-            return;
-        }
-        self.symbols_for_eval.remove(&name);
+    /// Finish the expansion [`Self::lookup_var_for_eval`] began, which needs
+    /// the variable it answered with rather than the name it was asked for: a
+    /// name can have been rebound since, and the substituted binding an
+    /// environment recursion answers with was never marked at all.
+    pub fn var_eval_complete(&mut self, var: &Var) {
+        self.expanding_vars.remove(&var_identity(var));
     }
 
     /// What this name held in the environment the invocation was started with,
@@ -2576,7 +2588,7 @@ impl Evaluator {
         var: &Var,
         guarded: bool,
     ) -> Result<Bytes> {
-        if guarded && self.symbols_for_eval.contains(&name) {
+        if guarded && self.expanding_vars.contains(&var_identity(var)) {
             return Ok(self
                 .inherited_binding(name)
                 .read()
@@ -2584,7 +2596,7 @@ impl Evaluator {
                 .into_owned()
                 .into());
         }
-        let entered = self.symbols_for_eval.insert(name);
+        let entered = self.expanding_vars.insert(var_identity(var));
         if guarded {
             self.environment_recursion += 1;
         }
@@ -2596,7 +2608,7 @@ impl Evaluator {
             self.environment_recursion -= 1;
         }
         if entered {
-            self.symbols_for_eval.remove(&name);
+            self.expanding_vars.remove(&var_identity(var));
         }
         value
     }
