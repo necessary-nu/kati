@@ -209,6 +209,10 @@ pub struct Flags {
     /// `.NOTPARALLEL` with no prerequisites: this makefile's own targets run
     /// one at a time. What it hands a sub-make is untouched.
     pub not_parallel: bool,
+
+    /// `--shuffle`: the order the goals and each target's prerequisites are
+    /// considered in, when it is not the order the Makefile wrote.
+    pub shuffle: crate::shuffle::Shuffle,
 }
 
 fn parse_command_line_option_with_arg(

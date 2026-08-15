@@ -2112,11 +2112,23 @@ impl<'a> DepBuilder<'a> {
         // remade, which is before it has looked at a goal at all — so a
         // makefile that also leaves the goals unanalysable is refused over,
         // not reported on.
-        let nodes = match planned {
+        let mut nodes = match planned {
             Ok(nodes) => nodes,
             Err(error) if refusal.is_none() => return Err(error),
             Err(_) => Vec::new(),
         };
+        // `--shuffle` reorders the goals and every prerequisite list reachable
+        // from them, and it happens here because the drop below reads those
+        // lists: GNU Make shuffles immediately before `update_goal_chain
+        // (goals)` and the circular walk takes `du->shuf` ahead of `du`, so the
+        // order chosen here is the order that decides which edge closes a loop.
+        // The Makefiles the read has to remake are deliberately not in it —
+        // GNU Make brings them up to date before it shuffles anything.
+        crate::shuffle::reorder(
+            self.ev.session.flags.shuffle,
+            self.ev.session.flags.not_parallel,
+            &mut nodes,
+        );
         self.drop_circular_dependencies(&regeneration_nodes, &nodes);
         Ok(Plan {
             nodes,
@@ -5139,7 +5151,17 @@ fn drop_prerequisite(
         return;
     };
     let (name, _) = edges.remove(at);
-    if names.get(at) == Some(&name) {
+    // The name list is what `$^`, `$+` and `$<` are read from, and it stays in
+    // the order the Makefile wrote whatever `--shuffle` did to the edges beside
+    // it — so the two are aligned only until something reorders one of them.
+    // Take the name where it stands when they still agree, which is every
+    // unshuffled run, and otherwise find it.
+    let at = if names.get(at) == Some(&name) {
+        Some(at)
+    } else {
+        names.iter().position(|candidate| *candidate == name)
+    };
+    if let Some(at) = at {
         names.remove(at);
     }
 }
