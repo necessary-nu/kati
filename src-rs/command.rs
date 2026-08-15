@@ -430,12 +430,24 @@ pub fn expansion_can_reach_make(
                 || expansion_can_reach_make(subst, ev, rule_vars, seen)
         }
         Value::Func { loc: _, fi, args } => {
-            // `call`, `value` and `eval` reach a variable by a name they are
-            // given rather than by one written here, so what they reach cannot
-            // be walked from this tree.
-            if matches!(fi.name, b"call" | b"value" | b"eval") {
+            // `call` and `value` reach a variable by a name they are given
+            // rather than by one written here, so what they reach cannot be
+            // walked from this tree.
+            if matches!(fi.name, b"call" | b"value") {
                 return true;
             }
+            // `eval` is walked like any other function. It expands to nothing,
+            // so it contributes no text to the recipe; a `$(MAKE)` it could
+            // reach is one written inside its own argument, and that is in this
+            // tree. Answering `true` for it instead would keep every recipe
+            // holding an `$(eval)` out of launch expansion — and when the
+            // `$(eval)` is the point, as it is for a recipe-time assignment or
+            // export, compiling it early is exactly what makes the timing
+            // wrong: the write would land before the recipes that ran ahead of
+            // it were expanded. A variable the `$(eval)` defines and a later
+            // line then expands to `$(MAKE)` is beyond any static walk; the
+            // check made after a deferred expansion catches that and refuses,
+            // rather than handing the executor a nested Make.
             args.iter()
                 .any(|arg| expansion_can_reach_make(arg, ev, rule_vars, seen))
         }

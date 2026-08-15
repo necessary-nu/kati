@@ -883,6 +883,35 @@ pub struct Evaluator {
     /// fatal rather than quietly ineffective (Savannah bug #12124).
     pub(crate) rules_snapped: bool,
 
+    /// Each planned target's own scope, by name, once the graph owns it.
+    ///
+    /// GNU Make keeps a target's variables on the file itself, so
+    /// `record_target_var` can reach them by name at any point in the run —
+    /// including from a recipe, long after `snap_deps`. Ronin hands the scopes
+    /// to the graph nodes instead, and this is the way back: without it a
+    /// recipe-time `$(eval tgt: V = x)` would land in a table nothing consults
+    /// again.
+    ///
+    /// Empty until the graph is built, which is exactly when a write through it
+    /// could still be read.
+    pub(crate) planned_scopes: HashMap<Symbol, Arc<Vars>>,
+
+    /// Names whose exported answer a recipe has changed since the graph was
+    /// compiled.
+    ///
+    /// GNU Make assembles a child's environment out of the export set at the
+    /// moment the job starts, so an `export`, an `unexport`, or a fresh value
+    /// for an already-exported name reaches every child started after it —
+    /// including the one the recipe that wrote it is about to start. Ronin
+    /// settles the compilation unit's environment once, before any recipe runs,
+    /// and this is the list of names that settlement can no longer be trusted
+    /// for.
+    ///
+    /// Only what a recipe touched, rather than the whole export set recomputed
+    /// per job: the settled answer is still right for every name nothing since
+    /// has said anything about.
+    pub(crate) exports_after_snap: HashSet<Symbol>,
+
     pub is_evaluating_command: bool,
     /// Whether expanding the current recipe referenced `MAKE`.
     ///
@@ -1028,6 +1057,8 @@ impl Evaluator {
             goals: Vec::new(),
 
             rules_snapped: false,
+            planned_scopes: HashMap::new(),
+            exports_after_snap: HashSet::new(),
             is_evaluating_command: false,
             expanded_make_in_command: Vec::new(),
         }
@@ -1376,6 +1407,10 @@ impl Evaluator {
         if stmt.is_final {
             var.write().readonly = true
         }
+        // A global assignment made after the graph was compiled can only have
+        // come from a recipe, and a new value for an exported name is a new
+        // environment for every child started from here on.
+        self.note_late_export(lhs);
         self.normalize_makeflags_assignment(lhs, &var, needs_assign)?;
         self.trace_variable_assign(&lhs, &var)?;
         Ok(())
@@ -1708,6 +1743,31 @@ impl Evaluator {
         result
     }
 
+    /// Finish a `+=` that has no build-time pass left to finish it, by
+    /// appending it to what the target reads for that name today.
+    ///
+    /// The same paste [`DepBuilder::apply_rule_vars`] makes while it installs
+    /// rule variables, done here because a recipe-time assignment arrives after
+    /// that pass has run. With nothing to append to, the tail stands on its
+    /// own — which is what the build's pass does with the same lookup empty.
+    fn settle_append(&mut self, name: Symbol, var: &Var) -> Result<()> {
+        let Some(previous) = self.lookup_var(name)? else {
+            return Ok(());
+        };
+        let origin = previous.read().origin();
+        let mut value = previous.read().eval_to_buf_mut(self)?;
+        if !value.is_empty() {
+            value.put_u8(b' ');
+        }
+        var.read().eval(self, &mut value)?;
+        let frame = Some(self.current_frame());
+        let loc = self.loc.clone();
+        *var.write() = Variable::with_simple_string(value.freeze(), origin, frame, loc)
+            .read()
+            .clone();
+        Ok(())
+    }
+
     fn record_rule_specific_assign(
         &mut self,
         targets: &[Symbol],
@@ -1716,12 +1776,29 @@ impl Evaluator {
     ) -> Result<()> {
         let modifiers = assignment.modifiers;
         for target in targets {
+            // Once the graph owns the scopes, `self.rule_vars` is a table
+            // nothing reads again, so the write has to reach the planned node's
+            // own scope instead. GNU Make needs no such branch: the target's
+            // variables are on the file from the moment it is entered, and
+            // `record_target_var` finds them there whenever it runs.
+            //
+            // What this cannot reach is a target already expanded — its recipe
+            // is text by now — and that is GNU's answer too, for the same
+            // reason.
+            let planned = self
+                .rules_snapped
+                .then(|| self.planned_scopes.get(target).cloned())
+                .flatten();
+            let planned_scope = planned.is_some();
             let fresh = !self.rule_vars.contains_key(target);
-            let scope = self
-                .rule_vars
-                .entry(*target)
-                .or_insert_with(|| Arc::new(Vars::new()))
-                .clone();
+            let scope = match planned {
+                Some(planned) => planned,
+                None => self
+                    .rule_vars
+                    .entry(*target)
+                    .or_insert_with(|| Arc::new(Vars::new()))
+                    .clone(),
+            };
             if fresh && is_pattern_rule {
                 self.pattern_rule_var_order.push(*target);
             }
@@ -1761,7 +1838,18 @@ impl Evaluator {
                 )?;
                 if needs_assign {
                     let mut readonly = false;
-                    rhs_var.write().assign_op = Some(if settled_in_scope {
+                    // A pending `+=` is one the build's own pass over the rule
+                    // variables would finish, by appending it to whatever the
+                    // target inherits. On the planned path that pass has
+                    // already run, so the append is finished here instead and
+                    // against the same chain — otherwise the target would read
+                    // the tail on its own, with the inherited value dropped.
+                    let pending_append =
+                        planned_scope && assignment.op == AssignOp::PlusEq && !settled_in_scope;
+                    if pending_append {
+                        self.settle_append(var_sym, &rhs_var)?;
+                    }
+                    rhs_var.write().assign_op = Some(if settled_in_scope || pending_append {
                         AssignOp::Eq
                     } else {
                         assignment.op
@@ -2430,6 +2518,17 @@ impl Evaluator {
         Ok(())
     }
 
+    /// Note that this name's exported answer may have moved since the
+    /// compilation unit settled its environment.
+    ///
+    /// Before the graph is compiled there is nothing to correct — the
+    /// settlement has not happened yet and will read the final answer.
+    fn note_late_export(&mut self, name: Symbol) {
+        if self.rules_snapped {
+            self.exports_after_snap.insert(name);
+        }
+    }
+
     /// Record what an `export NAME` or `unexport NAME` directive said.
     ///
     /// GNU Make looks the name up and, finding nothing, defines it as an empty
@@ -2441,6 +2540,7 @@ impl Evaluator {
         } else {
             VarExport::NoExport
         };
+        self.note_late_export(name);
         if let Some(var) = self.session.peek_global_var(name) {
             var.write().export = attribute;
             return Ok(());

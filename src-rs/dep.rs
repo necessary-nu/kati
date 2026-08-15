@@ -58,6 +58,117 @@ fn unbind(mut bindings: Vec<ScopedVar>) {
     while bindings.pop().is_some() {}
 }
 
+/// Which of the two variable sets GNU Make gives a file a binding landed in.
+///
+/// `initialize_file_variables` (GNU `src/variable.c`) chains a file's own
+/// target-specific set in front of one set holding every matching pattern's
+/// variables. The distinction is not decoration: each is a hash table, so a
+/// name bound twice inside one of them keeps only the last binding, and it is
+/// that binding's `private` that decides whether a prerequisite may read the
+/// name.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum RuleScopeKind {
+    /// GNU's `file->pat_variables`: every matching pattern, accumulated.
+    Pattern,
+    /// GNU's `file->variables`: what the target's own name bound.
+    Own,
+}
+
+/// The scopes that apply to one target, kept in GNU Make's two sets rather
+/// than flattened, so `private` can be answered per set.
+#[derive(Debug, Default)]
+struct RuleScopes {
+    /// Every matching pattern's scope, weakest first.
+    patterns: Vec<Arc<Vars>>,
+    /// The target's own target-specific scope, strongest of all.
+    own: Option<Arc<Vars>>,
+}
+
+impl RuleScopes {
+    fn is_empty(&self) -> bool {
+        self.patterns.is_empty() && self.own.is_none()
+    }
+
+    /// Weakest first, which is the order they must be installed in.
+    fn iter(&self) -> impl Iterator<Item = (RuleScopeKind, &Arc<Vars>)> {
+        self.patterns
+            .iter()
+            .map(|vars| (RuleScopeKind::Pattern, vars))
+            .chain(self.own.iter().map(|vars| (RuleScopeKind::Own, vars)))
+    }
+}
+
+/// One rule variable installed into the rule scope, kept with everything it
+/// would take to install it again once the whole run has been unwound.
+struct RuleBinding {
+    guard: ScopedVar,
+    kind: RuleScopeKind,
+    sym: Symbol,
+    var: Var,
+    private: bool,
+}
+
+/// Unwind a target's rule bindings down to what its prerequisites may read.
+///
+/// GNU Make decides this in `lookup_variable` (`src/variable.c`): a
+/// prerequisite reaches its parent's sets across a link marked
+/// `next_is_parent`, and from there on any binding it finds carrying
+/// `private_var` is stepped over instead of returned. The walk is still a walk
+/// — it stops at the first set holding the name with the flag clear — so the
+/// target's own set is asked first and the pattern set only if the own set
+/// either lacks the name or hid it behind `private`.
+///
+/// Ronin installs both sets into one scope, so the run is unwound whole and
+/// only the binding that survives GNU's walk is laid down again. Dropping the
+/// private guards where they lie would be a different rule and a wrong one
+/// twice over: it restores whatever each private binding happened to shadow
+/// rather than what is outermost, and it lets an earlier public binding show
+/// through a later private one that overwrote it inside the same set, where
+/// GNU has kept only the last.
+fn release_private(bindings: Vec<RuleBinding>, session: &Session) -> Vec<ScopedVar> {
+    // What each set is left holding for a name: one entry, the last written,
+    // exactly as one hash table slot is.
+    let mut surviving: HashMap<(Symbol, RuleScopeKind), (Var, bool)> = HashMap::new();
+    let mut scope = None;
+    for binding in &bindings {
+        surviving.insert(
+            (binding.sym, binding.kind),
+            (binding.var.clone(), binding.private),
+        );
+        scope.get_or_insert_with(|| binding.guard.scope());
+    }
+    let Some(scope) = scope else {
+        return Vec::new();
+    };
+
+    // Every name the run bound, in GNU's walk order per name.
+    let mut public = Vec::new();
+    let mut names = surviving.keys().map(|(sym, _)| *sym).collect::<Vec<_>>();
+    names.sort_by_cached_key(|sym| sym.as_bytes(session));
+    names.dedup();
+    for sym in names {
+        for kind in [RuleScopeKind::Own, RuleScopeKind::Pattern] {
+            let Some((var, private)) = surviving.get(&(sym, kind)) else {
+                continue;
+            };
+            // A private binding is stepped over, not stopped at: GNU's loop
+            // only returns where the flag is clear and otherwise carries on to
+            // the next set, so a target's own `private` defers to a matching
+            // pattern's public binding rather than hiding the name outright.
+            if !private {
+                public.push((sym, var.clone()));
+                break;
+            }
+        }
+    }
+
+    unbind(bindings.into_iter().map(|binding| binding.guard).collect());
+    public
+        .into_iter()
+        .map(|(sym, var)| ScopedVar::new(scope.clone(), sym, var))
+        .collect()
+}
+
 /// Hold a group of scope bindings for as long as the guard lives.
 ///
 /// A bare `Vec<ScopedVar>` would drop front to back, which [`unbind`] explains
@@ -1175,7 +1286,7 @@ struct PickedRuleInfo {
     merger: Option<Arc<Mutex<RuleMerger>>>,
     pattern_rule: Option<Arc<Rule>>,
     /// Weakest first. See `DepBuilder::applicable_rule_vars`.
-    vars: Vec<Arc<Vars>>,
+    vars: RuleScopes,
 }
 
 impl<'a> DepBuilder<'a> {
@@ -3054,18 +3165,20 @@ impl<'a> DepBuilder<'a> {
     /// triggered the shared action.
     fn push_expansion_scope(
         &mut self,
-        vars: &[Arc<Vars>],
+        scopes: &RuleScopes,
     ) -> (Option<Arc<Vars>>, Option<Arc<Vars>>) {
         let previous_rule_scope = self.cur_rule_vars.clone();
         let previous_eval_scope = self.ev.current_scope.clone();
-        if vars.is_empty() {
+        if scopes.is_empty() {
             return (previous_rule_scope, previous_eval_scope);
         }
         let scope = Arc::new(Vars::new());
         if let Some(previous) = &previous_rule_scope {
             scope.merge_from(previous);
         }
-        for vars in vars {
+        // Second expansion is the target's own, so `private` is no barrier and
+        // the two sets flatten in order.
+        for (_, vars) in scopes.iter() {
             scope.merge_from(vars);
         }
         self.cur_rule_vars = Some(scope.clone());
@@ -3236,28 +3349,21 @@ impl<'a> DepBuilder<'a> {
                 && node.actual_order_only_inputs.is_empty();
         }
         let vars = self.applicable_rule_vars(trigger);
-        let mut scoped_vars = Vec::new();
-        let mut private_scoped_vars = Vec::new();
+        let mut bound = Vec::new();
         let trigger_text = trigger.as_bytes(&self.ev.session);
         let frame = self.ev.enter(
             FrameType::Dependency,
             trigger_text,
             action.lock().loc.clone().unwrap_or_default(),
         );
-        self.apply_rule_vars(
-            &vars,
-            &action,
-            &frame,
-            &mut scoped_vars,
-            &mut private_scoped_vars,
-        )?;
+        self.apply_rule_vars(&vars, &action, &frame, &mut bound)?;
 
         let scope = self.cur_rule_vars.as_ref().map(|vars| {
             let scope = Vars::new();
             scope.merge_from(vars);
             Arc::new(scope)
         });
-        unbind(private_scoped_vars);
+        let scoped_vars = release_private(bound, &self.ev.session);
         action.lock().rule_vars = scope;
 
         // Each `::` record stands on its own, and what `.EXTRA_PREREQS` adds is
@@ -3985,16 +4091,17 @@ impl<'a> DepBuilder<'a> {
     }
 
     /// The matching patterns, then the target's own scope on top of them.
-    fn scopes_for(patterns: &[Arc<Vars>], own: Option<Arc<Vars>>) -> Vec<Arc<Vars>> {
-        let mut scopes = patterns.to_vec();
-        scopes.extend(own);
-        scopes
+    fn scopes_for(patterns: &[Arc<Vars>], own: Option<Arc<Vars>>) -> RuleScopes {
+        RuleScopes {
+            patterns: patterns.to_vec(),
+            own,
+        }
     }
 
     /// Every scope that applies to `output`, weakest first, without consulting
     /// the rule that makes it. For callers that have a target's name and no
     /// picked rule to go with it.
-    fn applicable_rule_vars(&self, output: Symbol) -> Vec<Arc<Vars>> {
+    fn applicable_rule_vars(&self, output: Symbol) -> RuleScopes {
         let patterns = self.matching_pattern_vars(output);
         Self::scopes_for(&patterns, self.lookup_rule_vars(output))
     }
@@ -4008,13 +4115,12 @@ impl<'a> DepBuilder<'a> {
     /// every value but the last.
     fn apply_rule_vars(
         &mut self,
-        scopes: &[Arc<Vars>],
+        scopes: &RuleScopes,
         node: &Arc<Mutex<DepNode>>,
         frame: &ScopedFrame,
-        scoped: &mut Vec<ScopedVar>,
-        private_scoped: &mut Vec<ScopedVar>,
+        bound: &mut Vec<RuleBinding>,
     ) -> Result<()> {
-        for vars in scopes {
+        for (kind, vars) in scopes.iter() {
             // Sorted because the order is observable and a HashMap's varies per
             // process. By name, not Make's order, which is as written — this
             // buys reproducibility only.
@@ -4068,13 +4174,17 @@ impl<'a> DepBuilder<'a> {
                 } else if *name == self.tags_var_name {
                     node.lock().tags_var = Some(new_var);
                 } else {
-                    let scoped_var =
-                        ScopedVar::new(self.cur_rule_vars.clone().unwrap(), *name, new_var);
-                    if is_private {
-                        private_scoped.push(scoped_var);
-                    } else {
-                        scoped.push(scoped_var);
-                    }
+                    bound.push(RuleBinding {
+                        guard: ScopedVar::new(
+                            self.cur_rule_vars.clone().unwrap(),
+                            *name,
+                            new_var.clone(),
+                        ),
+                        kind,
+                        sym: *name,
+                        var: new_var,
+                        private: is_private,
+                    });
                 }
             }
         }
@@ -4427,15 +4537,14 @@ impl<'a> DepBuilder<'a> {
         let (grouped_peer_order_only, barriers) = self.without_waits(grouped_peer_order_only);
         self.wait_barriers.extend(barriers);
 
-        let mut sv = Vec::new();
-        let mut private_sv = Vec::new();
+        let mut bound = Vec::new();
         let frame = self.ev.enter(
             FrameType::Dependency,
             output_str.clone(),
             n.lock().loc.clone().unwrap_or_default(),
         );
 
-        self.apply_rule_vars(&picked_rule_info.vars, &n, &frame, &mut sv, &mut private_sv)?;
+        self.apply_rule_vars(&picked_rule_info.vars, &n, &frame, &mut bound)?;
 
         // A `private` target-specific variable belongs to this target's own
         // recipe and to no prerequisite's, so the scope is read here, with it in
@@ -4445,7 +4554,7 @@ impl<'a> DepBuilder<'a> {
             v.merge_from(vars);
             Arc::new(v)
         });
-        unbind(private_sv);
+        let sv = release_private(bound, &self.ev.session);
 
         if self.ev.session.flags.warn_phony_looks_real
             && n.lock().is_phony
@@ -4691,7 +4800,18 @@ pub fn make_dep(
 ) -> Result<(Vec<NamedDepNode>, Vec<RegenerationRoot>)> {
     let mut db = DepBuilder::new(ev)?;
     let _tr = ScopedTimeReporter::new(&db.ev.session, "make dep (build)");
-    db.build(targets, read_makefiles, missing_includes)
+    let built = db.build(targets, read_makefiles, missing_includes)?;
+    // Hand the planned scopes back, so a target-specific assignment made from a
+    // recipe can still reach the target it names. GNU Make never has to do this
+    // — its target variables live on the file for the whole run — but Ronin's
+    // live on the node, and this is the only route from a name to one.
+    let planned = db
+        .done
+        .iter()
+        .filter_map(|(target, node)| node.lock().rule_vars.clone().map(|vars| (*target, vars)))
+        .collect();
+    db.ev.planned_scopes = planned;
+    Ok(built)
 }
 
 /// Whether the name has the shape Make reserves: a leading dot before any

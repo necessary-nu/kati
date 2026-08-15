@@ -1023,6 +1023,12 @@ impl ScopedVar {
         };
         Self { vars, sym, orig }
     }
+
+    /// The scope this binding was installed into, for a caller that has to
+    /// unwind a run of them and then install some of them again.
+    pub fn scope(&self) -> Arc<Vars> {
+        self.vars.clone()
+    }
 }
 
 impl Drop for ScopedVar {

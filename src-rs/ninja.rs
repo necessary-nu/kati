@@ -353,11 +353,17 @@ fn node_environment(
     ev: &mut Evaluator,
     node: &Arc<Mutex<DepNode>>,
 ) -> Result<Vec<crate::export::EnvironmentChange>> {
+    // What a recipe told the export set since the unit settled its environment
+    // goes on first, so a target's own scope still has the last word over it —
+    // the same order the unit's answer and the scope's already stand in.
+    let late = ev.exports_after_snap.iter().copied().collect::<Vec<_>>();
+    let mut changes = crate::export::late_environment(ev, &late)?;
     let scope = node.lock().rule_vars.clone();
     let Some(scope) = scope else {
-        return Ok(Vec::new());
+        return Ok(changes);
     };
-    crate::export::scoped_environment(ev, &scope)
+    changes.extend(crate::export::scoped_environment(ev, &scope)?);
+    Ok(changes)
 }
 
 struct NinjaGenerator<'a> {

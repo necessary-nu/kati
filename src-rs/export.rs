@@ -321,6 +321,44 @@ pub fn scoped_environment(ev: &mut Evaluator, scope: &Vars) -> Result<Vec<Enviro
     Ok(changes)
 }
 
+/// What a recipe has since told the export set, as changes to impose on a child
+/// started now.
+///
+/// GNU Make never needs this: it builds a child's environment out of the export
+/// set when the job starts, so everything an earlier recipe did is already in
+/// it. Ronin settles the compilation unit's environment once, before any recipe
+/// runs, and this is the correction for the names a recipe has spoken about
+/// since — an `export`, an `unexport`, or a new value for a name already
+/// exported.
+///
+/// A name with no global binding left is withdrawn rather than dropped: the
+/// settled environment may still be carrying it.
+///
+/// # Errors
+///
+/// Whatever expanding an exported variable's value rejects.
+pub fn late_environment(ev: &mut Evaluator, names: &[Symbol]) -> Result<Vec<EnvironmentChange>> {
+    let export_all = ev.session.flags.export_all_variables;
+    let mut names = names.to_vec();
+    // By name, so a recipe's environment does not depend on which way the hash
+    // fell.
+    names.sort_by_cached_key(|name| name.as_bytes(&ev.session));
+    let mut changes = Vec::with_capacity(names.len());
+    for name in names {
+        let global = ev
+            .session
+            .peek_global_var(name)
+            .filter(|global| !global.read().is_private);
+        let exported = global.filter(|global| should_export(name, global, export_all, &ev.session));
+        let value = match exported {
+            Some(var) => Some(var.read().eval_to_buf_mut(ev)?.freeze()),
+            None => None,
+        };
+        changes.push((name.as_bytes(&ev.session), value));
+    }
+    Ok(changes)
+}
+
 /// The names the invocation's own environment carries that this child must not
 /// see: `unexport`ed, `undefine`d, or replaced by a binding that is not
 /// exported.
