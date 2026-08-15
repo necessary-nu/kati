@@ -192,6 +192,19 @@ pub struct RegenerationRoot {
     pub required: bool,
 }
 
+/// What dependency analysis made of one read.
+pub struct Plan {
+    /// The roots of the dependency graph, in the order the targets asked for
+    /// them.
+    pub nodes: Vec<NamedDepNode>,
+    /// The Makefiles the read consulted that a rule says how to remake, in the
+    /// order the read reached them.
+    pub regenerations: Vec<RegenerationRoot>,
+    /// A required Makefile nothing can make, which ends the run once the
+    /// Makefiles ahead of it have been brought up to date.
+    pub refusal: Option<anyhow::Error>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct DoubleActionId {
     rule: usize,
@@ -2034,18 +2047,38 @@ impl<'a> DepBuilder<'a> {
 
     fn build(
         &mut self,
-        mut targets: Vec<Symbol>,
+        targets: Vec<Symbol>,
         read_makefiles: &[ReadMakefile],
         missing_includes: &[MissingInclude],
-    ) -> Result<(Vec<NamedDepNode>, Vec<RegenerationRoot>)> {
+    ) -> Result<Plan> {
         // Generated included Makefiles are compiler inputs rather than user
         // goals, and GNU Make remakes them before it picks a goal at all. Both
         // halves of that matter here: asking the graph for one must not change
         // what the Makefile builds once it is reread, and a required include
         // with no rule is the failure the run dies on, ahead of the complaint
         // about having nothing to aim at.
-        let regeneration_nodes = self.plan_regeneration(read_makefiles, missing_includes)?;
+        let (regeneration_nodes, refusal) =
+            self.plan_regeneration(read_makefiles, missing_includes)?;
+        let planned = self.plan_goals(targets);
+        // The refusal happens in GNU Make while the makefiles are being
+        // remade, which is before it has looked at a goal at all — so a
+        // makefile that also leaves the goals unanalysable is refused over,
+        // not reported on.
+        let nodes = match planned {
+            Ok(nodes) => nodes,
+            Err(error) if refusal.is_none() => return Err(error),
+            Err(_) => Vec::new(),
+        };
+        Ok(Plan {
+            nodes,
+            regenerations: regeneration_nodes,
+            refusal,
+        })
+    }
 
+    /// Plan the goals this invocation was aimed at, choosing the default when
+    /// it named none.
+    fn plan_goals(&mut self, mut targets: Vec<Symbol>) -> Result<Vec<NamedDepNode>> {
         if !self.ev.session.flags.gen_all_targets && targets.is_empty() {
             targets.push(self.default_goal()?);
         }
@@ -2093,7 +2126,7 @@ impl<'a> DepBuilder<'a> {
         self.apply_wait_barriers();
         self.mark_delete_on_error();
         self.keep_precious_intermediates();
-        Ok((nodes, regeneration_nodes))
+        Ok(nodes)
     }
 
     /// Plan one root of the graph: a goal, or a Makefile that has to be
@@ -2129,11 +2162,20 @@ impl<'a> DepBuilder<'a> {
     /// answer when there is no rule: `-include` and `sinclude` forget it
     /// without a word, while `include` reports the read it could not do and
     /// then dies naming the file as a target it cannot reach.
+    ///
+    /// It dies where it reaches it, not where it read it. GNU Make walks the
+    /// makefiles in the order it read them and brings each one up to date in
+    /// turn, so the ones ahead of the refusal are remade and the ones behind it
+    /// never are — `complain()` ends the run from inside `update_goal_chain`,
+    /// before `main.c` can even ask whether a remade makefile means the read
+    /// should start over. So the refusal is returned rather than raised: the
+    /// roots collected before it are what the frontend has to build, and the
+    /// refusal is what it raises once that is done.
     fn plan_regeneration(
         &mut self,
         read_makefiles: &[ReadMakefile],
         missing_includes: &[MissingInclude],
-    ) -> Result<Vec<RegenerationRoot>> {
+    ) -> Result<(Vec<RegenerationRoot>, Option<anyhow::Error>)> {
         let mut nodes = Vec::new();
         for &ReadMakefile {
             filename: makefile,
@@ -2166,9 +2208,14 @@ impl<'a> DepBuilder<'a> {
             if let Some(loc) = &include.loc {
                 warn_loc!(self.ev, Some(loc), "{name}: No such file or directory");
             }
-            error_loc!(self.ev, None, "*** No rule to make target '{name}'.");
+            let refusal = crate::color_error_log(
+                &self.ev.session,
+                None,
+                format!("*** No rule to make target '{name}'."),
+            );
+            return Ok((nodes, Some(refusal)));
         }
-        Ok(nodes)
+        Ok((nodes, None))
     }
 
     /// Whether GNU Make would try to bring this Makefile up to date.
@@ -4797,7 +4844,7 @@ pub fn make_dep(
     targets: Vec<Symbol>,
     read_makefiles: &[ReadMakefile],
     missing_includes: &[MissingInclude],
-) -> Result<(Vec<NamedDepNode>, Vec<RegenerationRoot>)> {
+) -> Result<Plan> {
     let mut db = DepBuilder::new(ev)?;
     let _tr = ScopedTimeReporter::new(&db.ev.session, "make dep (build)");
     let built = db.build(targets, read_makefiles, missing_includes)?;

@@ -75,7 +75,21 @@ fn run(session: Session, orig_args: OsString) -> Result<i32> {
         session.clear_glob_cache();
     }
 
-    let Evaluated { mut ev, nodes, .. } = evaluate(session)?;
+    let Evaluated {
+        mut ev,
+        nodes,
+        refusal,
+        ..
+    } = evaluate(session)?;
+
+    // A required makefile nothing can make ends the run. GNU Make first brings
+    // the makefiles it reached before that one up to date, and an embedding
+    // frontend that has a build to run does exactly that; this tool has no such
+    // phase, so there is nothing to do between reaching the refusal and raising
+    // it.
+    if let Some(refusal) = refusal {
+        return Err(refusal);
+    }
 
     if ev.session.flags.is_syntax_check_only {
         return Ok(0);

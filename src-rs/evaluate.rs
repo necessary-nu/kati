@@ -79,6 +79,14 @@ pub struct Evaluated {
     /// GNU Make forgets an optional one it cannot remake and dies on a required
     /// one.
     pub regeneration_nodes: Vec<RegenerationRoot>,
+    /// A required Makefile the read could not open and no rule can make.
+    ///
+    /// GNU Make refuses over one of these from inside the update that brings
+    /// the makefiles up to date, so the makefiles it reached before this one
+    /// are remade first and the run ends afterwards. The refusal travels with
+    /// the plan rather than in place of it, so a frontend can do that work in
+    /// between.
+    pub refusal: Option<anyhow::Error>,
 }
 
 /// The Makefile kati reads before the real one.
@@ -446,8 +454,7 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
         ev.dump_include_json(&filename)?;
     }
 
-    let nodes;
-    let regeneration_nodes;
+    let plan;
     {
         let _frame = ev.enter(
             FrameType::Phase,
@@ -457,13 +464,13 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
         let _tr = ScopedTimeReporter::new(&ev.session, "make dep time");
         let missing_includes = std::mem::take(&mut ev.missing_includes);
         let read_makefiles = std::mem::take(&mut ev.read_makefiles);
-        (nodes, regeneration_nodes) =
-            make_dep(&mut ev, targets, &read_makefiles, &missing_includes)?;
+        plan = make_dep(&mut ev, targets, &read_makefiles, &missing_includes)?;
     }
 
     Ok(Evaluated {
         ev,
-        nodes,
-        regeneration_nodes,
+        nodes: plan.nodes,
+        regeneration_nodes: plan.regenerations,
+        refusal: plan.refusal,
     })
 }
