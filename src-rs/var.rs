@@ -774,6 +774,27 @@ impl GlobalVars {
         self.vars.get_mut(idx).unwrap()
     }
 
+    /// Record that `-e` outranks the makefile for a name the environment
+    /// already holds, which is the moment GNU Make's origin says so.
+    ///
+    /// The environment is read before the switches are decoded, so every
+    /// variable from it is recorded as `environment` and stays that way for as
+    /// long as nothing disturbs it. GNU promotes the one in the slot as it is
+    /// about to be redefined or undefined — variable.c define_variable_in_set,
+    /// "V came from in the environment. Since it was defined before the
+    /// switches were parsed, it wasn't affected by -e." — and the promoted rank
+    /// is then what declines the write. A name nothing ever writes to is
+    /// therefore still `environment` when `$(origin)` asks.
+    pub fn note_environment_outranks_the_makefile(&mut self, sym: Symbol) {
+        let Some(existing) = self.writable_slot(sym) else {
+            return;
+        };
+        let mut existing = existing.write();
+        if existing.origin == VarOrigin::Environment {
+            existing.origin = VarOrigin::EnvironmentOverride;
+        }
+    }
+
     /// Assign to `sym` under GNU Make's readonly and origin precedence rules,
     /// which can decline the assignment silently.
     pub fn assign(

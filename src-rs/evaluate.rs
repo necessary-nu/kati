@@ -206,14 +206,12 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
         false,
         None,
     )?;
-    // Where an environment variable sits in Make's precedence order is the
-    // whole of `-e`: normally the makefile's own assignment wins, and under
-    // `-e` the environment does, which is what an overriding origin says.
-    let origin = if ev.session.flags.environment_overrides {
-        VarOrigin::EnvironmentOverride
-    } else {
-        VarOrigin::Environment
-    };
+    // GNU Make reads the environment before it decodes the switches, so every
+    // variable it finds there is recorded as `environment` and none of them can
+    // have been affected by a `-e` it has not seen yet. `-e` is a question of
+    // precedence, and the origin says so only once something tries to redefine
+    // the name and is refused — see `Session::set_global_var`.
+    let origin = VarOrigin::Environment;
     let environment = ev
         .session
         .invocation_environment
@@ -316,9 +314,18 @@ fn install_compiler_invocation_variables(ev: &mut Evaluator) {
         (Arc::new(Value::Literal(None, makeflags.clone())), makeflags)
     };
     let makeflags = ev.session.intern("MAKEFLAGS");
+    // GNU Make defines this one at the rank `-e` gives the environment rather
+    // than at the makefile's (main.c, `env_overrides ? o_env_override :
+    // o_file`), which is what keeps its own answer in place: a makefile writing
+    // `MAKEFLAGS += -r` under `-e` is outranked and the flag never arrives.
+    let origin = if ev.session.flags.environment_overrides {
+        VarOrigin::EnvironmentOverride
+    } else {
+        VarOrigin::File
+    };
     ev.session.globals.define(
         makeflags,
-        Variable::new_recursive(value, VarOrigin::File, None, None, original),
+        Variable::new_recursive(value, origin, None, None, original),
     );
 }
 

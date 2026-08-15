@@ -198,6 +198,9 @@ impl Session {
         is_override: bool,
         readonly: Option<&mut bool>,
     ) -> Result<()> {
+        if self.flags.environment_overrides {
+            self.globals.note_environment_outranks_the_makefile(sym);
+        }
         // Disjoint fields: the scope is written while the interner is read for
         // the readonly diagnostic. They were two locks before, and taking both
         // was the hazard this removes.
@@ -207,6 +210,9 @@ impl Session {
 
     /// Remove a global variable, if the `undefine` outranks what defined it.
     pub fn undefine_global_var(&mut self, sym: Symbol, is_override: bool) -> Result<()> {
+        if self.flags.environment_overrides {
+            self.globals.note_environment_outranks_the_makefile(sym);
+        }
         self.globals.undefine(&self.symtab, sym, is_override)
     }
 
