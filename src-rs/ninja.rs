@@ -225,6 +225,17 @@ pub struct ExpandedRecipe {
     pub description: Option<Bytes>,
     /// A nonzero status is an error Make was told to ignore.
     pub ignore_errors: bool,
+    /// The expansion produced no command line at all, so there is nothing to
+    /// run and no shell to run it in.
+    ///
+    /// GNU Make discovers this in `job_next_command`, which walks past every
+    /// expanded line that came out empty; reaching the end of them without
+    /// having started anything is `cs_not_started`, and `new_job` turns that
+    /// into a success without a process. The target counts as remade and the
+    /// run reports it up to date. `-q` reads the same fact from the other
+    /// side: `start_job_command` answers "something to do" only when a line
+    /// expanded to text, so a recipe of nothing answers 0.
+    pub runs_nothing: bool,
     /// What this target's own scope changes about the environment, over the
     /// export set the whole compilation unit already agreed on.
     pub recipe_environment: Vec<crate::export::EnvironmentChange>,
@@ -331,9 +342,11 @@ impl DeferredRecipes {
         let mut description = None;
         let mut script = BytesMut::new();
         // A recipe every line of which expanded to nothing has no line to read
-        // flags from, and still has to reach the shell as the empty script it
-        // is: GNU Make runs nothing and counts the target as remade.
-        let shell_flags = if commands.is_empty() {
+        // flags from, and no line for the flags to apply to either: `script`
+        // comes out empty and `runs_nothing` says so, rather than a shell
+        // being asked to run the empty script.
+        let runs_nothing = commands.is_empty();
+        let shell_flags = if runs_nothing {
             ce.ev.get_shell_flag(false)?
         } else {
             NinjaGenerator::script_shell_flags(&ce.ev.session.flags, &commands)
@@ -357,6 +370,7 @@ impl DeferredRecipes {
             description,
             ignore_errors,
             recipe_environment,
+            runs_nothing,
         })
     }
 }
