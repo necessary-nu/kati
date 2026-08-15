@@ -448,11 +448,7 @@ fn notdir_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) ->
     let text = args[0].eval_to_buf(ev)?;
     let mut ww = WordWriter::new(out);
     for tok in word_scanner(&text) {
-        if tok == b"/" {
-            ww.write(b"");
-        } else {
-            ww.write(crate::strutil::basename(tok));
-        }
+        ww.write(crate::strutil::basename(tok));
     }
     Ok(())
 }

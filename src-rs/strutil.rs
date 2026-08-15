@@ -406,13 +406,17 @@ pub fn dirname(s: &Bytes) -> Bytes {
     s.slice(..found)
 }
 
+/// The name with every directory in front of it removed, which is what GNU
+/// Make's `$(notdir)` and the `F` automatic variables read.
+///
+/// GNU scans back from the end of the word for a directory separator and keeps
+/// only what follows it (function.c func_notdir_suffix), so a name whose only
+/// directory is the filesystem root keeps nothing of it: `/x.o` is `x.o` and
+/// `/` is empty. A word with no separator at all is its own basename.
 pub fn basename(s: &[u8]) -> &[u8] {
     let Some(found) = memrchr(b'/', s) else {
         return s;
     };
-    if found == 0 {
-        return s;
-    }
     &s[found + 1..]
 }
 
@@ -855,6 +859,20 @@ mod test {
             escape_printf_b(b"one\\two\n\"$`"),
             Bytes::from_static(b"one\\\\\\\\two\\n\\\"\\$\\`")
         );
+    }
+
+    /// A root directory is a directory, so `$(notdir)` keeps nothing of it.
+    /// Recorded from GNU Make 4.4.1 cell by cell.
+    #[test]
+    fn test_basename() {
+        assert_eq!(basename(b"/x.o"), b"x.o");
+        assert_eq!(basename(b"//x"), b"x");
+        assert_eq!(basename(b"/"), b"");
+        assert_eq!(basename(b"///"), b"");
+        assert_eq!(basename(b"a/"), b"");
+        assert_eq!(basename(b"x"), b"x");
+        assert_eq!(basename(b"/a/b"), b"b");
+        assert_eq!(basename(b""), b"");
     }
 
     #[test]
