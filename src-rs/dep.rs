@@ -298,6 +298,20 @@ impl SearchPass {
     }
 }
 
+/// How a candidate rule's prerequisites were had, for a rule that applies.
+///
+/// GNU Make keeps the same division in one array: a `patdeps` carrying a file
+/// is a name the search made up to complete the chain, and one without is a
+/// name it found already there or took on trust. Both halves are acted on
+/// after the rule is chosen and neither means anything before it.
+#[derive(Default)]
+struct ReachedPrerequisites {
+    /// Names the search made up, so the Makefile never said them.
+    invented: Vec<Symbol>,
+    /// Names the search was given rather than making them.
+    found: Vec<Symbol>,
+}
+
 #[derive(Debug)]
 pub struct DepNode {
     /// The graph edge's primary output. An exact grouped action uses a private
@@ -353,6 +367,16 @@ pub struct DepNode {
     /// absent nor is swept up afterwards. A name that is later asked for in its
     /// own right stops being one of these.
     pub peer_outputs: Vec<Symbol>,
+    /// Whether [`Self::implicit_outputs`] are members of a pattern rule's
+    /// group rather than of an explicit one.
+    ///
+    /// The distinction is whose decision the run was. An explicit `&:` rule is
+    /// one decision over all its targets, so reaching any of them runs the
+    /// recipe for the one that was reached. A pattern rule spelling several
+    /// target patterns is one recipe over targets that each decide for
+    /// themselves, so the recipe runs for whichever of them turned out to need
+    /// making — a name that can only be known once the build compares them.
+    pub pattern_group: bool,
     pub actual_inputs: Vec<Symbol>,
     pub actual_order_only_inputs: Vec<Symbol>,
     pub actual_validations: Vec<Symbol>,
@@ -403,6 +427,7 @@ impl DepNode {
             delete_on_error_outputs: Vec::new(),
             implicit_outputs: Vec::new(),
             peer_outputs: Vec::new(),
+            pattern_group: false,
             actual_inputs: Vec::new(),
             actual_order_only_inputs: Vec::new(),
             actual_validations: Vec::new(),
@@ -1178,6 +1203,14 @@ struct DepBuilder<'a> {
     /// the two apart — a later search may reuse the answer only from at least
     /// as deep, where it has no more budget than the search that proved it.
     impossible: HashMap<Symbol, usize>,
+    /// Names a terminal rule was handed, which no implicit search may make.
+    ///
+    /// GNU Make's `tried_implicit`, set where a chosen terminal rule takes a
+    /// prerequisite it did not invent, and read where `remake.c` decides
+    /// whether a target with no recipe is worth searching for one. Terminal is
+    /// the whole claim: the rule applies to what is there, so the name it was
+    /// given has to be there rather than be arrived at.
+    tried_implicit: HashSet<Symbol>,
     /// Whether the last chain search stopped because the cycle guard cut it
     /// short rather than because the rules ran out.
     ///
@@ -1346,6 +1379,7 @@ impl<'a> DepBuilder<'a> {
             rules_in_use: HashSet::new(),
             found_compat_rule: false,
             impossible: HashMap::new(),
+            tried_implicit: HashSet::new(),
             chain_truncated: false,
             exists_cache: HashMap::new(),
             intermediates: HashSet::new(),
@@ -3811,17 +3845,17 @@ impl<'a> DepBuilder<'a> {
         outcome
     }
 
-    /// Whether every prerequisite this rule would need can be had, and which of
-    /// them the search would be inventing.
+    /// Whether every prerequisite this rule would need can be had, and how each
+    /// of them was had.
     ///
-    /// `None` is the rule failing. An empty list is it applying with nothing
-    /// invented.
+    /// `None` is the rule failing. An all-empty answer is it applying with
+    /// nothing invented and nothing to remember.
     fn implicit_prerequisites_reachable(
         &mut self,
         inputs: Vec<(Symbol, bool)>,
         pass: SearchPass,
-    ) -> Result<Option<Vec<Symbol>>> {
-        let mut invented = Vec::new();
+    ) -> Result<Option<ReachedPrerequisites>> {
+        let mut reached = ReachedPrerequisites::default();
         for (sym, from_pattern) in inputs {
             // A name an earlier search proved nothing can make fails this rule
             // outright, on either pass: the answer cannot have changed.
@@ -3829,6 +3863,7 @@ impl<'a> DepBuilder<'a> {
                 return Ok(None);
             }
             if self.exists(sym) {
+                reached.found.push(sym);
                 continue;
             }
             // The compatibility pass takes a prerequisite the Makefile merely
@@ -3837,6 +3872,7 @@ impl<'a> DepBuilder<'a> {
             // not make it up, it read it.
             if self.is_written_down(sym) {
                 if pass.compat {
+                    reached.found.push(sym);
                     continue;
                 }
                 // A name that is known but not promised is what makes a
@@ -3848,10 +3884,10 @@ impl<'a> DepBuilder<'a> {
                 return Ok(None);
             }
             if from_pattern && !self.mentioned.contains(&sym) {
-                invented.push(sym);
+                reached.invented.push(sym);
             }
         }
-        Ok(Some(invented))
+        Ok(Some(reached))
     }
 
     /// Whether an implicit chain could make this name, remembering a failure
@@ -3955,13 +3991,23 @@ impl<'a> DepBuilder<'a> {
             None => self.resolved_prerequisites(&rule.inputs, &matched_at),
         };
         let resolved_inputs: Vec<Symbol> = inputs.iter().map(|(input, _)| *input).collect();
-        let Some(invented) = self.while_rule_in_use(rule, |builder| {
+        let Some(reached) = self.while_rule_in_use(rule, |builder| {
             builder.implicit_prerequisites_reachable(inputs, pass)
         })?
         else {
             return Ok(None);
         };
-        self.intermediates.extend(invented);
+        self.intermediates.extend(reached.invented);
+        // A terminal rule reads what is already there, so a prerequisite it was
+        // given rather than made is one no implicit search may go on to make.
+        // GNU Make stamps it `tried_implicit` (`implicit.c`), which is what
+        // keeps `%.z:: %.x` from being satisfied by the `%.x:` rule below it,
+        // and the stamp lands as the rule is chosen — so whether a name was
+        // already reached in its own right decides the answer, exactly as the
+        // order of GNU Make's update walk does.
+        if rule.is_double_colon {
+            self.tried_implicit.extend(reached.found);
+        }
 
         // What the match read, kept for `$*`: with a directory held aside the
         // stem is not recoverable from the pattern and the name alone.
@@ -3992,6 +4038,7 @@ impl<'a> DepBuilder<'a> {
             // only marks such a name updated when this recipe runs; it does not
             // take it away from the rule its own search chose, and two rules
             // that can each make one name is not an error to it.
+            n.lock().pattern_group = true;
             let pat = Pattern::new(matched.as_bytes(&self.ev.session));
             for output_pattern in rule.output_patterns.clone() {
                 if output_pattern == matched {
@@ -4199,7 +4246,10 @@ impl<'a> DepBuilder<'a> {
         // built-in rules to find: `%: %.c` matches every name there is, so an
         // `all` declared `.PHONY` beside an `all.c` would otherwise acquire a
         // recipe that links a program nobody asked for.
-        if !self.phony.contains(&output) {
+        //
+        // Nor for a name a terminal rule has already been given, which is the
+        // other half of the same condition: `!file->tried_implicit`.
+        if !self.phony.contains(&output) && !self.tried_implicit.contains(&output) {
             let outer_compat = std::mem::replace(&mut self.found_compat_rule, false);
             let mut picked = None;
             for pass in SearchPass::all() {

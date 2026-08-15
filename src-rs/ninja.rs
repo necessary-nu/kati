@@ -253,10 +253,27 @@ impl DeferredRecipes {
         &self,
         ev: &mut Evaluator,
         id: DeferredRecipeId,
+        trigger: &[u8],
     ) -> Result<Option<ExpandedRecipe>> {
         let Some(recipe) = self.recipes.get(id) else {
             return Ok(None);
         };
+        // The name this run is on behalf of. One recipe can make several
+        // targets, and GNU Make binds `$@` to the one whose own state reached
+        // the rule — which is a question about the build rather than about the
+        // Makefile, so only the destination running it can answer it. Every
+        // other target has one name and this changes nothing for it.
+        //
+        // `recipe_output` and not `output`: the graph's own name for the edge
+        // may be a private one, and it is the Make target that automatic
+        // variables and diagnostics speak of.
+        if !trigger.is_empty() {
+            let bound = ev.session.intern(Bytes::copy_from_slice(trigger));
+            let mut node = recipe.node.lock();
+            if node.pattern_group && node.implicit_outputs.contains(&bound) {
+                node.recipe_output = bound;
+            }
+        }
         // Every recipe that reached this one ran and was waited for, which in
         // GNU Make is what ages the directory cache. Expanding a recipe is
         // therefore the one place in a build where a `$(wildcard)` has to look
