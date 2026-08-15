@@ -2069,6 +2069,7 @@ impl<'a> DepBuilder<'a> {
             Err(error) if refusal.is_none() => return Err(error),
             Err(_) => Vec::new(),
         };
+        self.drop_circular_dependencies(&regeneration_nodes, &nodes);
         Ok(Plan {
             nodes,
             regenerations: regeneration_nodes,
@@ -2127,6 +2128,106 @@ impl<'a> DepBuilder<'a> {
         self.mark_delete_on_error();
         self.keep_precious_intermediates();
         Ok(nodes)
+    }
+
+    /// Unlink the prerequisites that close a loop, the way GNU Make does,
+    /// rather than refusing the build.
+    ///
+    /// `update_file_1` marks a target updating while it walks that target's
+    /// prerequisites, and a prerequisite already marked is one the walk cannot
+    /// follow. GNU Make says `Circular %s <- %s dependency dropped.` and takes
+    /// that single entry out of the list it is walking (`remake.c`), so the
+    /// update carries on and the build succeeds. The entry is gone for good:
+    /// the list it left is the one `$^`, `$+` and `$?` are read from, so the
+    /// target whose prerequisite was dropped never sees it again.
+    ///
+    /// Which entry goes is therefore a question about the order of the walk,
+    /// and this is that walk: the Makefiles the read has to remake first, in
+    /// the order it reached them, then the goals in the order they were asked
+    /// for, and each target's prerequisites in the order they were written.
+    /// Entering a target that is already finished is not a loop, so a diamond
+    /// is left alone; only an ancestor of the edge being followed is.
+    ///
+    /// A frontend that reads the plan afterwards receives a graph with no
+    /// cycles in it, which is what lets its own refusal go on meaning what it
+    /// says for a graph nobody compiled from a Makefile.
+    fn drop_circular_dependencies(
+        &mut self,
+        regenerations: &[RegenerationRoot],
+        goals: &[NamedDepNode],
+    ) {
+        enum Step {
+            /// Follow this edge, dropping it if it closes a loop. The edge is
+            /// named by the node it leaves and which of that node's two lists
+            /// it is on, because that is the list the drop takes it out of.
+            Enter {
+                from: Option<(Arc<Mutex<DepNode>>, Prerequisites)>,
+                node: Arc<Mutex<DepNode>>,
+            },
+            /// This target's prerequisites have all been walked, so it is no
+            /// longer one a deeper edge could close a loop through.
+            Leave(Arc<Mutex<DepNode>>),
+        }
+
+        let mut updating = HashSet::new();
+        let mut updated = HashSet::new();
+        let roots = regenerations
+            .iter()
+            .map(|root| &root.node)
+            .chain(goals)
+            .map(|(_, node)| Step::Enter {
+                from: None,
+                node: node.clone(),
+            });
+        let mut work: Vec<Step> = roots.collect();
+        work.reverse();
+        while let Some(step) = work.pop() {
+            let (from, node) = match step {
+                Step::Leave(node) => {
+                    let id = identity(&node);
+                    updating.remove(&id);
+                    updated.insert(id);
+                    continue;
+                }
+                Step::Enter { from, node } => (from, node),
+            };
+            let id = identity(&node);
+            if updating.contains(&id) {
+                if let Some((from, list)) = from {
+                    let target = recipe_name(&self.ev.session, &from);
+                    let dropped = recipe_name(&self.ev.session, &node);
+                    warn_loc!(
+                        self.ev,
+                        None,
+                        "Circular {target} <- {dropped} dependency dropped."
+                    );
+                    drop_prerequisite(&from, list, &node);
+                }
+                continue;
+            }
+            if updated.contains(&id) {
+                continue;
+            }
+            updating.insert(id);
+            work.push(Step::Leave(node.clone()));
+            let held = node.lock();
+            let edges = held
+                .deps
+                .iter()
+                .map(|(_, dep)| (dep, Prerequisites::Compared))
+                .chain(
+                    held.order_onlys
+                        .iter()
+                        .map(|(_, dep)| (dep, Prerequisites::OrderOnly)),
+                )
+                .map(|(dep, list)| Step::Enter {
+                    from: Some((node.clone(), list)),
+                    node: dep.clone(),
+                })
+                .collect::<Vec<_>>();
+            drop(held);
+            work.extend(edges.into_iter().rev());
+        }
     }
 
     /// Plan one root of the graph: a goal, or a Makefile that has to be
@@ -4859,6 +4960,63 @@ pub fn make_dep(
         .collect();
     db.ev.planned_scopes = planned;
     Ok(built)
+}
+
+/// Which of a target's two prerequisite lists an edge was written on.
+///
+/// GNU Make keeps one list and marks the order-only half `ignore_mtime`; the
+/// plan keeps two. A dropped edge has to come off the one it was on, and off
+/// the names beside it that the automatic variables are read from.
+#[derive(Clone, Copy)]
+enum Prerequisites {
+    Compared,
+    OrderOnly,
+}
+
+/// What tells two planned targets apart while the plan is walked.
+///
+/// The plan hands the same record back for every mention of a name, so the
+/// record itself is the target — which is what GNU Make's `updating` flag is
+/// set on, and what makes a `::` target's separate actions one target between
+/// them.
+fn identity(node: &Arc<Mutex<DepNode>>) -> usize {
+    Arc::as_ptr(node) as usize
+}
+
+/// The Make target this planned record stands for, as a diagnostic names it.
+fn recipe_name(names: &impl Interner, node: &Arc<Mutex<DepNode>>) -> String {
+    let output = node.lock().recipe_output;
+    String::from_utf8_lossy(&output.as_bytes(names)).into_owned()
+}
+
+/// Take one prerequisite off the list it was written on.
+///
+/// Both halves go: the edge, which is what the graph is built from, and the
+/// name beside it, which is what `$^` and `$?` are read from. The edge list is
+/// the name list with the grouped record's own members appended, so an entry
+/// found before the names run out is that name — and a `&:` member, which was
+/// never a written prerequisite, leaves the names alone.
+fn drop_prerequisite(
+    from: &Arc<Mutex<DepNode>>,
+    list: Prerequisites,
+    dropped: &Arc<Mutex<DepNode>>,
+) {
+    let mut held = from.lock();
+    let from = &mut *held;
+    let (edges, names) = match list {
+        Prerequisites::Compared => (&mut from.deps, &mut from.actual_inputs),
+        Prerequisites::OrderOnly => (&mut from.order_onlys, &mut from.actual_order_only_inputs),
+    };
+    let Some(at) = edges
+        .iter()
+        .position(|(_, node)| Arc::ptr_eq(node, dropped))
+    else {
+        return;
+    };
+    let (name, _) = edges.remove(at);
+    if names.get(at) == Some(&name) {
+        names.remove(at);
+    }
 }
 
 /// Whether the name has the shape Make reserves: a leading dot before any
