@@ -135,12 +135,14 @@ impl Rule {
             return Ok(());
         };
 
-        // Static pattern rule.
+        // Static pattern rule. A rule whose targets are already patterns has
+        // nowhere to put a second one, and GNU Make names that collision for
+        // what it is rather than reusing the plain-target sentence.
         if !self.output_patterns.is_empty() {
             error_loc!(
                 session,
                 Some(&self.loc),
-                "*** mixed implicit and normal rules: deprecated syntax"
+                "*** mixed implicit and static pattern rules"
             );
         }
 

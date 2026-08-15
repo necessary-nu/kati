@@ -187,7 +187,7 @@ pub fn trim_suffix<'a>(s: &'a [u8], suffix: &[u8]) -> &'a [u8] {
 /// before a `%` that follows the wildcard: GNU stops rewriting the moment it
 /// has its answer, so `%x\%y` keeps its backslash and matches a name that
 /// carries one.
-fn find_percent(pat: Bytes) -> (Bytes, Option<usize>) {
+pub fn find_percent(pat: Bytes) -> (Bytes, Option<usize>) {
     match memchr(b'%', &pat) {
         None => return (pat, None),
         Some(at) if at == 0 || pat[at - 1] != b'\\' => return (pat, Some(at)),

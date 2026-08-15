@@ -33,7 +33,7 @@ use crate::file::Source;
 use crate::flags::Flags;
 use crate::loc::Loc;
 use crate::parser::{parse_assign_statement, parse_buf_no_stats};
-use crate::rule::{Rule, glob_word, is_pattern_rule};
+use crate::rule::{Rule, glob_word};
 use crate::session::{Context, Session};
 use crate::stats::StatsRegistry;
 use crate::stmt::{
@@ -41,7 +41,7 @@ use crate::stmt::{
     RuleStmt, Statement, UndefineStmt, VpathStmt,
 };
 use crate::strutil::{
-    Pattern, is_space_byte, makefile_word_scanner, strip_recipe_prefix_continuations,
+    Pattern, find_percent, is_space_byte, makefile_word_scanner, strip_recipe_prefix_continuations,
     trim_leading_curdir, trim_left_space, trim_right_space, word_scanner,
 };
 use crate::symtab::{Interner, Symbol, Symtab};
@@ -136,6 +136,20 @@ struct ExpandedRuleHead {
     delimiter: Option<RuleDelimiter>,
     expanded_command: Option<Bytes>,
     had_source_word: bool,
+}
+
+/// What a rule line's target list turned out to be, with the escaping already
+/// compressed out of every name.
+struct RuleTargets {
+    targets: Vec<Symbol>,
+    /// Whether the FIRST target carries an unescaped `%`. GNU Make reads that
+    /// one name to decide which kind of rule the line is, and measures the
+    /// rest against it.
+    is_pattern_rule: bool,
+    /// How many later targets disagreed with the first about that. Carried out
+    /// of the parse rather than complained about inside it, because a target
+    /// list is only obliged to be one kind or the other once it is a rule.
+    disagreeing: usize,
 }
 
 /// A canonical switch prefix, optionally retaining GNU Make's recursive
@@ -1416,6 +1430,35 @@ impl Evaluator {
         Ok(())
     }
 
+    /// Whether a target list that mixes the two kinds is well formed, said
+    /// where GNU Make says it: in `record_files`, once the line is known to be
+    /// a rule rather than a target-specific assignment.
+    ///
+    /// GNU Make has two sites and two severities for one spelling, and which
+    /// one a line reaches is decided by which kind of target came first. A
+    /// pattern rule carrying a plain target has no rule to compile and stops
+    /// the read (read.c:2126). A plain rule carrying a pattern is deprecated
+    /// rather than withdrawn (read.c:2310): GNU says so once per offending
+    /// name, reads on, exits 0, and keeps the name as an ordinary target that
+    /// happens to have a percent in it — with this rule's recipe and
+    /// prerequisites, and not as a pattern.
+    fn check_mixed_targets(session: &mut Session, loc: &Loc, targets: &RuleTargets) -> Result<()> {
+        if targets.disagreeing == 0 {
+            return Ok(());
+        }
+        if targets.is_pattern_rule {
+            error_loc!(session, Some(loc), "*** mixed implicit and normal rules");
+        }
+        for _ in 0..targets.disagreeing {
+            warn_loc!(
+                session,
+                Some(loc),
+                "*** mixed implicit and normal rules: deprecated syntax"
+            );
+        }
+        Ok(())
+    }
+
     // With rule broken into
     //   <before_term> <term> <after_term>
     // parses <before_term> into Symbol instances until encountering ':'
@@ -1425,7 +1468,7 @@ impl Evaluator {
         loc: &Loc,
         before_term: &Bytes,
         delimiter: Option<RuleDelimiter>,
-    ) -> Result<(Bytes, Vec<Symbol>, bool)> {
+    ) -> Result<(Bytes, RuleTargets)> {
         let Some(delimiter) = delimiter else {
             error_loc!(session, Some(loc), "*** missing separator.");
         };
@@ -1433,27 +1476,40 @@ impl Evaluator {
             - usize::from(before_term.get(delimiter.colon.wrapping_sub(1)) == Some(&b'&'));
         let targets_string = before_term.slice(0..targets_end);
         let after = before_term.slice(delimiter.colon + 1..);
-        let mut pattern_rule_count = 0;
         let mut targets: Vec<Symbol> = Vec::new();
         for word in makefile_word_scanner(&targets_string) {
             let target = word.slice_ref(trim_leading_curdir(&word));
             glob_word(session, target, &mut targets);
         }
-        // The `%` is read off what the glob left, as GNU Make does.
-        for target in &targets {
-            if is_pattern_rule(&target.as_bytes(&*session)) {
-                pattern_rule_count += 1;
+        // The `%` is read off what the glob left, as GNU Make does, and it is
+        // read with `find_percent`: a backslash escapes the wildcard, and the
+        // escaping is compressed out of the name the rule goes on to record. So
+        // `\%.o` is an ordinary target called `%.o` and makes nothing implicit.
+        let mut wildcards = Vec::with_capacity(targets.len());
+        for target in &mut targets {
+            let written = target.as_bytes(&*session);
+            let (name, wildcard) = find_percent(written.clone());
+            if name != written {
+                *target = session.intern(name);
             }
+            wildcards.push(wildcard.is_some());
         }
-        // Check consistency: either all outputs are patterns or none.
-        if pattern_rule_count > 0 && pattern_rule_count != targets.len() {
-            error_loc!(
-                session,
-                Some(loc),
-                "*** mixed implicit and normal rules: deprecated syntax"
-            );
-        }
-        Ok((after, targets, pattern_rule_count > 0))
+        // The first target says which kind of rule this is, and the rest are
+        // measured against it rather than counted.
+        let is_pattern_rule = wildcards.first().copied().unwrap_or(false);
+        let disagreeing = wildcards
+            .iter()
+            .skip(1)
+            .filter(|wildcard| **wildcard != is_pattern_rule)
+            .count();
+        Ok((
+            after,
+            RuleTargets {
+                targets,
+                is_pattern_rule,
+                disagreeing,
+            },
+        ))
     }
 
     fn eval_rule_word(&mut self, source: Bytes) -> Result<RuleWordExpansion> {
@@ -1917,9 +1973,10 @@ impl Evaluator {
         let is_grouped = before_term.get(delimiter.colon.wrapping_sub(1)) == Some(&b'&');
 
         let loc = self.loc.clone().unwrap();
-        let (mut after_targets, targets, is_pattern_rule) =
+        let (mut after_targets, parsed) =
             Evaluator::parse_rule_targets(&mut self.session, &loc, &before_term, Some(delimiter))?;
-        if targets.is_empty() {
+        let is_pattern_rule = parsed.is_pattern_rule;
+        if parsed.targets.is_empty() {
             self.rule_state = RuleState::Ignored;
             return Ok(());
         }
@@ -1935,9 +1992,8 @@ impl Evaluator {
             text: candidate.freeze(),
         };
         if let Some(assignment) = self.parse_rule_assignment(candidate, literal_command.as_ref())? {
-            return self.eval_rule_specific_assign(&targets, assignment, is_pattern_rule);
+            return self.eval_rule_specific_assign(&parsed.targets, assignment, is_pattern_rule);
         }
-
         // Past this point the line is a rule, and a rule read after the graph
         // was compiled has nowhere to go. GNU Make refuses it here for the same
         // reason and in the same place — this is `record_files`' first act, and
@@ -1951,6 +2007,12 @@ impl Evaluator {
                 "*** prerequisites cannot be defined in recipes."
             );
         }
+        // And this is `record_files`' second act, for the same reason: a target
+        // list that mixes the two kinds is only wrong once it has to become a
+        // rule. `a %.o: V = 1` is an ordinary target-specific assignment and
+        // GNU Make says nothing about it at all.
+        Evaluator::check_mixed_targets(&mut self.session, &loc, &parsed)?;
+        let targets = parsed.targets;
 
         let scan_expanded_command = !rest.is_empty();
         let mut rest = rest.to_vec();
