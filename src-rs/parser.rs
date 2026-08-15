@@ -909,13 +909,20 @@ fn starts_assignment(rest: &[u8]) -> bool {
 /// one token however it expands.
 pub(crate) fn is_variable_name(name: &[u8]) -> bool {
     let mut depth = 0usize;
-    for byte in name {
-        match byte {
+    let mut i = 0;
+    while i < name.len() {
+        match name[i] {
+            // A `$` reads the character after it as the name it references, so
+            // a blank there is inside the reference rather than the break
+            // between two words that would stop this being a name at all. A
+            // `$(` opens a reference the parenthesis depth already follows.
+            b'$' if !matches!(name.get(i + 1), Some(b'(' | b'{')) => i += 1,
             b'(' | b'{' => depth += 1,
             b')' | b'}' => depth = depth.saturating_sub(1),
             b' ' | b'\t' if depth == 0 => return false,
             _ => {}
         }
+        i += 1;
     }
     true
 }
@@ -984,9 +991,34 @@ pub fn parse_assign_statement(line: &[u8], sep: usize) -> ParsedAssign<'_> {
         lhs = &lhs[..lhs.len() - 1];
         op = AssignOp::ShellEq;
     }
-    lhs = trim_space(lhs);
+    let name_end = trim_right_space(lhs).len();
+    // GNU Make scans for the assignment operator by consuming the character
+    // after a `$` as the name that reference reads, so that character is inside
+    // the variable name however the split fell — `U$ := b` names `U$ `, which
+    // is `U` and the unset variable named " " (variable.c
+    // parse_variable_definition, the `default: continue` arm). Splitting the
+    // line by position and then trimming would leave the `$` at the end of a
+    // text, where it would read as the literal dollar a `$` at the end of a
+    // value is. An even run of dollars is written text rather than a reference,
+    // and takes nothing after it.
+    let takes_the_next = ends_with_reference_dollar(&line[..name_end]);
+    let name_end = if takes_the_next && name_end < line.len() {
+        name_end + 1
+    } else {
+        name_end
+    };
+    let lhs = trim_left_space(&line[..name_end]);
     let rhs = trim_left_space(&line[line.len().min(sep + 1)..]);
     ParsedAssign { lhs, rhs, op }
+}
+
+/// Whether the text ends with a `$` that begins a reference, rather than with
+/// written dollars.
+///
+/// GNU Make pairs the dollars off as it reads, so an odd run leaves one that
+/// takes whatever follows it as a name and an even run leaves none.
+fn ends_with_reference_dollar(text: &[u8]) -> bool {
+    text.iter().rev().take_while(|byte| **byte == b'$').count() % 2 == 1
 }
 
 #[cfg(test)]
@@ -1003,6 +1035,34 @@ mod tests {
             Parser::get_directive(&Bytes::from_static(b"endif")),
             Bytes::from_static(b"endif")
         );
+    }
+
+    /// The character after a `$` is the name that reference reads, so the split
+    /// between name and operator keeps it on the name's side rather than
+    /// leaving a `$` at the end of a text, where it would be a written dollar.
+    #[test]
+    fn a_name_ending_in_a_dollar_keeps_what_the_dollar_reads() {
+        let name = |line: &'static [u8], sep: usize| {
+            String::from_utf8_lossy(parse_assign_statement(line, sep).lhs).into_owned()
+        };
+        assert_eq!(name(b"U$ := b", 4), "U$ ");
+        assert_eq!(name(b"T$:= a", 3), "T$:");
+        assert_eq!(name(b"A$ = b", 3), "A$ ");
+        assert_eq!(name(b"A$$ := b", 5), "A$$");
+        assert_eq!(name(b"A := b", 3), "A");
+        assert_eq!(name(b"A = b", 2), "A");
+    }
+
+    /// A blank a `$` reads is inside the reference, so it does not stop the
+    /// text being a name; a blank between two words still does.
+    #[test]
+    fn a_blank_a_dollar_reads_leaves_a_name() {
+        assert!(is_variable_name(b"U$ "));
+        assert!(is_variable_name(b"T$:"));
+        assert!(is_variable_name(b"$(FOO BAR)"));
+        assert!(is_variable_name(b"A"));
+        assert!(!is_variable_name(b"A $$"));
+        assert!(!is_variable_name(b"A B"));
     }
 
     /// A target-specific assignment carries its modifiers in any order, and the

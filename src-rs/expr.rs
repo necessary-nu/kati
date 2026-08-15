@@ -589,12 +589,20 @@ pub fn parse_expr_impl_ext(
         }
 
         if c == b'$' {
-            if i + 1 >= s.len() {
-                break;
-            }
-
             if i > b {
                 list.push(Arc::new(Value::Literal(None, s.slice(b..i))));
+            }
+
+            // A `$` with nothing after it is one literal dollar, exactly as
+            // `$$` is: GNU Make's expander gives the two the same arm
+            // (expand.c variable_expand_string, `case '$': case '\0':`). The
+            // blanks in front of it are not trailing any more, so a caller
+            // asking for a right trim does not reach them.
+            if i + 1 >= s.len() {
+                list.push(Arc::new(Value::Literal(None, Bytes::from_static(b"$"))));
+                i += 1;
+                b = i;
+                continue;
             }
 
             if remaining.starts_with(b"$$") {
@@ -772,6 +780,18 @@ mod tests {
         }
         walk(&value, &mut out);
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// GNU Make's expander gives `$$` and a `$` at the end of the text the same
+    /// arm, so both are one written dollar.
+    #[test]
+    fn a_dollar_with_nothing_after_it_is_a_written_dollar() {
+        assert_eq!(literal_text(b"x$", ParseExprOpt::Normal), "x$");
+        assert_eq!(literal_text(b"$", ParseExprOpt::Normal), "$");
+        assert_eq!(literal_text(b"x$$", ParseExprOpt::Normal), "x$");
+        assert_eq!(literal_text(b"x$$$", ParseExprOpt::Normal), "x$$");
+        assert_eq!(literal_text(b"x  $", ParseExprOpt::Normal), "x  $");
+        assert_eq!(literal_text(b"A$", ParseExprOpt::Command), "A$");
     }
 
     #[test]
