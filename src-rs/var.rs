@@ -71,6 +71,14 @@ pub enum VarExport {
     Export,
     /// `unexport NAME` — never.
     NoExport,
+    /// Exported once anything but Make's own catalogue has set it.
+    ///
+    /// GNU Make gives this to `MAKEFILES` alone (`v_ifset` in variable.c
+    /// `define_automatic_variables`), and decides it on the origin rather than
+    /// on the value: `MAKEFILES =` in a makefile is a file-origin definition
+    /// and reaches a child as an empty string, while the built-in default does
+    /// not reach one at all.
+    IfSet,
 }
 
 /// Whether a name can reach a child's environment without being named by an

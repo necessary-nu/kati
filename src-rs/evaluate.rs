@@ -26,8 +26,8 @@ limitations under the License.
 //! [`crate::exec`]; a front end embedding kati follows it with its own
 //! [`BuildSink`](crate::build_sink::BuildSink).
 
-use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -301,7 +301,11 @@ fn install_compiler_invocation_variables(ev: &mut Evaluator) {
     let has_overrides = !make_overrides.is_empty() || inherited_overrides;
     if let Some(state) = &mut ev.session.flags.makeflags_assignment {
         state.has_overrides = has_overrides;
-        state.effective = makeflags.clone();
+        // Before a Makefile has written to it, the accumulated table is exactly
+        // what argv and the environment supplied — which is `protected`, and
+        // not the published `MAKEFLAGS`: the two differ by the switches the
+        // table carries without publishing.
+        state.effective = state.protected.clone();
     }
     let (value, original) = if has_overrides {
         let mut prefix = BytesMut::from(makeflags.as_ref());
@@ -357,6 +361,94 @@ fn install_default_goal(ev: &mut Evaluator) -> Result<()> {
     )
 }
 
+/// Bind `MAKEFILES` to the empty default it holds before anything sets it.
+///
+/// GNU Make gives it the weakest origin and the one export attribute nothing
+/// else has — `define_variable_cname ("MAKEFILES", "", o_default, 0)` then
+/// `v->export = v_ifset` in variable.c `define_automatic_variables`. Being
+/// defined is observable on its own: `$(origin MAKEFILES)` answers `default`
+/// rather than `undefined`, and the value is simple and empty.
+///
+/// It is not part of the catalogue `-R` withholds, because it is not in the
+/// catalogue: `make -R` still answers `default` here and still reads what the
+/// variable names.
+fn install_makefiles_variable(ev: &mut Evaluator) -> Result<()> {
+    let sym = ev.session.intern("MAKEFILES");
+    // The environment has already been imported, and GNU Make's write is an
+    // ordinary ranked one that a stronger origin declines — so an inherited
+    // `MAKEFILES` keeps its value and its origin. The attribute is set either
+    // way, because `define_variable_cname` hands back whichever variable now
+    // holds the name and `v->export = v_ifset` is written on that one.
+    if let Some(existing) = ev.session.peek_global_var(sym) {
+        existing.write().export = VarExport::IfSet;
+        return Ok(());
+    }
+    let var = Variable::with_simple_string(Bytes::new(), VarOrigin::Default, None, None);
+    var.write().export = VarExport::IfSet;
+    ev.session.set_global_var(sym, var, false, None)
+}
+
+/// Read the makefiles `MAKEFILES` names, before the ones the invocation asked
+/// for.
+///
+/// GNU Make does this at the top of `read_all_makefiles` with
+/// `RM_NO_DEFAULT_GOAL|RM_INCLUDED|RM_DONTCARE`, and every word of that matters:
+/// a name that will not open is passed over without a word, a target one of
+/// these files declares never becomes the default goal, and each file is
+/// appended to `MAKEFILE_LIST` as it opens, so they stand in front of the
+/// makefile the invocation named.
+///
+/// A makefile writing to `MAKEFILES` is too late to be read — this runs before
+/// any of them — which is why the variable is only useful from the environment
+/// or the command line.
+fn read_makefiles_variable(ev: &mut Evaluator) -> Result<()> {
+    let sym = ev.session.intern("MAKEFILES");
+    if ev.session.peek_global_var(sym).is_none() {
+        return Ok(());
+    }
+    let named = ev.eval_var(sym)?;
+    let names: Vec<Bytes> = crate::strutil::word_scanner(&named)
+        .map(|word| named.slice_ref(word))
+        .collect();
+    for name in names {
+        read_makefiles_entry(ev, &name)?;
+    }
+    Ok(())
+}
+
+/// One name from `MAKEFILES`: read if it opens, passed over in silence if it is
+/// not there, and never allowed to choose the default goal.
+///
+/// Not being there is the only thing `RM_DONTCARE` forgives. A name that exists
+/// and will not be read — a directory, a file with no permission — is the
+/// failure `-f` reports for the same name, under Make's own name because no
+/// makefile line asked for it.
+fn read_makefiles_entry(ev: &mut Evaluator, name: &Bytes) -> Result<()> {
+    let filename = OsString::from_vec(name.to_vec());
+    let _file_frame = ev.enter(FrameType::Parse, name.clone(), Loc::default());
+    let mk = match ev.session.get_makefile(&filename)? {
+        Source::Read(mk) => mk,
+        Source::Absent => return Ok(()),
+        Source::Unreadable(err) => error_loc!(
+            ev,
+            None,
+            "*** {}: {}",
+            filename.to_string_lossy(),
+            crate::strerror(&err)
+        ),
+    };
+    ev.note_read_makefile(name.clone(), false);
+    ev.note_makefile_list(name.clone())?;
+    let stmts = mk.stmts.lock().clone();
+    ev.withhold_the_default_goal(true);
+    let read = stmts.into_iter().try_for_each(|stmt| {
+        log!("{stmt:?}");
+        stmt.eval(ev)
+    });
+    ev.withhold_the_default_goal(false);
+    read
+}
+
 /// Evaluate the Makefile `session` names into the graph it describes.
 ///
 /// # Errors
@@ -383,6 +475,7 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
     crate::builtin_rules::install_suffixes_variable(&mut ev.session, !rules_installed);
 
     install_default_goal(&mut ev)?;
+    install_makefiles_variable(&mut ev)?;
 
     let bootstrap_asts = read_bootstrap_makefile(&mut ev.session, &targets)?;
     {
@@ -424,6 +517,10 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
             Loc::default(),
         );
         let _tr = ScopedTimeReporter::new(&ev.session, "eval time");
+
+        // What `MAKEFILES` names comes first, so an assignment one of those
+        // files makes is in scope while the invocation's own Makefile is read.
+        read_makefiles_variable(&mut ev)?;
 
         // Every Makefile the invocation named, in the order it named them —
         // which GNU Make reads as though they had been concatenated. Reading

@@ -517,6 +517,31 @@ pub fn abs_path(s: &[u8]) -> Result<Bytes> {
 }
 
 pub fn find_outside_paren(s: &[u8], pattern: &[u8]) -> Option<usize> {
+    find_outside(s, pattern, References::Read)
+}
+
+/// [`find_outside_paren`], spending the character after a `$` on the reference
+/// that reads it.
+///
+/// This is how GNU Make looks for an assignment operator: at a `$` it consumes
+/// what the reference reads before it looks again, so a character the reference
+/// spent can never be the operator (reference/gnumake/src/variable.c
+/// parse_variable_definition, the `if (c == '$')` arm and its
+/// `default: continue`). `T$:= a` is therefore a recursive assignment to `T$:`,
+/// not a simple one to `T`.
+pub fn find_outside_reference(s: &[u8], pattern: &[u8]) -> Option<usize> {
+    find_outside(s, pattern, References::Skipped)
+}
+
+/// Whether a scan reads the character after a `$` as ordinary text or spends it
+/// on the reference in front of it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum References {
+    Read,
+    Skipped,
+}
+
+fn find_outside(s: &[u8], pattern: &[u8], references: References) -> Option<usize> {
     let mut prev_backslash = false;
     let mut paren_stack: Vec<u8> = Vec::new();
     let mut pattern_set = [false; 128];
@@ -525,19 +550,29 @@ pub fn find_outside_paren(s: &[u8], pattern: &[u8]) -> Option<usize> {
         pattern_set[*c as usize] = true;
     }
 
-    for (i, c) in s.iter().enumerate() {
-        if c.is_ascii() && pattern_set[*c as usize] && paren_stack.is_empty() && !prev_backslash {
+    let mut i = 0;
+    while let Some(&c) = s.get(i) {
+        if c.is_ascii() && pattern_set[c as usize] && paren_stack.is_empty() && !prev_backslash {
             return Some(i);
         }
         match c {
             b'(' => paren_stack.push(b')'),
             b'{' => paren_stack.push(b'}'),
-            b')' | b'}' if paren_stack.last() == Some(c) => {
+            b')' | b'}' if paren_stack.last() == Some(&c) => {
                 paren_stack.pop();
+            }
+            // A `$(` or `${` opens a reference the parenthesis stack already
+            // follows to its close; anything else after a `$` is the one
+            // character that reference reads.
+            b'$' if references == References::Skipped
+                && !matches!(s.get(i + 1), Some(b'(' | b'{')) =>
+            {
+                i += 1;
             }
             _ => {}
         }
-        prev_backslash = *c == b'\\' && !prev_backslash;
+        prev_backslash = c == b'\\' && !prev_backslash;
+        i += 1;
     }
     None
 }
@@ -1132,6 +1167,27 @@ mod test {
     #[test]
     fn test_find_outside_paren_combinations() {
         assert_eq!(find_outside_paren(b"a(b\\:c):d", b":"), Some(7)); // Escaped ':' inside (), find ':' outside
+    }
+
+    /// The character a `$` reads is spent before the scan looks again, so an
+    /// operator character standing there is inside the name.
+    #[test]
+    fn find_outside_reference_spends_what_a_dollar_reads() {
+        // The `:` is the name `$:` references; the `=` after it is the operator.
+        assert_eq!(find_outside_reference(b"T$:= a", b":=;"), Some(3));
+        assert_eq!(find_outside_reference(b"P$+= more", b":=;"), Some(3));
+        // Only the first colon is spent; `::=` after it is written.
+        assert_eq!(find_outside_reference(b"F$:::= f", b":=;"), Some(3));
+        // A `$` that reads the `=` leaves no operator at all.
+        assert_eq!(find_outside_reference(b"T$= a", b":=;"), None);
+        // An even run of dollars reads nothing after it.
+        assert_eq!(find_outside_reference(b"G$$:= g", b":=;"), Some(3));
+        // A parenthesised reference is followed to its close, as before.
+        assert_eq!(find_outside_reference(b"H$(X)+= h", b":=;"), Some(6));
+        assert_eq!(find_outside_reference(b"J${X}:= j", b":=;"), Some(5));
+        assert_eq!(find_outside_reference(b"a$(b:c)d:e", b":"), Some(8));
+        // Without the reference reading, the same scan is unchanged.
+        assert_eq!(find_outside_paren(b"T$:= a", b":=;"), Some(2));
     }
 
     /// GNU Make's `fold_newlines` reads the output as a C string, drops the

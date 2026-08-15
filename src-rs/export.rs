@@ -130,6 +130,10 @@ fn should_export(name: Symbol, var: &Var, export_all: bool, names: &impl Interne
     match attribute {
         VarExport::Export => return true,
         VarExport::NoExport => return false,
+        // Neither the name filter nor a bare `export` is consulted for this
+        // one: GNU Make leaves the `v_ifset` arm as soon as the origin is not
+        // the built-in default.
+        VarExport::IfSet => return origin != VarOrigin::Default,
         VarExport::Default => {}
     }
     match origin {

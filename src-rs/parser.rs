@@ -31,8 +31,8 @@ use crate::{
         IfStmt, IncludeStmt, RuleStmt, Stmt, UndefineStmt, VpathStmt,
     },
     strutil::{
-        find_end_of_line, find_outside_paren, strip_recipe_prefix_continuations, trim_left_space,
-        trim_right_space, trim_space,
+        find_end_of_line, find_outside_paren, find_outside_reference,
+        strip_recipe_prefix_continuations, trim_left_space, trim_right_space, trim_space,
     },
     symtab::Symbol,
     var::VarExport,
@@ -200,7 +200,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_rule_or_assign(&mut self, line: Bytes) -> Result<()> {
-        let Some(sep) = find_outside_paren(line.as_ref(), b":=;") else {
+        let Some(sep) = find_outside_reference(line.as_ref(), b":=;") else {
             return self.parse_rule(line, None);
         };
         let s = &line[sep..];
@@ -344,7 +344,7 @@ impl<'a> Parser<'a> {
         if line.is_empty() {
             error_loc!(&*self.session, Some(&self.loc), "*** empty variable name.");
         }
-        if let Some(separator) = find_outside_paren(&line, b"=") {
+        if let Some(separator) = find_outside_reference(&line, b"=") {
             let assign = parse_assign_statement(&line, separator);
             self.define_name = Some(line.slice_ref(assign.lhs));
             self.define_op = assign.op;
@@ -876,7 +876,7 @@ fn parse_buf_no_stats_impl(
 /// asked without dispatching, so a caller can tell which of the two a line
 /// carrying an `export` word in front of it turned out to be.
 fn is_variable_definition(line: &[u8]) -> bool {
-    let Some(sep) = find_outside_paren(line, b":=;") else {
+    let Some(sep) = find_outside_reference(line, b":=;") else {
         return false;
     };
     let rest = &line[sep..];
@@ -972,22 +972,22 @@ pub fn parse_assign_statement(line: &[u8], sep: usize) -> ParsedAssign<'_> {
     assert!(sep != 0);
     let mut op = AssignOp::Eq;
     let mut lhs = &line[..sep];
-    if lhs.ends_with(b":::") {
+    if written_operator(lhs, b":::") {
         lhs = &lhs[..lhs.len() - 3];
         op = AssignOp::ImmediateRecursive;
-    } else if lhs.ends_with(b"::") {
+    } else if written_operator(lhs, b"::") {
         lhs = &lhs[..lhs.len() - 2];
         op = AssignOp::ColonEq;
-    } else if lhs.ends_with(b":") {
+    } else if written_operator(lhs, b":") {
         lhs = &lhs[..lhs.len() - 1];
         op = AssignOp::ColonEq;
-    } else if lhs.ends_with(b"+") {
+    } else if written_operator(lhs, b"+") {
         lhs = &lhs[..lhs.len() - 1];
         op = AssignOp::PlusEq;
-    } else if lhs.ends_with(b"?") {
+    } else if written_operator(lhs, b"?") {
         lhs = &lhs[..lhs.len() - 1];
         op = AssignOp::QuestionEq;
-    } else if lhs.ends_with(b"!") {
+    } else if written_operator(lhs, b"!") {
         lhs = &lhs[..lhs.len() - 1];
         op = AssignOp::ShellEq;
     }
@@ -1010,6 +1010,17 @@ pub fn parse_assign_statement(line: &[u8], sep: usize) -> ParsedAssign<'_> {
     let lhs = trim_left_space(&line[..name_end]);
     let rhs = trim_left_space(&line[line.len().min(sep + 1)..]);
     ParsedAssign { lhs, rhs, op }
+}
+
+/// Whether `text` ends with `operator` written as an operator, rather than with
+/// its first character read by a `$` standing in front of it.
+///
+/// GNU Make's scan spends the character after a `$` on the reference, so an
+/// operator that begins there was never one: `T$:= a` assigns with `=` and
+/// `T$:::= f` with `::=`, the leading colon of each having been read as the
+/// name `$:` references.
+fn written_operator(text: &[u8], operator: &[u8]) -> bool {
+    text.ends_with(operator) && !ends_with_reference_dollar(&text[..text.len() - operator.len()])
 }
 
 /// Whether the text ends with a `$` that begins a reference, rather than with
@@ -1063,6 +1074,55 @@ mod tests {
         assert!(is_variable_name(b"A"));
         assert!(!is_variable_name(b"A $$"));
         assert!(!is_variable_name(b"A B"));
+    }
+
+    /// An operator character a `$` reads is part of the name, so the operator
+    /// is whatever is written after it — the shorter one, or none at all.
+    #[test]
+    fn an_operator_a_dollar_reads_is_not_the_operator() {
+        let split = |line: &'static [u8], sep: usize| {
+            let assign = parse_assign_statement(line, sep);
+            (
+                String::from_utf8_lossy(assign.lhs).into_owned(),
+                assign.op,
+                String::from_utf8_lossy(assign.rhs).into_owned(),
+            )
+        };
+        assert_eq!(
+            split(b"T$:= a", 3),
+            ("T$:".into(), AssignOp::Eq, "a".into())
+        );
+        assert_eq!(
+            split(b"P$+= more", 3),
+            ("P$+".into(), AssignOp::Eq, "more".into())
+        );
+        assert_eq!(
+            split(b"C$?= c", 3),
+            ("C$?".into(), AssignOp::Eq, "c".into())
+        );
+        assert_eq!(
+            split(b"D$!= d", 3),
+            ("D$!".into(), AssignOp::Eq, "d".into())
+        );
+        // The first colon is the name's; `::=` after it is the operator.
+        assert_eq!(
+            split(b"E$::= e", 4),
+            ("E$:".into(), AssignOp::ColonEq, "e".into())
+        );
+        assert_eq!(
+            split(b"F$:::= f", 5),
+            ("F$:".into(), AssignOp::ColonEq, "f".into())
+        );
+        // An even run of dollars reads nothing after it, so `:=` is written.
+        assert_eq!(
+            split(b"G$$:= g", 4),
+            ("G$$".into(), AssignOp::ColonEq, "g".into())
+        );
+        // A parenthesised reference closes itself, leaving `+=` written.
+        assert_eq!(
+            split(b"H$(X)+= h", 6),
+            ("H$(X)".into(), AssignOp::PlusEq, "h".into())
+        );
     }
 
     /// A target-specific assignment carries its modifiers in any order, and the

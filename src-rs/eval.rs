@@ -833,6 +833,9 @@ pub struct Evaluator {
     pub loc: Option<Loc>,
     is_bootstrap: bool,
     is_commandline: bool,
+    /// Whether the read in progress is one whose targets may not choose the
+    /// default goal — the makefiles `MAKEFILES` names.
+    default_goal_withheld: bool,
 
     trace: bool,
     stack: Arc<Mutex<Vec<Arc<Frame>>>>,
@@ -1018,7 +1021,7 @@ impl Evaluator {
         self.session.flags.no_builtin_rules = decoded.no_builtin_rules;
         self.session.flags.no_builtin_variables = decoded.no_builtin_variables;
         if let Some(state) = &mut self.session.flags.makeflags_assignment {
-            state.effective = decoded.makeflags;
+            state.effective = decoded.carried;
         }
         Ok(())
     }
@@ -1040,6 +1043,7 @@ impl Evaluator {
             loc: None,
             is_bootstrap: false,
             is_commandline: false,
+            default_goal_withheld: false,
 
             trace,
             stack: Arc::new(Mutex::new(vec![Arc::new(Frame::new(
@@ -1120,6 +1124,16 @@ impl Evaluator {
     pub fn in_toplevel_makefile(&mut self) {
         self.is_bootstrap = false;
         self.is_commandline = false;
+    }
+
+    /// Whether a rule read from here may choose `.DEFAULT_GOAL`.
+    ///
+    /// GNU Make reads the makefiles `MAKEFILES` names under `RM_NO_DEFAULT_GOAL`
+    /// — they may declare rules, and a later `make` may name one as a goal, but
+    /// the goal a bare `make` builds still comes from the makefile the
+    /// invocation asked for.
+    pub fn withhold_the_default_goal(&mut self, withheld: bool) {
+        self.default_goal_withheld = withheld;
     }
 
     /// Snapshot command-line bindings in the recursive environment form GNU
@@ -2121,7 +2135,7 @@ impl Evaluator {
     /// considered, and reserved means a leading dot with no directory
     /// separator after it: `.PHONY` is a declaration, `.deps/x.Po` is a file.
     fn record_default_goal(&mut self, outputs: &[Symbol]) -> Result<()> {
-        if !self.default_goal_unset() {
+        if self.default_goal_withheld || !self.default_goal_unset() {
             return Ok(());
         }
         for output in outputs {

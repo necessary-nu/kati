@@ -36,6 +36,15 @@ use bytes::Bytes;
 pub struct DecodedMakeflags {
     /// `MAKEFLAGS` before the optional `MAKEOVERRIDES` reference.
     pub makeflags: Bytes,
+    /// The switch table the next assignment is decoded over.
+    ///
+    /// Not the same text as [`Self::makeflags`], because GNU Make's table
+    /// remembers switches it deliberately does not publish — `--jobserver-style`
+    /// is held in a variable of its own and never written into `MAKEFLAGS`, yet
+    /// a later assignment is still decoded with it in force. Publishing what the
+    /// table holds and carrying what it remembers are two questions, and only
+    /// the frontend knows which switches belong to which.
+    pub carried: Bytes,
     /// The same switches in command-line spelling.
     pub mflags: Bytes,
     pub is_dry_run: bool,
@@ -54,9 +63,11 @@ pub type MakeflagsDecoder =
 pub struct MakeflagsAssignment {
     pub decoder: MakeflagsDecoder,
     /// Switches inherited from the environment and argv, which outrank writes
-    /// in the Makefile.
+    /// in the Makefile, in the switch table's own spelling rather than the
+    /// published one.
     pub protected: Bytes,
-    /// The accumulated, canonical switch table after the last assignment.
+    /// The accumulated switch table after the last assignment, which is
+    /// [`DecodedMakeflags::carried`] and not what `MAKEFLAGS` shows.
     pub effective: Bytes,
     /// Command-line overrides make `$(MAKEOVERRIDES)` a permanent recursive
     /// suffix of `MAKEFLAGS`, even if the Makefile later empties it.
