@@ -2933,13 +2933,19 @@ impl<'a> DepBuilder<'a> {
         {
             return None;
         }
+        // GNU Make's `selective_vpath_search` settles this once, before it looks
+        // anywhere, because it is a question about the name being searched for
+        // rather than about any candidate.
+        let searching_for_a_target = self.names_a_target(name);
         let mut matched_any = false;
         for (entry, (pattern, directories)) in self.ev.session.vpaths.iter().enumerate() {
             if !pattern.matches(name) {
                 continue;
             }
             matched_any = true;
-            if let Some((found, directory)) = Self::first_directory_holding(directories, name) {
+            if let Some((found, directory)) =
+                self.first_directory_offering(directories, name, searching_for_a_target)
+            {
                 return Some((found, VpathRank { entry, directory }));
             }
         }
@@ -2949,13 +2955,27 @@ impl<'a> DepBuilder<'a> {
         // `VPATH` is a variable rather than a directive and so is read here
         // rather than recorded. It is searched after every `vpath` entry, which
         // is where its rank puts it.
-        let (found, directory) = Self::first_directory_holding(&self.vpath_variable(), name)?;
+        let (found, directory) =
+            self.first_directory_offering(&self.vpath_variable(), name, searching_for_a_target)?;
         let entry = self.ev.session.vpaths.len();
         Some((found, VpathRank { entry, directory }))
     }
 
-    /// The first of `directories` that holds `name`, and which one it was.
-    fn first_directory_holding(directories: &[Bytes], name: &[u8]) -> Option<(Bytes, usize)> {
+    /// The first of `directories` that offers `name`, and which one it was.
+    ///
+    /// A directory offers the name when it holds a file of that name, and also
+    /// when the Makefile has written the joined path down — the search is for
+    /// something the build can read, and a name a rule can make is as good as
+    /// one already on disk. GNU Make's own words for the second half are that
+    /// a "makefile-mentioned file need not exist", and the two are asked in
+    /// this order per directory rather than in two passes, so a mentioned name
+    /// in an earlier directory beats a file in a later one.
+    fn first_directory_offering(
+        &self,
+        directories: &[Bytes],
+        name: &[u8],
+        searching_for_a_target: bool,
+    ) -> Option<(Bytes, usize)> {
         for (index, directory) in directories.iter().enumerate() {
             let mut candidate = BytesMut::from(directory.as_ref());
             if !candidate.ends_with(b"/") {
@@ -2963,11 +2983,52 @@ impl<'a> DepBuilder<'a> {
             }
             candidate.put_slice(name);
             let candidate = candidate.freeze();
-            if std::fs::exists(OsStr::from_bytes(&candidate)).is_ok_and(|found| found) {
+            if self.makefile_offers(&candidate, searching_for_a_target)
+                || std::fs::exists(OsStr::from_bytes(&candidate)).is_ok_and(|found| found)
+            {
                 return Some((candidate, index));
             }
         }
         None
+    }
+
+    /// Whether the Makefile answers for `candidate` well enough for the search
+    /// to stop on it without asking the filesystem.
+    ///
+    /// The bar moves with what is being searched for. A name the Makefile does
+    /// not declare as a target is satisfied by any name the Makefile knows at
+    /// all — a target, a prerequisite of one, a goal, a name carrying
+    /// target-specific variables. A name that IS a target is satisfied only by
+    /// another target: GNU Make's comment dates the restriction to 1990 and
+    /// admits to not knowing what it fixed, and the 1993 loosening that lets a
+    /// target be chosen is the other half of the same condition.
+    fn makefile_offers(&self, candidate: &[u8], searching_for_a_target: bool) -> bool {
+        let Some(candidate) = self.ev.session.symtab.peek_symbol(candidate) else {
+            return false;
+        };
+        if searching_for_a_target {
+            return self.declares_a_target(candidate);
+        }
+        self.is_written_down(candidate)
+    }
+
+    /// Whether some rule in the Makefile writes this name down as a target.
+    ///
+    /// GNU Make's `is_target`, which a rule sets whether or not it carries a
+    /// recipe, and which `.PHONY` sets for every name it lists.
+    fn declares_a_target(&self, name: Symbol) -> bool {
+        self.rules.contains_key(&name) || self.phony.contains(&name)
+    }
+
+    /// The same question over a name that may never have been interned, which
+    /// is how the library search reaches it: a `.LIBPATTERNS` candidate is a
+    /// name the search invented, and asking about it must not mint it.
+    fn names_a_target(&self, name: &[u8]) -> bool {
+        self.ev
+            .session
+            .symtab
+            .peek_symbol(name)
+            .is_some_and(|name| self.declares_a_target(name))
     }
 
     /// The directories `VPATH` names, separated by colons or by whitespace.
