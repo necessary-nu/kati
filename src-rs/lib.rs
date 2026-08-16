@@ -71,6 +71,7 @@ pub mod regen_dump;
 pub mod rule;
 pub mod session;
 pub mod shuffle;
+pub mod simple_command;
 pub mod stats;
 pub mod stmt;
 pub mod strutil;

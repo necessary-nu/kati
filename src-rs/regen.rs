@@ -433,6 +433,7 @@ impl StampChecker {
             // in the environment this check was started in.
             &[],
             crate::fileutil::RedirectStderr::DevNull,
+            "",
         )?;
         let output = format_for_command_substitution(output);
         if sr.result != output {

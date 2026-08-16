@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::ExitStatusExt as _;
 use std::{
     collections::HashMap,
     ffi::{CStr, CString, OsStr},
@@ -59,6 +60,22 @@ pub fn get_timestamp(filename: &[u8]) -> Result<Option<SystemTime>> {
         .map_err(|err| crate::io_failure(Path::new(filename), &err))
 }
 
+/// POSIX's exit status for a command that could not be run at all.
+const COMMAND_NOT_FOUND: i32 = 127;
+
+/// What the C library would have said about this error, which is the wording
+/// GNU Make reports because it reports `strerror (errno)`.
+fn system_message(error: &std::io::Error) -> String {
+    match error.raw_os_error() {
+        Some(code) => std::io::Error::from_raw_os_error(code).to_string(),
+        None => error.to_string(),
+    }
+    .split(" (os error")
+    .next()
+    .unwrap_or_default()
+    .to_owned()
+}
+
 /// Run one command and read back what it wrote.
 ///
 /// `environment` is what Make's export set says about the child: a name bound
@@ -73,9 +90,22 @@ pub fn run_command(
     cmd: &Bytes,
     environment: &[(Bytes, Option<Bytes>)],
     redirect_stderr: RedirectStderr,
+    diagnostic_prefix: &str,
 ) -> Result<(ExitStatus, Vec<u8>)> {
+    // A line with no shell syntax in it is exec'd directly, exactly as GNU
+    // Make's `construct_command_argv_internal` does — so a program that is not
+    // there is reported against its own name and by whoever went looking,
+    // rather than in the words of a shell that was never needed.
+    let direct = crate::simple_command::direct_argv(cmd, shell, shellflag, false);
     let mut cmd_with_shell;
-    let args = if !shell.starts_with(b"/") || memchr2(b' ', b'$', shell).is_some() {
+    let owned;
+    let args: &[&OsStr] = if let Some(words) = &direct {
+        owned = words
+            .iter()
+            .map(|word| <OsStr as OsStrExt>::from_bytes(word))
+            .collect::<Vec<_>>();
+        &owned
+    } else if !shell.starts_with(b"/") || memchr2(b' ', b'$', shell).is_some() {
         let cmd_escaped = crate::strutil::escape_shell(cmd);
         cmd_with_shell = BytesMut::new();
         cmd_with_shell.put_slice(shell);
@@ -124,7 +154,19 @@ pub fn run_command(
     }
     cmd.stdout(writer);
 
-    let mut handle = cmd.spawn()?;
+    let mut handle = match cmd.spawn() {
+        Ok(handle) => handle,
+        // Only the direct launch answers for this: with a shell in the way the
+        // shell is what failed to find the program, and it says so itself.
+        Err(error) if direct.is_some() => {
+            let name = String::from_utf8_lossy(args[0].as_bytes()).into_owned();
+            eprintln!("{diagnostic_prefix}{name}: {}", system_message(&error));
+            // POSIX's status for a command that could not be run, which is what
+            // GNU Make's child reports for the same failure.
+            return Ok((ExitStatus::from_raw(COMMAND_NOT_FOUND << 8), Vec::new()));
+        }
+        Err(error) => return Err(error.into()),
+    };
     // Drop the cmd, otherwise the pipe will be retained.
     drop(cmd);
 
