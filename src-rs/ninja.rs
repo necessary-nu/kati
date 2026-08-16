@@ -215,6 +215,64 @@ pub struct DeferredRecipes {
     output_evaluation: OutputEvaluation,
 }
 
+/// One recipe line, translated out of Make's syntax and into a shell's.
+///
+/// GNU Make hands exactly this to `construct_command_argv` and starts a shell
+/// for it, or execs it itself when nothing in it needs one. What the flags say
+/// is the line's own: under `.POSIX:` a `-` prefix asks for a shell without
+/// `-e` while the line beside it still gets one.
+#[derive(Clone)]
+pub struct TranslatedLine {
+    pub text: Bytes,
+    /// The line was written with a `-` prefix, or `-i`/`.IGNORE` is in force:
+    /// its failure is reported and the recipe carries on past it.
+    pub ignore_error: bool,
+    /// The flags the shell for this line takes.
+    pub shell_flag: Bytes,
+    /// kati's own `.KATI_DEPFILE`-adjacent request that the line not be put in
+    /// a subshell when a script is assembled. Nothing to a destination that
+    /// gives the line a process of its own.
+    pub force_no_subshell: bool,
+}
+
+/// A whole recipe, each line translated and none of them joined yet.
+pub struct TranslatedRecipe {
+    /// One entry per written command line, in order, `None` where the
+    /// translation absorbed the line into something else.
+    pub lines: Vec<Option<TranslatedLine>>,
+    /// Every line ignores its errors, so a nonzero status from the assembled
+    /// script cannot be anything but an ignored failure.
+    pub wholly_ignored: bool,
+}
+
+impl TranslatedRecipe {
+    /// The lines that survived, in order.
+    pub fn kept(&self) -> impl Iterator<Item = &TranslatedLine> {
+        self.lines.iter().flatten()
+    }
+}
+
+/// One launch of a recipe, as GNU Make would perform it.
+pub struct RecipeStep {
+    /// The command line, for the shell that is going to run it.
+    pub text: Bytes,
+    /// The shell to run it under, and the flags that make the text an
+    /// argument. Per step, because GNU Make chooses them per line.
+    pub shell: Bytes,
+    pub shell_flags: Bytes,
+    /// A nonzero status from this step is an error Make was told to ignore:
+    /// it is not the recipe's answer and the steps after it still run.
+    pub ignore_error: bool,
+    /// The argument list to exec with no shell in between, when nothing in the
+    /// line needs one.
+    ///
+    /// GNU Make's `construct_command_argv_internal` decides this per line and
+    /// per shell, so a step that answers `Some` is one GNU Make would run
+    /// itself — and would report a missing program against its own name, in
+    /// Make's voice rather than a shell's.
+    pub direct: Option<Vec<Bytes>>,
+}
+
 /// One expanded recipe: what a [`SinkRule`] would have carried, had the text
 /// existed when the rule was declared.
 pub struct ExpandedRecipe {
@@ -222,8 +280,22 @@ pub struct ExpandedRecipe {
     pub shell: Bytes,
     /// The flags that make the shell take the script as an argument.
     pub shell_flags: Bytes,
-    /// The assembled shell script.
+    /// The assembled shell script: the whole recipe as one command line, for
+    /// a destination that can only run one.
     pub script: Bytes,
+    /// The same recipe as the sequence of launches GNU Make would perform.
+    ///
+    /// GNU Make runs each command line of a recipe as its own process:
+    /// `start_job_command` takes one line, `construct_command_argv` decides
+    /// whether it needs a shell at all, and `reap_children` comes back for the
+    /// next one when that process is done. A destination that can do the same
+    /// runs these in order and never looks at [`Self::script`]; one that
+    /// cannot does the reverse.
+    ///
+    /// `.ONESHELL` is the case where one process is not an approximation, and
+    /// there it holds exactly one step: the whole script, under the flags the
+    /// first line asked for.
+    pub steps: Vec<RecipeStep>,
     /// What to print while the command runs, when something chose.
     pub description: Option<Bytes>,
     /// A nonzero status is an error Make was told to ignore.
@@ -356,28 +428,84 @@ impl DeferredRecipes {
         } else {
             NinjaGenerator::script_shell_flags(&ce.ev.session.flags, &commands)
         };
-        let ignore_errors = NinjaGenerator::gen_shell_script(
+        let translated = NinjaGenerator::translate_recipe(
             &ce.ev.session.flags,
             &recipe_output,
             &commands,
+            &mut description,
+        );
+        let ignore_errors = NinjaGenerator::gen_shell_script(
+            &ce.ev.session.flags,
+            &translated,
             &shell_flags,
             &mut script,
-            &mut description,
         );
         if description.is_none() {
             description.clone_from(&recipe.description_fallback);
         }
+        let script = script.freeze();
         let recipe_environment = node_environment(ce.ev, &recipe.node)?;
+        let steps = recipe_steps(
+            &ce.ev.session.flags,
+            &translated,
+            &recipe.shell,
+            &shell_flags,
+            &script,
+        );
         Ok(ExpandedRecipe {
             shell: recipe.shell.clone(),
             shell_flags,
-            script: script.freeze(),
+            script,
+            steps,
             description,
             ignore_errors,
             recipe_environment,
             runs_nothing,
         })
     }
+}
+
+/// The launches one translated recipe becomes.
+///
+/// One per surviving command line, except under `.ONESHELL`, where GNU Make
+/// really does hand the whole recipe to one shell and the assembled script is
+/// the thing to run. A step's shell flags are its own line's, so nothing has
+/// to be taken back off inside the command the way an assembled script does
+/// it — the reason `gen_shell_script` writes a `set +e`.
+fn recipe_steps(
+    flags: &Flags,
+    translated: &TranslatedRecipe,
+    shell: &Bytes,
+    script_flags: &Bytes,
+    script: &Bytes,
+) -> Vec<RecipeStep> {
+    let step = |text: Bytes, shell_flags: Bytes, ignore_error: bool| RecipeStep {
+        direct: crate::simple_command::direct_argv(&text, shell, &shell_flags, flags.one_shell),
+        text,
+        shell: shell.clone(),
+        shell_flags,
+        ignore_error,
+    };
+    if flags.one_shell {
+        if script.is_empty() {
+            return Vec::new();
+        }
+        return vec![step(
+            script.clone(),
+            script_flags.clone(),
+            translated.wholly_ignored,
+        )];
+    }
+    translated
+        .kept()
+        .map(|line| {
+            step(
+                line.text.clone(),
+                line.shell_flag.clone(),
+                line.ignore_error,
+            )
+        })
+        .collect()
 }
 
 /// What one node's target-specific scope changes about the environment its
@@ -751,45 +879,38 @@ impl<'a> NinjaGenerator<'a> {
             .clone()
     }
 
-    /// Assemble the recipe into one shell script, and say what to print while
-    /// it runs if the recipe itself said so.
+    /// Turn each written recipe line into the text a shell should receive,
+    /// and say what to print while it runs if the recipe itself said so.
+    ///
+    /// This is the whole of what a recipe line becomes on its own: the Make
+    /// syntax is gone, the prefixes have been read, and what is left is one
+    /// command line, exactly as GNU Make's `construct_command_argv` receives
+    /// one. Everything after this is a question about how many shells the
+    /// destination is willing to start.
     ///
     /// `description` is left `None` when the Makefile did not say. Each sink
     /// can then narrate an inline recipe with the expanded script itself,
     /// without making this front end choose a destination-specific format.
     ///
-    /// Returns whether the script's own status can be read as an ignored
-    /// error, which is [`SinkRule::ignore_errors`].
-    fn gen_shell_script(
+    /// A line the translation absorbed keeps its place as `None` rather than
+    /// being dropped, because the join below counts the lines still to come
+    /// while it walks them and would subshell differently if it could not see
+    /// where the absorbed one was.
+    fn translate_recipe(
         flags: &Flags,
         name: &Bytes,
         commands: &[Command],
-        script_flags: &[u8],
-        cmd_buf: &mut BytesMut,
         description: &mut Option<Bytes>,
-    ) -> bool {
+    ) -> TranslatedRecipe {
         // A nonzero status is certainly an ignored failure only when every line
         // ignores errors: otherwise it may be the `&&` chain stopping at a line
         // whose failure counts. Read over every command rather than the ones
         // that survive the loop, so dropping one can only make this stricter.
         let wholly_ignored = !commands.is_empty() && commands.iter().all(|c| c.ignore_error);
-        // Ignored lines are chained rather than conjoined, so the next line runs
-        // whatever the last one left and the last line's status is the script's.
-        let separator: &[u8] = match (flags.one_shell, wholly_ignored) {
-            (true, _) => b"\n",
-            (false, true) => b" ; ",
-            (false, false) => b" && ",
-        };
-        let mut command_count = commands.len();
+        let mut lines = Vec::with_capacity(commands.len());
+        let mut kept_any = false;
         for c in commands {
             let inp = c.cmd.slice_ref(c.cmd.trim_ascii_start());
-
-            // Under `.ONESHELL` the recipe is one script: no subshell to
-            // confine a `cd`, and the lines are separated rather than chained,
-            // so a failing one does not stop the rest.
-            let needs_subshell =
-                !flags.one_shell && (command_count > 1 || c.ignore_error) && !c.force_no_subshell;
-
             let mut translated = Self::translate_command(inp);
             let echoed = (flags.detect_android_echo && description.is_none() && !c.echo)
                 .then(|| Self::get_description_from_command(&translated))
@@ -797,13 +918,64 @@ impl<'a> NinjaGenerator<'a> {
             if let Some(echoed) = echoed {
                 *description = Some(echoed);
                 translated.clear();
-            } else if Self::is_output_mkdir(name, &translated) && !c.echo && cmd_buf.is_empty() {
+            } else if Self::is_output_mkdir(name, &translated) && !c.echo && !kept_any {
                 translated.clear();
             }
             if translated.is_empty() {
-                command_count -= 1;
+                lines.push(None);
                 continue;
             }
+            kept_any = true;
+            lines.push(Some(TranslatedLine {
+                text: translated,
+                ignore_error: c.ignore_error,
+                shell_flag: c.shell_flag.clone(),
+                force_no_subshell: c.force_no_subshell,
+            }));
+        }
+        TranslatedRecipe {
+            lines,
+            wholly_ignored,
+        }
+    }
+
+    /// Assemble the translated recipe into one shell script.
+    ///
+    /// A destination that can only run one command per edge — a Ninja manifest
+    /// is one, since a binding holds one command line — needs the whole recipe
+    /// in a single script, and the subshells, the `&&` chain and the muting
+    /// below are what stands in for the several shells GNU Make would have
+    /// started. A destination that can start one shell per line does not use
+    /// this at all and reads [`TranslatedRecipe::lines`] instead.
+    ///
+    /// Returns whether the script's own status can be read as an ignored
+    /// error, which is [`SinkRule::ignore_errors`].
+    fn gen_shell_script(
+        flags: &Flags,
+        recipe: &TranslatedRecipe,
+        script_flags: &[u8],
+        cmd_buf: &mut BytesMut,
+    ) -> bool {
+        let wholly_ignored = recipe.wholly_ignored;
+        // Ignored lines are chained rather than conjoined, so the next line runs
+        // whatever the last one left and the last line's status is the script's.
+        let separator: &[u8] = match (flags.one_shell, wholly_ignored) {
+            (true, _) => b"\n",
+            (false, true) => b" ; ",
+            (false, false) => b" && ",
+        };
+        let mut command_count = recipe.lines.len();
+        for line in &recipe.lines {
+            let Some(c) = line else {
+                command_count -= 1;
+                continue;
+            };
+
+            // Under `.ONESHELL` the recipe is one script: no subshell to
+            // confine a `cd`, and the lines are separated rather than chained,
+            // so a failing one does not stop the rest.
+            let needs_subshell =
+                !flags.one_shell && (command_count > 1 || c.ignore_error) && !c.force_no_subshell;
 
             // An ignored line the script cannot speak for has to lose its
             // status here, because a later line needs the one channel out. The
@@ -830,7 +1002,7 @@ impl<'a> NinjaGenerator<'a> {
             if relax {
                 fragment.put_slice(b"set +e ; ");
             }
-            fragment.put_slice(&translated);
+            fragment.put_slice(&c.text);
             if needs_subshell {
                 fragment.put_slice(b" )");
             }
@@ -947,13 +1119,17 @@ impl<'a> NinjaGenerator<'a> {
             let mut cmd_buf = BytesMut::new();
             let recipe_output_str = node.recipe_output.as_bytes(&self.ce.ev.session);
             let script_flags = Self::script_shell_flags(&self.ce.ev.session.flags, &nn.commands);
-            let ignore_errors = Self::gen_shell_script(
+            let translated = Self::translate_recipe(
                 &self.ce.ev.session.flags,
                 &recipe_output_str,
                 &nn.commands,
+                &mut description,
+            );
+            let ignore_errors = Self::gen_shell_script(
+                &self.ce.ev.session.flags,
+                &translated,
                 &script_flags,
                 &mut cmd_buf,
-                &mut description,
             );
             if description.is_none()
                 && (self.phony_aliases.resolve(node.output) != node.output
@@ -1030,13 +1206,17 @@ impl<'a> NinjaGenerator<'a> {
             let mut residual_description = None;
             // The residual is a subset of the same recipe and reaches the same
             // shell, so it is assembled against the flags that shell has.
-            let residual_ignore_errors = Self::gen_shell_script(
+            let residual_translated = Self::translate_recipe(
                 &self.ce.ev.session.flags,
                 &recipe_output_str,
                 &residual_commands,
+                &mut residual_description,
+            );
+            let residual_ignore_errors = Self::gen_shell_script(
+                &self.ce.ev.session.flags,
+                &residual_translated,
                 &script_flags,
                 &mut residual_buf,
-                &mut residual_description,
             );
             // Automatic depfile detection appends the copy to kati's manifest
             // command. The direct graph runs the residual command instead, so
@@ -1960,6 +2140,108 @@ mod tests {
         );
     }
 
+    /// The launches a recipe becomes, as `(text, ignore_error, is direct)`.
+    fn steps_of(lines: &[(&'static [u8], bool)], one_shell: bool) -> Vec<(String, bool, bool)> {
+        let mut names = Symtab::new();
+        let output = names.intern(&b"out"[..]);
+        let commands: Vec<Command> = lines
+            .iter()
+            .map(|(cmd, dash_prefixed)| Command {
+                output,
+                cmd: Bytes::from_static(cmd),
+                echo: true,
+                ignore_error: *dash_prefixed,
+                dash_prefixed: *dash_prefixed,
+                shell_flag: Bytes::from_static(b"-c"),
+                force_no_subshell: false,
+                recursive_line: false,
+                recursive_make: Vec::new(),
+                uncomposable_recursion: false,
+            })
+            .collect();
+        let flags = Flags {
+            one_shell,
+            ..Flags::default()
+        };
+        let script_flags = NinjaGenerator::script_shell_flags(&flags, &commands);
+        let mut description = None;
+        let translated = NinjaGenerator::translate_recipe(
+            &flags,
+            &Bytes::from_static(b"out"),
+            &commands,
+            &mut description,
+        );
+        let mut script = BytesMut::new();
+        NinjaGenerator::gen_shell_script(&flags, &translated, &script_flags, &mut script);
+        let script = script.freeze();
+        let shell = Bytes::from_static(b"/bin/sh");
+        recipe_steps(&flags, &translated, &shell, &script_flags, &script)
+            .into_iter()
+            .map(|step| {
+                (
+                    String::from_utf8_lossy(&step.text).into_owned(),
+                    step.ignore_error,
+                    step.direct.is_some(),
+                )
+            })
+            .collect()
+    }
+
+    /// GNU Make runs each command line of a recipe as its own process, so a
+    /// recipe becomes as many launches as it has lines — and none of them
+    /// wears the subshell, the `&&` or the muting that assembling one script
+    /// out of them needs.
+    #[test]
+    fn a_recipe_becomes_one_launch_per_command_line() {
+        assert_eq!(
+            steps_of(&[(b"cd /tmp", false), (b"pwd > out", false)], false),
+            vec![
+                ("cd /tmp".to_owned(), false, false),
+                ("pwd > out".to_owned(), false, false),
+            ]
+        );
+        // The `-` prefix is per line here, where the assembled script has to
+        // mute the line and read the whole recipe's status at the end. Both
+        // are exec'd directly: `true` and `false` are programs on the path and
+        // not among the shell builtins GNU Make lists.
+        assert_eq!(
+            steps_of(&[(b"false", true), (b"true", false)], false),
+            vec![
+                ("false".to_owned(), true, true),
+                ("true".to_owned(), false, true),
+            ]
+        );
+    }
+
+    /// `.ONESHELL` is the one case where a single process is not an
+    /// approximation: GNU Make really does hand the whole recipe to one shell.
+    #[test]
+    fn oneshell_is_one_launch_holding_the_whole_script() {
+        assert_eq!(
+            steps_of(&[(b"cd /tmp", false), (b"pwd > out", false)], true),
+            vec![("cd /tmp\npwd > out".to_owned(), false, false)]
+        );
+    }
+
+    /// Which launches GNU Make would exec itself, from `simple_command`'s
+    /// answer per line rather than per recipe.
+    #[test]
+    fn a_line_with_no_shell_syntax_is_launched_without_a_shell() {
+        assert_eq!(
+            steps_of(&[(b"./prog arg", false), (b"./prog > out", false)], false),
+            vec![
+                ("./prog arg".to_owned(), false, true),
+                ("./prog > out".to_owned(), false, false),
+            ]
+        );
+        // Under `.ONESHELL` the recipe is one script with newlines in it, and
+        // a newline is a separator the shell has to read.
+        assert_eq!(
+            steps_of(&[(b"./prog arg", false), (b"./other", false)], true),
+            vec![("./prog arg\n./other".to_owned(), false, false)]
+        );
+    }
+
     /// The script and the ignore-errors flag `sink_node` would hand to a sink
     /// for a recipe whose lines are `(expansion, whether errors are ignored)`.
     fn recipe_script(lines: &[(&'static [u8], bool)]) -> (Bytes, bool) {
@@ -1999,14 +2281,14 @@ mod tests {
         let script_flags = NinjaGenerator::script_shell_flags(&flags, &commands);
         let mut cmd_buf = BytesMut::new();
         let mut description = None;
-        let ignore_errors = NinjaGenerator::gen_shell_script(
+        let translated = NinjaGenerator::translate_recipe(
             &flags,
             &Bytes::from_static(b"out"),
             &commands,
-            &script_flags,
-            &mut cmd_buf,
             &mut description,
         );
+        let ignore_errors =
+            NinjaGenerator::gen_shell_script(&flags, &translated, &script_flags, &mut cmd_buf);
         assert_eq!(description, None, "no Makefile echo, so no description");
         ((cmd_buf.freeze(), ignore_errors), script_flags)
     }
