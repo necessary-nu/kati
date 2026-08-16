@@ -266,9 +266,13 @@ pub struct Plan {
     /// The Makefiles the read consulted that a rule says how to remake, in the
     /// order the read reached them.
     pub regenerations: Vec<RegenerationRoot>,
-    /// A required Makefile nothing can make, which ends the run once the
-    /// Makefiles ahead of it have been brought up to date.
-    pub refusal: Option<Refusal>,
+    /// The required Makefiles nothing can make, in the order the read reached
+    /// them, which end the run once the Makefiles around them have been brought
+    /// up to date.
+    ///
+    /// At most one without `-k`, because the first ends the run where it is
+    /// found and the update never reaches the rest. All of them with it.
+    pub refusals: Vec<Refusal>,
 }
 
 /// A required Makefile the read could not open and no rule can make, with what
@@ -291,6 +295,19 @@ pub struct Refusal {
     pub complaint: Option<String>,
     /// What ends the run.
     pub error: anyhow::Error,
+    /// `Failed to remake makefile 'X'.`, which comes after every refusal rather
+    /// than beside its own.
+    ///
+    /// A different site from the two above and a different pass over the same
+    /// files: `main.c`'s `us_failed` arm walks `read_files` in order once the
+    /// update has RETURNED, and names each one it cares about that was left
+    /// `updated` with a failing status (main.c:2544). Without `-k` the update
+    /// does not return — `complain()` is `fatal` and the run ends inside it — so
+    /// these are never reached; with `-k` they all are, after all of them.
+    ///
+    /// Located at the `include` line like the complaint, and under Make's own
+    /// name for a Makefile the command line named.
+    pub summary: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -2259,7 +2276,7 @@ impl<'a> DepBuilder<'a> {
         // what the Makefile builds once it is reread, and a required include
         // with no rule is the failure the run dies on, ahead of the complaint
         // about having nothing to aim at.
-        let (regeneration_nodes, refusal) =
+        let (regeneration_nodes, refusals) =
             self.plan_regeneration(read_makefiles, missing_includes)?;
         let planned = self.plan_goals(targets);
         // The refusal happens in GNU Make while the makefiles are being
@@ -2268,7 +2285,7 @@ impl<'a> DepBuilder<'a> {
         // not reported on.
         let mut nodes = match planned {
             Ok(nodes) => nodes,
-            Err(error) if refusal.is_none() => return Err(error),
+            Err(error) if refusals.is_empty() => return Err(error),
             Err(_) => Vec::new(),
         };
         // `--shuffle` reorders the goals and every prerequisite list reachable
@@ -2287,7 +2304,7 @@ impl<'a> DepBuilder<'a> {
         Ok(Plan {
             nodes,
             regenerations: regeneration_nodes,
-            refusal,
+            refusals,
         })
     }
 
@@ -2494,8 +2511,9 @@ impl<'a> DepBuilder<'a> {
         &mut self,
         read_makefiles: &[ReadMakefile],
         missing_includes: &[MissingInclude],
-    ) -> Result<(Vec<RegenerationRoot>, Option<Refusal>)> {
+    ) -> Result<(Vec<RegenerationRoot>, Vec<Refusal>)> {
         let mut nodes = Vec::new();
+        let mut refusals = Vec::new();
         for &ReadMakefile {
             filename: makefile,
             required,
@@ -2556,9 +2574,26 @@ impl<'a> DepBuilder<'a> {
                 None,
                 format!("*** No rule to make target '{name}'."),
             );
-            return Ok((nodes, Some(Refusal { complaint, error })));
+            let summary = crate::color_warn_text(
+                &self.ev.session,
+                include.loc.as_ref(),
+                format!("Failed to remake makefile '{name}'."),
+            );
+            refusals.push(Refusal {
+                complaint,
+                error,
+                summary,
+            });
+            // Without `-k` this one ends the run from inside the update, so the
+            // makefiles behind it are never considered and never reported.
+            // `complain()` reads `keep_going_flag` and chooses `error` over
+            // `fatal` (remake.c:422), and the update then walks on to the next
+            // makefile — which is the whole of the difference.
+            if !self.ev.session.flags.keep_going {
+                break;
+            }
         }
-        Ok((nodes, None))
+        Ok((nodes, refusals))
     }
 
     /// Whether GNU Make would try to bring this Makefile up to date.

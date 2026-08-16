@@ -78,7 +78,7 @@ fn run(session: Session, orig_args: OsString) -> Result<i32> {
     let Evaluated {
         mut ev,
         nodes,
-        refusal,
+        mut refusals,
         ..
     } = evaluate(session)?;
 
@@ -87,7 +87,25 @@ fn run(session: Session, orig_args: OsString) -> Result<i32> {
     // frontend that has a build to run does exactly that; this tool has no such
     // phase, so there is nothing to do between reaching the refusal and raising
     // it.
-    if let Some(refusal) = refusal {
+    //
+    // More than one only under `-k`, where GNU Make reports over every makefile
+    // it cannot make and then lists them all again. That second list has to come
+    // after every refusal, so under `-k` this reports the lot itself and leaves
+    // with a status rather than an error — an error returned here would be
+    // printed by the caller, which is after the summaries rather than before.
+    if ev.session.flags.keep_going && !refusals.is_empty() {
+        for refusal in &refusals {
+            if let Some(complaint) = &refusal.complaint {
+                eprintln!("{complaint}");
+            }
+            eprintln!("{}", refusal.error);
+        }
+        for refusal in &refusals {
+            eprintln!("{}", refusal.summary);
+        }
+        return Ok(ABANDONED);
+    }
+    if let Some(refusal) = refusals.pop() {
         // The complaint about the file that would not open is GNU Make's to
         // print beside the refusal rather than at the read, so it is still
         // held; with nothing to do in between, printing it is all that is left.

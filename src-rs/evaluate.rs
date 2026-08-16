@@ -96,7 +96,7 @@ pub struct Evaluated {
     /// the plan rather than in place of it, so a frontend can do that work in
     /// between — and the located complaint about the file travels with the
     /// refusal, because GNU Make prints that from the same place.
-    pub refusal: Option<crate::dep::Refusal>,
+    pub refusals: Vec<crate::dep::Refusal>,
 }
 
 /// The Makefile kati reads before the real one.
@@ -600,6 +600,6 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
         ev,
         nodes: plan.nodes,
         regeneration_nodes: plan.regenerations,
-        refusal: plan.refusal,
+        refusals: plan.refusals,
     })
 }

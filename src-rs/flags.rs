@@ -213,6 +213,15 @@ pub struct Flags {
     /// `--shuffle`: the order the goals and each target's prerequisites are
     /// considered in, when it is not the order the Makefile wrote.
     pub shuffle: crate::shuffle::Shuffle,
+
+    /// `-k`: a failure is reported and passed over rather than ending the run.
+    ///
+    /// It reaches the evaluator because the makefile update is where GNU Make
+    /// reads it first. `complain()` chooses between `fatal` and `error` on
+    /// `keep_going_flag` (reference/gnumake/src/remake.c:422), so the switch
+    /// decides whether the first makefile nothing can make is the last one
+    /// considered or merely the first of several reported.
+    pub keep_going: bool,
 }
 
 fn parse_command_line_option_with_arg(
