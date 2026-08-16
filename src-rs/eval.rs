@@ -702,10 +702,26 @@ pub struct MissingInclude {
     /// Whether the directive was `include` rather than `-include` or
     /// `sinclude`, and therefore whether failing to remake it is fatal.
     pub required: bool,
-    /// Where the directive was read, for the diagnostic that names it. Absent
+    /// Where the directive was read, for the diagnostic that names it. Missing
     /// for a Makefile the command line named, which no line of any Makefile
     /// asked for and which GNU Make therefore reports under its own name.
     pub loc: Option<Loc>,
+    /// The system's words for why the read did not happen, which is what the
+    /// complaint quotes. `No such file or directory` for a name nothing is at,
+    /// and the open's own errno for a name something is at that would not open —
+    /// GNU Make stores `errno` on the goaldep whatever it was (read.c:347) and
+    /// `show_goal_error` prints `strerror` of it, so the two travel the same way
+    /// and differ only in these words.
+    pub reason: String,
+}
+
+/// The system's words for a name nothing is at.
+///
+/// Taken from the errno rather than written out, so that a file which was there
+/// when the read looked and gone by the time it opened reports in exactly the
+/// same terms as one that was never there at all.
+pub(crate) fn absent() -> String {
+    crate::strerror(&std::io::Error::from_raw_os_error(libc::ENOENT))
 }
 
 impl IncludeGraph {
@@ -2357,6 +2373,7 @@ impl Evaluator {
         let filename = OsString::from_vec(fname.to_vec());
         collect_stats_with_slow_report!(self, "included makefiles", &filename);
 
+        let loc = self.loc.clone();
         let mk = match self.session.get_makefile(&filename)? {
             Source::Read(mk) => mk,
             Source::Absent => error_loc!(
@@ -2365,26 +2382,62 @@ impl Evaluator {
                 "{} does not exist",
                 filename.to_string_lossy()
             ),
-            Source::Unreadable(_) if !required => return Ok(()),
-            // The system's own reason, at the `include` that asked for the
-            // file: an `io::Error` reaching the user on its own names neither.
+            // A file that would not open is an unread makefile like one that is
+            // not there, whatever the errno said. GNU Make's `eval_makefile`
+            // stores it on the goaldep and returns without a word
+            // (reference/gnumake/src/read.c:347), so the run carries on to the
+            // update, which remakes the file if a rule says how and refuses over
+            // it if the read needed it and nothing does. Reporting it from here
+            // instead would end the run ahead of both, and ahead of every
+            // Makefile the read had still to remake.
+            Source::Unopened(err) => {
+                self.note_unread_include(fname.clone(), required, loc, &crate::strerror(&err));
+                return Ok(());
+            }
+            // Opened, and then would not read. GNU Make does not defer this one:
+            // `readline` finds `ferror` and calls `pfatal_with_name`
+            // (read.c:2744), which names the file under Make's own name and
+            // stops. No location, because the failure is the file's rather than
+            // the including line's — this is the path `include`ing a directory
+            // takes, where the open succeeds and only the read says so.
             Source::Unreadable(err) => error_loc!(
                 self,
-                self.loc.as_ref(),
-                "{}: {}",
+                None,
+                "*** {}: {}",
                 filename.to_string_lossy(),
                 crate::strerror(&err)
             ),
+            // Out of descriptors or out of memory: about Make rather than about
+            // this file, and reported where the read was (read.c:347).
+            Source::Exhausted(err) => {
+                error_loc!(self, self.loc.as_ref(), "*** {}", crate::strerror(&err))
+            }
         };
 
         let v = fname.slice_ref(trim_leading_curdir(fname));
         self.note_read_makefile(v.clone(), required);
         self.note_makefile_list(v)?;
         let stmts = mk.stmts.lock().clone();
-        for stmt in stmts {
-            log!("{stmt:?}");
-            stmt.eval(self)?;
-        }
+        // The inclusion stack belongs to what the included file says, not to
+        // whether it could be obtained: a diagnostic about the open or the read
+        // already names the file and the line that asked for it, and stacking a
+        // second mention of the same line on top of it says nothing.
+        let read = 'read: {
+            for stmt in stmts {
+                log!("{stmt:?}");
+                if let Err(failed) = stmt.eval(self) {
+                    break 'read Err(failed);
+                }
+            }
+            Ok(())
+        };
+        anyhow::Context::with_context(read, || {
+            format!(
+                "In file included from {}:",
+                loc.as_ref()
+                    .map_or_else(String::new, |loc| loc.display(&self.session).to_string())
+            )
+        })?;
 
         if !self.profiled_files.is_empty() {
             for mk in std::mem::take(&mut self.profiled_files) {
@@ -2457,11 +2510,21 @@ impl Evaluator {
             .push(ReadMakefile { filename, required });
     }
 
-    pub(crate) fn note_missing_include(
+    /// Record a Makefile the read wanted and did not get, with the system's own
+    /// words for why.
+    ///
+    /// Absence is one reason among several rather than the only one. GNU Make
+    /// stores whatever `errno` the open left on the goaldep and says nothing
+    /// (read.c:347), so a file that is not there and a file that would not open
+    /// reach the update as the same kind of entry — one the update remakes if a
+    /// rule says how, and refuses over otherwise — and differ only in the words
+    /// the complaint quotes.
+    pub(crate) fn note_unread_include(
         &mut self,
         filename: Bytes,
         required: bool,
         loc: Option<Loc>,
+        reason: &str,
     ) {
         self.note_read_makefile(filename.clone(), required);
         let filename = self.session.intern(filename);
@@ -2477,6 +2540,7 @@ impl Evaluator {
             filename,
             required,
             loc,
+            reason: reason.to_owned(),
         });
     }
 
@@ -2490,24 +2554,21 @@ impl Evaluator {
             let pat = self.at_include_dirs(pat);
             let files = self.session.glob(pat.clone());
 
-            let missing = match files.as_ref() {
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-                Err(err) => {
-                    if stmt.should_exist {
-                        error_loc!(
-                            self,
-                            self.loc.as_ref(),
-                            "{}: {}",
-                            String::from_utf8_lossy(&pat),
-                            crate::strerror(err)
-                        );
-                    }
-                    continue;
-                }
-                Ok(files) => files.is_empty(),
+            // A name the read did not get, and why. GNU Make treats every such
+            // name alike: it never globs a plain `include` at all, it calls
+            // `fopen` and keeps whatever errno that left (read.c:347), so a
+            // directory component with no search permission arrives as
+            // `Permission denied` on the name and is deferred to the update
+            // exactly as absence is. Reporting it here would end the run ahead
+            // of the Makefiles the read still had to remake.
+            let unread = match files.as_ref() {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(absent()),
+                Err(err) => Some(crate::strerror(err)),
+                Ok(files) if files.is_empty() => Some(absent()),
+                Ok(_) => None,
             };
-            if missing {
-                self.note_missing_include(pat, stmt.should_exist, Some(stmt.loc()));
+            if let Some(reason) = unread {
+                self.note_unread_include(pat, stmt.should_exist, Some(stmt.loc()), &reason);
                 continue;
             }
             let Ok(files) = files.as_ref() else {
@@ -2530,14 +2591,7 @@ impl Evaluator {
 
                 {
                     let _frame = self.enter(FrameType::Parse, fname.clone(), stmt.loc());
-                    let included_from = format!(
-                        "In file included from {}:",
-                        stmt.loc().display(&self.session)
-                    );
-                    anyhow::Context::with_context(
-                        self.do_include(fname, stmt.should_exist),
-                        || included_from,
-                    )?;
+                    self.do_include(fname, stmt.should_exist)?;
                 }
             }
         }

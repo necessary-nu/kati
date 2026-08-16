@@ -104,7 +104,7 @@ pub fn get_makefile(session: &mut Session, filename: &OsStr) -> Result<Source> {
         Source::Absent => {
             session.makefiles.cache.insert(filename, None);
         }
-        Source::Unreadable(_) => {
+        Source::Unopened(_) | Source::Unreadable(_) | Source::Exhausted(_) => {
             session.makefiles.extra_file_deps.insert(filename);
         }
     }

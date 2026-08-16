@@ -179,19 +179,30 @@ fn read_named_makefile(ev: &mut Evaluator, makefile: &OsStr) -> Result<()> {
     let _file_frame = ev.enter(FrameType::Parse, name.clone(), Loc::default());
     let mk = match ev.session.get_makefile(makefile)? {
         Source::Read(mk) => mk,
-        Source::Absent => {
-            warn_loc!(
-                ev,
-                None,
-                "{}: No such file or directory",
-                makefile.to_string_lossy()
-            );
-            ev.note_missing_include(name, true, None);
+        // A file that is not there and a file that would not open are one
+        // answer here, and GNU Make reports both from the same line: it is
+        // `perror_with_name ("", *makefiles)` after `eval_makefile` returns
+        // (read.c:219), which quotes whatever errno the open left. So the
+        // complaint is made here, under Make's own name because no `include`
+        // line asked for the file, and the name still goes on to the update as
+        // a target it must reach — which a later Makefile may yet supply a rule
+        // for.
+        source @ (Source::Absent | Source::Unopened(_)) => {
+            let reason = match &source {
+                Source::Unopened(err) => crate::strerror(err),
+                _ => crate::strerror(&std::io::Error::from_raw_os_error(libc::ENOENT)),
+            };
+            warn_loc!(ev, None, "{}: {reason}", makefile.to_string_lossy());
+            ev.note_unread_include(name, true, None, &reason);
             return Ok(());
         }
-        // No `include` asked for this one, so there is no line to point
-        // at; the diagnostic still has to say which file and why.
-        Source::Unreadable(err) => error_loc!(
+        // Opened and then unreadable, or Make itself out of descriptors: GNU
+        // Make defers neither. `readline` finds `ferror` and calls
+        // `pfatal_with_name` (read.c:2744), and the three exhaustion errnos are
+        // fatal where the open happened (read.c:347). No `include` asked for
+        // this one, so there is no line to point at; the diagnostic still has to
+        // say which file and why.
+        Source::Unreadable(err) | Source::Exhausted(err) => error_loc!(
             ev,
             None,
             "*** {}: {}",
@@ -426,20 +437,25 @@ fn read_makefiles_variable(ev: &mut Evaluator) -> Result<()> {
     Ok(())
 }
 
-/// One name from `MAKEFILES`: read if it opens, passed over in silence if it is
-/// not there, and never allowed to choose the default goal.
+/// One name from `MAKEFILES`: read if it opens, passed over in silence if it
+/// does not, and never allowed to choose the default goal.
 ///
-/// Not being there is the only thing `RM_DONTCARE` forgives. A name that exists
-/// and will not be read — a directory, a file with no permission — is the
-/// failure `-f` reports for the same name, under Make's own name because no
-/// makefile line asked for it.
+/// `RM_DONTCARE` forgives the whole of the open, not absence alone. GNU Make
+/// reads these with `eval_makefile (name, RM_NO_DEFAULT_GOAL|RM_INCLUDED|
+/// RM_DONTCARE)` (read.c:204) and never looks at `errno` afterwards the way the
+/// `-f` loop does, so a name with no permission is as quiet as a name nothing is
+/// at — `MAKEFILES=secret.mk` builds the goals and says nothing at all.
+///
+/// A read that fails after the open succeeded is not forgiven by anything: it is
+/// `pfatal_with_name` from inside `readline` (read.c:2744), which is why
+/// `MAKEFILES=<a directory>` stops the run under Make's own name.
 fn read_makefiles_entry(ev: &mut Evaluator, name: &Bytes) -> Result<()> {
     let filename = OsString::from_vec(name.to_vec());
     let _file_frame = ev.enter(FrameType::Parse, name.clone(), Loc::default());
     let mk = match ev.session.get_makefile(&filename)? {
         Source::Read(mk) => mk,
-        Source::Absent => return Ok(()),
-        Source::Unreadable(err) => error_loc!(
+        Source::Absent | Source::Unopened(_) => return Ok(()),
+        Source::Unreadable(err) | Source::Exhausted(err) => error_loc!(
             ev,
             None,
             "*** {}: {}",

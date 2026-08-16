@@ -228,6 +228,20 @@ impl Drop for Unbind {
 pub struct RegenerationRoot {
     pub node: NamedDepNode,
     pub required: bool,
+    /// Whether the read wanted this file's contents and did not get them.
+    ///
+    /// GNU Make answers that with the file's timestamp rather than with a flag:
+    /// `eval_makefile` writes `deps->file->last_mtime = NONEXISTENT_MTIME` on
+    /// the same two lines that record the errno (read.c:409), so a Makefile that
+    /// would not open is one that is not there as far as every later question is
+    /// concerned. That is what makes its rule run — a file with a recipe and no
+    /// prerequisites is up to date when it exists, and this says it does not —
+    /// and it is the difference between an unopenable include being repaired by
+    /// its own rule and being quietly done without.
+    ///
+    /// Absence sets it too, and means nothing there: the file really is missing,
+    /// so the frontend would have reached the same answer by looking.
+    pub unread: bool,
 }
 
 /// What dependency analysis made of one read.
@@ -2474,17 +2488,18 @@ impl<'a> DepBuilder<'a> {
         } in read_makefiles
         {
             let node = self.plan_root(makefile)?;
+            let unread = missing_includes
+                .iter()
+                .find(|include| include.filename == makefile);
             if Self::is_remakable(&node) {
                 nodes.push(RegenerationRoot {
                     node: (makefile, node),
                     required,
+                    unread: unread.is_some(),
                 });
                 continue;
             }
-            let Some(include) = missing_includes
-                .iter()
-                .find(|include| include.filename == makefile)
-            else {
+            let Some(include) = unread else {
                 continue;
             };
             if !required {
@@ -2498,11 +2513,15 @@ impl<'a> DepBuilder<'a> {
             // refusal is left. An `include` line has one, and GNU Make holds
             // that complaint back until it refuses — so it is rendered here,
             // where the location is known, and printed with the refusal.
+            // The words are the read's, not this line's: GNU Make stores the
+            // open's `errno` on the goaldep and `show_goal_error` prints
+            // `strerror` of it, so a file with no permission complains in its own
+            // terms rather than being called absent.
             let complaint = include.loc.as_ref().map(|loc| {
                 crate::color_warn_text(
                     &self.ev.session,
                     Some(loc),
-                    format!("{name}: No such file or directory"),
+                    format!("{name}: {}", include.reason),
                 )
             });
             let error = crate::color_error_log(
