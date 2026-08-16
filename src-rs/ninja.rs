@@ -1119,6 +1119,7 @@ impl<'a> NinjaGenerator<'a> {
         };
         let inputs = symbols(&node.deps);
         let order_only_inputs = symbols(&node.order_onlys);
+        let forgiven_order_only_inputs = named(&node.forgiven_order_onlys);
         let validations = symbols(&node.validations);
         let implicit_outputs = named(&node.implicit_outputs);
         let output = self.phony_aliases.resolve(node.output);
@@ -1193,6 +1194,7 @@ impl<'a> NinjaGenerator<'a> {
                 implicit_outputs: &implicit_outputs,
                 inputs: &inputs,
                 order_only_inputs: &order_only_inputs,
+                forgiven_order_only_inputs: &forgiven_order_only_inputs,
                 validations: &validations,
                 always_dirty: node.is_phony || node.unconditional_double_colon,
                 deferred_freshness_outputs: &deferred_freshness_outputs,
@@ -1868,6 +1870,7 @@ mod tests {
                     implicit_outputs: &[],
                     inputs: &[input],
                     order_only_inputs: &[],
+                    forgiven_order_only_inputs: &[],
                     validations: &[],
                     always_dirty: true,
                     deferred_freshness_outputs: &[],

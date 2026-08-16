@@ -306,6 +306,17 @@ pub struct SinkEdge<'a> {
     /// Inputs that must exist before the command runs but whose timestamps do
     /// not make it dirty.
     pub order_only_inputs: &'a [Symbol],
+    /// The subset of [`Self::order_only_inputs`] whose failure this edge is
+    /// willing to outlive: the wait holds and the status waited for is
+    /// discarded.
+    ///
+    /// Ninja's manifest has no spelling for it — an order-only input there
+    /// blocks its consumer when it fails — so a sink that writes `build.ninja`
+    /// ignores this and a sink with scheduler support keeps it as graph
+    /// metadata. It exists because GNU Make's double-colon chain under `-k`
+    /// runs a target's later entries after an earlier entry failed, which is an
+    /// ordering with the status taken out of it.
+    pub forgiven_order_only_inputs: &'a [Symbol],
     /// Targets to build alongside this one, whose results it does not consume.
     pub validations: &'a [Symbol],
     /// The Make target is `.PHONY`: it names no file, so nothing can find it up

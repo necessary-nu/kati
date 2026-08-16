@@ -386,6 +386,15 @@ pub struct DepNode {
     pub cmds: Vec<Arc<Value>>,
     pub deps: Vec<NamedDepNode>,
     pub order_onlys: Vec<NamedDepNode>,
+    /// The order-only inputs whose failure this node is willing to outlive.
+    ///
+    /// A subset of [`Self::order_onlys`]: the wait still holds, and the status
+    /// waited for is discarded. Under `-k` GNU Make walks a double-colon
+    /// chain past an entry that failed and runs the target's later entries
+    /// (`remake.c`: the chain loop abandons the rest only when `keep_going_flag`
+    /// is clear), so the edge that serialises one entry behind another has to
+    /// mean "after it, whatever it did" rather than "after it succeeded".
+    pub forgiven_order_onlys: Vec<Symbol>,
     pub validations: Vec<NamedDepNode>,
     pub has_rule: bool,
     /// Whether this node is the first rule of the read. Read only where a
@@ -504,6 +513,7 @@ impl DepNode {
             cmds: Vec::new(),
             deps: Vec::new(),
             order_onlys: Vec::new(),
+            forgiven_order_onlys: Vec::new(),
             validations: Vec::new(),
             has_rule: false,
             is_default_target: false,
@@ -3839,10 +3849,14 @@ impl<'a> DepBuilder<'a> {
                     .iter()
                     .any(|(output, _)| *output == previous_output)
                 {
-                    action
-                        .lock()
-                        .order_onlys
-                        .push((previous_output, previous.clone()));
+                    let mut node = action.lock();
+                    node.order_onlys.push((previous_output, previous.clone()));
+                    // The chain is an ordering and nothing else. GNU Make runs
+                    // the next entry of a `::` target after the previous one
+                    // whatever the previous one did; without `-k` the run stops
+                    // at the failure before this entry could be reached anyway,
+                    // which is where the two answers come apart.
+                    node.forgiven_order_onlys.push(previous_output);
                 }
             }
         }
