@@ -242,6 +242,20 @@ pub struct RegenerationRoot {
     /// Absence sets it too, and means nothing there: the file really is missing,
     /// so the frontend would have reached the same answer by looking.
     pub unread: bool,
+    /// The located complaint about the read that did not happen, held until the
+    /// update decides this file is not coming after all.
+    ///
+    /// GNU Make holds it on the goaldep as an errno and prints it from
+    /// `show_goal_error`, which has two callers: `complain()` for a file nothing
+    /// can make, and `child_error` (job.c:581) for a rule that ran and lost. So a
+    /// Makefile with a rule carries one too, and says it only if that rule loses
+    /// — a rule that wins starts the read over, and the file it wrote is read
+    /// rather than complained about.
+    ///
+    /// `None` when the read got the file, when `-include` asked for it, and for
+    /// a Makefile the command line named — no `include` line, so no location,
+    /// and GNU Make reported that one from the read.
+    pub complaint: Option<String>,
 }
 
 /// What dependency analysis made of one read.
@@ -2491,11 +2505,39 @@ impl<'a> DepBuilder<'a> {
             let unread = missing_includes
                 .iter()
                 .find(|include| include.filename == makefile);
+            // The held complaint, rendered wherever the read's failure is known
+            // and printed wherever the update decides the file is not coming.
+            // `show_goal_error` has two callers and only one guard between them:
+            // `(goal_dep->flags & (RM_INCLUDED|RM_DONTCARE)) != RM_INCLUDED`
+            // returns, so a required `include` complains, `-include` never does,
+            // and a file the command line named — which is not RM_INCLUDED and
+            // has no line to point at — was already reported by the read.
+            let complaint = unread
+                .filter(|_| required)
+                .and_then(|include| include.loc.as_ref().map(|loc| (include, loc)))
+                .map(|(include, loc)| {
+                    let name = include.filename.as_bytes(&self.ev.session);
+                    // The words are the read's, not this line's: GNU Make stores
+                    // the open's `errno` on the goaldep and prints `strerror` of
+                    // it, so a file with no permission complains in its own terms
+                    // rather than being called absent.
+                    crate::color_warn_text(
+                        &self.ev.session,
+                        Some(loc),
+                        format!("{}: {}", String::from_utf8_lossy(&name), include.reason),
+                    )
+                });
             if Self::is_remakable(&node) {
+                // A required include with a rule still holds its complaint, for
+                // the second `show_goal_error` caller: `child_error` (job.c:581)
+                // prints it when that rule loses, one line ahead of naming the
+                // failure. Until then it is never said at all — the rule is
+                // expected to succeed and the read to start over.
                 nodes.push(RegenerationRoot {
                     node: (makefile, node),
                     required,
                     unread: unread.is_some(),
+                    complaint,
                 });
                 continue;
             }
@@ -2507,23 +2549,8 @@ impl<'a> DepBuilder<'a> {
             }
             let name = include.filename.as_bytes(&self.ev.session);
             let name = String::from_utf8_lossy(&name).into_owned();
-            // A Makefile the command line named carries no location, because no
-            // `include` line asked for it. GNU Make reports that one where it
-            // failed to open, so the read has already said so and only the
-            // refusal is left. An `include` line has one, and GNU Make holds
-            // that complaint back until it refuses — so it is rendered here,
-            // where the location is known, and printed with the refusal.
-            // The words are the read's, not this line's: GNU Make stores the
-            // open's `errno` on the goaldep and `show_goal_error` prints
-            // `strerror` of it, so a file with no permission complains in its own
-            // terms rather than being called absent.
-            let complaint = include.loc.as_ref().map(|loc| {
-                crate::color_warn_text(
-                    &self.ev.session,
-                    Some(loc),
-                    format!("{name}: {}", include.reason),
-                )
-            });
+            // The first `show_goal_error` caller: `complain()` at remake.c:414,
+            // the refusal over a file nothing knows how to make.
             let error = crate::color_error_log(
                 &self.ev.session,
                 None,
