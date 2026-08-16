@@ -142,6 +142,28 @@ pub enum FileEvaluation {
     Expansion,
 }
 
+/// Who performs an `$(info ...)`, `$(warning ...)` or `$(error ...)` written
+/// inside a recipe.
+///
+/// GNU Make performs all three while it expands the recipe, in `new_job`,
+/// before any command line exists. The text is not a command and never becomes
+/// one: a recipe whose whole expansion is `$(info X)` prints X and then has no
+/// command line at all, so no shell starts, the target reports up to date, and
+/// `-q` answers zero. kati turned each into a `printf` written into the recipe,
+/// which is the only thing a manifest writer can do — the text has to survive
+/// to a run that happens on another day. A destination that runs the build
+/// itself expands the recipe in the process that is about to run it, which is
+/// exactly where GNU Make prints.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputEvaluation {
+    /// Written into the recipe as a command that prints when it runs, which is
+    /// kati's own behaviour and what a manifest writer keeps.
+    RecipeCommand,
+    /// Performed while the recipe is expanded, which is GNU Make's
+    /// `func_info`, `func_warning` and `func_error`.
+    Expansion,
+}
+
 /// A pool kati declares for itself.
 ///
 /// Pools kati only *refers* to — the ones `.KATI_NINJA_POOL` and
@@ -415,6 +437,18 @@ pub trait BuildSink {
     /// itself, so it performs it where GNU Make performs it.
     fn file_evaluation(&self) -> FileEvaluation {
         FileEvaluation::Refused
+    }
+
+    /// Who performs an `$(info ...)`, `$(warning ...)` or `$(error ...)`
+    /// written inside a recipe.
+    ///
+    /// A manifest writer defers all three into the recipe, because the
+    /// expansion that would print happens while the manifest is written and
+    /// the text has to reach whoever runs it later. Ronin's direct graph sink
+    /// expands the recipe in the process that runs it, so it prints where GNU
+    /// Make prints and leaves no command behind.
+    fn output_evaluation(&self) -> OutputEvaluation {
+        OutputEvaluation::RecipeCommand
     }
 
     /// When this sink wants a recipe turned into command text.

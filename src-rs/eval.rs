@@ -27,7 +27,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use memchr::memchr;
 use parking_lot::Mutex;
 
-use crate::build_sink::{FileEvaluation, NewInputsTiming, ShellEvaluation};
+use crate::build_sink::{FileEvaluation, NewInputsTiming, OutputEvaluation, ShellEvaluation};
 use crate::expr::{Evaluable, ParseExprOpt, Value, parse_expr};
 use crate::file::Source;
 use crate::flags::Flags;
@@ -850,6 +850,9 @@ pub struct Evaluator {
     /// Whether the selected destination performs a `$(file ...)` in a recipe
     /// or refuses it.
     pub(crate) file_evaluation: FileEvaluation,
+    /// Whether the selected destination prints an `$(info ...)` in a recipe
+    /// where GNU Make prints it, or writes it into the recipe as a command.
+    pub(crate) output_evaluation: OutputEvaluation,
     /// `filter-out` patterns applied to the deferred `$?` marker while the
     /// current recipe is expanded.
     pub(crate) deferred_new_inputs_filter_out: Vec<Bytes>,
@@ -1059,6 +1062,7 @@ impl Evaluator {
             new_inputs_timing: NewInputsTiming::RecipeShell,
             shell_evaluation: ShellEvaluation::RecipeShell,
             file_evaluation: FileEvaluation::Refused,
+            output_evaluation: OutputEvaluation::RecipeCommand,
             deferred_new_inputs_filter_out: Vec::new(),
             eval_depth: 0,
             delayed_output_commands: Vec::new(),
@@ -2886,6 +2890,18 @@ impl Evaluator {
     /// destination that runs the build performs it where GNU Make does.
     pub fn refuses_file_operations(&self) -> bool {
         self.avoid_io && self.file_evaluation == FileEvaluation::Refused
+    }
+
+    /// Whether an `$(info ...)`, `$(warning ...)` or `$(error ...)` reached
+    /// from here becomes a command in the recipe rather than happening now.
+    ///
+    /// The same split again, and the one where GNU Make's own answer is the
+    /// most visible: it prints while it expands, so a recipe that is nothing
+    /// but the call has no command line and starts no shell. Only a recipe
+    /// being compiled for a manifest defers, because there the expansion and
+    /// the run are different days.
+    pub fn defers_output_to_the_recipe(&self) -> bool {
+        self.avoid_io && self.output_evaluation == OutputEvaluation::RecipeCommand
     }
 
     pub fn get_shell(&mut self) -> Result<Bytes> {

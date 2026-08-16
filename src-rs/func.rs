@@ -1185,7 +1185,7 @@ fn deferred_output(message: &[u8], suffix: &[u8]) -> Bytes {
 
 fn info_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> Result<()> {
     let a = args[0].eval_to_buf(ev)?;
-    if ev.avoid_io {
+    if ev.defers_output_to_the_recipe() {
         ev.delayed_output_commands.push(deferred_output(&a, b""));
     } else {
         println!("{}", String::from_utf8_lossy(&a));
@@ -1195,7 +1195,7 @@ fn info_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> 
 
 fn warning_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> Result<()> {
     let a = args[0].eval_to_buf(ev)?;
-    if ev.avoid_io {
+    if ev.defers_output_to_the_recipe() {
         let mut message = BytesMut::new();
         let loc = ev.loc.clone().unwrap_or_default();
         message.put_slice(loc.display(&ev.session).to_string().as_bytes());
@@ -1211,7 +1211,7 @@ fn warning_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) 
 
 fn error_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> Result<()> {
     let a = args[0].eval_to_buf(ev)?;
-    if ev.avoid_io {
+    if ev.defers_output_to_the_recipe() {
         let mut message = BytesMut::new();
         let loc = ev.loc.clone().unwrap_or_default();
         message.put_slice(loc.display(&ev.session).to_string().as_bytes());
