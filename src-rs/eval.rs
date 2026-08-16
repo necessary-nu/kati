@@ -784,6 +784,31 @@ fn var_identity(var: &Var) -> usize {
     Arc::as_ptr(var) as *const () as usize
 }
 
+/// One planned target's scope, and enough of the graph around it to say who
+/// else reads what is written into it.
+///
+/// GNU Make needs none of this: `initialize_file_variables` chains a file's
+/// variable sets in front of its parent's, so a write into a target's set at
+/// any point in the run is seen through the link by everything that has not
+/// been expanded yet. Ronin flattens the chain when it plans — each node holds
+/// a copy — so a write arriving afterwards has to be carried down the same link
+/// by hand.
+pub(crate) struct PlannedScope {
+    /// The scope the target's own recipe reads.
+    pub(crate) vars: Arc<Vars>,
+    /// Each name the target bound in its own right, and whether that binding
+    /// survives into what its inheritors read.
+    ///
+    /// The two answers separate: the target's own copy is shadowed by any
+    /// binding of its own, but only a public one shadows for the targets
+    /// beneath it, because a `private` binding is stepped over rather than
+    /// stopped at.
+    pub(crate) own: HashMap<Symbol, bool>,
+    /// The targets whose `file->parent` is this one, so the ones this scope is
+    /// the next link for.
+    pub(crate) inheritors: Vec<Symbol>,
+}
+
 /// Make evaluation, over a session it owns.
 ///
 /// Every diagnostic raised during evaluation renders a symbol or a location, so
@@ -914,7 +939,7 @@ pub struct Evaluator {
     ///
     /// Empty until the graph is built, which is exactly when a write through it
     /// could still be read.
-    pub(crate) planned_scopes: HashMap<Symbol, Arc<Vars>>,
+    pub(crate) planned_scopes: HashMap<Symbol, PlannedScope>,
 
     /// Names whose exported answer a recipe has changed since the graph was
     /// compiled.
@@ -1861,7 +1886,11 @@ impl Evaluator {
             // reason.
             let planned = self
                 .rules_snapped
-                .then(|| self.planned_scopes.get(target).cloned())
+                .then(|| {
+                    self.planned_scopes
+                        .get(target)
+                        .map(|scope| scope.vars.clone())
+                })
                 .flatten();
             let planned_scope = planned.is_some();
             let fresh = !self.rule_vars.contains_key(target);
@@ -1954,10 +1983,55 @@ impl Evaluator {
                 if assignment.is_final {
                     rhs_var.write().readonly = true;
                 }
+                // Written last, so what travels down the link is the binding
+                // with its `private` and `export` marks already on it.
+                if planned_scope && !modifiers.directive.is_private {
+                    self.inherit_planned_assignment(*target, var_sym, &rhs_var);
+                }
             }
             self.current_scope = None
         }
         Ok(())
+    }
+
+    /// Carry a recipe-time target-specific assignment down the inheritance
+    /// links, as GNU Make's chain of variable sets carries it for free.
+    ///
+    /// `initialize_file_variables` puts a file's own set in front of its
+    /// parent's, so a prerequisite does not hold a copy of what its parent
+    /// bound — it holds a link to it, and a write into the parent's set is read
+    /// through that link by anything not yet expanded. Ronin copies instead, so
+    /// the write is made into each copy the link leads to.
+    ///
+    /// Two questions decide how far it goes, and they are not the same one. A
+    /// target that bound the name itself does not take the write, because its
+    /// own binding is what its recipe reads. But only a PUBLIC binding of its
+    /// own stops the walk there: a `private` one is stepped over by whatever
+    /// reads across the link, so the targets beneath it still take the write.
+    fn inherit_planned_assignment(&mut self, target: Symbol, name: Symbol, var: &Var) {
+        let mut visited = HashSet::new();
+        visited.insert(target);
+        let mut frontier = self
+            .planned_scopes
+            .get(&target)
+            .map(|scope| scope.inheritors.clone())
+            .unwrap_or_default();
+        while let Some(inheritor) = frontier.pop() {
+            if !visited.insert(inheritor) {
+                continue;
+            }
+            let Some(scope) = self.planned_scopes.get(&inheritor) else {
+                continue;
+            };
+            let own = scope.own.get(&name).copied();
+            if own.is_none() {
+                let mut readonly = false;
+                let _ = scope.vars.assign(name, var.clone(), &mut readonly);
+            }
+            if own != Some(true) {
+                frontier.extend(scope.inheritors.iter().copied());
+            }
+        }
     }
 
     pub fn eval_rule(&mut self, stmt: &RuleStmt) -> Result<()> {

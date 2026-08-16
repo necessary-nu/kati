@@ -114,6 +114,15 @@ pub struct Session {
     /// a later directive for the same pattern extends it rather than replacing
     /// it.
     pub vpaths: Vec<(crate::strutil::Pattern, Vec<Bytes>)>,
+    /// `.SUFFIXES` as the whole read left it, in the order it was written, each
+    /// entry keeping its leading dot.
+    ///
+    /// Settled once the last Makefile is closed, because `.SUFFIXES:` clears
+    /// the list and a later line adds to what is left. It decides which suffix
+    /// rules exist, and it is also what `$*` reads for an explicit rule: GNU
+    /// Make's `set_file_variables` walks this list rather than a fixed table,
+    /// so a Makefile that rewrote it moves that answer too.
+    pub suffixes: Vec<Bytes>,
 }
 
 impl Default for Session {
@@ -166,6 +175,7 @@ impl Session {
             used_undefined_vars: HashSet::new(),
             shell_status: None,
             vpaths: Vec::new(),
+            suffixes: Vec::new(),
         }
     }
 

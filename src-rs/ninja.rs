@@ -1127,7 +1127,29 @@ impl<'a> NinjaGenerator<'a> {
         let deferred_freshness_outputs = if let Some(action) = &node.grouped_double_action {
             named(&action.members)
         } else if nn.deferred_new_inputs {
-            vec![self.phony_aliases.resolve(node.recipe_output)]
+            // Every name the edge was reached for decides its freshness, not
+            // only the one whose recipe is about to be expanded. A pattern rule
+            // spelling several target patterns is one recipe over targets that
+            // each answer for themselves, so a second target being absent is a
+            // reason to run it — and a recipe naming `$?` is the one that gets
+            // its answer here rather than from the scan's own stat loop, which
+            // `is_virtual_output` has taken these names out of.
+            //
+            // A peer is the exception and the same one the ordinary path makes:
+            // a name nobody asked for neither forces the recipe by being absent
+            // nor is compared against anything.
+            let peers = node.peer_outputs.iter().copied().collect::<HashSet<_>>();
+            let mut reached = Vec::with_capacity(1 + node.implicit_outputs.len());
+            for name in std::iter::once(node.recipe_output)
+                .chain(node.implicit_outputs.iter().copied())
+                .filter(|name| !peers.contains(name))
+            {
+                let name = self.phony_aliases.resolve(name);
+                if !reached.contains(&name) {
+                    reached.push(name);
+                }
+            }
+            reached
         } else {
             Vec::new()
         };

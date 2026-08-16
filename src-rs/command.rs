@@ -202,6 +202,24 @@ impl AutoCommandVar {
                         &current_dep_node.recipe_output.as_bytes(names),
                         &Bytes::from_static(b"%"),
                     ));
+                } else {
+                    // An explicit rule has no match to read a stem out of, and
+                    // Unix Make's answer for one is the target name with a
+                    // known suffix taken off. `set_file_variables`
+                    // (src/commands.c:97) walks `.SUFFIXES` in the order the
+                    // read left it and stops at the first entry the name ends
+                    // with, so which of two suffixes is found is a question
+                    // about the list's order rather than about which is
+                    // longer, and a name the list does not reach reads as
+                    // empty. The name has to be longer than the suffix, so a
+                    // target named for the suffix itself has no stem either.
+                    let name = current_dep_node.recipe_output.as_bytes(names);
+                    for suffix in &ev.session.suffixes {
+                        if name.len() > suffix.len() && name.ends_with(suffix.as_ref()) {
+                            out.put_slice(&name[..name.len() - suffix.len()]);
+                            break;
+                        }
+                    }
                 }
             }
             AutoCommand::Question {

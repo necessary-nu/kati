@@ -28,7 +28,7 @@ use std::{
 
 use crate::{
     error_loc,
-    eval::{Evaluator, FrameType, MissingInclude, ReadMakefile, ScopedFrame},
+    eval::{Evaluator, FrameType, MissingInclude, PlannedScope, ReadMakefile, ScopedFrame},
     expr::{Evaluable, Value},
     loc::Loc,
     log,
@@ -104,8 +104,26 @@ struct RuleBinding {
     guard: ScopedVar,
     kind: RuleScopeKind,
     sym: Symbol,
-    var: Var,
+    /// What anything reading across the parent link reads, which is not always
+    /// what the target's own recipe read — `guard` holds that one. The two
+    /// differ where a `+=` had to walk past a `private` binding for its base,
+    /// which GNU decides per reader rather than once.
+    public: Var,
     private: bool,
+}
+
+/// Fold one variable set's outcome into what a reader outside the target sees.
+///
+/// A set is one hash table slot per name in GNU Make, so only what the set was
+/// left holding is asked about — and if that carries `private`, the set
+/// contributes nothing at all to the outward view, whatever an earlier binding
+/// in it left there.
+fn commit_public(public: &mut HashMap<Symbol, Var>, set: HashMap<Symbol, (Var, bool)>) {
+    for (sym, (var, private)) in set {
+        if !private {
+            public.insert(sym, var);
+        }
+    }
 }
 
 /// Unwind a target's rule bindings down to what its prerequisites may read.
@@ -125,7 +143,20 @@ struct RuleBinding {
 /// rather than what is outermost, and it lets an earlier public binding show
 /// through a later private one that overwrote it inside the same set, where
 /// GNU has kept only the last.
-fn release_private(bindings: Vec<RuleBinding>, session: &Session) -> Vec<ScopedVar> {
+///
+/// What is laid down is the binding's `public` value rather than the one its
+/// own recipe read. A `+=` walks the chain again for its base
+/// (`variable_append`, src/expand.c:511) under the reader's own `local`, so a
+/// binding the target's recipe appended to may be one this walk stepped over —
+/// and then the surviving name's value is not the one the target itself saw.
+///
+/// Also reports each name the run bound and whether it survived, which is
+/// [`DepNode::own_rule_vars`]: a write arriving after the graph is planned needs
+/// both answers to know how far down the inheritance chain it reaches.
+fn release_private(
+    bindings: Vec<RuleBinding>,
+    session: &Session,
+) -> (Vec<ScopedVar>, Vec<(Symbol, bool)>) {
     // What each set is left holding for a name: one entry, the last written,
     // exactly as one hash table slot is.
     let mut surviving: HashMap<(Symbol, RuleScopeKind), (Var, bool)> = HashMap::new();
@@ -133,20 +164,22 @@ fn release_private(bindings: Vec<RuleBinding>, session: &Session) -> Vec<ScopedV
     for binding in &bindings {
         surviving.insert(
             (binding.sym, binding.kind),
-            (binding.var.clone(), binding.private),
+            (binding.public.clone(), binding.private),
         );
         scope.get_or_insert_with(|| binding.guard.scope());
     }
     let Some(scope) = scope else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
 
     // Every name the run bound, in GNU's walk order per name.
     let mut public = Vec::new();
+    let mut own = Vec::new();
     let mut names = surviving.keys().map(|(sym, _)| *sym).collect::<Vec<_>>();
     names.sort_by_cached_key(|sym| sym.as_bytes(session));
     names.dedup();
     for sym in names {
+        let mut survives = false;
         for kind in [RuleScopeKind::Own, RuleScopeKind::Pattern] {
             let Some((var, private)) = surviving.get(&(sym, kind)) else {
                 continue;
@@ -157,16 +190,21 @@ fn release_private(bindings: Vec<RuleBinding>, session: &Session) -> Vec<ScopedV
             // pattern's public binding rather than hiding the name outright.
             if !private {
                 public.push((sym, var.clone()));
+                survives = true;
                 break;
             }
         }
+        own.push((sym, survives));
     }
 
     unbind(bindings.into_iter().map(|binding| binding.guard).collect());
-    public
-        .into_iter()
-        .map(|(sym, var)| ScopedVar::new(scope.clone(), sym, var))
-        .collect()
+    (
+        public
+            .into_iter()
+            .map(|(sym, var)| ScopedVar::new(scope.clone(), sym, var))
+            .collect(),
+        own,
+    )
 }
 
 /// Hold a group of scope bindings for as long as the guard lives.
@@ -428,6 +466,24 @@ pub struct DepNode {
     /// only by that search; an explicit or static pattern rule leaves it None
     /// and `$*` is read off the pattern as before.
     pub stem: Option<Symbol>,
+    /// The target that reached this one first, which is what it inherits
+    /// target-specific variables from.
+    ///
+    /// GNU Make's `file->parent`, set by `update_file` the first time a name is
+    /// reached and never moved: `initialize_file_variables` then chains this
+    /// file's sets in front of that one's, so a name reached from two places
+    /// inherits from the first of them and from no other. Recorded because a
+    /// recipe-time `$(eval tgt: V = x)` has to reach every scope that link
+    /// leads to, which is a walk down these and not down the prerequisites.
+    pub planning_parent: Option<Symbol>,
+    /// Each name this target bound in its own right, and whether that binding
+    /// survives into what a target inheriting from this one reads.
+    ///
+    /// The pair is GNU's two questions about one binding: the target's own
+    /// recipe reads it whatever it is, and a `private` one is stepped over by
+    /// anything reading across the parent link. Kept so a write arriving after
+    /// the graph is planned knows where to stop.
+    pub own_rule_vars: Vec<(Symbol, bool)>,
     pub loc: Option<Loc>,
 }
 
@@ -471,6 +527,8 @@ impl DepNode {
             tags_var: None,
             output_pattern: None,
             stem: None,
+            planning_parent: None,
+            own_rule_vars: Vec::new(),
             loc: None,
         }))
     }
@@ -1285,14 +1343,6 @@ struct DepBuilder<'a> {
     /// The recipe `.DEFAULT` offers for a target with no rule of its own.
     default_rule: Option<Arc<Rule>>,
     suffix_rules: SuffixRuleMap,
-    /// `.SUFFIXES` as the whole read left it, in the order it was written.
-    ///
-    /// GNU Make derives every suffix rule from this list once the last Makefile
-    /// is closed, so it decides which rules exist rather than merely filtering
-    /// them: a bare `.SUFFIXES:` withdraws the built-in catalogue's suffix half
-    /// and a later line puts back whichever pairs it names. The entries keep
-    /// their leading dot, because that is how the pair's name is spelled.
-    suffixes: Vec<Bytes>,
     /// The name the invocation's own preamble is read under, which is how a
     /// `.SUFFIXES` Make wrote is told apart from one a Makefile wrote.
     bootstrap_filename: Symbol,
@@ -1428,7 +1478,6 @@ impl<'a> DepBuilder<'a> {
             wait_barriers: Vec::new(),
             default_rule: None,
             suffix_rules: HashMap::new(),
-            suffixes: Vec::new(),
             bootstrap_filename,
             extra_prereqs_var_name,
             global_extra_prereqs: (Vec::new(), Vec::new()),
@@ -1656,7 +1705,10 @@ impl<'a> DepBuilder<'a> {
         if self.ev.session.flags.no_builtin_rules && !written_by_makefile {
             declared.clear();
         }
-        self.suffixes = declared
+        // Published on the session rather than kept here: `$*` for an
+        // explicit rule reads the same list while a recipe expands, which is
+        // long after this builder is gone.
+        self.ev.session.suffixes = declared
             .iter()
             .map(|suffix| suffix.as_bytes(&self.ev.session))
             .collect();
@@ -1895,7 +1947,7 @@ impl<'a> DepBuilder<'a> {
     /// withhold.
     fn install_builtin_rules(&mut self) -> Result<()> {
         let withheld = self.ev.session.flags.no_builtin_rules;
-        for source in self.suffixes.clone() {
+        for source in self.ev.session.suffixes.clone() {
             self.install_suffix_disqualifier(&source)?;
             self.install_null_suffix_rule(&source, withheld)?;
         }
@@ -2008,14 +2060,20 @@ impl<'a> DepBuilder<'a> {
     /// A suffix-rule name read as the two declared suffixes it is written from,
     /// if both of them are on the list.
     fn declared_suffix_pair(&self, name: &str) -> Option<(Bytes, Bytes)> {
-        for source in &self.suffixes {
+        for source in &self.ev.session.suffixes {
             let Some(rest) = name.as_bytes().strip_prefix(source.as_ref()) else {
                 continue;
             };
             if rest.is_empty() {
                 continue;
             }
-            if let Some(target) = self.suffixes.iter().find(|target| target.as_ref() == rest) {
+            if let Some(target) = self
+                .ev
+                .session
+                .suffixes
+                .iter()
+                .find(|target| target.as_ref() == rest)
+            {
                 return Some((source.clone(), target.clone()));
             }
         }
@@ -2031,7 +2089,13 @@ impl<'a> DepBuilder<'a> {
     /// sort is stable, so two rules with the same source suffix keep the order
     /// population left them in, which is the later definition first.
     fn order_suffix_rules_by_suffix_list(&mut self) {
-        let order = self.suffixes.iter().map(undotted).collect::<Vec<_>>();
+        let order = self
+            .ev
+            .session
+            .suffixes
+            .iter()
+            .map(undotted)
+            .collect::<Vec<_>>();
         let names = &self.ev.session;
         for rules in self.suffix_rules.values_mut() {
             rules.sort_by_key(|rule| {
@@ -3664,8 +3728,12 @@ impl<'a> DepBuilder<'a> {
             scope.merge_from(vars);
             Arc::new(scope)
         });
-        let scoped_vars = release_private(bound, &self.ev.session);
-        action.lock().rule_vars = scope;
+        let (scoped_vars, own_rule_vars) = release_private(bound, &self.ev.session);
+        {
+            let mut node = action.lock();
+            node.rule_vars = scope;
+            node.own_rule_vars = own_rule_vars;
+        }
 
         // Each `::` record stands on its own, and what `.EXTRA_PREREQS` adds is
         // required of every one of them — out of the automatic variables here
@@ -4437,7 +4505,24 @@ impl<'a> DepBuilder<'a> {
         frame: &ScopedFrame,
         bound: &mut Vec<RuleBinding>,
     ) -> Result<()> {
+        // What a reader outside this target is left with for a name, which is
+        // GNU's `variable_append` walking with `local = 0`: a set holding the
+        // name `private` is stepped over, so a `+=` further in finds its base
+        // beyond it. Committed one set at a time, because a set is one hash
+        // slot per name and only what the set is left holding decides.
+        let mut public_now: HashMap<Symbol, Var> = HashMap::new();
+        let mut pending: HashMap<Symbol, (Var, bool)> = HashMap::new();
+        let mut installing: Option<RuleScopeKind> = None;
+        // What the name held before this run bound it at all, which is where
+        // the outward walk lands when every set it passed was `private`. It has
+        // to be taken as the name is first met: the scope is installed into as
+        // the run goes, so asking again later answers with the run's own work.
+        let mut outer: HashMap<Symbol, Option<Var>> = HashMap::new();
         for (kind, vars) in scopes.iter() {
+            if installing != Some(kind) {
+                commit_public(&mut public_now, std::mem::take(&mut pending));
+                installing = Some(kind);
+            }
             // Sorted because the order is observable and a HashMap's varies per
             // process. By name, not Make's order, which is as written — this
             // buys reproducibility only.
@@ -4459,27 +4544,78 @@ impl<'a> DepBuilder<'a> {
                 // fresh simple variable and would leave the keyword behind.
                 let is_private = var.read().is_private;
                 let mut new_var = var.clone();
+                let mut public_var = var.clone();
+                let standing = self.ev.lookup_var(*name)?;
+                if !outer.contains_key(name) {
+                    outer.insert(*name, standing.clone());
+                }
                 match var.read().assign_op {
                     Some(AssignOp::PlusEq) => {
-                        if let Some(old_var) = self.ev.lookup_var(*name)? {
+                        if let Some(old_var) = standing {
+                            // The base a reader outside the target would have
+                            // found: what an earlier binding in this same set
+                            // left — a set pastes onto its own slot whether or
+                            // not the slot is private — else what the sets
+                            // already committed left, else what stood before
+                            // the run, which is where a wholly private run
+                            // leaves the walk.
+                            let public_base = pending
+                                .get(name)
+                                .map(|(var, _)| var.clone())
+                                .or_else(|| public_now.get(name).cloned())
+                                .or_else(|| outer.get(name).cloned().flatten());
                             let mut s = old_var.read().eval_to_buf_mut(self.ev)?;
+                            let base_len = s.len();
                             if !s.is_empty() {
                                 s.put_u8(b' ')
                             }
                             new_var.read().eval(self.ev, &mut s)?;
+                            let joined = s.freeze();
+                            // The appended text, taken back out of the join
+                            // rather than expanded a second time: expanding it
+                            // twice would run whatever it reaches twice.
+                            let added =
+                                joined.slice(if base_len == 0 { 0 } else { base_len + 1 }..);
+                            let origin = old_var.read().origin();
+                            let loc = node.lock().loc.clone();
                             new_var = Variable::with_simple_string(
-                                s.freeze(),
-                                old_var.read().origin(),
+                                joined,
+                                origin,
                                 frame.current(),
-                                node.lock().loc.clone(),
+                                loc.clone(),
                             );
+                            public_var = match public_base {
+                                Some(base) if Arc::ptr_eq(&base, &old_var) => new_var.clone(),
+                                Some(base) => {
+                                    let mut s = base.read().eval_to_buf_mut(self.ev)?;
+                                    if !s.is_empty() {
+                                        s.put_u8(b' ')
+                                    }
+                                    s.put_slice(&added);
+                                    Variable::with_simple_string(
+                                        s.freeze(),
+                                        base.read().origin(),
+                                        frame.current(),
+                                        loc,
+                                    )
+                                }
+                                // Nothing outward to append to, so the walk
+                                // hands back the appended text on its own.
+                                None => Variable::with_simple_string(
+                                    added,
+                                    origin,
+                                    frame.current(),
+                                    loc,
+                                ),
+                            };
                         }
                     }
-                    Some(AssignOp::QuestionEq) if self.ev.lookup_var(*name)?.is_some() => {
+                    Some(AssignOp::QuestionEq) if standing.is_some() => {
                         continue;
                     }
                     _ => {}
                 }
+                pending.insert(*name, (public_var.clone(), is_private));
 
                 if *name == self.depfile_var_name {
                     node.lock().depfile_var = Some(new_var);
@@ -4499,7 +4635,7 @@ impl<'a> DepBuilder<'a> {
                         ),
                         kind,
                         sym: *name,
-                        var: new_var,
+                        public: public_var,
                         private: is_private,
                     });
                 }
@@ -4630,6 +4766,9 @@ impl<'a> DepBuilder<'a> {
             is_intermediate,
             is_intermediate && !self.all_secondary && !self.secondary.contains(&output),
         );
+        // Set here and only here: the memoised return above is what makes the
+        // first caller the parent, which is the whole of GNU Make's rule.
+        n.lock().planning_parent = needed_by;
         self.done.insert(output, n.clone());
 
         let Some(mut picked_rule_info) = self.pick_rule(output, &n)? else {
@@ -4871,7 +5010,8 @@ impl<'a> DepBuilder<'a> {
             v.merge_from(vars);
             Arc::new(v)
         });
-        let sv = release_private(bound, &self.ev.session);
+        let (sv, own_rule_vars) = release_private(bound, &self.ev.session);
+        n.lock().own_rule_vars = own_rule_vars;
 
         if self.ev.session.flags.warn_phony_looks_real
             && n.lock().is_phony
@@ -5122,11 +5262,37 @@ pub fn make_dep(
     // recipe can still reach the target it names. GNU Make never has to do this
     // — its target variables live on the file for the whole run — but Ronin's
     // live on the node, and this is the only route from a name to one.
-    let planned = db
+    //
+    // The inheritance link comes back with them, because the assignment reaches
+    // more than the target it names: everything whose scope was copied from
+    // that one and has not been expanded yet reads it too.
+    let mut planned: HashMap<Symbol, PlannedScope> = db
         .done
         .iter()
-        .filter_map(|(target, node)| node.lock().rule_vars.clone().map(|vars| (*target, vars)))
+        .filter_map(|(target, node)| {
+            let node = node.lock();
+            node.rule_vars.clone().map(|vars| {
+                (
+                    *target,
+                    PlannedScope {
+                        vars,
+                        own: node.own_rule_vars.iter().copied().collect(),
+                        inheritors: Vec::new(),
+                    },
+                )
+            })
+        })
         .collect();
+    let links = db
+        .done
+        .iter()
+        .filter_map(|(target, node)| node.lock().planning_parent.map(|parent| (parent, *target)))
+        .collect::<Vec<_>>();
+    for (parent, child) in links {
+        if let Some(scope) = planned.get_mut(&parent) {
+            scope.inheritors.push(child);
+        }
+    }
     db.ev.planned_scopes = planned;
     Ok(built)
 }
