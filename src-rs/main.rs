@@ -88,7 +88,13 @@ fn run(session: Session, orig_args: OsString) -> Result<i32> {
     // phase, so there is nothing to do between reaching the refusal and raising
     // it.
     if let Some(refusal) = refusal {
-        return Err(refusal);
+        // The complaint about the file that would not open is GNU Make's to
+        // print beside the refusal rather than at the read, so it is still
+        // held; with nothing to do in between, printing it is all that is left.
+        if let Some(complaint) = refusal.complaint {
+            eprintln!("{complaint}");
+        }
+        return Err(refusal.error);
     }
 
     if ev.session.flags.is_syntax_check_only {

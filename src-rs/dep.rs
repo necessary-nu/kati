@@ -202,7 +202,29 @@ pub struct Plan {
     pub regenerations: Vec<RegenerationRoot>,
     /// A required Makefile nothing can make, which ends the run once the
     /// Makefiles ahead of it have been brought up to date.
-    pub refusal: Option<anyhow::Error>,
+    pub refusal: Option<Refusal>,
+}
+
+/// A required Makefile the read could not open and no rule can make, with what
+/// GNU Make says about it, in the order it says it.
+///
+/// Both halves are held back rather than raised where they are discovered.
+/// GNU Make records the errno on the `goaldep` as `eval_makefile` fails to open
+/// the file and says nothing at all; the complaint comes out of
+/// `show_goal_error` beside the refusal, from inside the update that brings the
+/// makefiles up to date. So a run that remakes a Makefile ahead of this one
+/// narrates that work first, and both of these come after it.
+pub struct Refusal {
+    /// The located `No such file or directory`, rendered where the `include`
+    /// line that asked for the file is known, and printed where GNU Make
+    /// prints it.
+    ///
+    /// `None` for a Makefile the command line named: no `include` line asked
+    /// for it, so it has no location, and GNU Make reports that one from the
+    /// read instead.
+    pub complaint: Option<String>,
+    /// What ends the run.
+    pub error: anyhow::Error,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -2332,11 +2354,15 @@ impl<'a> DepBuilder<'a> {
     /// should start over. So the refusal is returned rather than raised: the
     /// roots collected before it are what the frontend has to build, and the
     /// refusal is what it raises once that is done.
+    ///
+    /// The located complaint goes with it, for the same reason and to the same
+    /// place: `show_goal_error` prints it from inside that update rather than
+    /// from the read, so the work the frontend does in between comes first.
     fn plan_regeneration(
         &mut self,
         read_makefiles: &[ReadMakefile],
         missing_includes: &[MissingInclude],
-    ) -> Result<(Vec<RegenerationRoot>, Option<anyhow::Error>)> {
+    ) -> Result<(Vec<RegenerationRoot>, Option<Refusal>)> {
         let mut nodes = Vec::new();
         for &ReadMakefile {
             filename: makefile,
@@ -2365,16 +2391,22 @@ impl<'a> DepBuilder<'a> {
             // A Makefile the command line named carries no location, because no
             // `include` line asked for it. GNU Make reports that one where it
             // failed to open, so the read has already said so and only the
-            // refusal is left.
-            if let Some(loc) = &include.loc {
-                warn_loc!(self.ev, Some(loc), "{name}: No such file or directory");
-            }
-            let refusal = crate::color_error_log(
+            // refusal is left. An `include` line has one, and GNU Make holds
+            // that complaint back until it refuses — so it is rendered here,
+            // where the location is known, and printed with the refusal.
+            let complaint = include.loc.as_ref().map(|loc| {
+                crate::color_warn_text(
+                    &self.ev.session,
+                    Some(loc),
+                    format!("{name}: No such file or directory"),
+                )
+            });
+            let error = crate::color_error_log(
                 &self.ev.session,
                 None,
                 format!("*** No rule to make target '{name}'."),
             );
-            return Ok((nodes, Some(refusal)));
+            return Ok((nodes, Some(Refusal { complaint, error })));
         }
         Ok((nodes, None))
     }

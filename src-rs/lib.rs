@@ -230,17 +230,31 @@ fn color_error_log(
 }
 
 fn color_warn_log(ctx: &impl crate::session::Context, loc: Option<&crate::loc::Loc>, msg: String) {
+    eprintln!("{}", color_warn_text(ctx, loc, msg));
+}
+
+/// The same diagnostic [`color_warn_log`] prints, returned instead of printed.
+///
+/// For the one complaint GNU Make does not make where it discovers it: an
+/// `include` line naming a file that would not open is recorded as it is read
+/// and reported later, from inside the update that brings the makefiles up to
+/// date (`show_goal_error`, `remake.c`). Rendering and emitting are separated
+/// so that the words are settled where the location is known and the moment is
+/// chosen elsewhere.
+pub fn color_warn_text(
+    ctx: &impl crate::session::Context,
+    loc: Option<&crate::loc::Loc>,
+    msg: String,
+) -> String {
     let Some(loc) = loc else {
         // With no file and line to lead with, GNU Make leads with its own name,
         // exactly as it does for a fatal raised from nowhere in particular.
         // Empty is kati's own binary, which has never led with anything.
         let program = &ctx.flags().program_name;
         if program.is_empty() {
-            eprintln!("{msg}");
-        } else {
-            eprintln!("{program}: {msg}");
+            return msg;
         }
-        return;
+        return format!("{program}: {msg}");
     };
     let loc = loc.display(ctx);
 
@@ -248,9 +262,9 @@ fn color_warn_log(ctx: &impl crate::session::Context, loc: Option<&crate::loc::L
         let mut filtered = trim_prefix_str(&msg, "*warning*: ");
         filtered = trim_prefix_str(filtered, "warning: ");
 
-        eprintln!("{BOLD}{loc}: {MAGENTA}warning: {RESET}{BOLD}{filtered}{RESET}")
+        format!("{BOLD}{loc}: {MAGENTA}warning: {RESET}{BOLD}{filtered}{RESET}")
     } else {
-        eprintln!("{loc}: {msg}")
+        format!("{loc}: {msg}")
     }
 }
 

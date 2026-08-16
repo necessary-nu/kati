@@ -85,8 +85,9 @@ pub struct Evaluated {
     /// the makefiles up to date, so the makefiles it reached before this one
     /// are remade first and the run ends afterwards. The refusal travels with
     /// the plan rather than in place of it, so a frontend can do that work in
-    /// between.
-    pub refusal: Option<anyhow::Error>,
+    /// between — and the located complaint about the file travels with the
+    /// refusal, because GNU Make prints that from the same place.
+    pub refusal: Option<crate::dep::Refusal>,
 }
 
 /// The Makefile kati reads before the real one.
