@@ -5418,11 +5418,41 @@ fn recipe_name(names: &impl Interner, node: &Arc<Mutex<DepNode>>) -> String {
 
 /// Take one prerequisite off the list it was written on.
 ///
-/// Both halves go: the edge, which is what the graph is built from, and the
-/// name beside it, which is what `$^` and `$?` are read from. The edge list is
+/// Both halves go, and they go by position rather than by name. The edge is
+/// what the graph is built from; the name beside it is what `$^`, `$+` and `$?`
+/// are read from, and the two lists are one list twice over — the edge list is
 /// the name list with the grouped record's own members appended, so an entry
-/// found before the names run out is that name — and a `&:` member, which was
+/// found before the names run out is that name, and a `&:` member, which was
 /// never a written prerequisite, leaves the names alone.
+///
+/// The position and the name part company under `--shuffle`, and GNU Make goes
+/// with the position. Its walk carries two chains over the same prerequisites —
+/// `->next` in written order and `->shuf` in the shuffled one — reads the file
+/// through the shuffled chain and unlinks through the written one
+/// (reference/gnumake/src/remake.c:596):
+///
+/// ```text
+///     d = du->shuf ? du->shuf : du;
+///     ...
+///     if (is_updating (d->file))
+///       {
+///         error (NILF, "Circular %s <- %s dependency dropped.", ...);
+///         if (lastd == 0) file->deps = du->next; else lastd->next = du->next;
+/// ```
+///
+/// So the message names `d` and the list loses `du`: the entry that goes is the
+/// one standing where the walk had got to, not the one that closed the loop.
+/// The two are the same entry in every unshuffled run, which is why this only
+/// shows under a shuffle — `t: x t` under `--shuffle=reverse` leaves `$^` as
+/// `t`, the sibling's name, because the shuffled chain reached `t` while the
+/// written chain was still at `x`.
+///
+/// Ronin's `deps` is the shuffled order and `actual_inputs` is the written one,
+/// and the walk enters `deps` in index order — so the index the walk had got to
+/// is GNU Make's written position, and taking the name at that index is what
+/// GNU Make unlinks. The edge itself still goes with the loop it closed rather
+/// than with the position, because a frontend reads this plan afterwards and
+/// must not be handed a cycle.
 fn drop_prerequisite(
     from: &Arc<Mutex<DepNode>>,
     list: Prerequisites,
@@ -5440,18 +5470,8 @@ fn drop_prerequisite(
     else {
         return;
     };
-    let (name, _) = edges.remove(at);
-    // The name list is what `$^`, `$+` and `$<` are read from, and it stays in
-    // the order the Makefile wrote whatever `--shuffle` did to the edges beside
-    // it — so the two are aligned only until something reorders one of them.
-    // Take the name where it stands when they still agree, which is every
-    // unshuffled run, and otherwise find it.
-    let at = if names.get(at) == Some(&name) {
-        Some(at)
-    } else {
-        names.iter().position(|candidate| *candidate == name)
-    };
-    if let Some(at) = at {
+    edges.remove(at);
+    if at < names.len() {
         names.remove(at);
     }
 }
