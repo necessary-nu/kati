@@ -199,14 +199,32 @@ impl<'a> Parser<'a> {
         self.parse_rule_or_assign(line)
     }
 
+    /// Decide whether this line defines a variable or describes a rule, in
+    /// GNU Make's order: the assignment question first, over the whole line,
+    /// and a rule only when the answer is no.
+    ///
+    /// A `;` takes no part in the first question. `parse_variable_definition`
+    /// (reference/gnumake/src/variable.c) has no case for one — it is not in
+    /// `STOP_SET (c, MAP_COMMENT|MAP_NUL)`, it is not blank, it is not `=` or
+    /// `:`, and `*p` is not `=` — so it falls through `other:` and the walk
+    /// carries on to whatever operator is written after it. `a;b=c` therefore
+    /// defines a variable whose name holds a semicolon.
+    ///
+    /// It takes part in the second question, where it is the separator between
+    /// a rule and the recipe written on the same line: GNU Make cuts the line
+    /// at the first unquoted `;` and then looks for the colon in what is left,
+    /// which is why `a;b: c` is `missing separator` rather than a rule — the
+    /// colon went with the recipe.
+    ///
+    /// So the two questions are separated rather than the character set tuned.
+    /// Asking them at once, on whichever of `:`, `=` and `;` came first, is a
+    /// scan that stops on a character GNU Make had no case for.
     fn parse_rule_or_assign(&mut self, line: Bytes) -> Result<()> {
-        let Some(sep) = find_outside_reference(line.as_ref(), b":=;") else {
+        let Some(sep) = find_outside_reference(line.as_ref(), b":=") else {
             return self.parse_rule(line, None);
         };
         let s = &line[sep..];
-        if s.starts_with(b";") {
-            return self.parse_rule(line, None);
-        } else if s.starts_with(b"=") {
+        if s.starts_with(b"=") {
             if sep != 0 && !is_variable_name(parse_assign_statement(&line, sep).lhs) {
                 return self.parse_rule(line, None);
             }
@@ -876,7 +894,7 @@ fn parse_buf_no_stats_impl(
 /// asked without dispatching, so a caller can tell which of the two a line
 /// carrying an `export` word in front of it turned out to be.
 fn is_variable_definition(line: &[u8]) -> bool {
-    let Some(sep) = find_outside_reference(line, b":=;") else {
+    let Some(sep) = find_outside_reference(line, b":=") else {
         return false;
     };
     let rest = &line[sep..];
@@ -1125,8 +1143,45 @@ mod tests {
         );
     }
 
+    /// A `;` takes no part in the question "does this line define a variable".
+    ///
+    /// `parse_variable_definition` has no case for one, so the scan walks past
+    /// it to whatever operator is written after — which makes the semicolon
+    /// part of the variable's name. It is the rule-and-recipe separator only in
+    /// the second question, which is asked of a line that defines nothing.
+    #[test]
+    fn a_semicolon_does_not_stop_an_assignment_scan() {
+        for line in [
+            b"a;b=c".as_slice(),
+            b"x;y := z",
+            b"a;b += c",
+            b"a;b ?= c",
+            b"a;b != echo c",
+            b"a;b:::= c",
+        ] {
+            assert!(is_variable_definition(line), "{}", line.escape_ascii());
+        }
+        // The name really is the whole of it, semicolon included.
+        assert_eq!(parse_assign_statement(b"a;b=c", 3).lhs, b"a;b");
+        assert_eq!(parse_assign_statement(b"x;y := z", 5).lhs, b"x;y");
+        let appended = parse_assign_statement(b"a;b += c", 5);
+        assert_eq!(appended.lhs, b"a;b");
+        assert_eq!(appended.op, AssignOp::PlusEq);
+        // A blank still ends the name, so a second word before the operator
+        // means the line defines nothing however the semicolon fell.
+        for line in [b"a; b = c".as_slice(), b"foo ; bar=baz"] {
+            assert!(!is_variable_definition(line), "{}", line.escape_ascii());
+        }
+        // A colon that is not an assignment operator leaves this a rule, and
+        // the rule parse is where the semicolon becomes the recipe separator.
+        for line in [b"a;b: c".as_slice(), b"all: a;b=c", b"all: dep ; recipe"] {
+            assert!(!is_variable_definition(line), "{}", line.escape_ascii());
+        }
+    }
+
     /// A target-specific assignment carries its modifiers in any order, and the
-    /// word left over is the name however it is spelled.
+    /// word left over is the name however it is spelled."""
+
     #[test]
     fn modifiers_come_off_a_target_specific_name() {
         for (line, name, words, is_private) in [
