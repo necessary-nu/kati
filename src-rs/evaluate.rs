@@ -56,6 +56,15 @@ use crate::{error_loc, log, warn_loc};
 /// the shell, and `grouped-target` parses but runs the recipe once per target
 /// rather than once for the group.
 ///
+/// `archives` is deliberately absent though `lib.a(member.o)` is now read as a
+/// member of an archive: the shape, the built-in `(%): %` rule, `$%` and
+/// member freshness off the archive index are here, and `ar_glob`, the
+/// `.X.a` suffix conversion, `lib.a(a.o b.o)` and `-t` are not. GNU Make's own
+/// suite is the measure and says so plainly — claiming the feature runs its
+/// `features/archives` script, whose sixteen cases leave eight compiler-class
+/// differences today. Those eight are what the remaining work is worth, and
+/// the entry belongs here when they are gone.
+///
 /// Build-side features belong to whoever runs the recipes, not to the
 /// evaluator, and arrive through [`Flags::extra_features`].
 pub const EVALUATOR_FEATURES: &[&str] =

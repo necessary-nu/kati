@@ -45,6 +45,7 @@ pub use anyhow;
 /// cannot avoid naming it.
 pub use bytes;
 
+pub mod archive;
 pub mod build_sink;
 pub mod builtin_rules;
 pub mod builtins;

@@ -761,7 +761,16 @@ struct PatternMatch {
 impl PatternMatch {
     /// How `pattern` matches `output`, or `None` when it does not.
     fn of(pattern: &Pattern, output: &Bytes) -> Option<Self> {
-        let path_len = directory_length(output);
+        // A name being searched for as an archive member carries no directory
+        // the match may hold aside: GNU Make sets `lastslash = 0` outright for
+        // the archive pass (reference/gnumake/src/implicit.c), so a member
+        // written `lib.a(d/foo.o)` has the whole of `d/foo.o` for its stem and
+        // `(%)` fills it back in unchanged.
+        let path_len = if crate::archive::is_archive_search_name(output) {
+            0
+        } else {
+            directory_length(output)
+        };
         let hold_directory = path_len > 0 && !pattern.as_bytes().contains(&b'/');
         let matched = if hold_directory {
             output.slice(path_len..)
@@ -807,6 +816,24 @@ impl PatternMatch {
 /// `foo/bar/`.
 fn directory_length(name: &[u8]) -> usize {
     memrchr(b'/', &name[..name.len().saturating_sub(1)]).map_or(0, |at| at + 1)
+}
+
+/// One implicit-rule search: the target being made, the name matched against
+/// the candidate patterns, and which relaxation of the search this is.
+///
+/// The two names are the same thing for an ordinary target and come apart for
+/// an archive member, which GNU Make searches for twice — once as
+/// `lib.a(foo.o)` and once as `(foo.o)`, with the archive held aside
+/// (`try_implicit_rule`, reference/gnumake/src/implicit.c).
+#[derive(Clone, Copy)]
+struct ImplicitSearch<'a> {
+    /// The target the chosen rule will make, which names the node and the
+    /// scopes its variables are looked up in.
+    output: Symbol,
+    /// The name the patterns are matched against and the stem is read out of.
+    name: &'a Bytes,
+    /// Which of the four relaxations of `pattern_search` this is.
+    pass: SearchPass,
 }
 
 /// One target pattern of one pattern rule, as the search considers it.
@@ -4161,11 +4188,11 @@ impl<'a> DepBuilder<'a> {
         rule: &Arc<Rule>,
         matched: Symbol,
         candidate_order: usize,
-        output: Symbol,
+        search: ImplicitSearch<'_>,
         n: Arc<Mutex<DepNode>>,
-        pass: SearchPass,
     ) -> Result<Option<Arc<Rule>>> {
-        let output_str = output.as_bytes(&self.ev.session);
+        let ImplicitSearch { output, pass, .. } = search;
+        let output_str = search.name.clone();
         let pat = Pattern::new(matched.as_bytes(&self.ev.session));
         let Some(matched_at) = PatternMatch::of(&pat, &output_str) else {
             return Ok(None);
@@ -4437,6 +4464,7 @@ impl<'a> DepBuilder<'a> {
         // Nor for a name a terminal rule has already been given, which is the
         // other half of the same condition: `!file->tried_implicit`.
         if !self.phony.contains(&output) && !self.tried_implicit.contains(&output) {
+            let whole_name = output.as_bytes(&self.ev.session);
             let outer_compat = std::mem::replace(&mut self.found_compat_rule, false);
             let mut picked = None;
             for pass in SearchPass::all() {
@@ -4446,9 +4474,50 @@ impl<'a> DepBuilder<'a> {
                 if pass.compat && !self.found_compat_rule {
                     break;
                 }
-                picked = self.pick_pattern_rule(output, n, &rule_merger, &patterns, &vars, pass)?;
+                picked = self.pick_pattern_rule(
+                    ImplicitSearch {
+                        output,
+                        name: &whole_name,
+                        pass,
+                    },
+                    n,
+                    &rule_merger,
+                    &patterns,
+                    &vars,
+                )?;
                 if picked.is_some() {
                     break;
+                }
+            }
+            // The archive-member search, GNU Make's second call to
+            // `pattern_search` from `try_implicit_rule`. It runs only after the
+            // first has failed, because — as the comment there puts it — the
+            // ordinary search uses more of the target's name and is therefore
+            // the more specific of the two. What changes is only the name being
+            // matched: `lib.a(foo.o)` is searched for as `(foo.o)`, with the
+            // archive held aside entirely, which is how the built-in `(%): %`
+            // rule matches and how its stem comes out as the member name.
+            if picked.is_none()
+                && let Some(archive_name) = crate::archive::archive_search_name(&whole_name)
+            {
+                for pass in SearchPass::all() {
+                    if pass.compat && !self.found_compat_rule {
+                        break;
+                    }
+                    picked = self.pick_pattern_rule(
+                        ImplicitSearch {
+                            output,
+                            name: &archive_name,
+                            pass,
+                        },
+                        n,
+                        &rule_merger,
+                        &patterns,
+                        &vars,
+                    )?;
+                    if picked.is_some() {
+                        break;
+                    }
                 }
             }
             self.found_compat_rule = outer_compat;
@@ -4646,14 +4715,14 @@ impl<'a> DepBuilder<'a> {
 
     fn pick_pattern_rule(
         &mut self,
-        output: Symbol,
+        search: ImplicitSearch<'_>,
         n: &Arc<Mutex<DepNode>>,
         rule_merger: &Option<Arc<Mutex<RuleMerger>>>,
         patterns: &[Arc<Vars>],
         vars: &Option<Arc<Vars>>,
-        pass: SearchPass,
     ) -> Result<Option<PickedRuleInfo>> {
-        let candidates = self.ordered_candidates(&output.as_bytes(&self.ev.session));
+        let ImplicitSearch { output, pass, .. } = search;
+        let candidates = self.ordered_candidates(search.name);
         for candidate in candidates {
             // A terminal rule is not offered the pass that invents what it
             // needs. GNU Make rejects one outright while it is looking to make
@@ -4669,9 +4738,8 @@ impl<'a> DepBuilder<'a> {
                 &candidate.rule,
                 candidate.pattern,
                 candidate.order,
-                output,
+                search,
                 n.clone(),
-                pass,
             )?
             else {
                 continue;
@@ -4687,6 +4755,13 @@ impl<'a> DepBuilder<'a> {
         }
 
         let output_str = output.as_bytes(&self.ev.session);
+        // The suffix map is keyed by a filename's extension, and the archive
+        // pass is matching `(member)` rather than a filename. GNU Make reaches
+        // its `.X.a` suffix rules as the pattern rules `convert_to_pattern`
+        // made of them, never through this map.
+        if search.name != &output_str {
+            return Ok(None);
+        }
         let Some(output_suffix) = get_ext(&output_str) else {
             return Ok(None);
         };

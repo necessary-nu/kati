@@ -22,7 +22,6 @@ use std::{collections::HashSet, fmt::Debug, sync::Arc};
 use crate::{
     build_sink::{FileEvaluation, NewInputsTiming, OutputEvaluation, ShellEvaluation},
     dep::DepNode,
-    error_loc,
     eval::Evaluator,
     exec::ExecStatus,
     expr::{Evaluable, Value},
@@ -56,7 +55,9 @@ enum AutoCommand {
         found_new_inputs: Arc<Mutex<bool>>,
         timing: NewInputsTiming,
     },
-    NotImplemented,
+    /// `$%`, the archive member: the half of `lib.a(member.o)` inside the
+    /// parentheses, and empty for every target that is not one.
+    Percent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,7 +78,7 @@ impl AutoCommand {
             AutoCommand::Bar => '|',
             AutoCommand::Star => '*',
             AutoCommand::Question { .. } => '?',
-            AutoCommand::NotImplemented => '%',
+            AutoCommand::Percent => '%',
         }
     }
 }
@@ -153,11 +154,24 @@ impl AutoCommandVar {
 
         match &self.typ {
             AutoCommand::At => {
-                out.put_slice(&current_dep_node.recipe_output.as_bytes(names));
+                // For `lib.a(member.o)` the target is the archive and the
+                // member is `$%`; `set_file_variables` splits them at the
+                // first `(` (reference/gnumake/src/commands.c).
+                let name = current_dep_node.recipe_output.as_bytes(names);
+                match crate::archive::split_archive_name(&name) {
+                    Some((archive, _)) => out.put_slice(&name.slice(..archive.len())),
+                    None => out.put_slice(&name),
+                }
+            }
+            AutoCommand::Percent => {
+                let name = current_dep_node.recipe_output.as_bytes(names);
+                if let Some((archive, _)) = crate::archive::split_archive_name(&name) {
+                    out.put_slice(&name.slice(archive.len() + 1..name.len() - 1));
+                }
             }
             AutoCommand::Less => {
                 if let Some(ai) = current_dep_node.actual_inputs.first() {
-                    out.put_slice(&ai.as_bytes(names));
+                    out.put_slice(&crate::archive::member_or_whole(&ai.as_bytes(names)))
                 }
             }
             AutoCommand::Hat => {
@@ -165,14 +179,14 @@ impl AutoCommandVar {
                 let mut ww = WordWriter::new(out);
                 for ai in current_dep_node.actual_inputs.iter() {
                     if seen.insert(*ai) {
-                        ww.write(&ai.as_bytes(names))
+                        ww.write(&crate::archive::member_or_whole(&ai.as_bytes(names)))
                     }
                 }
             }
             AutoCommand::Plus => {
                 let mut ww = WordWriter::new(out);
                 for ai in current_dep_node.actual_inputs.iter() {
-                    ww.write(&ai.as_bytes(names))
+                    ww.write(&crate::archive::member_or_whole(&ai.as_bytes(names)))
                 }
             }
             AutoCommand::Bar => {
@@ -213,7 +227,15 @@ impl AutoCommandVar {
                     // longer, and a name the list does not reach reads as
                     // empty. The name has to be longer than the suffix, so a
                     // target named for the suffix itself has no stem either.
-                    let name = current_dep_node.recipe_output.as_bytes(names);
+                    // An archive member's stem is read off the member name,
+                    // not off the whole target: `lib.a(foo.o)` has `$*` of
+                    // `foo` (src/commands.c, the same `ar_name` branch that
+                    // sets `$@` and `$%`).
+                    let whole = current_dep_node.recipe_output.as_bytes(names);
+                    let name = match crate::archive::split_archive_name(&whole) {
+                        Some((archive, _)) => whole.slice(archive.len() + 1..whole.len() - 1),
+                        None => whole,
+                    };
                     for suffix in &ev.session.suffixes {
                         if name.len() > suffix.len() && name.ends_with(suffix.as_ref()) {
                             out.put_slice(&name[..name.len() - suffix.len()]);
@@ -322,14 +344,6 @@ impl AutoCommandVar {
                         }
                     }
                 }
-            }
-            AutoCommand::NotImplemented => {
-                error_loc!(
-                    ev,
-                    ev.loc.as_ref(),
-                    "Automatic variable `${}' isn't supported yet",
-                    self.sym.display(ev)
-                );
             }
         }
         Ok(())
@@ -740,7 +754,7 @@ impl<'a> CommandEvaluator<'a> {
         )?;
         // TODO: Implement them.
         ret.register_bare_autocommand('|', AutoCommand::Bar)?;
-        ret.register_autocommand('%', AutoCommand::NotImplemented)?;
+        ret.register_autocommand('%', AutoCommand::Percent)?;
         Ok(ret)
     }
 
