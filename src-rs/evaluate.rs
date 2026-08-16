@@ -472,6 +472,12 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
     if catalogue_installed {
         crate::builtins::install_default_variables(&mut ev.session)?;
     }
+    // GNU Make's `define_automatic_variables`, which runs whatever `-R` says:
+    // the path forms of the automatic variables are part of the language, and
+    // a Makefile can read their origin, flavor and text before any rule has
+    // been chosen.
+    crate::builtins::install_path_automatic_variables(&mut ev.session)?;
+
     let rules_installed = !ev.session.flags.no_builtin_rules;
     crate::builtin_rules::install_suffixes_variable(&mut ev.session, !rules_installed);
 

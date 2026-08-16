@@ -843,16 +843,25 @@ impl GlobalVars {
             if origin == VarOrigin::CommandLine && assigning == VarOrigin::File {
                 return Ok(());
             }
-            // A Makefile assigning over `$@` is the unimplemented case. The
-            // front end re-arming its own automatic variables — which it does
-            // whenever it starts expanding recipes again, and it may do that
-            // more than once now that a recipe can be expanded as its edge is
-            // launched — is not an assignment at all. Neither is assigning over
-            // a loop or parameter name: that write never reaches the binding,
-            // because [`Self::writable_slot`] sent it to the global slot the
-            // binding is standing in front of.
+            // An automatic variable is the top of the origin ladder, so a
+            // Makefile assignment, an `override`, a command-line variable and
+            // an `undefine` all bounce off `@D` and leave it reading
+            // `automatic`. GNU Make declines these silently — nothing is
+            // printed and the run carries on — so this returns rather than
+            // diagnosing. A target-specific `all: @D = x` is a different
+            // question and still takes, because it is written into the rule's
+            // own scope, which is searched before this one.
+            //
+            // The front end re-arming its own automatic variables — which it
+            // does whenever it starts expanding recipes again, and it may do
+            // that more than once now that a recipe can be expanded as its edge
+            // is launched — is not an assignment at all, so automatic over
+            // automatic goes through. Neither is assigning over a loop or
+            // parameter name: that write never reaches the binding, because
+            // [`Self::writable_slot`] sent it to the global slot the binding is
+            // standing in front of.
             if origin == VarOrigin::Automatic && assigning != VarOrigin::Automatic {
-                error!("overriding automatic variable is not implemented yet");
+                return Ok(());
             }
             carry_export_attribute(orig, &var);
         }

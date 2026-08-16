@@ -244,6 +244,52 @@ pub fn install_default_variables(session: &mut Session) -> Result<()> {
     Ok(())
 }
 
+/// The automatic variables whose value is written down rather than computed.
+///
+/// GNU Make's `define_automatic_variables` (`src/variable.c`) defines the `D`
+/// and `F` form of each per-file automatic once, at startup, as an ordinary
+/// recursive variable whose text names the base form. Only the base forms are
+/// per-file, set by `set_file_variables` when a rule is chosen; the path forms
+/// never need a rule in hand, because all they hold is a `dir`/`notdir`
+/// expression over a base form that may or may not be bound yet.
+///
+/// The consequence a Makefile can see is that `$(origin @D)` answers
+/// `automatic` and `$(value @D)` reads back the expression **outside any
+/// recipe**, where `$(origin @)` still answers `undefined`. `$(@D)` there
+/// expands through an unbound `$@` and produces nothing, which is the answer
+/// GNU Make gives.
+///
+/// `|` is absent deliberately: GNU Make defines no `$(|D)` or `$(|F)`, so
+/// those two read as ordinary variables nobody defined.
+const PATH_AUTOMATIC_BASES: &[char] = &['@', '%', '<', '?', '^', '+', '*'];
+
+/// Install the `D` and `F` automatic variables.
+///
+/// Called once per evaluation, beside the tool catalogue and before any
+/// Makefile is read. Unlike the catalogue these are **not** withheld by `-R`:
+/// the switch withholds tool names, and an automatic variable is part of the
+/// language rather than part of the toolchain.
+///
+/// # Errors
+///
+/// Returns a parse failure for a generated expression, which is a defect here.
+pub fn install_path_automatic_variables(session: &mut Session) -> Result<()> {
+    for base in PATH_AUTOMATIC_BASES {
+        for (suffix, text) in [
+            ('D', format!("$(patsubst %/,%,$(dir ${base}))")),
+            ('F', format!("$(notdir ${base})")),
+        ] {
+            let sym = session.intern(format!("{base}{suffix}"));
+            let text = Bytes::from(text);
+            let mut loc = Loc::default();
+            let parsed = parse_expr(session, &mut loc, text.clone(), ParseExprOpt::Normal)?;
+            let var = Variable::new_recursive(parsed, VarOrigin::Automatic, None, None, text);
+            session.globals.define(sym, var);
+        }
+    }
+    Ok(())
+}
+
 /// Substitute the POSIX values, as `.POSIX:` appearing as a target does.
 ///
 /// Not withheld by `-R`: the switch withholds the catalogue, and `.POSIX:` is
