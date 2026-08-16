@@ -169,7 +169,15 @@ impl Rule {
             error_loc!(session, Some(&self.loc), "*** multiple target patterns.");
         }
         let target_pattern = *self.output_patterns.first().unwrap();
-        if !is_pattern_rule(&target_pattern.as_bytes(&*session)) {
+        // Whether the pattern holds a wildcard at all is `find_percent`'s
+        // question and not "is there a percent here": a backslash escapes the
+        // wildcard, so `\%.o` is the literal name `%.o` and carries none. GNU
+        // Make asks it right here — `pattern_percent = find_percent_cached
+        // (&target->name)` in read.c, refusing when the answer is null — and a
+        // static pattern rule whose target pattern is not a pattern is not a
+        // rule.
+        let pat = Pattern::new(target_pattern.as_bytes(&*session));
+        if !pat.is_pattern() {
             error_loc!(
                 session,
                 Some(&self.loc),
@@ -182,7 +190,6 @@ impl Rule {
         // the line and tests each target against it later, in `record_files`,
         // so a rule that names two patterns dies on that alone rather than
         // first complaining that neither of them matched anything.
-        let pat = Pattern::new(target_pattern.as_bytes(&*session));
         let unmatched = self
             .outputs
             .iter()
@@ -292,10 +299,6 @@ pub fn split_order_only(inputs: &Bytes) -> (Bytes, Bytes) {
         Some(i) => (inputs.slice(..i), inputs.slice(i + 1..)),
         None => (inputs.clone(), Bytes::new()),
     }
-}
-
-pub fn is_pattern_rule(target: &[u8]) -> bool {
-    memchr(b'%', target).is_some()
 }
 
 /// Match one word of a target or prerequisite list against the filesystem, as

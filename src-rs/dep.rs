@@ -32,7 +32,7 @@ use crate::{
     expr::{Evaluable, Value},
     loc::Loc,
     log,
-    rule::{Rule, glob_word, is_pattern_rule, split_order_only},
+    rule::{Rule, glob_word, split_order_only},
     session::{Context, Session},
     stmt::AssignOp,
     strutil::{
@@ -1770,7 +1770,10 @@ impl<'a> DepBuilder<'a> {
         let precious = self.ev.session.intern(".PRECIOUS");
         if let Some((targets, _)) = self.get_rule_inputs(precious)? {
             for t in targets {
-                if is_pattern_rule(&t.as_bytes(&self.ev.session)) {
+                // The same reading the static rule's target pattern gets: a
+                // `\%` is an escaped percent and leaves no wildcard, so
+                // `.PRECIOUS: \%.o` names a file rather than a family.
+                if Pattern::new(t.as_bytes(&self.ev.session)).is_pattern() {
                     self.precious_patterns.insert(t);
                 } else {
                     self.precious.insert(t);

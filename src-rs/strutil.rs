@@ -235,6 +235,14 @@ impl Pattern {
         &self.pat
     }
 
+    /// Whether a wildcard survived the escaping, which is GNU Make's
+    /// `find_percent_cached (...) != 0` and the only thing that makes a text a
+    /// pattern. A `\%` reduces to a literal percent and leaves none, so the
+    /// text matches one name and stands for no family of them.
+    pub const fn is_pattern(&self) -> bool {
+        self.percent_index.is_some()
+    }
+
     pub fn matches(&self, str: &[u8]) -> bool {
         if let Some(percent_index) = self.percent_index {
             return self.match_impl(str, percent_index);
@@ -961,6 +969,27 @@ mod test {
         assert_eq!(percent_of(b"foo\\\\\\%bar"), ("foo\\%bar".to_owned(), None));
         assert_eq!(percent_of(b"\\%%"), ("%%".to_owned(), Some(1)));
         assert_eq!(percent_of(b"\\%"), ("%".to_owned(), None));
+    }
+
+    #[test]
+    fn a_text_is_a_pattern_only_while_a_wildcard_survives_the_escaping() {
+        // What a static rule's target pattern is refused on: `\%.o` is the
+        // one name `%.o` and stands for no family, so it is not a pattern
+        // however plainly a percent is written in it.
+        for one_name in [b"\\%.o".as_slice(), b"foo\\%bar", b"foo\\\\\\%bar"] {
+            assert!(
+                !Pattern::new(Bytes::copy_from_slice(one_name)).is_pattern(),
+                "{}",
+                String::from_utf8_lossy(one_name)
+            );
+        }
+        for family in [b"%.o".as_slice(), b"%\\%.o", b"foo\\\\%bar"] {
+            assert!(
+                Pattern::new(Bytes::copy_from_slice(family)).is_pattern(),
+                "{}",
+                String::from_utf8_lossy(family)
+            );
+        }
     }
 
     #[test]
