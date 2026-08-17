@@ -158,19 +158,19 @@ struct RuleMerger {
 
   void SetImplicitOutput(Symbol output, Symbol p, const RuleMerger* merger) {
     if (!merger->primary_rule) {
-      ERROR("*** implicit output `%s' on phony target `%s'", output.c_str(),
+      ERROR("*** implicit output '%s' on phony target '%s'", output.c_str(),
             p.c_str());
     }
     if (parent) {
       ERROR_LOC(merger->primary_rule->cmd_loc(),
-                "*** implicit output `%s' of `%s' was already defined by `%s' "
+                "*** implicit output '%s' of '%s' was already defined by '%s' "
                 "at %s:%d",
                 output.c_str(), p.c_str(), parent_sym.c_str(),
                 LOCF(parent->primary_rule->cmd_loc()));
     }
     if (primary_rule) {
       ERROR_LOC(primary_rule->cmd_loc(),
-                "*** implicit output `%s' may not have commands",
+                "*** implicit output '%s' may not have commands",
                 output.c_str());
     }
     parent = merger;
@@ -181,7 +181,7 @@ struct RuleMerger {
     if (rules.empty()) {
       is_double_colon = r->is_double_colon;
     } else if (is_double_colon != r->is_double_colon) {
-      ERROR_LOC(r->loc, "*** target file `%s' has both : and :: entries.",
+      ERROR_LOC(r->loc, "*** target file '%s' has both : and :: entries.",
                 output.c_str());
     }
 
@@ -189,14 +189,14 @@ struct RuleMerger {
         !r->is_double_colon) {
       if (g_flags.werror_overriding_commands) {
         ERROR_LOC(r->cmd_loc(),
-                  "*** overriding commands for target `%s', previously defined "
+                  "*** overriding commands for target '%s', previously defined "
                   "at %s:%d",
                   output.c_str(), LOCF(primary_rule->cmd_loc()));
       } else {
-        WARN_LOC(r->cmd_loc(), "warning: overriding commands for target `%s'",
+        WARN_LOC(r->cmd_loc(), "warning: overriding commands for target '%s'",
                  output.c_str());
         WARN_LOC(primary_rule->cmd_loc(),
-                 "warning: ignoring old commands for target `%s'",
+                 "warning: ignoring old commands for target '%s'",
                  output.c_str());
       }
       primary_rule = r;

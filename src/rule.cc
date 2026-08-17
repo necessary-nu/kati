@@ -80,7 +80,7 @@ void Rule::ParsePrerequisites(const std::string_view& line,
     target_pattern = TrimLeadingCurdir(target_pattern);
     for (Symbol target : outputs) {
       if (!Pattern(target_pattern).Match(target.str())) {
-        WARN_LOC(loc, "target `%s' doesn't match the target pattern",
+        WARN_LOC(loc, "target '%s' doesn't match the target pattern",
                  target.c_str());
       }
     }

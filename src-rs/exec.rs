@@ -222,7 +222,7 @@ pub fn exec(roots: Vec<NamedDepNode>, ev: &mut Evaluator) -> Result<()> {
     if executor.num_commands == 0 {
         for (sym, _) in roots {
             println!(
-                "kati: Nothing to be done for `{}'.",
+                "kati: Nothing to be done for '{}'.",
                 sym.display(&executor.ce.ev.session)
             )
         }

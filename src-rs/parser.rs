@@ -146,7 +146,7 @@ impl<'a> Parser<'a> {
         if !self.if_stack.is_empty() {
             let mut loc = self.loc.clone();
             loc.line += 1;
-            error_loc!(&*self.session, Some(&loc), "*** missing `endif'.");
+            error_loc!(&*self.session, Some(&loc), "*** missing 'endif'.");
         }
         if self.define_name.is_some() {
             let mut loc = self.loc.clone();
@@ -154,7 +154,7 @@ impl<'a> Parser<'a> {
             error_loc!(
                 &*self.session,
                 Some(&loc),
-                "*** missing `endef', unterminated `define'.",
+                "*** missing 'endef', unterminated 'define'.",
             );
         }
 
@@ -399,7 +399,7 @@ impl<'a> Parser<'a> {
             warn_loc!(
                 &*self.session,
                 Some(&self.loc),
-                "extraneous text after `endef' directive"
+                "extraneous text after 'endef' directive"
             );
         }
 
@@ -582,7 +582,7 @@ impl<'a> Parser<'a> {
             warn_loc!(
                 &*self.session,
                 Some(&self.loc),
-                "extraneous text after `ifeq' directive"
+                "extraneous text after 'ifeq' directive"
             )
         }
 
@@ -599,7 +599,7 @@ impl<'a> Parser<'a> {
             error_loc!(
                 &*self.session,
                 Some(&self.loc),
-                "*** only one `else' per conditional."
+                "*** only one 'else' per conditional."
             );
         }
         st.is_in_else = true;
@@ -615,7 +615,7 @@ impl<'a> Parser<'a> {
             warn_loc!(
                 &*self.session,
                 Some(&self.loc),
-                "extraneous text after `else' directive"
+                "extraneous text after 'else' directive"
             );
         }
         self.num_if_nest = 0;
@@ -628,7 +628,7 @@ impl<'a> Parser<'a> {
             error_loc!(
                 &*self.session,
                 Some(&self.loc),
-                "extraneous text after `endif` directive"
+                "extraneous text after 'endif' directive"
             );
         }
         let num_nest = self.if_stack.last().unwrap().num_nest;
@@ -773,7 +773,7 @@ impl<'a> Parser<'a> {
             error_loc!(
                 &*self.session,
                 Some(&self.loc),
-                "*** extraneous `{keyword}'."
+                "*** extraneous '{keyword}'."
             );
         }
         Ok(())

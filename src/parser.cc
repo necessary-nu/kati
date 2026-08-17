@@ -76,10 +76,10 @@ class Parser {
     }
 
     if (!if_stack_.empty())
-      ERROR_LOC(Loc(loc_.filename, loc_.lineno + 1), "*** missing `endif'.");
+      ERROR_LOC(Loc(loc_.filename, loc_.lineno + 1), "*** missing 'endif'.");
     if (!define_name_.empty())
       ERROR_LOC(Loc(loc_.filename, define_start_line_),
-                "*** missing `endef', unterminated `define'.");
+                "*** missing 'endef', unterminated 'define'.");
   }
 
   static std::vector<ParseErrorStmt*> parse_errors;
@@ -276,7 +276,7 @@ class Parser {
     std::string_view rest = TrimRightSpace(
         RemoveComment(TrimLeftSpace(line.substr(sizeof("endef") - 1))));
     if (!rest.empty()) {
-      WARN_LOC(loc_, "extraneous text after `endef' directive");
+      WARN_LOC(loc_, "extraneous text after 'endef' directive");
     }
 
     AssignStmt* stmt = new AssignStmt();
@@ -353,7 +353,7 @@ class Parser {
       }
     }
     if (!s.empty()) {
-      WARN_LOC(loc_, "extraneous text after `ifeq' directive");
+      WARN_LOC(loc_, "extraneous text after 'ifeq' directive");
       return true;
     }
     return true;
@@ -378,7 +378,7 @@ class Parser {
       return;
     IfState& st = if_stack_.top();
     if (st.is_in_else) {
-      Error("*** only one `else' per conditional.");
+      Error("*** only one 'else' per conditional.");
       return;
     }
     st.is_in_else = true;
@@ -390,7 +390,7 @@ class Parser {
 
     num_if_nest_ = st.num_nest + 1;
     if (!HandleDirective(next_if, else_if_directives_)) {
-      WARN_LOC(loc_, "extraneous text after `else' directive");
+      WARN_LOC(loc_, "extraneous text after 'else' directive");
     }
     num_if_nest_ = 0;
   }
@@ -399,7 +399,7 @@ class Parser {
     if (!CheckIfStack("endif"))
       return;
     if (!line.empty()) {
-      Error("extraneous text after `endif` directive");
+      Error("extraneous text after 'endif' directive");
       return;
     }
     int num_nest = if_stack_.top().num_nest;
@@ -458,7 +458,7 @@ class Parser {
   }
   bool CheckIfStack(const char* keyword) {
     if (if_stack_.empty()) {
-      Error(StringPrintf("*** extraneous `%s'.", keyword));
+      Error(StringPrintf("*** extraneous '%s'.", keyword));
       return false;
     }
     return true;

@@ -1098,7 +1098,7 @@ impl RuleMerger {
                 error_loc!(
                     ctx,
                     None,
-                    "*** implicit output `{}' on phony target `{}'",
+                    "*** implicit output '{}' on phony target '{}'",
                     output.display(ctx),
                     p.display(ctx)
                 );
@@ -1112,7 +1112,7 @@ impl RuleMerger {
                         .as_ref()
                         .and_then(|r| r.cmd_loc.clone())
                         .as_ref(),
-                    "*** implicit output `{}' of `{}' was already defined by `{}' at {}",
+                    "*** implicit output '{}' of '{}' was already defined by '{}' at {}",
                     output.display(ctx),
                     p.display(ctx),
                     self.parent_sym.unwrap().display(ctx),
@@ -1128,7 +1128,7 @@ impl RuleMerger {
                 error_loc!(
                     ctx,
                     primary_rule.cmd_loc.as_ref(),
-                    "*** implicit output `{}' may not have commands",
+                    "*** implicit output '{}' may not have commands",
                     output.display(ctx)
                 );
             }
@@ -1145,7 +1145,7 @@ impl RuleMerger {
             error_loc!(
                 ctx,
                 Some(&r.loc),
-                "*** target file `{}' has both : and :: entries.",
+                "*** target file '{}' has both : and :: entries.",
                 output.display(ctx)
             );
         }
@@ -1159,7 +1159,7 @@ impl RuleMerger {
                 error_loc!(
                     ctx,
                     r.cmd_loc.as_ref(),
-                    "*** overriding commands for target `{}', previously defined at {}",
+                    "*** overriding commands for target '{}', previously defined at {}",
                     output.display(ctx),
                     primary_rule
                         .cmd_loc
@@ -1171,13 +1171,13 @@ impl RuleMerger {
                 warn_loc!(
                     ctx,
                     r.cmd_loc.as_ref(),
-                    "warning: overriding commands for target `{}'",
+                    "warning: overriding commands for target '{}'",
                     output.display(ctx)
                 );
                 warn_loc!(
                     ctx,
                     primary_rule.cmd_loc.as_ref(),
-                    "warning: ignoring old commands for target `{}'",
+                    "warning: ignoring old commands for target '{}'",
                     output.display(ctx)
                 )
             }
@@ -3115,7 +3115,7 @@ impl<'a> DepBuilder<'a> {
                 warn_loc!(
                     self.ev,
                     None,
-                    ".LIBPATTERNS element `{}' is not a pattern",
+                    ".LIBPATTERNS element '{}' is not a pattern",
                     String::from_utf8_lossy(&element)
                 );
                 continue;

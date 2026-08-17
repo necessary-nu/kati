@@ -145,7 +145,7 @@ void Exec(const std::vector<NamedDepNode>& roots, Evaluator* ev) {
   }
   if (executor.Count() == 0) {
     for (auto const& root : roots) {
-      printf("kati: Nothing to be done for `%s'.\n", root.first.c_str());
+      printf("kati: Nothing to be done for '%s'.\n", root.first.c_str());
     }
   }
 }

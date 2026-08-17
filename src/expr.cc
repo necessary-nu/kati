@@ -395,7 +395,7 @@ void ParseFunc(Loc* loc,
 
   if (nargs <= f->min_arity()) {
     ERROR_LOC(start_loc,
-              "*** insufficient number of arguments (%d) to function `%s'.",
+              "*** insufficient number of arguments (%d) to function '%s'.",
               nargs - 1, f->name());
   }
 

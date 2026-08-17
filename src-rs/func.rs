@@ -319,12 +319,12 @@ fn parse_numeric(text: &[u8], what: &str, ev: &mut Evaluator) -> Result<i64> {
 
 fn word_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
     let n_str = args[0].eval_to_buf(ev)?;
-    let mut n = parse_numeric(&n_str, "invalid first argument to `word' function", ev)?;
+    let mut n = parse_numeric(&n_str, "invalid first argument to 'word' function", ev)?;
     if n < 1 {
         error_loc!(
             ev,
             ev.loc.as_ref(),
-            "*** first argument to `word' function must be greater than 0."
+            "*** first argument to 'word' function must be greater than 0."
         );
     }
 
@@ -340,8 +340,8 @@ fn word_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
 }
 
 fn wordlist_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
-    let bad_first = "invalid first argument to `wordlist' function";
-    let bad_second = "invalid second argument to `wordlist' function";
+    let bad_first = "invalid first argument to 'wordlist' function";
+    let bad_second = "invalid second argument to 'wordlist' function";
     let s_str = args[0].eval_to_buf(ev)?;
     let si = parse_numeric(&s_str, bad_first, ev)?;
     if si < 1 {
@@ -896,7 +896,7 @@ fn call_builtin(
         error_loc!(
             ev,
             ev.loc.as_ref(),
-            "*** insufficient number of arguments ({}) to function `{}'.",
+            "*** insufficient number of arguments ({}) to function '{}'.",
             args.len(),
             String::from_utf8_lossy(fi.name)
         );
@@ -1060,7 +1060,7 @@ impl MakeInt {
             error_loc!(
                 ev,
                 ev.loc.as_ref(),
-                "*** non-numeric {ordinal} argument to `intcmp' function: empty value."
+                "*** non-numeric {ordinal} argument to 'intcmp' function: empty value."
             );
         }
         let negative = trimmed[0] == b'-';
@@ -1074,7 +1074,7 @@ impl MakeInt {
             error_loc!(
                 ev,
                 ev.loc.as_ref(),
-                "*** non-numeric {ordinal} argument to `intcmp' function: '{}'.",
+                "*** non-numeric {ordinal} argument to 'intcmp' function: '{}'.",
                 String::from_utf8_lossy(text)
             );
         }
@@ -2241,14 +2241,14 @@ mod tests {
         let (result, _) = eval_with(&mut ev, "$(intcmp 12a,1,foo)");
         let message = result.unwrap_err().to_string();
         assert!(
-            message.contains("non-numeric first argument to `intcmp' function: '12a'."),
+            message.contains("non-numeric first argument to 'intcmp' function: '12a'."),
             "{message}"
         );
 
         let (result, _) = eval_with(&mut ev, "$(intcmp 0, ,foo)");
         let message = result.unwrap_err().to_string();
         assert!(
-            message.contains("non-numeric second argument to `intcmp' function: empty value."),
+            message.contains("non-numeric second argument to 'intcmp' function: empty value."),
             "{message}"
         );
     }
@@ -2265,7 +2265,7 @@ mod tests {
         let message = result.unwrap_err().to_string();
         assert!(
             message.contains(
-                "invalid first argument to `word' function: '9999999999999999999' out of range."
+                "invalid first argument to 'word' function: '9999999999999999999' out of range."
             ),
             "{message}"
         );
@@ -2284,19 +2284,19 @@ mod tests {
         for (expression, expected) in [
             (
                 "$(word abc,a b c)",
-                "invalid first argument to `word' function: 'abc'.",
+                "invalid first argument to 'word' function: 'abc'.",
             ),
             (
                 "$(word ,a b c)",
-                "invalid first argument to `word' function: empty value.",
+                "invalid first argument to 'word' function: empty value.",
             ),
             (
                 "$(word 0,a b c)",
-                "first argument to `word' function must be greater than 0.",
+                "first argument to 'word' function must be greater than 0.",
             ),
             (
                 "$(word -1,a b c)",
-                "first argument to `word' function must be greater than 0.",
+                "first argument to 'word' function must be greater than 0.",
             ),
         ] {
             let (result, _) = eval_with(&mut ev, expression);
@@ -2320,15 +2320,15 @@ mod tests {
         for (expression, expected) in [
             (
                 "$(wordlist 000,3,a b c)",
-                "invalid first argument to `wordlist' function: '0'.",
+                "invalid first argument to 'wordlist' function: '0'.",
             ),
             (
                 "$(wordlist 2,-1,a b c)",
-                "invalid second argument to `wordlist' function: '-1'.",
+                "invalid second argument to 'wordlist' function: '-1'.",
             ),
             (
                 "$(wordlist 2,9999999999999999999,a b c)",
-                "invalid second argument to `wordlist' function: '9999999999999999999' out of range.",
+                "invalid second argument to 'wordlist' function: '9999999999999999999' out of range.",
             ),
         ] {
             let (result, _) = eval_with(&mut ev, expression);
@@ -2353,7 +2353,7 @@ mod tests {
         let (result, _) = eval_with(&mut ev, "$(call filter,%.c)");
         let message = result.unwrap_err().to_string();
         assert!(
-            message.contains("insufficient number of arguments (1) to function `filter'."),
+            message.contains("insufficient number of arguments (1) to function 'filter'."),
             "{message}"
         );
 

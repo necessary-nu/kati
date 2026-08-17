@@ -368,7 +368,7 @@ fn parse_func(
         error_loc!(
             session,
             Some(&start_loc),
-            "*** insufficient number of arguments ({}) to function `{}'.",
+            "*** insufficient number of arguments ({}) to function '{}'.",
             nargs - 1,
             String::from_utf8_lossy(fi.name)
         );

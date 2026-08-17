@@ -164,7 +164,7 @@ void AutoQuestionVar::Eval(Evaluator* ev, std::string* s) const {
 }
 
 void AutoNotImplementedVar::Eval(Evaluator* ev, std::string*) const {
-  ev->Error(StringPrintf("Automatic variable `$%s' isn't supported yet", sym_));
+  ev->Error(StringPrintf("Automatic variable '$%s' isn't supported yet", sym_));
 }
 
 void AutoSuffixDVar::Eval(Evaluator* ev, std::string* s) const {

@@ -198,7 +198,7 @@ impl Rule {
             warn_loc!(
                 session,
                 Some(&self.loc),
-                "target `{}' doesn't match the target pattern",
+                "target '{}' doesn't match the target pattern",
                 target.display(&*session)
             );
         }

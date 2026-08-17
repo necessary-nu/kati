@@ -229,11 +229,11 @@ void WordFunc(const std::vector<Value*>& args, Evaluator* ev, std::string* s) {
   int n = GetNumericValueForFunc(n_str);
   if (n < 0) {
     ev->Error(
-        StringPrintf("*** non-numeric first argument to `word' function: '%s'.",
+        StringPrintf("*** non-numeric first argument to 'word' function: '%s'.",
                      n_str.c_str()));
   }
   if (n == 0) {
-    ev->Error("*** first argument to `word' function must be greater than 0.");
+    ev->Error("*** first argument to 'word' function must be greater than 0.");
   }
 
   const std::string&& text = args[1]->Eval(ev);
@@ -253,12 +253,12 @@ void WordlistFunc(const std::vector<Value*>& args,
   int si = GetNumericValueForFunc(s_str);
   if (si < 0) {
     ev->Error(StringPrintf(
-        "*** non-numeric first argument to `wordlist' function: '%s'.",
+        "*** non-numeric first argument to 'wordlist' function: '%s'.",
         s_str.c_str()));
   }
   if (si == 0) {
     ev->Error(
-        StringPrintf("*** invalid first argument to `wordlist' function: %s`",
+        StringPrintf("*** invalid first argument to 'wordlist' function: '%s'.",
                      s_str.c_str()));
   }
 
@@ -266,7 +266,7 @@ void WordlistFunc(const std::vector<Value*>& args,
   int ei = GetNumericValueForFunc(e_str);
   if (ei < 0) {
     ev->Error(StringPrintf(
-        "*** non-numeric second argument to `wordlist' function: '%s'.",
+        "*** non-numeric second argument to 'wordlist' function: '%s'.",
         e_str.c_str()));
   }
 
