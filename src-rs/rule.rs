@@ -88,19 +88,17 @@ impl Rule {
 
     fn parse_inputs(&mut self, session: &mut Session, inputs_str: &Bytes) {
         let (inputs, order_only) = split_order_only(inputs_str);
-        for input in makefile_word_scanner(&inputs) {
-            let word = input.slice_ref(trim_leading_curdir(&input));
+        for input in file_sequence(&inputs) {
             let identity_start = self.inputs.len();
-            glob_word(session, word, &mut self.inputs);
+            glob_word(session, input.clone(), &mut self.inputs);
             if input.as_ref() != b".WAIT" {
                 self.prerequisite_names
                     .extend_from_slice(&self.inputs[identity_start..]);
             }
         }
-        for input in makefile_word_scanner(&order_only) {
-            let word = input.slice_ref(trim_leading_curdir(&input));
+        for input in file_sequence(&order_only) {
             let identity_start = self.order_only_inputs.len();
-            glob_word(session, word, &mut self.order_only_inputs);
+            glob_word(session, input.clone(), &mut self.order_only_inputs);
             if input.as_ref() != b".WAIT" {
                 self.prerequisite_names
                     .extend_from_slice(&self.order_only_inputs[identity_start..]);
@@ -301,24 +299,80 @@ pub fn split_order_only(inputs: &Bytes) -> (Bytes, Bytes) {
     }
 }
 
-/// Match one word of a target or prerequisite list against the filesystem, as
+/// Split a rule's target or prerequisite text into the names GNU Make reads
+/// out of it.
+///
+/// GNU Make's `parse_file_seq` (reference/gnumake/src/read.c) in the order it
+/// does the three things: split into words, strip a leading `./` from each,
+/// and reopen any archive group so that `lib.a(a.o b.o)` names two members
+/// rather than one whose name has a space in it.
+///
+/// Globbing is deliberately not here. It happens per name in [`glob_word`],
+/// because an archive name globs in two places at once — the archive half
+/// against the filesystem and the member half against the archive's index —
+/// and the group has to be reopened before either can be asked about.
+pub fn file_sequence(text: &Bytes) -> Vec<Bytes> {
+    let words: Vec<Bytes> = makefile_word_scanner(text)
+        .map(|word| word.slice_ref(trim_leading_curdir(&word)))
+        .collect();
+    // The group machinery is reached only for text holding a `(`, which is
+    // GNU Make's own condition for looking and is false for almost every rule.
+    if words.iter().any(|word| word.contains(&b'(')) {
+        return crate::archive::reopen_groups(words);
+    }
+    words
+}
+
+/// Match one name of a target or prerequisite list against the filesystem, as
 /// GNU Make does for any name holding `?`, `*` or `[`. A name matching nothing
 /// is kept as it was written, which is how `%` survives to make a pattern rule
 /// and how a refusal still names what the makefile asked for.
+///
+/// An archive name is matched in two halves, as `parse_file_seq` matches it:
+/// the archive against the filesystem, and then the member against that
+/// archive's index rather than against the filesystem again.
 pub fn glob_word(session: &mut Session, word: Bytes, into: &mut Vec<Symbol>) {
     if !word.iter().any(|c| matches!(c, b'?' | b'*' | b'[')) {
         into.push(session.intern(word));
         return;
     }
-    let matched = session.glob(word.clone());
-    match matched.as_ref() {
-        Ok(paths) if !paths.is_empty() => {
-            for path in paths {
-                let sym = session.intern(path.clone());
-                into.push(sym);
+    if let Some((archive, member)) = crate::archive::split_archive_name(&word) {
+        let archive = word.slice_ref(archive);
+        let member = word.slice_ref(member);
+        // The archive half is an ordinary filename and globs like one; a
+        // pattern matching nothing stands as written, so a member of an
+        // archive that is not there yet is still asked for.
+        let mut archives = Vec::new();
+        glob_word_on_disk(session, archive, &mut archives);
+        for archive in archives {
+            match crate::archive::glob_members(&archive, &member) {
+                Some(members) => into.extend(
+                    members
+                        .iter()
+                        .map(|found| session.intern(crate::archive::member_name(&archive, found))),
+                ),
+                // No matches, or no pattern: the member name stands as
+                // written, and the build refuses over it if it is not there.
+                None => into.push(session.intern(crate::archive::member_name(&archive, &member))),
             }
         }
-        _ => into.push(session.intern(word)),
+        return;
+    }
+    let mut matched = Vec::new();
+    glob_word_on_disk(session, word, &mut matched);
+    into.extend(matched.into_iter().map(|name| session.intern(name)));
+}
+
+/// The filesystem half, which is `glob()` and the rule that a pattern matching
+/// nothing is kept as it was written.
+fn glob_word_on_disk(session: &mut Session, word: Bytes, into: &mut Vec<Bytes>) {
+    if !word.iter().any(|c| matches!(c, b'?' | b'*' | b'[')) {
+        into.push(word);
+        return;
+    }
+    match session.glob(word.clone()).as_ref() {
+        Ok(paths) if !paths.is_empty() => into.extend(paths.iter().cloned()),
+        _ => into.push(word),
     }
 }
 

@@ -35,7 +35,10 @@ limitations under the License.
 //! one, it must end with `)`, and the parentheses must not be adjacent — so
 //! `lib.a()` is an ordinary filename and `(x)` is too.
 
-use bytes::Bytes;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+
+use bytes::{BufMut, Bytes, BytesMut};
 
 /// Whether `name` is written in the archive-member shape.
 ///
@@ -109,6 +112,275 @@ pub fn is_archive_search_name(name: &[u8]) -> bool {
     name.len() > 2 && name.first() == Some(&b'(') && name.last() == Some(&b')')
 }
 
+/// Reopen the archive groups in one rule's worth of file names.
+///
+/// `libf.a(x.o y.o z.o)` is one word to the tokenizer and three names to GNU
+/// Make. `parse_file_seq` (reference/gnumake/src/read.c) keeps the text up to
+/// and including the `(` as a prefix and puts each following word inside a
+/// pair of its own, so the group above becomes `libf.a(x.o)`, `libf.a(y.o)`
+/// and `libf.a(z.o)` — which is why that spelling and the three written out
+/// longhand behave identically.
+///
+/// Three details are the whole of the shape, and each is GNU Make's:
+///
+/// * A group only opens when some **later** word ends in `)`. Without one the
+///   text is not a group at all and every word is left exactly as written, so
+///   `lib.a(a.o b.o` names a file called `lib.a(a.o` and another called `b.o`.
+/// * A word that is only the opening `lib.a(`, or only the closing `)`, is a
+///   separator rather than a member, and contributes no name. That is what
+///   makes `lib.a( a.o b.o )` mean what `lib.a(a.o b.o)` means.
+/// * A word already ending in `)` closes the group; any other word is given a
+///   closing parenthesis of its own and the group stays open.
+///
+/// A word beginning with `(` never opens a group, because the member name
+/// would be empty.
+pub fn reopen_groups(words: Vec<Bytes>) -> Vec<Bytes> {
+    // GNU Make reaches this only for a name holding a `(`; the caller keeps
+    // that check, because the overwhelming majority of rules hold none.
+    let mut names = Vec::with_capacity(words.len());
+    // `Some(prefix)` is GNU Make's `tp > tmpbuf`: a group is open and every
+    // word is a member of it.
+    let mut prefix: Option<Bytes> = None;
+
+    for (index, word) in words.iter().enumerate() {
+        let mut member = word.clone();
+        if prefix.is_none() {
+            if word.is_empty() || word.first() == Some(&b'(') || word.last() == Some(&b')') {
+                names.push(member);
+                continue;
+            }
+            let Some(open) = word.iter().position(|byte| *byte == b'(') else {
+                names.push(member);
+                continue;
+            };
+            // A valid group MUST have a word ending in `)` still to come.
+            if !words[index + 1..]
+                .iter()
+                .any(|later| later.last() == Some(&b')'))
+            {
+                names.push(member);
+                continue;
+            }
+            prefix = Some(word.slice(..=open));
+            member = word.slice(open + 1..);
+            // The word was the bare `lib.a(`, so it names no member.
+            if member.is_empty() {
+                continue;
+            }
+        }
+
+        let open = prefix.clone().expect("a group is open");
+        if member.last() == Some(&b')') {
+            prefix = None;
+            // The word was the bare `)`, which closes the group and no more.
+            if member.len() == 1 {
+                continue;
+            }
+            names.push(join(&open, &member, b""));
+        } else {
+            names.push(join(&open, &member, b")"));
+        }
+    }
+    names
+}
+
+fn join(prefix: &[u8], member: &[u8], suffix: &[u8]) -> Bytes {
+    let mut name = BytesMut::with_capacity(prefix.len() + member.len() + suffix.len());
+    name.put_slice(prefix);
+    name.put_slice(member);
+    name.put_slice(suffix);
+    name.freeze()
+}
+
+/// Whether a member name is a pattern to match against an archive's index.
+///
+/// GNU Make's `ar_glob_pattern_p` (reference/gnumake/src/ar.c), which is
+/// deliberately not the same test as the one for a filename: a `[` counts only
+/// once a `]` follows it, so `lib.a(m[13.o)` names a member spelt that way
+/// rather than globbing. A backslash quotes the character after it.
+pub fn member_is_a_pattern(pattern: &[u8]) -> bool {
+    let mut index = 0usize;
+    let mut opened = false;
+    while let Some(&byte) = pattern.get(index) {
+        match byte {
+            b'?' | b'*' => return true,
+            b'\\' => index += 1,
+            b'[' => opened = true,
+            b']' if opened => return true,
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Every member name the archive's index holds, in the order it holds them.
+///
+/// GNU Make's `ar_scan` (reference/gnumake/src/arscan.c) reduced to the one
+/// question the front end asks of it: which members are there. Only the
+/// SysV/GNU format `ar` writes here is read — the `!<arch>\n` magic, fixed
+/// 60-byte member headers, the `//` long-name table for names too long for the
+/// header, and 4.4BSD's `#1/LEN` extended names. Anything that does not parse
+/// is an archive with no members, which is what `ar_scan` reports for an
+/// invalid archive to a caller that only wanted to match names.
+fn member_names(archive: &Path) -> Option<Vec<Bytes>> {
+    /// Bytes of the magic that opens an archive.
+    const MAGIC: &[u8; 8] = b"!<arch>\n";
+    /// Bytes of one member header.
+    const HEADER: usize = 60;
+
+    let mut file = std::fs::File::open(archive).ok()?;
+    let mut magic = [0u8; MAGIC.len()];
+    file.read_exact(&mut magic).ok()?;
+    if &magic != MAGIC {
+        return None;
+    }
+
+    let mut found = Vec::new();
+    let mut long_names = Vec::new();
+    let mut header = [0u8; HEADER];
+    loop {
+        // A short read is the end of the archive rather than a failure: every
+        // member found before it is still a member.
+        if file.read_exact(&mut header).is_err() {
+            return Some(found);
+        }
+        if &header[58..60] != b"`\n" {
+            return Some(found);
+        }
+        let size: i64 = parse_field(&header[48..58])?;
+        if size < 0 {
+            return Some(found);
+        }
+        let raw = trim_trailing(&header[..16]);
+
+        // The long-name table is a member like any other, and is read for its
+        // data rather than named as one.
+        if raw == b"//" || raw == b"ARFILENAMES/" {
+            long_names.resize(usize::try_from(size).ok()?, 0);
+            file.read_exact(&mut long_names).ok()?;
+            skip_padding(&mut file, size)?;
+            continue;
+        }
+
+        let mut extended = Vec::new();
+        let name: &[u8] = if raw.first() == Some(&b'/') || raw.first() == Some(&b' ') {
+            // GNU `ar`: an offset into the long-name table.
+            let offset: usize = parse_field(&raw[1..])?;
+            let table = long_names.get(offset..)?;
+            let end = table
+                .iter()
+                .position(|byte| *byte == b'\n' || *byte == b'\0')
+                .unwrap_or(table.len());
+            trim_trailing_slash(&table[..end])
+        } else if raw.starts_with(b"#1/") {
+            // 4.4BSD: the real name is the first bytes of the member's data.
+            let length: usize = parse_field(&raw[3..])?;
+            extended.resize(length, 0);
+            file.read_exact(&mut extended).ok()?;
+            let end = extended
+                .iter()
+                .position(|byte| *byte == b'\0')
+                .unwrap_or(extended.len());
+            extended.truncate(end);
+            &extended
+        } else {
+            trim_trailing_slash(raw)
+        };
+
+        if !name.is_empty() {
+            found.push(Bytes::copy_from_slice(name));
+        }
+
+        let consumed = i64::try_from(extended.len()).ok()?;
+        file.seek(SeekFrom::Current(size - consumed)).ok()?;
+        skip_padding(&mut file, size)?;
+    }
+}
+
+/// An archive member header field, which is left-aligned ASCII padded with
+/// spaces and may be entirely blank.
+fn parse_field<T: TryFrom<i64>>(field: &[u8]) -> Option<T> {
+    let text = std::str::from_utf8(trim_trailing(field)).ok()?;
+    if text.is_empty() {
+        return T::try_from(0).ok();
+    }
+    T::try_from(text.parse::<i64>().ok()?).ok()
+}
+
+fn trim_trailing(field: &[u8]) -> &[u8] {
+    let end = field
+        .iter()
+        .rposition(|byte| *byte != b' ' && *byte != 0)
+        .map_or(0, |last| last + 1);
+    &field[..end]
+}
+
+const fn trim_trailing_slash(name: &[u8]) -> &[u8] {
+    match name.split_last() {
+        Some((b'/', rest)) => rest,
+        _ => name,
+    }
+}
+
+/// Every member's data is padded to an even offset.
+fn skip_padding(file: &mut std::fs::File, size: i64) -> Option<()> {
+    if size % 2 == 1 {
+        file.seek(SeekFrom::Current(1)).ok()?;
+    }
+    Some(())
+}
+
+/// The members of `archive` matching `pattern`, sorted, or `None` when the
+/// pattern is not one or nothing matched.
+///
+/// GNU Make's `ar_glob`. Two things about it are worth stating rather than
+/// inferring, because both are visible in what a build does:
+///
+/// * The pattern is matched against the archive's **index**, not against the
+///   filesystem. An object sitting beside the archive and not filed in it does
+///   not match, and a member whose object has been deleted still does.
+/// * `fnmatch` is called with `FNM_PATHNAME|FNM_PERIOD`, so `*.o` does not
+///   match a member called `.hidden.o` — a leading period has to be written.
+///
+/// `None` rather than an empty list for no matches, because GNU Make then uses
+/// the pattern as the member's literal name and lets the build refuse over it.
+pub fn glob_members(archive: &[u8], pattern: &[u8]) -> Option<Vec<Bytes>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    if !member_is_a_pattern(pattern) {
+        return None;
+    }
+    let names = member_names(Path::new(std::ffi::OsStr::from_bytes(archive)))?;
+    let pattern = std::ffi::CString::new(pattern).ok()?;
+    let mut matched: Vec<Bytes> = names
+        .into_iter()
+        .filter(|name| {
+            crate::fileutil::fnmatch(&pattern, name, libc::FNM_PATHNAME | libc::FNM_PERIOD)
+        })
+        .collect();
+    if matched.is_empty() {
+        return None;
+    }
+    // GNU Make sorts the whole `lib.a(member)` names it built with
+    // `alpha_compare`, which is `strcmp` once the first byte ties. The archive
+    // half is the same for all of them, so sorting the members is the same
+    // order.
+    matched.sort_unstable();
+    Some(matched)
+}
+
+/// Rejoin an archive and a member into the one name the rest of the front end
+/// reads.
+pub fn member_name(archive: &[u8], member: &[u8]) -> Bytes {
+    let mut name = BytesMut::with_capacity(archive.len() + member.len() + 2);
+    name.put_slice(archive);
+    name.put_u8(b'(');
+    name.put_slice(member);
+    name.put_u8(b')');
+    name.freeze()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +437,186 @@ mod tests {
             Some(Bytes::from_static(b"(foo.o)"))
         );
         assert_eq!(archive_search_name(&Bytes::from_static(b"plain.o")), None);
+    }
+
+    fn reopened(text: &str) -> Vec<String> {
+        let words = text
+            .split_whitespace()
+            .map(|word| Bytes::copy_from_slice(word.as_bytes()))
+            .collect();
+        reopen_groups(words)
+            .into_iter()
+            .map(|name| String::from_utf8(name.to_vec()).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn one_pair_of_parentheses_can_name_several_members() {
+        assert_eq!(reopened("lib.a(a.o b.o)"), ["lib.a(a.o)", "lib.a(b.o)"]);
+        assert_eq!(
+            reopened("lib.a(a.o   b.o\tc.o)"),
+            ["lib.a(a.o)", "lib.a(b.o)", "lib.a(c.o)"]
+        );
+        // The two spellings a makefile is entitled to use interchangeably.
+        assert_eq!(
+            reopened("lib.a(a.o) lib.a(b.o)"),
+            reopened("lib.a(a.o b.o)")
+        );
+    }
+
+    #[test]
+    fn a_bare_parenthesis_separates_rather_than_names() {
+        assert_eq!(reopened("lib.a( a.o b.o)"), ["lib.a(a.o)", "lib.a(b.o)"]);
+        assert_eq!(reopened("lib.a(a.o b.o )"), ["lib.a(a.o)", "lib.a(b.o)"]);
+        assert_eq!(reopened("lib.a( a.o b.o )"), ["lib.a(a.o)", "lib.a(b.o)"]);
+    }
+
+    #[test]
+    fn a_group_that_never_closes_is_not_a_group() {
+        // No later word ends in `)`, so nothing is reopened and both words are
+        // the names the makefile wrote.
+        assert_eq!(reopened("lib.a(a.o b.o"), ["lib.a(a.o", "b.o"]);
+        assert_eq!(reopened("lib.a("), ["lib.a("]);
+    }
+
+    #[test]
+    fn a_closed_group_lets_the_words_after_it_alone() {
+        assert_eq!(
+            reopened("lib.a(a.o b.o) plain.txt"),
+            ["lib.a(a.o)", "lib.a(b.o)", "plain.txt"]
+        );
+        assert_eq!(
+            reopened("lib.a(a.o b.o) other.a(c.o)"),
+            ["lib.a(a.o)", "lib.a(b.o)", "other.a(c.o)"]
+        );
+    }
+
+    #[test]
+    fn a_name_beginning_with_a_parenthesis_opens_nothing() {
+        assert_eq!(reopened("(a.o b.o)"), ["(a.o", "b.o)"]);
+    }
+
+    #[test]
+    fn a_member_pattern_is_the_one_gnu_make_globs() {
+        assert!(member_is_a_pattern(b"*.o"));
+        assert!(member_is_a_pattern(b"m?.o"));
+        assert!(member_is_a_pattern(b"m[13].o"));
+        // `[` alone is not a pattern until a `]` closes it.
+        assert!(!member_is_a_pattern(b"m[13.o"));
+        assert!(!member_is_a_pattern(b"plain.o"));
+        // A backslash quotes the character after it.
+        assert!(!member_is_a_pattern(br"m\*.o"));
+    }
+
+    /// A directory of this test's own, named for the test rather than counted,
+    /// so two tests never read each other's archives. Removed again when the
+    /// test ends.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(test: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("kati-archive-{}-{test}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("a scratch directory");
+            Self(path)
+        }
+
+        /// Built by `ar` on this host rather than by hand, so the reader is
+        /// measured against the format that actually reaches it.
+        fn archive(&self, members: &[&str]) -> Vec<u8> {
+            for member in members {
+                std::fs::write(self.0.join(member), b"body\n").unwrap();
+            }
+            let path = self.0.join("lib.a");
+            let ok = std::process::Command::new("ar")
+                .arg("-rc")
+                .arg(&path)
+                .args(members)
+                .current_dir(&self.0)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+            path.into_os_string().into_encoded_bytes()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_index_is_what_a_member_pattern_is_matched_against() {
+        let scratch = Scratch::new("index-not-filesystem");
+        let archive = scratch.archive(&["m3.o", "m1.o", "m2.o"]);
+        // Filed after the archive was written, so it is on the filesystem and
+        // not in the index — and must not match.
+        std::fs::write(scratch.0.join("q.o"), b"body\n").unwrap();
+        let archive = archive.as_slice();
+
+        assert_eq!(
+            glob_members(archive, b"*.o"),
+            Some(vec![
+                Bytes::from_static(b"m1.o"),
+                Bytes::from_static(b"m2.o"),
+                Bytes::from_static(b"m3.o"),
+            ]),
+            "sorted, and the index's own order is not it"
+        );
+        assert_eq!(
+            glob_members(archive, b"m[13].o"),
+            Some(vec![
+                Bytes::from_static(b"m1.o"),
+                Bytes::from_static(b"m3.o")
+            ])
+        );
+        assert_eq!(glob_members(archive, b"*.zzz"), None);
+        assert_eq!(glob_members(archive, b"m1.o"), None, "not a pattern");
+        assert_eq!(glob_members(b"/nonexistent/lib.a", b"*.o"), None);
+    }
+
+    #[test]
+    fn a_long_member_name_comes_out_of_the_long_name_table() {
+        let scratch = Scratch::new("long-names");
+        let archive = scratch.archive(&["short.o", "a-very-long-member-name.o"]);
+        assert_eq!(
+            glob_members(&archive, b"*.o"),
+            Some(vec![
+                Bytes::from_static(b"a-very-long-member-name.o"),
+                Bytes::from_static(b"short.o"),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_leading_period_has_to_be_written_out() {
+        let scratch = Scratch::new("leading-period");
+        let archive = scratch.archive(&[".hidden.o", "plain.o"]);
+        // FNM_PERIOD: `*` does not match the leading period.
+        assert_eq!(
+            glob_members(&archive, b"*.o"),
+            Some(vec![Bytes::from_static(b"plain.o")])
+        );
+        assert_eq!(
+            glob_members(&archive, b".*.o"),
+            Some(vec![Bytes::from_static(b".hidden.o")])
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_an_archive_holds_no_members() {
+        let scratch = Scratch::new("not-an-archive");
+        let path = scratch.0.join("not-an-archive");
+        std::fs::write(&path, b"just bytes\n").unwrap();
+        assert_eq!(
+            glob_members(
+                path.into_os_string().into_encoded_bytes().as_slice(),
+                b"*.o"
+            ),
+            None
+        );
     }
 }

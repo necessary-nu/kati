@@ -1425,6 +1425,17 @@ struct DepBuilder<'a> {
     /// The recipe `.DEFAULT` offers for a target with no rule of its own.
     default_rule: Option<Arc<Rule>>,
     suffix_rules: SuffixRuleMap,
+    /// The `.X.a:` rules, kept apart because each makes a second pattern rule
+    /// that the first one's fate does not decide.
+    ///
+    /// `convert_to_pattern` builds `(%.o): %.X` and `%.a: %.X` from one suffix
+    /// rule and installs them independently, so a makefile that also writes
+    /// `%.a: %.X` by hand takes the name of the second and leaves the first
+    /// standing. Reading them back out of [`DepBuilder::suffix_rules`] would
+    /// lose exactly that case, because the written rule has already removed the
+    /// entry by then — see
+    /// [`DepBuilder::discard_suffix_rules_a_pattern_rule_holds`].
+    archive_suffix_rules: Vec<Arc<Rule>>,
     /// The name the invocation's own preamble is read under, which is how a
     /// `.SUFFIXES` Make wrote is told apart from one a Makefile wrote.
     bootstrap_filename: Symbol,
@@ -1560,6 +1571,7 @@ impl<'a> DepBuilder<'a> {
             wait_barriers: Vec::new(),
             default_rule: None,
             suffix_rules: HashMap::new(),
+            archive_suffix_rules: Vec::new(),
             bootstrap_filename,
             extra_prereqs_var_name,
             global_extra_prereqs: (Vec::new(), Vec::new()),
@@ -1706,8 +1718,7 @@ impl<'a> DepBuilder<'a> {
         let (compared, order_only) = split_order_only(text);
         let mut names = (Vec::new(), Vec::new());
         for (half, into) in [(compared, &mut names.0), (order_only, &mut names.1)] {
-            for word in makefile_word_scanner(&half) {
-                let word = word.slice_ref(trim_leading_curdir(&word));
+            for word in crate::rule::file_sequence(&half) {
                 glob_word(&mut self.ev.session, word, into);
             }
         }
@@ -2044,8 +2055,77 @@ impl<'a> DepBuilder<'a> {
         // again now that they are all known.
         self.discard_suffix_rules_a_pattern_rule_holds();
         self.order_suffix_rules_by_suffix_list();
+        // Before the catalogue's own `(%): %`, because that is the order
+        // `convert_to_pattern` and `install_default_implicit_rules` run in and
+        // the more specific target pattern is the one a member should reach
+        // first.
+        self.install_archive_suffix_rules()?;
         if !withheld {
             self.install_default_pattern_rules()?;
+        }
+        Ok(())
+    }
+
+    /// The second pattern rule a `.X.a:` suffix rule makes: `(%.o): %.X`.
+    ///
+    /// `convert_to_pattern` (reference/gnumake/src/rule.c:361) turns a suffix
+    /// rule whose target suffix is `.a` into **two** pattern rules rather than
+    /// one. `%.a: %.X` is the ordinary conversion and lives in the suffix map
+    /// like every other; this is the other one, and it is what lets a makefile
+    /// that writes its own `.c.a:` file an object straight into an archive:
+    ///
+    /// ```text
+    /// .SUFFIXES: .a .o .c
+    /// .c.a: ; $(CC) -c $(CFLAGS) $< ; $(AR) r $@ $*.o ; $(RM) $*.o
+    /// all: libx.a(foo.o)
+    /// ```
+    ///
+    /// The target pattern is literally `(%.o)`, whatever the source suffix is —
+    /// GNU Make writes it as a constant (`convert_suffix_rule`'s null-target
+    /// case) because the thing being filed into an archive is an object. So the
+    /// stem is the member's basename rather than its whole name: matching
+    /// `(foo.o)` gives `$*` of `foo` and `$<` of `foo.X`, where the built-in
+    /// `(%): %` would have given `foo.o` and `foo.o`.
+    ///
+    /// Built here rather than where the suffix rule was read, because a pair is
+    /// only converted while both its suffixes are declared and `.SUFFIXES` is
+    /// not settled until the last makefile closes. Built from
+    /// [`DepBuilder::archive_suffix_rules`] rather than from the suffix map,
+    /// because a makefile that writes `%.a: %.X` by hand empties the map entry
+    /// and still gets this rule — the two conversions are installed
+    /// independently, each with `new_pattern_rule`'s override off.
+    fn install_archive_suffix_rules(&mut self) -> Result<()> {
+        if self.archive_suffix_rules.is_empty() {
+            return Ok(());
+        }
+        let declared = self
+            .ev
+            .session
+            .suffixes
+            .iter()
+            .map(undotted)
+            .collect::<HashSet<_>>();
+        if !declared.contains(&Bytes::from_static(b"a")) {
+            return Ok(());
+        }
+        let target = self.ev.session.intern("(%.o)");
+        for suffix_rule in std::mem::take(&mut self.archive_suffix_rules) {
+            let source = suffix_rule.inputs[0].as_bytes(&self.ev.session);
+            if !declared.contains(&source) {
+                continue;
+            }
+            let mut prerequisite = BytesMut::with_capacity(source.len() + 2);
+            prerequisite.put_slice(b"%.");
+            prerequisite.put_slice(&source);
+            let prerequisite = self.ev.session.intern(prerequisite.freeze());
+
+            let mut rule = Rule::new(suffix_rule.loc.clone(), false, false);
+            rule.cmd_loc = suffix_rule.cmd_loc.clone();
+            rule.output_patterns.push(target);
+            rule.inputs.push(prerequisite);
+            rule.prerequisite_names.push(prerequisite);
+            rule.cmds = suffix_rule.cmds.clone();
+            self.populate_implicit_rule(Arc::new(rule), false)?;
         }
         Ok(())
     }
@@ -3448,10 +3528,15 @@ impl<'a> DepBuilder<'a> {
         r.inputs.push(input_sym);
         r.prerequisite_names.push(input_sym);
         r.is_suffix_rule = true;
-        self.suffix_rules
-            .entry(output_suffix)
-            .or_default()
-            .push(Arc::new(r));
+        let r = Arc::new(r);
+        // A `.X.a:` rule makes a second pattern rule as well as this one, and
+        // the two do not stand or fall together. Kept whole rather than built
+        // now: whether it is converted at all depends on `.SUFFIXES`, which is
+        // not settled until every makefile has been read.
+        if output_suffix.as_ref() == b"a" {
+            self.archive_suffix_rules.push(Arc::clone(&r));
+        }
+        self.suffix_rules.entry(output_suffix).or_default().push(r);
         Ok(true)
     }
 

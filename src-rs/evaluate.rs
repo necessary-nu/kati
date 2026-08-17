@@ -56,17 +56,28 @@ use crate::{error_loc, log, warn_loc};
 /// the shell, and `grouped-target` parses but runs the recipe once per target
 /// rather than once for the group.
 ///
-/// `archives` is deliberately absent though `lib.a(member.o)` is now read as a
-/// member of an archive: the shape, the built-in `(%): %` rule, `$%` and
-/// member freshness off the archive index are here, and `ar_glob`, the
-/// `.X.a` suffix conversion, `lib.a(a.o b.o)` and `-t` are not. GNU Make's own
-/// suite is the measure and says so plainly — claiming the feature runs its
-/// `features/archives` script, whose sixteen cases leave eight compiler-class
-/// differences today. Those eight are what the remaining work is worth, and
-/// the entry belongs here when they are gone.
+/// `archives` is absent from *this* list although the evaluator now has every
+/// front-end half of it — the `lib.a(member.o)` name shape, the built-in
+/// `(%): %` rule, `$%`, `ar_glob` over the archive's index, the `.X.a`
+/// conversion's second pattern rule, and `lib.a(a.o b.o)` naming two members.
+/// It is absent because the feature is not the evaluator's alone to claim: a
+/// member's timestamp comes out of the archive's index rather than off a file
+/// of that name, and reading it is the business of whoever stats the graph.
+/// The evaluator emitting these names to a front end that stats them as
+/// filenames would get a working parse and a wrong build.
 ///
-/// Build-side features belong to whoever runs the recipes, not to the
-/// evaluator, and arrive through [`Flags::extra_features`].
+/// So `archives` arrives through [`Flags::extra_features`], declared by the
+/// front end that has both halves — Ronin's Make mode, which sets
+/// `archive_members` on its disk interface. `jobserver` is here for the same
+/// reason and by the same rule: build-side features belong to whoever runs the
+/// recipes.
+///
+/// What is not implemented is `-t` on a member, and it is worth being exact
+/// about why, because it is not an archive gap. `-t` is not implemented on
+/// anything: it is accepted and ignored, per the `Accept without emulation`
+/// disposition in docs/make-compiler-boundary-audit.md. GNU Make's own
+/// `features/archives` script — the measure for this feature — never invokes
+/// it.
 pub const EVALUATOR_FEATURES: &[&str] =
     &["target-specific", "order-only", "else-if", "shortest-stem"];
 
