@@ -88,20 +88,17 @@ fn run(session: Session, orig_args: OsString) -> Result<i32> {
     // phase, so there is nothing to do between reaching the refusal and raising
     // it.
     //
-    // More than one only under `-k`, where GNU Make reports over every makefile
-    // it cannot make and then lists them all again. That second list has to come
-    // after every refusal, so under `-k` this reports the lot itself and leaves
-    // with a status rather than an error — an error returned here would be
-    // printed by the caller, which is after the summaries rather than before.
+    // More than one only under `-k`, where the update walks on past the makefile
+    // it cannot make instead of ending there. All of them are reported here and
+    // the run leaves with a status rather than an error, because an error
+    // returned from here would be printed by the caller and so would come after
+    // the refusals that precede it rather than in its own place among them.
     if ev.session.flags.keep_going && !refusals.is_empty() {
         for refusal in &refusals {
             if let Some(complaint) = &refusal.complaint {
                 eprintln!("{complaint}");
             }
             eprintln!("{}", refusal.error);
-        }
-        for refusal in &refusals {
-            eprintln!("{}", refusal.summary);
         }
         return Ok(ABANDONED);
     }

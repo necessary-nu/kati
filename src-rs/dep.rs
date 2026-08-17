@@ -275,8 +275,8 @@ pub struct Plan {
     pub refusals: Vec<Refusal>,
 }
 
-/// A required Makefile the read could not open and no rule can make, with what
-/// GNU Make says about it, in the order it says it.
+/// A required Makefile the read could not open and no rule can make: the
+/// failure that ends the run, and why the file could not be read.
 ///
 /// Both halves are held back rather than raised where they are discovered.
 /// GNU Make records the errno on the `goaldep` as `eval_makefile` fails to open
@@ -295,19 +295,6 @@ pub struct Refusal {
     pub complaint: Option<String>,
     /// What ends the run.
     pub error: anyhow::Error,
-    /// `Failed to remake makefile 'X'.`, which comes after every refusal rather
-    /// than beside its own.
-    ///
-    /// A different site from the two above and a different pass over the same
-    /// files: `main.c`'s `us_failed` arm walks `read_files` in order once the
-    /// update has RETURNED, and names each one it cares about that was left
-    /// `updated` with a failing status (main.c:2544). Without `-k` the update
-    /// does not return — `complain()` is `fatal` and the run ends inside it — so
-    /// these are never reached; with `-k` they all are, after all of them.
-    ///
-    /// Located at the `include` line like the complaint, and under Make's own
-    /// name for a Makefile the command line named.
-    pub summary: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -2654,16 +2641,7 @@ impl<'a> DepBuilder<'a> {
                 None,
                 format!("*** No rule to make target '{name}'."),
             );
-            let summary = crate::color_warn_text(
-                &self.ev.session,
-                include.loc.as_ref(),
-                format!("Failed to remake makefile '{name}'."),
-            );
-            refusals.push(Refusal {
-                complaint,
-                error,
-                summary,
-            });
+            refusals.push(Refusal { complaint, error });
             // Without `-k` this one ends the run from inside the update, so the
             // makefiles behind it are never considered and never reported.
             // `complain()` reads `keep_going_flag` and chooses `error` over
