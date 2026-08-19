@@ -433,7 +433,7 @@ impl DeferredRecipes {
             &ce.ev.session.flags,
             &recipe_output,
             &commands,
-            &mut description,
+            Some(&mut description),
         );
         let ignore_errors = NinjaGenerator::gen_shell_script(
             &ce.ev.session.flags,
@@ -815,43 +815,287 @@ impl<'a> NinjaGenerator<'a> {
         cmd == dirname(name)
     }
 
-    /// The text a lone `echo` was going to print, which is a better thing to
-    /// show while the command runs than the command itself.
+    /// One of `echo`'s words, added to the text it was going to print with
+    /// the single space the shell puts between the words it split.
+    fn push_echo_word(text: &mut BytesMut, word: &[u8], spaced: &mut bool, wrote: &mut bool) {
+        if *spaced {
+            text.put_u8(b' ');
+            *spaced = false;
+        }
+        text.put_slice(word);
+        *wrote = true;
+    }
+
+    /// Where a line's leading `set -flags ;` starts and ends, or twice the
+    /// start of the line when it has none.
     ///
-    /// This is a literal string, not a format: it is what the Makefile said,
-    /// with the shell quoting taken off.
-    fn get_description_from_command(cmd: &Bytes) -> Option<Bytes> {
-        let cmd = cmd.strip_prefix(b"echo ")?;
-
-        let mut prev_backslash = false;
-        let mut quote = None;
-        let mut out_buf = BytesMut::new();
-
-        // Strip outer quotes, and fail if it is not a single echo command
-        for c in cmd {
-            let c = *c;
-            if prev_backslash {
-                prev_backslash = false;
-                out_buf.put_u8(c);
-            } else if c == b'\\' {
-                prev_backslash = true;
-                out_buf.put_u8(c);
-            } else if let Some(q) = quote {
-                if c == q {
-                    quote = None;
-                } else {
-                    out_buf.put_u8(c);
+    /// kbuild writes its quiet command as `set -e; echo …; cmd`, so the flags
+    /// the line sets for itself stand in front of the echo and have to outlive
+    /// it. Only a run of `-flag` words is read: anything else is an argument
+    /// to `set`, which is a shell state this compiler is not going to reason
+    /// about, and `None` says so.
+    fn shell_options_prefix(bytes: &[u8]) -> Option<(usize, usize)> {
+        let blank = |c: u8| c == b' ' || c == b'\t';
+        let mut at = 0;
+        while bytes.get(at).is_some_and(|c| blank(*c)) {
+            at += 1;
+        }
+        let start = at;
+        if !(bytes[at..].starts_with(b"set ") || bytes[at..].starts_with(b"set\t")) {
+            return Some((start, start));
+        }
+        at += 3;
+        loop {
+            while bytes.get(at).is_some_and(|c| blank(*c)) {
+                at += 1;
+            }
+            match bytes.get(at) {
+                Some(b';') => {
+                    at += 1;
+                    return Some((start, at));
                 }
-            } else {
-                match c {
-                    b'\'' | b'"' | b'`' => quote = Some(c),
-                    b'<' | b'>' | b'&' | b'|' | b';' => return None,
-                    _ => out_buf.put_u8(c),
+                Some(b'-') => {
+                    let flag = at;
+                    at += 1;
+                    while bytes.get(at).is_some_and(u8::is_ascii_alphabetic) {
+                        at += 1;
+                    }
+                    if at == flag + 1 || !matches!(bytes.get(at), Some(b' ' | b'\t' | b';')) {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// The text a silenced `echo` was going to print, and the work it leaves
+    /// behind.
+    ///
+    /// GNU Make's recipe echo and Ninja's description say the same thing in
+    /// two voices, so a Makefile that silences its own recipe and echoes a
+    /// short line in its place — kbuild's quiet command, and every build
+    /// system that has grown one — has written a description in Make's
+    /// vocabulary. Reading it here is what stops the build saying it twice:
+    /// once as the progress line, which carries the whole script when the
+    /// Makefile named nothing better, and once as the echo's own output.
+    ///
+    /// The shapes recognised are deliberately few, and are the ones a quiet
+    /// command macro writes:
+    ///
+    /// ```text
+    /// echo TEXT
+    /// echo TEXT ; WORK
+    /// echo TEXT && WORK
+    /// set -e ; echo TEXT ; WORK
+    /// ```
+    ///
+    /// `TEXT` is what the shell would have handed `echo`: quotes off, and an
+    /// unquoted run of blanks collapsed to the one space `echo` puts between
+    /// its arguments. Everything whose meaning is settled at run time rather
+    /// than here — a redirect, a pipe, command substitution, a glob, a
+    /// backslash whose reading belongs to whichever `echo` the shell has, an
+    /// option — is not narration this compiler can lift, and that line keeps
+    /// its echo and runs it. A missed hoist prints one line too many; a wrong
+    /// one eats output that was never narration, so every doubt bails.
+    ///
+    /// This is the text as the Makefile wrote it, not a format: a literal
+    /// string with the shell quoting taken off.
+    fn split_narrating_echo(cmd: &Bytes) -> Option<(Bytes, Bytes)> {
+        let bytes = cmd.as_ref();
+        let blank = |c: u8| c == b' ' || c == b'\t';
+        let (options_start, options_end) = Self::shell_options_prefix(bytes)?;
+        let mut at = options_end;
+
+        while bytes.get(at).is_some_and(|c| blank(*c)) {
+            at += 1;
+        }
+        if !bytes[at..].starts_with(b"echo") {
+            return None;
+        }
+        at += 4;
+        if !bytes.get(at).is_some_and(|c| blank(*c)) {
+            return None;
+        }
+        while bytes.get(at).is_some_and(|c| blank(*c)) {
+            at += 1;
+        }
+        // Which options `echo` reads is the shell's business rather than this
+        // compiler's: `-n` and `-e` change what reaches the terminal.
+        if bytes.get(at) == Some(&b'-') {
+            return None;
+        }
+
+        let mut text = BytesMut::new();
+        let mut spaced = false;
+        let mut wrote = false;
+        let work_at;
+        loop {
+            match bytes.get(at) {
+                None => {
+                    work_at = at;
+                    break;
+                }
+                Some(b';') => {
+                    work_at = at + 1;
+                    break;
+                }
+                Some(b'&') if bytes.get(at + 1) == Some(&b'&') => {
+                    work_at = at + 2;
+                    break;
+                }
+                Some(&c) if blank(c) => {
+                    spaced = wrote;
+                    at += 1;
+                }
+                Some(b'\'') => {
+                    at += 1;
+                    let start = at;
+                    while bytes.get(at).is_some_and(|c| *c != b'\'') {
+                        at += 1;
+                    }
+                    if bytes.get(at) != Some(&b'\'') {
+                        return None;
+                    }
+                    Self::push_echo_word(&mut text, &bytes[start..at], &mut spaced, &mut wrote);
+                    at += 1;
+                }
+                Some(b'"') => {
+                    at += 1;
+                    let start = at;
+                    // Inside double quotes a dollar, a backtick and a
+                    // backslash are still the shell's to read.
+                    while bytes
+                        .get(at)
+                        .is_some_and(|c| !matches!(c, b'"' | b'$' | b'`' | b'\\'))
+                    {
+                        at += 1;
+                    }
+                    if bytes.get(at) != Some(&b'"') {
+                        return None;
+                    }
+                    Self::push_echo_word(&mut text, &bytes[start..at], &mut spaced, &mut wrote);
+                    at += 1;
+                }
+                // Every character a shell reads for itself: expansion,
+                // redirection, another command, a name that is a pattern.
+                Some(
+                    b'$' | b'`' | b'\\' | b'|' | b'&' | b'<' | b'>' | b'(' | b')' | b'*' | b'?'
+                    | b'[' | b']' | b'{' | b'}' | b'~' | b'!' | b'#',
+                ) => return None,
+                Some(&c) => {
+                    Self::push_echo_word(&mut text, &[c], &mut spaced, &mut wrote);
+                    at += 1;
                 }
             }
         }
+        // A backslash that reached here was inside single quotes, where the
+        // shell leaves it for `echo` — and /bin/sh's `echo` reads `\n` as a
+        // newline where bash's builtin prints it. Nothing that depends on
+        // which shell the recipe gets is a description.
+        if text.is_empty() || text.contains(&b'\\') {
+            return None;
+        }
 
-        Some(out_buf.freeze())
+        let mut work_start = work_at;
+        while bytes.get(work_start).is_some_and(|c| blank(*c)) {
+            work_start += 1;
+        }
+        let work = if work_start >= bytes.len() {
+            // Nothing is left for the flags to protect either.
+            Bytes::new()
+        } else if options_end > options_start {
+            let mut joined = BytesMut::with_capacity(bytes.len());
+            joined.put_slice(&bytes[options_start..options_end]);
+            joined.put_u8(b' ');
+            joined.put_slice(&bytes[work_start..]);
+            joined.freeze()
+        } else {
+            cmd.slice(work_start..)
+        };
+        Some((text.freeze(), work))
+    }
+
+    /// The narration a recipe line begins with, where the edge it is part of
+    /// can carry it.
+    ///
+    /// Four things decide this beyond the shape of the line itself.
+    ///
+    /// A recipe that silenced every line has taken its own narration over,
+    /// and only such a recipe is read this way: where a line was left loud,
+    /// GNU Make echoes it and the command Ronin shows for an undescribed edge
+    /// is what answers that echo.
+    ///
+    /// An echo that announces nothing is the recipe's output rather than its
+    /// narration — `make print-version` is a recipe of one echo, and `make
+    /// help` a recipe of several, and in both the caller is reading stdout —
+    /// so the hoist waits until the text is about work that is not more of
+    /// the same. Android's kati reads a lone echo as a description regardless,
+    /// which is the whole of `--detect_android_echo`.
+    ///
+    /// Under `-s` nothing is narrated and under `-n` nothing is run, and in
+    /// both the command is what the build shows. Moving the text out of it
+    /// there would take it off the screen rather than tidy it up.
+    ///
+    /// A recipe naming a liftable `$(MAKE)` becomes several edges out of one
+    /// rule, which share the description this would set, and its segments are
+    /// translated in passes of their own. Left alone, the echo stays in the
+    /// segment that wrote it and is said once.
+    fn hoisted_narration(
+        flags: &Flags,
+        commands: &[Command],
+        index: usize,
+        line: &Bytes,
+    ) -> Option<(Bytes, Bytes)> {
+        if flags.is_silent_mode || flags.is_dry_run {
+            return None;
+        }
+        if commands.iter().any(|c| !c.recursive_make.is_empty()) {
+            return None;
+        }
+        // A recipe that silenced every one of its lines has taken its own
+        // narration over, and the echo it wrote is all it means to say. A
+        // recipe that left a line loud has not: GNU Make echoes that line, and
+        // the command Ronin shows for an edge that named no description is the
+        // counterpart of exactly that echo. Taking the text out of one line
+        // while another still speaks for itself would narrate the recipe half
+        // one way and half the other.
+        if commands.iter().any(|c| c.echo) {
+            return None;
+        }
+        let (text, work) = Self::split_narrating_echo(line)?;
+        let announces = flags.detect_android_echo
+            || Self::is_work_worth_announcing(&work)
+            || commands[index + 1..].iter().any(|c| {
+                let line = c.cmd.slice_ref(c.cmd.trim_ascii_start());
+                Self::is_work_worth_announcing(&Self::translate_command(line))
+            });
+        announces.then_some((text, work))
+    }
+
+    /// Whether what is left of a recipe is work an echo above it was about.
+    ///
+    /// Nothing is not, and neither is more echoing: a recipe made of echoes is
+    /// a recipe whose output is the point, and `make help` is what it looks
+    /// like. Reading the first of its lines as the description would put one
+    /// line in the progress counter and leave the rest on stdout, which is
+    /// neither what the Makefile wrote nor anything else.
+    ///
+    /// This asks what the command *is*, not what its text says, so an echo
+    /// whose argument no description could be read out of still answers no.
+    /// The cost of that is a description not hoisted, which is a line of
+    /// narration too many; the cost of the other answer is output moved into
+    /// the progress counter.
+    fn is_work_worth_announcing(work: &Bytes) -> bool {
+        let bytes = work.as_ref();
+        let Some((_, at)) = Self::shell_options_prefix(bytes) else {
+            return !bytes.trim_ascii().is_empty();
+        };
+        let rest = bytes[at..].trim_ascii_start();
+        !(rest.is_empty()
+            || rest == b"echo"
+            || rest.starts_with(b"echo ")
+            || rest.starts_with(b"echo\t"))
     }
 
     /// The flags the whole fused script runs under.
@@ -889,9 +1133,14 @@ impl<'a> NinjaGenerator<'a> {
     /// one. Everything after this is a question about how many shells the
     /// destination is willing to start.
     ///
-    /// `description` is left `None` when the Makefile did not say. Each sink
-    /// can then narrate an inline recipe with the expanded script itself,
-    /// without making this front end choose a destination-specific format.
+    /// `description` is where the narration a recipe wrote for itself is put,
+    /// and it is left `None` when the Makefile said nothing a description
+    /// could be read out of. Each sink can then narrate an inline recipe with
+    /// the expanded script itself, without making this front end choose a
+    /// destination-specific format. A caller with nowhere to put narration —
+    /// one segment of a recipe whose whole text has already been read for it —
+    /// passes `None` and gets the lines as written, because hoisting there
+    /// would delete the text rather than move it.
     ///
     /// A line the translation absorbed keeps its place as `None` rather than
     /// being dropped, because the join below counts the lines still to come
@@ -901,7 +1150,7 @@ impl<'a> NinjaGenerator<'a> {
         flags: &Flags,
         name: &Bytes,
         commands: &[Command],
-        description: &mut Option<Bytes>,
+        mut description: Option<&mut Option<Bytes>>,
     ) -> TranslatedRecipe {
         // A nonzero status is certainly an ignored failure only when every line
         // ignores errors: otherwise it may be the `&&` chain stopping at a line
@@ -910,15 +1159,20 @@ impl<'a> NinjaGenerator<'a> {
         let wholly_ignored = !commands.is_empty() && commands.iter().all(|c| c.ignore_error);
         let mut lines = Vec::with_capacity(commands.len());
         let mut kept_any = false;
-        for c in commands {
+        for (index, c) in commands.iter().enumerate() {
             let inp = c.cmd.slice_ref(c.cmd.trim_ascii_start());
             let mut translated = Self::translate_command(inp);
-            let echoed = (flags.detect_android_echo && description.is_none() && !c.echo)
-                .then(|| Self::get_description_from_command(&translated))
-                .flatten();
-            if let Some(echoed) = echoed {
-                *description = Some(echoed);
-                translated.clear();
+            let hoisted = match description.as_deref() {
+                Some(None) if !c.echo => {
+                    Self::hoisted_narration(flags, commands, index, &translated)
+                }
+                _ => None,
+            };
+            if let Some((text, work)) = hoisted {
+                if let Some(slot) = description.as_deref_mut() {
+                    *slot = Some(text);
+                }
+                translated = work;
             } else if Self::is_output_mkdir(name, &translated) && !c.echo && !kept_any {
                 translated.clear();
             }
@@ -1041,8 +1295,10 @@ impl<'a> NinjaGenerator<'a> {
         depfile: &Option<Bytes>,
     ) -> Result<(Bytes, bool)> {
         let mut buf = BytesMut::new();
-        let mut description = None;
-        let translated = Self::translate_recipe(flags, recipe_output, commands, &mut description);
+        // No description: this segment is part of a recipe whose whole text
+        // was read for narration already, and a second reading here could
+        // only take an echo out of the script with nowhere to put it.
+        let translated = Self::translate_recipe(flags, recipe_output, commands, None);
         let ignore_errors = Self::gen_shell_script(flags, &translated, script_flags, &mut buf);
         if detect_depfile && !buf.is_empty() {
             let segment_depfile = get_depfile_from_command(&mut buf)?;
@@ -1157,7 +1413,7 @@ impl<'a> NinjaGenerator<'a> {
                 &self.ce.ev.session.flags,
                 &recipe_output_str,
                 &nn.commands,
-                &mut description,
+                Some(&mut description),
             );
             let ignore_errors = Self::gen_shell_script(
                 &self.ce.ev.session.flags,
@@ -1736,12 +1992,17 @@ fn escape_build_target(names: &dyn Interner, s: Symbol) -> Bytes {
 /// exactly the bytes that crossed the sink.
 fn escape_ninja_value(s: &[u8]) -> Bytes {
     let extras = s.iter().filter(|c| **c == b'$').count();
-    if extras == 0 {
+    // A binding's leading spaces are the manifest's separator rather than
+    // value, so a description that begins with the indent a quiet command
+    // lines its targets up under would reach the reader without it. Escaping
+    // them is how a manifest says the space is text.
+    let indent = s.iter().take_while(|c| **c == b' ').count();
+    if extras == 0 && indent == 0 {
         return Bytes::copy_from_slice(s);
     }
-    let mut r = BytesMut::with_capacity(s.len() + extras);
-    for c in s {
-        if *c == b'$' {
+    let mut r = BytesMut::with_capacity(s.len() + extras + indent);
+    for (index, c) in s.iter().enumerate() {
+        if *c == b'$' || index < indent {
             r.put_u8(b'$');
         }
         r.put_u8(*c);
@@ -2173,22 +2434,79 @@ mod tests {
         assert!(!out.contains("out:put"), "{out}");
     }
 
-    fn get_desc(cmd: &'static [u8]) -> Option<String> {
-        NinjaGenerator::get_description_from_command(&Bytes::from_static(cmd))
-            .map(|d| String::from_utf8_lossy(d.as_ref()).to_string())
+    /// The narration and the work a line splits into, as strings.
+    fn split_echo(cmd: &'static [u8]) -> Option<(String, String)> {
+        NinjaGenerator::split_narrating_echo(&Bytes::from_static(cmd)).map(|(text, work)| {
+            (
+                String::from_utf8_lossy(text.as_ref()).into_owned(),
+                String::from_utf8_lossy(work.as_ref()).into_owned(),
+            )
+        })
     }
 
     #[test]
-    fn test_get_description_from_command() {
-        assert_eq!(get_desc(b"echo Hello"), Some("Hello".into()));
+    fn a_narrating_echo_gives_up_its_text_and_keeps_its_work() {
         assert_eq!(
-            get_desc(b"echo \"Hello 'World'\""),
-            Some("Hello 'World'".into())
+            split_echo(b"echo Hello"),
+            Some(("Hello".into(), String::new()))
         );
         assert_eq!(
-            get_desc(b"echo Hello \\\" World"),
-            Some("Hello \\\" World".into())
+            split_echo(b"echo \"Hello 'World'\""),
+            Some(("Hello 'World'".into(), String::new()))
         );
+        // The two shapes a quiet command macro writes, which is the whole
+        // point: the echo comes out and what it announced stays.
+        assert_eq!(
+            split_echo(b"set -e; echo '  CC      misc.o'; cc -c -o misc.o misc.c"),
+            Some((
+                "  CC      misc.o".into(),
+                "set -e; cc -c -o misc.o misc.c".into()
+            ))
+        );
+        assert_eq!(
+            split_echo(b"echo '  CC      misc.o' && cc -c -o misc.o misc.c"),
+            Some(("  CC      misc.o".into(), "cc -c -o misc.o misc.c".into()))
+        );
+        // A shell splits the words and `echo` puts one space back.
+        assert_eq!(
+            split_echo(b"echo   a   b ; touch out"),
+            Some(("a b".into(), "touch out".into()))
+        );
+        // Quoting comes off wherever it is, and the flags outlive the echo
+        // only while there is work left for them to govern.
+        assert_eq!(
+            split_echo(b"echo '  CC      'misc.o; cc misc.c"),
+            Some(("  CC      misc.o".into(), "cc misc.c".into()))
+        );
+        assert_eq!(
+            split_echo(b"set -eu ; echo done"),
+            Some(("done".into(), String::new()))
+        );
+    }
+
+    #[test]
+    fn an_echo_the_shell_would_decide_is_not_narration() {
+        // Redirection, pipes and command substitution: what reaches the
+        // terminal is not this text, or is not known here at all.
+        assert_eq!(split_echo(b"echo hi > out"), None);
+        assert_eq!(split_echo(b"echo hi | tee out"), None);
+        assert_eq!(split_echo(b"echo `date`"), None);
+        assert_eq!(split_echo(b"echo $HOME"), None);
+        assert_eq!(split_echo(b"echo \"$(date)\""), None);
+        // A backslash is read by whichever `echo` the shell has.
+        assert_eq!(split_echo(b"echo Hello \\\" World"), None);
+        assert_eq!(split_echo(b"echo 'a\\nb'; touch out"), None);
+        // An option changes what is printed, and a glob is a name to be found.
+        assert_eq!(split_echo(b"echo -n hi; touch out"), None);
+        assert_eq!(split_echo(b"echo *.c; touch out"), None);
+        // `||` reads the echo's status, and taking it out would drop it.
+        assert_eq!(split_echo(b"echo hi || true"), None);
+        // Not an echo at all, and `set` given something other than flags.
+        assert_eq!(split_echo(b"echoes hi"), None);
+        assert_eq!(split_echo(b"set -o pipefail; echo hi; touch out"), None);
+        assert_eq!(split_echo(b"cc -c misc.c"), None);
+        // An unterminated quote is not a line this reading understands.
+        assert_eq!(split_echo(b"echo 'hi"), None);
     }
 
     #[test]
@@ -2234,7 +2552,7 @@ mod tests {
             &flags,
             &Bytes::from_static(b"out"),
             &commands,
-            &mut description,
+            Some(&mut description),
         );
         let mut script = BytesMut::new();
         NinjaGenerator::gen_shell_script(&flags, &translated, &script_flags, &mut script);
@@ -2350,7 +2668,7 @@ mod tests {
             &flags,
             &Bytes::from_static(b"out"),
             &commands,
-            &mut description,
+            Some(&mut description),
         );
         let ignore_errors =
             NinjaGenerator::gen_shell_script(&flags, &translated, &script_flags, &mut cmd_buf);
@@ -2361,6 +2679,167 @@ mod tests {
     /// The script for a one-line recipe whose errors are nobody's to ignore.
     fn script_for(cmd: &'static [u8]) -> Bytes {
         recipe_script(&[(cmd, false)]).0
+    }
+
+    /// The description and the script a silenced recipe compiles to, which is
+    /// the pair a quiet command is asking for.
+    fn narrated_recipe(lines: &[&'static [u8]], flags: &Flags) -> (Option<String>, String) {
+        let mut names = Symtab::new();
+        let output = names.intern(&b"out"[..]);
+        let commands: Vec<Command> = lines
+            .iter()
+            .map(|cmd| Command {
+                output,
+                cmd: Bytes::from_static(cmd),
+                echo: false,
+                ignore_error: false,
+                dash_prefixed: false,
+                shell_flag: Bytes::from_static(b"-c"),
+                force_no_subshell: false,
+                recursive_line: false,
+                recursive_make: Vec::new(),
+                uncomposable_recursion: false,
+            })
+            .collect();
+        let script_flags = NinjaGenerator::script_shell_flags(flags, &commands);
+        let mut cmd_buf = BytesMut::new();
+        let mut description = None;
+        let translated = NinjaGenerator::translate_recipe(
+            flags,
+            &Bytes::from_static(b"out"),
+            &commands,
+            Some(&mut description),
+        );
+        NinjaGenerator::gen_shell_script(flags, &translated, &script_flags, &mut cmd_buf);
+        (
+            description.map(|d| String::from_utf8_lossy(&d).into_owned()),
+            String::from_utf8_lossy(&cmd_buf).into_owned(),
+        )
+    }
+
+    /// kbuild writes one quiet command two ways — fused into the compile, and
+    /// on a line of its own above it — and both have to compile to the same
+    /// thing: the text on the edge, the work in the command, the echo nowhere.
+    #[test]
+    fn both_quiet_command_shapes_compile_to_the_same_description() {
+        let flags = Flags::default();
+        assert_eq!(
+            narrated_recipe(
+                &[b"set -e; echo '  CC      misc.o'; cc -c -o misc.o misc.c"],
+                &flags
+            ),
+            (
+                Some("  CC      misc.o".into()),
+                "set -e; cc -c -o misc.o misc.c".into()
+            )
+        );
+        assert_eq!(
+            narrated_recipe(
+                &[b"echo '  CC      misc.o'", b"cc -c -o misc.o misc.c"],
+                &flags
+            ),
+            (
+                Some("  CC      misc.o".into()),
+                "cc -c -o misc.o misc.c".into()
+            )
+        );
+    }
+
+    /// A recipe that is nothing but an echo is a recipe whose output is the
+    /// point — `make print-version`, read by whatever ran it — so the text
+    /// stays on stdout where the Makefile put it.
+    #[test]
+    fn an_echo_with_nothing_to_announce_stays_in_the_command() {
+        assert_eq!(
+            narrated_recipe(&[b"echo 1.2.3"], &Flags::default()),
+            (None, "echo 1.2.3".into())
+        );
+        // `make help` is the same recipe with more lines in it, and reading
+        // the first of them as the description would put one line in the
+        // progress counter and leave the rest on stdout.
+        assert_eq!(
+            narrated_recipe(&[b"echo 'usage:'", b"echo '  make all'"], &Flags::default()),
+            (None, "(echo 'usage:' ) && (echo '  make all' )".into())
+        );
+        assert_eq!(
+            narrated_recipe(&[b"echo one; echo two"], &Flags::default()),
+            (None, "echo one; echo two".into())
+        );
+        let android = Flags {
+            detect_android_echo: true,
+            ..Flags::default()
+        };
+        assert_eq!(
+            narrated_recipe(&[b"echo 1.2.3"], &android),
+            (Some("1.2.3".into()), String::new())
+        );
+    }
+
+    /// A recipe that left one line loud has not taken its own narration over:
+    /// GNU Make echoes that line, and the command Ronin shows for an edge that
+    /// named no description is the counterpart of exactly that echo.
+    #[test]
+    fn a_recipe_with_a_line_left_loud_keeps_its_command() {
+        let mut names = Symtab::new();
+        let output = names.intern(&b"out"[..]);
+        let flags = Flags::default();
+        let commands: Vec<Command> = [
+            (&b"echo '  CC      misc.o'"[..], false),
+            (b"cc misc.c", true),
+        ]
+        .into_iter()
+        .map(|(cmd, echo)| Command {
+            output,
+            cmd: Bytes::from_static(cmd),
+            echo,
+            ignore_error: false,
+            dash_prefixed: false,
+            shell_flag: Bytes::from_static(b"-c"),
+            force_no_subshell: false,
+            recursive_line: false,
+            recursive_make: Vec::new(),
+            uncomposable_recursion: false,
+        })
+        .collect();
+        let mut description = None;
+        let translated = NinjaGenerator::translate_recipe(
+            &flags,
+            &Bytes::from_static(b"out"),
+            &commands,
+            Some(&mut description),
+        );
+        let mut script = BytesMut::new();
+        NinjaGenerator::gen_shell_script(&flags, &translated, b"-c", &mut script);
+        assert_eq!(description, None);
+        assert_eq!(
+            String::from_utf8_lossy(&script),
+            "(echo '  CC      misc.o' ) && (cc misc.c )"
+        );
+    }
+
+    /// `-s` narrates nothing and `-n` runs nothing, so in both the command is
+    /// the whole of what the build shows and the echo has to stay inside it.
+    #[test]
+    fn a_run_that_shows_no_description_keeps_the_echo() {
+        let fused = "(echo '  CC      misc.o' ) && (cc -c -o misc.o misc.c )";
+        for flags in [
+            Flags {
+                is_silent_mode: true,
+                ..Flags::default()
+            },
+            Flags {
+                is_dry_run: true,
+                ..Flags::default()
+            },
+        ] {
+            assert_eq!(
+                narrated_recipe(
+                    &[b"echo '  CC      misc.o'", b"cc -c -o misc.o misc.c"],
+                    &flags
+                ),
+                (None, fused.into())
+            );
+        }
     }
 
     /// The manifest stanza a writer produces for one rule.
@@ -2511,6 +2990,19 @@ mod tests {
         assert_eq!(
             ninja_unescape(binding(&manifest, "description").as_bytes()),
             b"making $PATH"
+        );
+    }
+
+    /// A manifest skips the blanks after a binding's `=`, so a description
+    /// that begins with the indent a quiet command lines its targets up under
+    /// has to say that the indent is text.
+    #[test]
+    fn a_manifest_keeps_a_descriptions_leading_indent() {
+        let manifest = declare_rule_for(SinkCommand::Inline(b"cc -c misc.c"), Some(b"  CC misc.o"));
+        assert_eq!(binding(&manifest, "description"), "$ $ CC misc.o");
+        assert_eq!(
+            ninja_unescape(binding(&manifest, "description").as_bytes()),
+            b"  CC misc.o"
         );
     }
 
