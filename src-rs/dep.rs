@@ -36,8 +36,8 @@ use crate::{
     session::{Context, Session},
     stmt::AssignOp,
     strutil::{
-        Pattern, WordWriter, get_ext, is_space_byte, makefile_word_scanner, strip_ext,
-        substitute_stem, trim_leading_curdir, word_scanner,
+        Pattern, WordWriter, is_space_byte, makefile_word_scanner, substitute_stem,
+        trim_leading_curdir, word_scanner,
     },
     symtab::{Interner, Symbol},
     timeutil::ScopedTimeReporter,
@@ -576,17 +576,6 @@ impl DepNode {
     }
 }
 
-fn replace_suffix(session: &mut Session, s: Symbol, newsuf: &Symbol) -> Symbol {
-    let s = s.as_bytes(&*session);
-    let s = strip_ext(&s);
-    let newsuf = newsuf.as_bytes(&*session);
-    let mut r = BytesMut::with_capacity(s.len() + newsuf.len() + 1);
-    r.put_slice(s);
-    r.put_u8(b'.');
-    r.put_slice(&newsuf);
-    session.intern(r.freeze())
-}
-
 /// Rewrite a deferred prerequisite's `%` to a reference standing for the stem
 /// ahead of the second expansion, the first one of each whitespace-separated
 /// token as GNU Make does. Substituting the stem itself would expand it a third
@@ -753,9 +742,26 @@ fn apply_output_pattern(
     if !prerequisites_reach(session, r, output) {
         return ret;
     }
-    if r.is_suffix_rule {
+    if r.is_suffix_rule
+        && let Some(pattern) = r.output_patterns.first()
+    {
+        // A converted suffix rule is the pattern rule `%.y: %.x`, and its
+        // prerequisite is that pattern filled in for the name the search
+        // matched. The source suffix is held without the dot it is written
+        // with, because that is how the map is keyed, so the dot goes back on
+        // here. Measuring the stem off the target pattern rather than off the
+        // last dot in the name is what lets a suffix hold a dot of its own:
+        // `%..o` matching `foo..o` leaves `foo`, where the last dot leaves
+        // `foo.`.
+        let pattern = Pattern::new(pattern.as_bytes(&*session));
+        let output_str = output.as_bytes(&*session);
         for input in inputs {
-            ret.push(replace_suffix(session, output, input));
+            let input = input.as_bytes(&*session);
+            let mut source = BytesMut::with_capacity(input.len() + 2);
+            source.put_slice(b"%.");
+            source.put_slice(&input);
+            let buf = pattern.append_subst(&output_str, &source.freeze());
+            ret.push(session.intern(buf));
         }
         return ret;
     }
@@ -1021,6 +1027,15 @@ fn undotted(suffix: &Bytes) -> Bytes {
     suffix.slice(usize::from(suffix.starts_with(b"."))..)
 }
 
+/// Whether a name is shaped like the `.x.y` a suffix rule is usually written
+/// as, which is not the same question as whether it is one.
+///
+/// Whether it *is* one is answered by
+/// [`DepBuilder::convert_written_suffix_rules`], against the declared suffix
+/// list, and cannot be answered while makefiles are still being read. This
+/// answers the two questions that arise before then and are about the name
+/// alone: whether a second recipe for it is worth a warning, and whether a
+/// name nothing declared belongs in the manifest.
 fn is_suffix_rule(names: &impl Interner, output: &Symbol) -> bool {
     if !is_special_target(names, output) {
         return false;
@@ -1792,11 +1807,6 @@ impl<'a> DepBuilder<'a> {
             .iter()
             .map(|suffix| suffix.as_bytes(&self.ev.session))
             .collect();
-        if declared.is_empty() {
-            self.suffix_rules.clear();
-        } else {
-            self.keep_only_declared_suffix_rules(&declared);
-        }
         Ok(())
     }
 
@@ -2000,22 +2010,49 @@ impl<'a> DepBuilder<'a> {
         self.all_secondary || self.intermediates.contains(&output)
     }
 
-    /// A `.x.y:` rule is a suffix rule only while both `.x` and `.y` are on the
-    /// list, so a Makefile that clears the list and declares its own decides
-    /// which rules survive.
-    fn keep_only_declared_suffix_rules(&mut self, declared: &[Symbol]) {
-        let declared = declared
+    /// The suffix rules that could make `name`, each with the stem it leaves.
+    ///
+    /// GNU Make turns every suffix rule into the pattern `%<target suffix>`
+    /// and sorts the patterns a name matched by the length of the stem,
+    /// shortest first (reference/gnumake/src/implicit.c). A longer suffix
+    /// leaves a shorter stem, so the declared list is read longest first:
+    /// `foo..o` reaches `.c..o:` before `%.o` is tried, and `%.o` is still
+    /// there to be tried after it.
+    ///
+    /// Reading the list is the only way to know where a name's suffix begins.
+    /// The last dot answers only while no declared suffix holds one.
+    fn suffix_rule_candidates(&self, name: &Bytes) -> Vec<(Bytes, Arc<Rule>)> {
+        let mut suffixes = self
+            .ev
+            .session
+            .suffixes
             .iter()
-            .map(|s| undotted(&s.as_bytes(&self.ev.session)))
-            .collect::<HashSet<_>>();
-        let names = &self.ev.session;
-        self.suffix_rules.retain(|output_suffix, rules| {
-            if !declared.contains(output_suffix) {
-                return false;
-            }
-            rules.retain(|rule| declared.contains(&rule.inputs[0].as_bytes(names)));
-            !rules.is_empty()
-        });
+            .filter(|suffix| name.ends_with(suffix.as_ref()))
+            .cloned()
+            .collect::<Vec<_>>();
+        suffixes.sort_by_key(|suffix| std::cmp::Reverse(suffix.len()));
+        let mut candidates = Vec::new();
+        for suffix in suffixes {
+            let Some(rules) = self.suffix_rules.get(&undotted(&suffix)) else {
+                continue;
+            };
+            let stem = name.slice(..name.len() - suffix.len());
+            candidates.extend(rules.iter().map(|rule| (stem.clone(), rule.clone())));
+        }
+        candidates
+    }
+
+    /// The name a suffix rule reads to make a target with this stem.
+    ///
+    /// The source suffix is held without the dot it was written with, because
+    /// that is how the map is keyed, so the dot goes back on here.
+    fn suffix_rule_input(&mut self, stem: &Bytes, rule: &Rule) -> Symbol {
+        let source = rule.inputs[0].as_bytes(&self.ev.session);
+        let mut name = BytesMut::with_capacity(stem.len() + source.len() + 1);
+        name.put_slice(stem);
+        name.put_u8(b'.');
+        name.put_slice(&source);
+        self.ev.session.intern(name.freeze())
     }
 
     /// Turn `.SUFFIXES` into rules, and add the rules that were always
@@ -2030,6 +2067,7 @@ impl<'a> DepBuilder<'a> {
     /// withhold.
     fn install_builtin_rules(&mut self) -> Result<()> {
         let withheld = self.ev.session.flags.no_builtin_rules;
+        self.convert_written_suffix_rules()?;
         for source in self.ev.session.suffixes.clone() {
             self.install_suffix_disqualifier(&source)?;
             self.install_null_suffix_rule(&source, withheld)?;
@@ -2038,8 +2076,7 @@ impl<'a> DepBuilder<'a> {
             self.install_builtin_suffix_pairs()?;
         }
         // A written pattern rule keeps any name a suffix rule would have taken,
-        // and the built-in pairs have only just arrived, so the comparison runs
-        // again now that they are all known.
+        // and every suffix rule there will be is now known.
         self.discard_suffix_rules_a_pattern_rule_holds();
         self.order_suffix_rules_by_suffix_list();
         // Before the catalogue's own `(%): %`, because that is the order
@@ -3388,10 +3425,6 @@ impl<'a> DepBuilder<'a> {
                 self.populate_explicit_rule(rule)?;
             }
         }
-        self.discard_suffix_rules_a_pattern_rule_holds();
-        for rules in self.suffix_rules.values_mut() {
-            rules.reverse();
-        }
         // TODO: This clone likely isn't necessary with some refactoring
         for (symbol, merger) in self.rules.clone() {
             let Some(vars) = self.lookup_rule_vars(symbol) else {
@@ -3437,11 +3470,17 @@ impl<'a> DepBuilder<'a> {
         Ok(())
     }
 
-    fn populate_suffix_rule(&mut self, rule: &Rule, output: Symbol) -> Result<bool> {
+    /// Say that writing a rule in the `.x.y` form is deprecated, if the run
+    /// asked to be told.
+    ///
+    /// The complaint is about the syntax rather than about the rule, so it is
+    /// made where the syntax was written and not where the conversion happens:
+    /// under `-r` the suffix list is empty and nothing converts, and a
+    /// makefile that wrote `.c.o:` there has still written one.
+    fn deprecate_suffix_rule_syntax(&mut self, rule: &Rule, output: Symbol) -> Result<()> {
         if !is_suffix_rule(&self.ev.session, &output) {
-            return Ok(false);
+            return Ok(());
         }
-
         if self.ev.session.flags.werror_suffix_rules {
             error_loc!(
                 self.ev,
@@ -3457,14 +3496,58 @@ impl<'a> DepBuilder<'a> {
                 output.display(self.ev)
             );
         }
+        Ok(())
+    }
 
+    /// The suffix rules the makefiles wrote, found the way GNU Make finds
+    /// them: by writing every declared suffix in front of every other and
+    /// looking the name up.
+    ///
+    /// `convert_to_pattern` (reference/gnumake/src/rule.c) never reads a name
+    /// to decide where its two suffixes meet, and that is the whole of why a
+    /// suffix may hold a dot. zsh sets `OBJ=.o`, declares `..o` beside `.o`,
+    /// and writes `.c.$(OBJ):` — the name is `.c..o`, and it splits as `.c`
+    /// and `..o` because those are the two entries on the list and for no
+    /// other reason. Counting dots answers a different question and gets that
+    /// one wrong.
+    ///
+    /// A pair of equal suffixes is skipped, as GNU skips it: nothing is made
+    /// from itself.
+    ///
+    /// This runs once the last makefile has closed, because the list it reads
+    /// is the one that read left behind.
+    fn convert_written_suffix_rules(&mut self) -> Result<()> {
+        for source in self.ev.session.suffixes.clone() {
+            for target in self.ev.session.suffixes.clone() {
+                if source == target {
+                    continue;
+                }
+                let mut name = BytesMut::with_capacity(source.len() + target.len());
+                name.put_slice(&source);
+                name.put_slice(&target);
+                let written = self.ev.session.intern(name.freeze());
+                let Some(merger) = self.lookup_rule_merger(written) else {
+                    continue;
+                };
+                let rules = merger.lock().rules.clone();
+                // Later definition first, which is the order the whole map is
+                // kept in and the order the search reads it back in.
+                for rule in rules.iter().rev() {
+                    self.convert_suffix_rule(rule, &source, &target)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn convert_suffix_rule(&mut self, rule: &Rule, source: &Bytes, target: &Bytes) -> Result<()> {
         if rule.cmds.is_empty() {
             // `convert_to_pattern` looks the suffix pair's name up as a file and
             // passes over one with no recipe, so a recipe-less `.w.tex:` never
             // becomes a rule that could make anything. Writing one beside a
             // `.w.tex:` that does have a recipe therefore withdraws nothing:
             // the recipe is what was converted, and it is still there.
-            return Ok(false);
+            return Ok(());
         }
 
         // POSIX says a suffix rule has no prerequisites, and GNU Make 4.4.1
@@ -3476,7 +3559,7 @@ impl<'a> DepBuilder<'a> {
         // target survives, which is the half `is_buildable_target` answers.
         if !rule.inputs.is_empty() || !rule.order_only_inputs.is_empty() {
             if self.ev.is_posix() {
-                return Ok(false);
+                return Ok(());
             }
             warn_loc!(
                 self.ev,
@@ -3485,37 +3568,29 @@ impl<'a> DepBuilder<'a> {
             );
         }
 
-        let mut output = output.as_bytes(&self.ev.session);
-        output.advance(1);
-        let dot_index = memchr(b'.', &output).unwrap();
-
-        let input_suffix = output.slice(..dot_index);
-        let output_suffix = output.slice(dot_index + 1..);
+        let output_suffix = undotted(target);
         let mut r = rule.clone();
-        let mut output_pattern = BytesMut::with_capacity(output_suffix.len() + 2);
-        output_pattern.put_slice(b"%.");
-        output_pattern.put_slice(&output_suffix);
         r.output_patterns.clear();
-        r.output_patterns
-            .push(self.ev.session.intern(output_pattern.freeze()));
+        r.output_patterns.push(self.suffix_pattern(target));
         r.inputs.clear();
         r.order_only_inputs.clear();
         r.prerequisite_names.clear();
         r.deferred_prerequisites = None;
-        let input_sym = self.ev.session.intern(input_suffix);
+        let input_sym = self.ev.session.intern(undotted(source));
         r.inputs.push(input_sym);
         r.prerequisite_names.push(input_sym);
         r.is_suffix_rule = true;
         let r = Arc::new(r);
         // A `.X.a:` rule makes a second pattern rule as well as this one, and
-        // the two do not stand or fall together. Kept whole rather than built
-        // now: whether it is converted at all depends on `.SUFFIXES`, which is
-        // not settled until every makefile has been read.
-        if output_suffix.as_ref() == b"a" {
+        // the two do not stand or fall together, so it is kept whole for
+        // [`DepBuilder::install_archive_suffix_rules`] to build. GNU asks
+        // whether the target suffix is exactly `.a`, which is not the same as
+        // asking whether it ends in one.
+        if target.as_ref() == b".a" {
             self.archive_suffix_rules.push(Arc::clone(&r));
         }
         self.suffix_rules.entry(output_suffix).or_default().push(r);
-        Ok(true)
+        Ok(())
     }
 
     /// Throw away every suffix rule a written pattern rule already speaks for,
@@ -3583,7 +3658,7 @@ impl<'a> DepBuilder<'a> {
                 .or_insert_with(RuleMerger::new)
                 .lock()
                 .add_rule(&*self.ev, *output, rule.clone())?;
-            self.populate_suffix_rule(&rule, *output)?;
+            self.deprecate_suffix_rule_syntax(&rule, *output)?;
         }
         Ok(())
     }
@@ -4546,21 +4621,12 @@ impl<'a> DepBuilder<'a> {
             }
         }
 
-        let Some(suffix) = get_ext(&output_str) else {
-            return Ok(false);
-        };
-        if !suffix.starts_with(b".") {
-            return Ok(false);
-        }
-        let Some(found) = self.suffix_rules.get(&suffix[1..]).cloned() else {
-            return Ok(false);
-        };
-        for irule in &found {
-            if self.rules_in_use.contains(&Self::rule_id(irule)) {
+        for (stem, irule) in self.suffix_rule_candidates(&output_str) {
+            if self.rules_in_use.contains(&Self::rule_id(&irule)) {
                 continue;
             }
-            let input = replace_suffix(&mut self.ev.session, output, &irule.inputs[0]);
-            let reachable = self.while_rule_in_use(irule, |builder| {
+            let input = self.suffix_rule_input(&stem, &irule);
+            let reachable = self.while_rule_in_use(&irule, |builder| {
                 if builder.proven_impossible(input, depth + 1) {
                     return Ok(false);
                 }
@@ -4916,29 +4982,20 @@ impl<'a> DepBuilder<'a> {
         }
 
         let output_str = output.as_bytes(&self.ev.session);
-        // The suffix map is keyed by a filename's extension, and the archive
+        // The suffix map is reached from a filename's ending, and the archive
         // pass is matching `(member)` rather than a filename. GNU Make reaches
         // its `.X.a` suffix rules as the pattern rules `convert_to_pattern`
         // made of them, never through this map.
         if search.name != &output_str {
             return Ok(None);
         }
-        let Some(output_suffix) = get_ext(&output_str) else {
-            return Ok(None);
-        };
-        if !output_suffix.starts_with(b".") {
-            return Ok(None);
-        }
-        let Some(found) = self.suffix_rules.get(&output_suffix[1..]).cloned() else {
-            return Ok(None);
-        };
 
-        for irule in &found {
+        for (stem, irule) in self.suffix_rule_candidates(&output_str) {
             assert!(irule.inputs.len() == 1);
-            if self.rules_in_use.contains(&Self::rule_id(irule)) {
+            if self.rules_in_use.contains(&Self::rule_id(&irule)) {
                 continue;
             }
-            let input = replace_suffix(&mut self.ev.session, output, &irule.inputs[0]);
+            let input = self.suffix_rule_input(&stem, &irule);
             if self.proven_impossible(input, 0) {
                 continue;
             }
@@ -4948,7 +5005,7 @@ impl<'a> DepBuilder<'a> {
                 self.found_compat_rule |= !pass.compat;
             }
             if !self.exists(input) && !taken_on_trust {
-                let reachable = self.while_rule_in_use(irule, |builder| {
+                let reachable = self.while_rule_in_use(&irule, |builder| {
                     Ok(pass.chaining && builder.intermediate_reachable(input, 0, pass.compat)?)
                 })?;
                 if !reachable {
@@ -4968,7 +5025,7 @@ impl<'a> DepBuilder<'a> {
             }
             return Ok(Some(PickedRuleInfo {
                 merger: rule_merger.clone(),
-                pattern_rule: Some(irule.clone()),
+                pattern_rule: Some(irule),
                 vars: Self::scopes_for(patterns, vars),
             }));
         }
