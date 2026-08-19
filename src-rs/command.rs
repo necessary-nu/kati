@@ -1141,7 +1141,7 @@ impl<'a> CommandEvaluator<'a> {
         Ok(())
     }
 
-    // [spec:ronin:req:make.recursive-invocation+1]
+    // [spec:ronin:req:make.recursive-invocation+2]
     pub fn eval(&mut self, n: &Arc<Mutex<DepNode>>) -> Result<Vec<Command>> {
         let mut result: Vec<Command> = Vec::new();
         let node_cmds;

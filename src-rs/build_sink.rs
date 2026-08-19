@@ -265,7 +265,7 @@ pub struct SinkRule<'a> {
     /// work of its own. Such a recipe is not refused. It reaches the executor
     /// as the script it is, and the Make it names starts — which is what GNU
     /// Make does with it, and the only answer that leaves nothing unbuilt.
-    // [spec:ronin:req:make.recursive-invocation+1]
+    // [spec:ronin:req:make.recursive-invocation+2]
     pub subninjas: &'a [SinkSubninja<'a>],
     /// The recipe's own lines written after the last invocation, assembled
     /// into one script. A graph sink runs this parent action after the child
