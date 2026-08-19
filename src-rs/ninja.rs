@@ -402,10 +402,11 @@ impl DeferredRecipes {
         let commands = ce.eval(&recipe.node)?;
         // The classification that decided this recipe could be deferred is
         // made before anything is expanded, so it is checked here against what
-        // the expansion actually did. A recursive invocation reaching this
-        // point would be a nested Make process rather than a composed child
-        // graph, which is the one thing the compiler must never hand its
-        // executor.
+        // the expansion actually did. Deferral is only ever offered to a
+        // recipe no expansion of which can reach `MAKE`, so a recursion here
+        // is the classification having been wrong rather than a recipe with a
+        // remainder to run — and a graph that was built believing it had no
+        // child to compose cannot grow one now.
         if commands
             .iter()
             .any(|command| !command.recursive_make.is_empty() || command.uncomposable_recursion)
@@ -1149,23 +1150,24 @@ impl<'a> NinjaGenerator<'a> {
                 .commands
                 .iter()
                 .any(|command| !command.recursive_make.is_empty());
-            // Splitting is all-or-nothing. A sink must never receive a
-            // plausible-looking prefix while another recursive line remains
-            // hidden in the discarded executor script. A multi-line
-            // `.ONESHELL` recipe shares shell state across lines, and more
-            // than one MAKE reference on a line does not identify one static
-            // child compilation. A line GNU Make classified recursive whose
-            // invocation cannot be lifted out is the third way that happens,
-            // and the one that used to pass unseen: it carries no
-            // `recursive_make`, so it would have been read as ordinary
-            // residual work and left to start a nested Make beside the child
-            // graphs its siblings became.
+            // What stops a recipe splitting is a shell whose state the split
+            // would lose: a multi-line `.ONESHELL` recipe runs its lines in
+            // one shell, and more than one MAKE reference on a line does not
+            // identify one static child compilation.
+            //
+            // A line GNU Make classified recursive whose invocation cannot be
+            // lifted out is neither. It carries no `recursive_make`, so it is
+            // residual work and reaches the executor as written — which is
+            // exactly what the same line does when it is a recipe's only
+            // recursion, and there is no reading of the graph on which having
+            // a liftable sibling makes it worse. Refusing the whole recipe for
+            // it made a mixed recipe stricter than either of the two recipes
+            // it is made of, and vim's top-level Makefile — one liftable `cd
+            // src && $(MAKE) $@` beside two guards holding `$(MAKE)` calls
+            // that are false for every goal it is asked for — is a tree that
+            // built nothing because of it.
             let composable_subninjas = contains_recursive
                 && (!self.ce.ev.session.flags.one_shell || nn.commands.len() == 1)
-                && nn
-                    .commands
-                    .iter()
-                    .all(|command| !command.uncomposable_recursion)
                 && nn
                     .commands
                     .iter()
@@ -1178,10 +1180,14 @@ impl<'a> NinjaGenerator<'a> {
                         let [make] = command.recursive_make.as_slice() else {
                             return None;
                         };
+                        // What the child is compiled from is the invocation,
+                        // not the line the invocation was written on: a line
+                        // that is one invocation inside a subshell reaches the
+                        // resolver without the subshell, because that is what
+                        // the recogniser read to call it liftable.
+                        let lifted = crate::command::unwrapped_command(&command.cmd);
                         Some((
-                            Self::translate_command(
-                                command.cmd.slice_ref(command.cmd.trim_ascii_start()),
-                            ),
+                            Self::translate_command(command.cmd.slice_ref(lifted)),
                             make.clone(),
                         ))
                     })

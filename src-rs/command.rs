@@ -664,10 +664,76 @@ fn spawns_make(command: &[u8], make: &[u8]) -> bool {
     })
 }
 
+/// One command with the subshell a whole recipe line sits inside taken off.
+///
+/// A line that is nothing but a parenthesized sequence *is* that sequence. The
+/// parentheses keep a directory change and an environment from reaching the
+/// rest of the script, and a line holding only the sequence has no rest of the
+/// script for them to reach: GNU Make hands the line to a shell of its own
+/// either way. vim's top-level Makefile writes `(cd runtime/indent && $(MAKE)
+/// clean)`, and what that starts is the same child, with the same goals, in
+/// the same directory, as the line without its parentheses.
+///
+/// Only `(`, and only when it closes at the very end. `(a) && (b)` is two
+/// commands and opens on the first byte, so the match has to be found rather
+/// than assumed. A brace group means the same thing to a shell and is left
+/// alone on purpose: `{` is a command word only in command position, so
+/// reading one wrongly changes what a line means, where a `(` is always the
+/// operator.
+pub fn unwrapped_command(command: &[u8]) -> &[u8] {
+    let mut command = command.trim_ascii();
+    while let Some(body) = subshell_body(command) {
+        command = body.trim_ascii();
+        // The `;` a sequence may end with belongs to the sequence, and with
+        // the parentheses gone there is nothing left for it to separate.
+        command = command
+            .strip_suffix(b";")
+            .unwrap_or(command)
+            .trim_ascii_end();
+    }
+    command
+}
+
+/// What a leading `(` encloses, when what it encloses is the whole command.
+fn subshell_body(command: &[u8]) -> Option<&[u8]> {
+    if !command.starts_with(b"(") {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut index = 0;
+    while index < command.len() {
+        let byte = command[index];
+        match quote {
+            Some(delimiter) => {
+                if byte == delimiter {
+                    quote = None;
+                } else if byte == b'\\' && delimiter == b'"' {
+                    index += 1;
+                }
+            }
+            None => match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'\\' => index += 1,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (index + 1 == command.len()).then(|| &command[1..index]);
+                    }
+                }
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    None
+}
+
 /// Whether one expanded `MAKE` value occupies the command position of a
 /// recipe line rather than merely being printed or passed as data.
 fn invokes_make(command: &[u8], make: &[u8]) -> bool {
-    let mut command = command.trim_ascii_start();
+    let mut command = unwrapped_command(command);
     if starts_with_word(command, b"exec") {
         command = command[b"exec".len()..].trim_ascii_start();
     }
@@ -928,7 +994,8 @@ impl<'a> CommandEvaluator<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoCommand, AutoCommandVar, AutoCommandVariant, invokes_make, references_make, spawns_make,
+        AutoCommand, AutoCommandVar, AutoCommandVariant, invokes_make, references_make,
+        spawns_make, unwrapped_command,
     };
     use crate::expr::{ParseExprOpt, parse_expr};
     use crate::loc::Loc;
@@ -1008,6 +1075,43 @@ mod tests {
         assert!(!invokes_make(b"printf '%s' make", b"make"));
         assert!(!invokes_make(b"echo make && true", b"make"));
         assert!(!invokes_make(b"make-believe child", b"make"));
+    }
+
+    /// The subshell vim's top-level Makefile writes its recursion inside, and
+    /// the shapes that look like it and are not one command.
+    #[test]
+    fn a_subshell_around_the_whole_line_is_not_a_command() {
+        assert_eq!(
+            unwrapped_command(b"(cd sub && make child)"),
+            b"cd sub && make child"
+        );
+        assert_eq!(
+            unwrapped_command(b"  ( ( make child ; ) )  "),
+            b"make child"
+        );
+        assert_eq!(
+            unwrapped_command(b"(cd a && make b) && (cd c && make d)"),
+            b"(cd a && make b) && (cd c && make d)"
+        );
+        assert_eq!(
+            unwrapped_command(b"(cd a && make b) # )"),
+            b"(cd a && make b) # )"
+        );
+        assert_eq!(unwrapped_command(b"echo '(a)'"), b"echo '(a)'");
+        // Unbalanced, so there is no body to find and the line stands as
+        // written for the shell to complain about.
+        assert_eq!(
+            unwrapped_command(b"(cd sub && make child"),
+            b"(cd sub && make child"
+        );
+
+        assert!(invokes_make(b"(cd sub && make child)", b"make"));
+        assert!(invokes_make(b"(make child)", b"make"));
+        assert!(!invokes_make(b"(echo make)", b"make"));
+        assert!(!invokes_make(
+            b"(cd a && make b); (cd c && make d)",
+            b"make"
+        ));
     }
 
     /// Whether a recipe line as written classifies as recursive, which is the
