@@ -1021,6 +1021,40 @@ impl<'a> NinjaGenerator<'a> {
         wholly_ignored && !cmd_buf.is_empty()
     }
 
+    /// One run of a recursive recipe's own lines, assembled into the script a
+    /// shell receives, and whether that script's status is an ignored failure.
+    ///
+    /// Each such run is a subset of the same recipe and reaches the same shell,
+    /// so it is assembled against the flags that shell has rather than against
+    /// flags derived from the subset.
+    ///
+    /// Automatic depfile detection appends the copy to kati's manifest command.
+    /// A sink that runs these scripts instead needs the identical
+    /// transformation, and every one of them must name the file the whole
+    /// recipe named.
+    fn residual_segment(
+        flags: &Flags,
+        recipe_output: &Bytes,
+        script_flags: &[u8],
+        commands: &[Command],
+        detect_depfile: bool,
+        depfile: &Option<Bytes>,
+    ) -> Result<(Bytes, bool)> {
+        let mut buf = BytesMut::new();
+        let mut description = None;
+        let translated = Self::translate_recipe(flags, recipe_output, commands, &mut description);
+        let ignore_errors = Self::gen_shell_script(flags, &translated, script_flags, &mut buf);
+        if detect_depfile && !buf.is_empty() {
+            let segment_depfile = get_depfile_from_command(&mut buf)?;
+            if segment_depfile != *depfile {
+                return Err(anyhow::anyhow!(
+                    "recursive recipe residual selected a different depfile"
+                ));
+            }
+        }
+        Ok((buf.freeze(), ignore_errors))
+    }
+
     fn get_depfile(&mut self, node: &DepNode, cmd_buf: &mut BytesMut) -> Result<Option<Bytes>> {
         if let Some(depfile_var) = node.depfile_var.clone() {
             let depfile = depfile_var.read().eval_to_buf(self.ce.ev)?;
@@ -1195,53 +1229,65 @@ impl<'a> NinjaGenerator<'a> {
             } else {
                 Vec::new()
             };
+            // Where a residual line falls among the invocations is where it
+            // runs. GNU Make runs a recipe's lines in the order they were
+            // written, so the lines ahead of an invocation belong to that
+            // invocation — they have to have happened before the Make it names
+            // reads anything — and only the lines after the last invocation are
+            // the recipe's own trailing action.
+            let mut preceding_commands = Vec::new();
+            let mut residual_commands = Vec::new();
+            if composable_subninjas {
+                let mut segment = Vec::new();
+                for command in &nn.commands {
+                    if command.recursive_make.is_empty() {
+                        segment.push(command.clone());
+                    } else {
+                        preceding_commands.push(std::mem::take(&mut segment));
+                    }
+                }
+                residual_commands = segment;
+            }
+            let detect_depfile =
+                node.depfile_var.is_none() && self.ce.ev.session.flags.detect_depfiles;
+            let mut preceding_storage = Vec::with_capacity(preceding_commands.len());
+            for segment in &preceding_commands {
+                preceding_storage.push(Self::residual_segment(
+                    &self.ce.ev.session.flags,
+                    &recipe_output_str,
+                    &script_flags,
+                    segment,
+                    detect_depfile,
+                    &depfile,
+                )?);
+            }
             let subninjas = subninja_storage
                 .iter()
-                .map(|(command, make)| crate::build_sink::SinkSubninja { command, make })
+                .zip(&preceding_storage)
+                .map(|((command, make), (preceding, preceding_ignore_errors))| {
+                    crate::build_sink::SinkSubninja {
+                        command,
+                        make,
+                        preceding: (!preceding.is_empty()).then(|| {
+                            if preceding.len() > 100 * 1000 {
+                                SinkCommand::ResponseFile(preceding)
+                            } else {
+                                SinkCommand::Inline(preceding)
+                            }
+                        }),
+                        preceding_ignore_errors: *preceding_ignore_errors,
+                    }
+                })
                 .collect::<Vec<_>>();
-            let residual_commands = if composable_subninjas {
-                nn.commands
-                    .iter()
-                    .filter(|command| command.recursive_make.is_empty())
-                    .cloned()
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            let mut residual_buf = BytesMut::new();
-            let mut residual_description = None;
-            // The residual is a subset of the same recipe and reaches the same
-            // shell, so it is assembled against the flags that shell has.
-            let residual_translated = Self::translate_recipe(
+            let (residual_script, residual_ignore_errors) = Self::residual_segment(
                 &self.ce.ev.session.flags,
                 &recipe_output_str,
-                &residual_commands,
-                &mut residual_description,
-            );
-            let residual_ignore_errors = Self::gen_shell_script(
-                &self.ce.ev.session.flags,
-                &residual_translated,
                 &script_flags,
-                &mut residual_buf,
-            );
-            // Automatic depfile detection appends the copy to kati's manifest
-            // command. The direct graph runs the residual command instead, so
-            // it needs the identical transformation and must name the same
-            // discovered file.
-            if composable_subninjas
-                && !residual_buf.is_empty()
-                && node.depfile_var.is_none()
-                && self.ce.ev.session.flags.detect_depfiles
-            {
-                let residual_depfile = get_depfile_from_command(&mut residual_buf)?;
-                if residual_depfile != depfile {
-                    return Err(anyhow::anyhow!(
-                        "recursive recipe residual selected a different depfile"
-                    ));
-                }
-            }
-            let residual_too_long = residual_buf.len() > 100 * 1000;
-            let residual_script = residual_buf.freeze();
+                &residual_commands,
+                composable_subninjas && detect_depfile,
+                &depfile,
+            )?;
+            let residual_too_long = residual_script.len() > 100 * 1000;
             // A sink that holds command text before anything runs needs this
             // now; the one that expands at launch reads the same scope then.
             let recipe_environment = match &node.rule_vars {

@@ -199,6 +199,18 @@ pub struct SinkSubninja<'a> {
     pub command: &'a [u8],
     /// The value produced by the `MAKE` reference in command position.
     pub make: &'a [u8],
+    /// The recipe's own lines written after the previous invocation and before
+    /// this one, assembled into one script.
+    ///
+    /// GNU Make runs a recipe's lines in the order they were written, and a
+    /// line before an invocation runs before the Make that invocation starts
+    /// reads anything. A sink that compiles the child instead of starting it
+    /// therefore has to run this before it compiles: the only state one shell
+    /// line can hand the next is on the filesystem, and a Makefile the child
+    /// includes is read from there.
+    pub preceding: Option<SinkCommand<'a>>,
+    /// Whether every line in [`Self::preceding`] ignores failure.
+    pub preceding_ignore_errors: bool,
 }
 
 /// The half of a Make dependency node that Ninja binds to a `rule`.
@@ -256,8 +268,11 @@ pub struct SinkRule<'a> {
     /// sink refuses those rather than running them, because running them is a
     /// nested Make process.
     pub contains_recursive: bool,
-    /// The non-recursive recipe lines, assembled after extracting subninjas.
-    /// A graph sink runs this parent action after the child graphs.
+    /// The recipe's own lines written after the last invocation, assembled
+    /// into one script. A graph sink runs this parent action after the child
+    /// graphs, which is where the recipe wrote it. Lines written before an
+    /// invocation are on that invocation's
+    /// [`SinkSubninja::preceding`] instead.
     pub residual_command: Option<SinkCommand<'a>>,
     /// Whether every residual line ignores failure.
     pub residual_ignore_errors: bool,
