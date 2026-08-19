@@ -37,6 +37,7 @@ limitations under the License.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -438,6 +439,60 @@ pub fn member_date(archive: &Path, member: &[u8]) -> Option<i64> {
     })
     .ok()
     .flatten()
+}
+
+/// GNU Make's `f_mtime` for a name written `lib.a(member.o)`: the date a build
+/// compares that name by, or `None` when there is no such member.
+///
+/// Three questions in order (reference/gnumake/src/remake.c), and the third is
+/// the one nobody expects:
+///
+/// * the archive must exist, or its members do not exist either;
+/// * the index must record a date for the member, where a date of zero reads as
+///   no member at all — see [`member_date`];
+/// * a file of the member's own name sitting on disk **newer** than the indexed
+///   date makes the member count as absent, because it was rebuilt and has not
+///   been filed yet.
+///
+/// The date is the start of its second. The archive header keeps whole seconds
+/// and GNU Make builds the timestamp with `file_timestamp_cons (hname,
+/// member_date, 0)` — the rounding that makes a member filed in the same second
+/// as its source count as current belongs to the other side of the comparison,
+/// where the member is the target being made, and is
+/// [`member_timestamp_as_target`].
+pub fn member_timestamp(archive: &[u8], member: &[u8]) -> Option<SystemTime> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = Path::new(std::ffi::OsStr::from_bytes(archive));
+    crate::fileutil::get_timestamp(archive).ok().flatten()?;
+    let date = member_date(path, member)?;
+    let seconds = u64::try_from(date).ok()?;
+    let indexed = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds))?;
+    // A member file on disk is compared in whole seconds, because whole seconds
+    // is all the archive kept: GNU Make asks
+    // `FILE_TIMESTAMP_S (memmtime) > member_date`.
+    if let Ok(Some(filed)) = crate::fileutil::get_timestamp(member)
+        && filed
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .is_ok_and(|since| since.as_secs() > seconds)
+    {
+        return None;
+    }
+    Some(indexed)
+}
+
+/// The same date read as the target of a rule rather than as a prerequisite of
+/// one, which is one second later minus a nanosecond.
+///
+/// GNU Make sets `low_resolution_time` on an archive member and then rounds the
+/// mtime of the file it is updating up to the end of its second
+/// (reference/gnumake/src/remake.c: `this_mtime += FILE_TIMESTAMPS_PER_S - 1 -
+/// ns`). It is what keeps a member filed in the same second as the object it
+/// was filed from from looking older than it, and so what stops the archive
+/// being rewritten on every invocation. It applies to the file being made and
+/// to nothing else, so a member read as a prerequisite keeps the plain date.
+pub fn member_timestamp_as_target(archive: &[u8], member: &[u8]) -> Option<SystemTime> {
+    member_timestamp(archive, member).map(|date| date + Duration::from_nanos(1_000_000_000 - 1))
 }
 
 /// Write the archive's own modification time into `member`'s index entry, which
@@ -912,6 +967,47 @@ mod tests {
 
         assert!(member_date(&path, b"a-very-long-member-name.o").is_some_and(|date| date > 0));
         assert_eq!(member_date(&path, b"member.o"), None);
+    }
+
+    /// `f_mtime`'s three questions about a member, and the third — a member
+    /// file on disk newer than the indexed copy means the member was rebuilt
+    /// and not filed, so it counts as absent — is the one nothing else asks.
+    #[test]
+    fn a_members_date_answers_f_mtimes_three_questions() {
+        let scratch = Scratch::new("member-timestamp");
+        let path = scratch.written("-rcU", &["member.o"]);
+        let archive = path.clone().into_os_string().into_encoded_bytes();
+        let filed = scratch.0.join("member.o");
+        let asked = filed.clone().into_os_string().into_encoded_bytes();
+
+        let date = member_date(&path, b"member.o").expect("ar -U recorded a date");
+        let seconds = u64::try_from(date).unwrap();
+        assert_eq!(
+            member_timestamp(&archive, &asked),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+            "the date is the start of its second, as file_timestamp_cons builds it"
+        );
+        assert_eq!(
+            member_timestamp_as_target(&archive, &asked),
+            Some(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(seconds + 1) - Duration::from_nanos(1)
+            ),
+            "read as the file being made, low_resolution_time rounds it up"
+        );
+
+        // The member file rebuilt and not yet filed.
+        std::fs::File::open(&filed)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds + 60))
+            .unwrap();
+        assert_eq!(member_timestamp(&archive, &asked), None);
+
+        assert_eq!(
+            member_timestamp(b"/nonexistent/lib.a", b"member.o"),
+            None,
+            "the archive is not there, so its members are not either"
+        );
+        assert_eq!(member_timestamp(&archive, b"absent.o"), None);
     }
 
     /// The three ways a touch has nothing to write into, which are three

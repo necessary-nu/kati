@@ -35,6 +35,33 @@ use crate::{
 
 pub(crate) const DEFERRED_NEW_INPUTS_REFERENCE: &[u8] = b"${KATI_NEW_INPUTS}";
 
+/// The date a prerequisite is compared by, which for `lib.a(member.o)` comes
+/// out of the archive's index rather than off a file of that name.
+///
+/// GNU Make's `f_mtime` reads the shape wherever it is written, so a name with
+/// parentheses in it is never handed to the filesystem — where it would always
+/// miss, and every archive member would then be newer than everything.
+fn prerequisite_timestamp(name: &Bytes) -> Result<Option<std::time::SystemTime>> {
+    match crate::archive::split_archive_name(name) {
+        Some((archive, member)) => Ok(crate::archive::member_timestamp(archive, member)),
+        None => get_timestamp(name),
+    }
+}
+
+/// The same question asked about the file being made rather than about one of
+/// its prerequisites.
+///
+/// The two differ for an archive member and only for one: GNU Make marks it
+/// `low_resolution_time` and rounds the date of the file it is updating up to
+/// the end of its second, so a member filed in the same second as the object it
+/// came from counts as current.
+fn target_timestamp(name: &Bytes) -> Result<Option<std::time::SystemTime>> {
+    match crate::archive::split_archive_name(name) {
+        Some((archive, member)) => Ok(crate::archive::member_timestamp_as_target(archive, member)),
+        None => get_timestamp(name),
+    }
+}
+
 #[derive(Clone)]
 pub struct AutoCommandVar {
     typ: AutoCommand,
@@ -255,15 +282,15 @@ impl AutoCommandVar {
                     // prerequisite has settled and the comparison GNU Make
                     // makes here is the one the filesystem already answers.
                     let mut ww = WordWriter::new(out);
-                    let target_age = ExecStatus::Timestamp(get_timestamp(
+                    let target_age = ExecStatus::Timestamp(target_timestamp(
                         &current_dep_node.recipe_output.as_bytes(names),
                     )?);
                     for ai in current_dep_node.actual_inputs.iter() {
                         let ai_str = ai.as_bytes(names);
                         if seen.insert(*ai)
-                            && ExecStatus::Timestamp(get_timestamp(&ai_str)?) > target_age
+                            && ExecStatus::Timestamp(prerequisite_timestamp(&ai_str)?) > target_age
                         {
-                            ww.write(&ai_str);
+                            ww.write(&crate::archive::member_or_whole(&ai_str));
                         }
                     }
                 } else if ev.avoid_io
@@ -281,7 +308,7 @@ impl AutoCommandVar {
                     let mut oldest_member = None;
                     let mut missing_member = action.has_phony_member;
                     for member in &action.members {
-                        match get_timestamp(&member.as_bytes(names))? {
+                        match target_timestamp(&member.as_bytes(names))? {
                             Some(mtime) => {
                                 oldest_member = Some(
                                     oldest_member
@@ -294,14 +321,14 @@ impl AutoCommandVar {
                     let mut ww = WordWriter::new(out);
                     for ai in &current_dep_node.actual_inputs {
                         let ai_str = ai.as_bytes(names);
-                        let input_mtime = get_timestamp(&ai_str)?;
+                        let input_mtime = prerequisite_timestamp(&ai_str)?;
                         if seen.insert(*ai)
                             && (missing_member
                                 || action.phony_inputs.contains(ai)
                                 || input_mtime.is_none()
                                 || oldest_member.is_some_and(|oldest| input_mtime > Some(oldest)))
                         {
-                            ww.write(&ai_str);
+                            ww.write(&crate::archive::member_or_whole(&ai_str));
                         }
                     }
                 } else if ev.avoid_io {
@@ -332,15 +359,15 @@ impl AutoCommandVar {
                     }
                 } else {
                     let mut ww = WordWriter::new(out);
-                    let target_age = ExecStatus::Timestamp(get_timestamp(
+                    let target_age = ExecStatus::Timestamp(target_timestamp(
                         &current_dep_node.recipe_output.as_bytes(names),
                     )?);
                     for ai in current_dep_node.actual_inputs.iter() {
                         let ai_str = ai.as_bytes(names);
                         if seen.insert(*ai)
-                            && ExecStatus::Timestamp(get_timestamp(&ai_str)?) > target_age
+                            && ExecStatus::Timestamp(prerequisite_timestamp(&ai_str)?) > target_age
                         {
-                            ww.write(&ai_str)
+                            ww.write(&crate::archive::member_or_whole(&ai_str))
                         }
                     }
                 }

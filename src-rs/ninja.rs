@@ -1358,6 +1358,27 @@ impl<'a> NinjaGenerator<'a> {
             .cloned()
             .map(Pattern::new)
             .collect::<Vec<_>>();
+        // The late value's spelling for a prerequisite the graph knows by a
+        // name the recipe does not read. `lib.a(m.o)` is the only one there is:
+        // GNU Make puts the member alone into `$?`, and this is the one
+        // automatic variable whose value is not settled here.
+        let deferred_new_input_names = if nn.deferred_new_inputs {
+            node.deps
+                .iter()
+                .filter_map(|(input, _)| {
+                    let name = input.as_bytes(&self.ce.ev.session);
+                    let member = crate::archive::member_or_whole(&name);
+                    (member != name).then(|| {
+                        (
+                            self.phony_aliases.resolve(*input),
+                            self.ce.ev.session.intern(member),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let deferred_excluded_new_inputs = if nn.deferred_new_inputs {
             node.deps
                 .iter()
@@ -1399,6 +1420,7 @@ impl<'a> NinjaGenerator<'a> {
                         }),
                 deferred_always_new_inputs: &deferred_always_new_inputs,
                 deferred_excluded_new_inputs: &deferred_excluded_new_inputs,
+                deferred_new_input_names: &deferred_new_input_names,
                 completion_join: node.grouped_double_join,
                 intermediate: node.is_intermediate,
                 disposable: node.is_disposable,
@@ -2063,6 +2085,7 @@ mod tests {
                     deferred_freshness_always_dirty: false,
                     deferred_always_new_inputs: &[],
                     deferred_excluded_new_inputs: &[],
+                    deferred_new_input_names: &[],
                     completion_join: false,
                     intermediate: false,
                     disposable: false,

@@ -344,6 +344,21 @@ pub struct SinkEdge<'a> {
     /// They still participate in the edge's freshness decision; only the
     /// automatic variable's published value omits them.
     pub deferred_excluded_new_inputs: &'a [Symbol],
+    /// Normal inputs the late value spells differently from the name the graph
+    /// knows them by, paired with the spelling to publish.
+    ///
+    /// `lib.a(m.o)` is the one prerequisite whose name in the graph is not the
+    /// name the recipe reads: GNU Make puts only the member into `$?`, `$^`,
+    /// `$+` and `$<` (src/commands.c), and every one of those but `$?` is
+    /// expanded here, where the reduction is already made. `$?` is the one
+    /// whose value cannot be known until the prerequisites have settled, so the
+    /// spelling has to travel with the deferral rather than be applied to it —
+    /// a destination that substitutes the value assigns no meaning to these
+    /// names and must not have to know that a parenthesis is one.
+    ///
+    /// Empty for every edge with nothing to respell, which is every edge that
+    /// mentions no archive.
+    pub deferred_new_input_names: &'a [(Symbol, Symbol)],
     /// This edge publishes a real output only after its private action inputs
     /// have settled.  It runs no command itself.
     pub completion_join: bool,
