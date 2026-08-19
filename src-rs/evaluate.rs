@@ -448,14 +448,26 @@ fn read_makefiles_variable(ev: &mut Evaluator) -> Result<()> {
     Ok(())
 }
 
-/// One name from `MAKEFILES`: read if it opens, passed over in silence if it
-/// does not, and never allowed to choose the default goal.
+/// One name from `MAKEFILES`: read if it opens, remade if a rule says how, and
+/// never allowed to choose the default goal.
 ///
 /// `RM_DONTCARE` forgives the whole of the open, not absence alone. GNU Make
 /// reads these with `eval_makefile (name, RM_NO_DEFAULT_GOAL|RM_INCLUDED|
 /// RM_DONTCARE)` (read.c:204) and never looks at `errno` afterwards the way the
 /// `-f` loop does, so a name with no permission is as quiet as a name nothing is
-/// at — `MAKEFILES=secret.mk` builds the goals and says nothing at all.
+/// at — `MAKEFILES=secret.mk` says nothing at all.
+///
+/// Quiet is not the same as absent from the update. The goaldep `eval_makefile`
+/// returns joins `read_files` like any other, so the makefile update considers
+/// the name, remakes it if a rule says how, and starts the read over on what the
+/// recipe wrote: `RM_DONTCARE` forgives the failure, it does not excuse the
+/// attempt. `MAKEFILES=gen.mk` over a Makefile holding a `gen.mk:` rule is a
+/// fragment that bootstraps itself, which is most of what the variable is for.
+///
+/// So the name is noted whichever way the open went — as read when it opened,
+/// and as a Makefile the read wanted and did not get when it did not. Forgiven
+/// either way, which is the shape `-include` already travels: no complaint is
+/// held for it, and a name with no rule behind it passes without a word.
 ///
 /// A read that fails after the open succeeded is not forgiven by anything: it is
 /// `pfatal_with_name` from inside `readline` (read.c:2744), which is why
@@ -465,7 +477,14 @@ fn read_makefiles_entry(ev: &mut Evaluator, name: &Bytes) -> Result<()> {
     let _file_frame = ev.enter(FrameType::Parse, name.clone(), Loc::default());
     let mk = match ev.session.get_makefile(&filename)? {
         Source::Read(mk) => mk,
-        Source::Absent | Source::Unopened(_) => return Ok(()),
+        source @ (Source::Absent | Source::Unopened(_)) => {
+            let reason = match &source {
+                Source::Unopened(err) => crate::strerror(err),
+                _ => crate::strerror(&std::io::Error::from_raw_os_error(libc::ENOENT)),
+            };
+            ev.note_unread_include(name.clone(), false, None, &reason);
+            return Ok(());
+        }
         Source::Unreadable(err) | Source::Exhausted(err) => error_loc!(
             ev,
             None,
