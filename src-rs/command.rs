@@ -383,6 +383,16 @@ impl Debug for AutoCommandVar {
     }
 }
 
+/// One static child invocation lifted out of a recipe line.
+#[derive(Clone, Debug)]
+pub struct LiftedInvocation {
+    /// What the child is compiled from: the invocation alone, with any wrapper
+    /// the shell would have reached through already taken off.
+    pub command: Bytes,
+    /// The value the `MAKE` reference in its command position produced.
+    pub make: Bytes,
+}
+
 #[derive(Clone)]
 pub struct Command {
     pub output: Symbol,
@@ -413,9 +423,9 @@ pub struct Command {
     /// and not run under `-n`, so it is the reference that classifies and not
     /// the value it expands to.
     pub recursive_line: bool,
-    /// Values produced by `MAKE` references while expanding this recipe line,
-    /// kept only where the expansion put one in the invoked command position.
-    pub recursive_make: Vec<Bytes>,
+    /// The static child invocations this line names, in the order the shell
+    /// would run them. Empty for a line that names none the compiler can lift.
+    pub recursive_make: Vec<LiftedInvocation>,
     /// A recursion this compiler can see but cannot turn into a child
     /// compilation: the line is classified recursive and starts a Make process
     /// somewhere a shell begins a command, but not in a position
@@ -701,24 +711,81 @@ fn spawns_make(command: &[u8], make: &[u8]) -> bool {
 /// clean)`, and what that starts is the same child, with the same goals, in
 /// the same directory, as the line without its parentheses.
 ///
-/// Only `(`, and only when it closes at the very end. `(a) && (b)` is two
-/// commands and opens on the first byte, so the match has to be found rather
-/// than assumed. A brace group means the same thing to a shell and is left
-/// alone on purpose: `{` is a command word only in command position, so
-/// reading one wrongly changes what a line means, where a `(` is always the
-/// operator.
+/// Only when the wrapper closes at the very end. `(a) && (b)` is two commands
+/// and opens on the first byte, so the match has to be found rather than
+/// assumed.
+///
+/// A brace group is the same wrapper written the other way and is taken off
+/// too, but it costs more to recognise: `(` is always the operator, while `{`
+/// is a reserved word and so opens a group only where a command may begin and
+/// only as a word of its own. `echo a{b}` is one word and `{ a; }` is a group,
+/// and reading either as the other changes what the line means.
 pub fn unwrapped_command(command: &[u8]) -> &[u8] {
     let mut command = command.trim_ascii();
-    while let Some(body) = subshell_body(command) {
+    while let Some(body) = subshell_body(command).or_else(|| brace_group_body(command)) {
         command = body.trim_ascii();
         // The `;` a sequence may end with belongs to the sequence, and with
-        // the parentheses gone there is nothing left for it to separate.
+        // the wrapper gone there is nothing left for it to separate. A brace
+        // group must be closed by one, so this is where that one goes.
         command = command
             .strip_suffix(b";")
             .unwrap_or(command)
             .trim_ascii_end();
     }
     command
+}
+
+/// What a leading `{` encloses, when what it encloses is the whole command.
+///
+/// `{` and `}` are reserved words rather than operators, so each is read only
+/// where a command may begin: that is what tells the group in `{ cd a; }` from
+/// the brace in `echo a}`, and it is why a byte test would be wrong here where
+/// it is right for `(`.
+fn brace_group_body(command: &[u8]) -> Option<&[u8]> {
+    // A reserved word is a word: `{cd a; }` runs a program called `{cd`.
+    if !command.starts_with(b"{") || !command.get(1).is_some_and(u8::is_ascii_whitespace) {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut quote = None;
+    // Whether what comes next would begin a command, which is the only place a
+    // reserved word is one.
+    let mut command_position = true;
+    let mut index = 0;
+    while index < command.len() {
+        let byte = command[index];
+        match quote {
+            Some(delimiter) => {
+                if byte == delimiter {
+                    quote = None;
+                } else if byte == b'\\' && delimiter == b'"' {
+                    index += 1;
+                }
+            }
+            None => match byte {
+                b'\'' | b'"' => {
+                    quote = Some(byte);
+                    command_position = false;
+                }
+                b'\\' => {
+                    index += 1;
+                    command_position = false;
+                }
+                b'{' if command_position => depth += 1,
+                b'}' if command_position => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (index + 1 == command.len()).then(|| &command[1..index]);
+                    }
+                }
+                b';' | b'&' | b'|' | b'(' | b'\n' => command_position = true,
+                byte if byte.is_ascii_whitespace() => {}
+                _ => command_position = false,
+            },
+        }
+        index += 1;
+    }
+    None
 }
 
 /// What a leading `(` encloses, when what it encloses is the whole command.
@@ -757,29 +824,198 @@ fn subshell_body(command: &[u8]) -> Option<&[u8]> {
     None
 }
 
+/// The static child invocations one recipe line names, in the order the shell
+/// would run them, and empty for a line naming none the compiler can lift.
+///
+/// Two shapes are lifted, and the second is what a line naming more than one
+/// child looks like. A line that IS an invocation is that invocation, with the
+/// `cd` a child is entered through still on it, because the resolver reads
+/// that. A line that is nothing but invocations joined by `&&` names each of
+/// them: `&&` runs the next only when the last one won and in that order,
+/// which is exactly what one child graph ordered after another does, so the
+/// two describe the same build. No other joiner does — `;` runs the next
+/// whatever the last one did, and `||` runs it only when the last one lost —
+/// so a line holding one is left to run as written.
+pub fn lifted_invocations(line: &Bytes, make_values: &[Bytes]) -> Vec<LiftedInvocation> {
+    let lifted = |text: &[u8]| {
+        let command = unwrapped_command(text);
+        make_values
+            .iter()
+            .find(|make| invokes_make(command, make))
+            .map(|make| LiftedInvocation {
+                command: line.slice_ref(command),
+                make: make.clone(),
+            })
+    };
+    let whole = unwrapped_command(line);
+    let conjuncts = conjuncts(whole);
+    if conjuncts.len() > 1
+        && let Some(invocations) = conjuncts
+            .iter()
+            .map(|conjunct| lifted(conjunct))
+            .collect::<Option<Vec<_>>>()
+    {
+        return invocations;
+    }
+    lifted(whole).into_iter().collect()
+}
+
+/// Split a command where a shell would run the next part only if this one won.
+///
+/// Quoting, escapes and wrappers are respected, so the `&&` inside `(a && b)`
+/// or `"x && y"` is not a place this splits: what is wanted is the joints of
+/// the line itself, not of everything written on it.
+fn conjuncts(command: &[u8]) -> Vec<&[u8]> {
+    let mut conjuncts = Vec::new();
+    let mut start = 0;
+    let mut parens = 0usize;
+    let mut braces = 0usize;
+    let mut quote = None;
+    let mut command_position = true;
+    let mut index = 0;
+    while index < command.len() {
+        let byte = command[index];
+        match quote {
+            Some(delimiter) => {
+                if byte == delimiter {
+                    quote = None;
+                } else if byte == b'\\' && delimiter == b'"' {
+                    index += 1;
+                }
+            }
+            None => match byte {
+                b'\'' | b'"' => {
+                    quote = Some(byte);
+                    command_position = false;
+                }
+                b'\\' => {
+                    index += 1;
+                    command_position = false;
+                }
+                b'(' => {
+                    parens += 1;
+                    command_position = true;
+                }
+                b')' => {
+                    parens = parens.saturating_sub(1);
+                    command_position = false;
+                }
+                b'{' if command_position => braces += 1,
+                b'}' if command_position => braces = braces.saturating_sub(1),
+                b'&' if parens == 0 && braces == 0 && command.get(index + 1) == Some(&b'&') => {
+                    conjuncts.push(&command[start..index]);
+                    index += 1;
+                    start = index + 1;
+                    command_position = true;
+                }
+                b';' | b'&' | b'|' | b'\n' => command_position = true,
+                byte if byte.is_ascii_whitespace() => {}
+                _ => command_position = false,
+            },
+        }
+        index += 1;
+    }
+    conjuncts.push(&command[start..]);
+    conjuncts
+}
+
 /// Whether one expanded `MAKE` value occupies the command position of a
-/// recipe line rather than merely being printed or passed as data.
+/// command the resolver can read as the argument list it is.
+///
+/// Two questions in one, because separating them would leave a gap that ends
+/// a run. The recogniser says a line is a child invocation and the resolver
+/// then splits it into the words the nested process would have received as
+/// argv — and a line the recogniser claims and the resolver cannot read is a
+/// build that stops, where GNU Make would have handed the line to a shell.
+/// So what is lifted is a subset of what the resolver reads: ordinary bytes,
+/// quotes, backslash escapes and command substitutions are an argument list;
+/// every other shell operator is a program, and a line holding one runs as
+/// the line it is.
 fn invokes_make(command: &[u8], make: &[u8]) -> bool {
     let mut command = unwrapped_command(command);
+    // `cd DIR && make …` selects where the child is read, and the resolver
+    // takes the directory off itself, so it travels with the invocation.
+    if let [entered, invocation] = conjuncts(command).as_slice()
+        && starts_with_word(entered.trim_ascii_start(), b"cd")
+        && is_argument_list(entered)
+    {
+        command = invocation.trim_ascii();
+    }
     if starts_with_word(command, b"exec") {
         command = command[b"exec".len()..].trim_ascii_start();
     }
-    if starts_with_word(command, make) {
-        return true;
-    }
+    starts_with_word(command, make) && is_argument_list(command)
+}
 
-    let Some(and) = command.windows(2).position(|bytes| bytes == b"&&") else {
-        return false;
-    };
-    let before = command[..and].trim_ascii();
-    let mut after = command[and + 2..].trim_ascii_start();
-    if !starts_with_word(before, b"cd") {
-        return false;
+/// Whether a command is words and nothing else — no operator that would make
+/// it a program rather than one invocation.
+///
+/// The rejected set is the resolver's: `src/make/cli/subninja.rs` splits these
+/// same bytes into argv and refuses everything here refuses, plus a `$` that
+/// does not open a command substitution.
+fn is_argument_list(command: &[u8]) -> bool {
+    let mut quote = None;
+    let mut index = 0;
+    while index < command.len() {
+        let byte = command[index];
+        match quote {
+            Some(delimiter) => {
+                if byte == delimiter {
+                    quote = None;
+                } else if byte == b'\\' && delimiter == b'"' {
+                    index += 1;
+                }
+            }
+            None => match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'\\' => index += 1,
+                b'$' if command.get(index + 1) == Some(&b'(') => {
+                    let Some(end) = substitution_end(command, index + 2) else {
+                        return false;
+                    };
+                    index = end;
+                }
+                b'|' | b'&' | b';' | b'<' | b'>' | b'(' | b')' | b'{' | b'}' | b'$' | b'`'
+                | b'*' | b'?' | b'[' | b']' | b'~' | b'#' | b'\n' => return false,
+                _ => {}
+            },
+        }
+        index += 1;
     }
-    if starts_with_word(after, b"exec") {
-        after = after[b"exec".len()..].trim_ascii_start();
+    quote.is_none()
+}
+
+/// Where the command substitution opened before `start` closes.
+fn substitution_end(command: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut quote = None;
+    let mut index = start;
+    while index < command.len() {
+        let byte = command[index];
+        match quote {
+            Some(delimiter) => {
+                if byte == delimiter {
+                    quote = None;
+                } else if byte == b'\\' && delimiter == b'"' {
+                    index += 1;
+                }
+            }
+            None => match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'\\' => index += 1,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            },
+        }
+        index += 1;
     }
-    starts_with_word(after, make)
+    None
 }
 
 fn parse_command_prefixes(
@@ -956,11 +1192,7 @@ impl<'a> CommandEvaluator<'a> {
                     parse_command_prefixes(cmd, &mut echo, &mut dash_prefixed, &mut recursive_line);
 
                 if !cmd.is_empty() {
-                    let recursive_make: Vec<Bytes> = make_values
-                        .iter()
-                        .filter(|make| invokes_make(&cmd, make))
-                        .cloned()
-                        .collect();
+                    let recursive_make = lifted_invocations(&cmd, &make_values);
                     // Only a classified line is held to this. A `MAKE`-valued
                     // variable that GNU Make never classified is composed when
                     // the expansion makes that possible and otherwise left as
@@ -1021,8 +1253,8 @@ impl<'a> CommandEvaluator<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoCommand, AutoCommandVar, AutoCommandVariant, invokes_make, references_make,
-        spawns_make, unwrapped_command,
+        AutoCommand, AutoCommandVar, AutoCommandVariant, invokes_make, lifted_invocations,
+        references_make, spawns_make, unwrapped_command,
     };
     use crate::expr::{ParseExprOpt, parse_expr};
     use crate::loc::Loc;
@@ -1139,6 +1371,65 @@ mod tests {
             b"(cd a && make b); (cd c && make d)",
             b"make"
         ));
+    }
+
+    /// A brace group is the subshell written the other way, and `{` is a word
+    /// rather than an operator, so what tells the two apart is where it sits.
+    #[test]
+    fn a_brace_group_around_the_whole_line_is_not_a_command() {
+        assert_eq!(
+            unwrapped_command(b"{ cd sub && make child; }"),
+            b"cd sub && make child"
+        );
+        assert_eq!(unwrapped_command(b"{ ( make child ; ) ; }"), b"make child");
+        // `{` opens a group only as a word of its own, and only where a
+        // command may begin.
+        assert_eq!(
+            unwrapped_command(b"{cd sub && make child; }"),
+            b"{cd sub && make child; }"
+        );
+        assert_eq!(unwrapped_command(b"echo a{b}"), b"echo a{b}");
+        assert_eq!(unwrapped_command(b"echo '{ a; }'"), b"echo '{ a; }'");
+        // Two groups, so the first `}` is not the line's own close.
+        assert_eq!(
+            unwrapped_command(b"{ make a; } && { make b; }"),
+            b"{ make a; } && { make b; }"
+        );
+
+        assert!(invokes_make(b"{ cd sub && make child; }", b"make"));
+        assert!(!invokes_make(b"{ echo make; }", b"make"));
+    }
+
+    /// A line that is nothing but invocations joined by `&&` names each of
+    /// them, and a line that merely holds one somewhere names none.
+    #[test]
+    fn a_conjunction_of_invocations_names_each_of_them() {
+        let lifted = |line: &'static [u8]| {
+            lifted_invocations(&Bytes::from_static(line), &[Bytes::from_static(b"make")])
+                .into_iter()
+                .map(|invocation| invocation.command)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            lifted(b"make -C a && make -C b"),
+            [&b"make -C a"[..], b"make -C b"]
+        );
+        assert_eq!(
+            lifted(b"(cd a && make) && { cd b && make; }"),
+            [&b"cd a && make"[..], b"cd b && make"]
+        );
+        // One invocation, and the `cd` in front of it belongs to it.
+        assert_eq!(
+            lifted(b"cd sub && make child"),
+            [&b"cd sub && make child"[..]]
+        );
+        // A joiner that is not `&&` does not order two children: `;` runs the
+        // next whatever the last one did.
+        assert!(lifted(b"make -C a ; make -C b").is_empty());
+        // Work beside the invocation that the child graph cannot carry.
+        assert!(lifted(b"cd a && make && echo done").is_empty());
+        assert!(lifted(b"make -C a > log").is_empty());
+        assert!(lifted(b"echo make && make -C b").is_empty());
     }
 
     /// Whether a recipe line as written classifies as recursive, which is the

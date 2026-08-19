@@ -258,16 +258,15 @@ pub struct SinkRule<'a> {
     /// Recursive `$(MAKE)` invocations extracted from the recipe in their
     /// written order. A graph sink compiles these as semantic subninjas rather
     /// than handing nested Make processes to its executor.
+    ///
+    /// Empty for a recipe that names recursion nothing can lift out of it: a
+    /// multi-line `.ONESHELL` recipe, whose lines share a shell a split would
+    /// lose, and a line whose invocation sits behind a runtime test or beside
+    /// work of its own. Such a recipe is not refused. It reaches the executor
+    /// as the script it is, and the Make it names starts — which is what GNU
+    /// Make does with it, and the only answer that leaves nothing unbuilt.
     // [spec:ronin:req:make.recursive-invocation+1]
     pub subninjas: &'a [SinkSubninja<'a>],
-    /// At least one line in the recipe is a recursive `$(MAKE)` invocation.
-    /// This can be true while [`Self::subninjas`] is empty when a multi-line
-    /// `.ONESHELL` recipe, one shell line holding more than one MAKE
-    /// reference, or a recursion GNU Make classified but that sits where no
-    /// static child invocation can be lifted out, cannot be split safely. A
-    /// sink refuses those rather than running them, because running them is a
-    /// nested Make process.
-    pub contains_recursive: bool,
     /// The recipe's own lines written after the last invocation, assembled
     /// into one script. A graph sink runs this parent action after the child
     /// graphs, which is where the recipe wrote it. Lines written before an

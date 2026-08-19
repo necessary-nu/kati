@@ -1134,7 +1134,6 @@ impl<'a> NinjaGenerator<'a> {
                     recipe_environment: &[],
                     deferred_recipe: Some(deferred),
                     subninjas: &[],
-                    contains_recursive: false,
                     residual_command: None,
                     residual_ignore_errors: false,
                     description: None,
@@ -1180,55 +1179,42 @@ impl<'a> NinjaGenerator<'a> {
             // TODO: Find this number automatically.
             let too_long_for_argv = cmd_buf.len() > 100 * 1000;
             let script = cmd_buf.freeze();
-            let contains_recursive = nn
-                .commands
-                .iter()
-                .any(|command| !command.recursive_make.is_empty());
-            // What stops a recipe splitting is a shell whose state the split
-            // would lose: a multi-line `.ONESHELL` recipe runs its lines in
-            // one shell, and more than one MAKE reference on a line does not
-            // identify one static child compilation.
+            // One thing stops a recipe splitting, and it is a shell whose state
+            // the split would lose. A multi-line `.ONESHELL` recipe runs its
+            // lines in one shell, so a line before the invocation can have
+            // changed the directory the invocation runs in or set a variable it
+            // reads, and no reading of the recipe can say it did not. Such a
+            // recipe is not refused: it is a recipe with no liftable recursion,
+            // which is a recipe that runs as written and lets the Make it names
+            // start. That is the same answer a recipe whose only recursion
+            // cannot be lifted has always had, and refusing this one instead
+            // made a build that GNU Make completes into a build that does not
+            // start.
             //
             // A line GNU Make classified recursive whose invocation cannot be
-            // lifted out is neither. It carries no `recursive_make`, so it is
-            // residual work and reaches the executor as written — which is
-            // exactly what the same line does when it is a recipe's only
-            // recursion, and there is no reading of the graph on which having
-            // a liftable sibling makes it worse. Refusing the whole recipe for
-            // it made a mixed recipe stricter than either of the two recipes
-            // it is made of, and vim's top-level Makefile — one liftable `cd
-            // src && $(MAKE) $@` beside two guards holding `$(MAKE)` calls
-            // that are false for every goal it is asked for — is a tree that
-            // built nothing because of it.
-            let composable_subninjas = contains_recursive
-                && (!self.ce.ev.session.flags.one_shell || nn.commands.len() == 1)
-                && nn
+            // lifted out carries no `recursive_make` either, so it is residual
+            // work beside whatever else the recipe composes.
+            let composable_subninjas = !self.ce.ev.session.flags.one_shell
+                || nn.commands.len() == 1
+                || nn
                     .commands
                     .iter()
-                    .filter(|command| !command.recursive_make.is_empty())
-                    .all(|command| command.recursive_make.len() == 1);
+                    .all(|command| command.recursive_make.is_empty());
             let subninja_storage = if composable_subninjas {
                 nn.commands
                     .iter()
-                    .filter_map(|command| {
-                        let [make] = command.recursive_make.as_slice() else {
-                            return None;
-                        };
-                        // What the child is compiled from is the invocation,
-                        // not the line the invocation was written on: a line
-                        // that is one invocation inside a subshell reaches the
-                        // resolver without the subshell, because that is what
-                        // the recogniser read to call it liftable.
-                        let lifted = crate::command::unwrapped_command(&command.cmd);
-                        Some((
-                            Self::translate_command(command.cmd.slice_ref(lifted)),
-                            make.clone(),
-                        ))
+                    .flat_map(|command| command.recursive_make.iter())
+                    .map(|invocation| {
+                        (
+                            Self::translate_command(invocation.command.clone()),
+                            invocation.make.clone(),
+                        )
                     })
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
+            let contains_recursive = !subninja_storage.is_empty();
             // Where a residual line falls among the invocations is where it
             // runs. GNU Make runs a recipe's lines in the order they were
             // written, so the lines ahead of an invocation belong to that
@@ -1237,13 +1223,18 @@ impl<'a> NinjaGenerator<'a> {
             // the recipe's own trailing action.
             let mut preceding_commands = Vec::new();
             let mut residual_commands = Vec::new();
-            if composable_subninjas {
+            if contains_recursive {
                 let mut segment = Vec::new();
                 for command in &nn.commands {
                     if command.recursive_make.is_empty() {
                         segment.push(command.clone());
                     } else {
-                        preceding_commands.push(std::mem::take(&mut segment));
+                        // A line naming more than one invocation wrote nothing
+                        // between them, so only the first of them has lines
+                        // ahead of it.
+                        for _ in &command.recursive_make {
+                            preceding_commands.push(std::mem::take(&mut segment));
+                        }
                     }
                 }
                 residual_commands = segment;
@@ -1284,7 +1275,7 @@ impl<'a> NinjaGenerator<'a> {
                 &recipe_output_str,
                 &script_flags,
                 &residual_commands,
-                composable_subninjas && detect_depfile,
+                contains_recursive && detect_depfile,
                 &depfile,
             )?;
             let residual_too_long = residual_script.len() > 100 * 1000;
@@ -1308,7 +1299,6 @@ impl<'a> NinjaGenerator<'a> {
                     },
                     deferred_recipe: None,
                     subninjas: &subninjas,
-                    contains_recursive,
                     residual_command: (!residual_script.is_empty()).then_some(
                         if residual_too_long {
                             SinkCommand::ResponseFile(&residual_script)
@@ -2404,7 +2394,6 @@ mod tests {
                     recipe_environment: &[],
                     deferred_recipe: None,
                     subninjas: &[],
-                    contains_recursive: false,
                     residual_command: None,
                     residual_ignore_errors: false,
                     description,
