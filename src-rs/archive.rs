@@ -214,60 +214,132 @@ pub fn member_is_a_pattern(pattern: &[u8]) -> bool {
     false
 }
 
-/// Every member name the archive's index holds, in the order it holds them.
-///
-/// GNU Make's `ar_scan` (reference/gnumake/src/arscan.c) reduced to the one
-/// question the front end asks of it: which members are there. Only the
-/// SysV/GNU format `ar` writes here is read — the `!<arch>\n` magic, fixed
-/// 60-byte member headers, the `//` long-name table for names too long for the
-/// header, and 4.4BSD's `#1/LEN` extended names. Anything that does not parse
-/// is an archive with no members, which is what `ar_scan` reports for an
-/// invalid archive to a caller that only wanted to match names.
-fn member_names(archive: &Path) -> Option<Vec<Bytes>> {
-    /// Bytes of the magic that opens an archive.
-    const MAGIC: &[u8; 8] = b"!<arch>\n";
-    /// Bytes of one member header.
-    const HEADER: usize = 60;
+/// One member of an archive, as the scan met it.
+pub struct Member<'a> {
+    /// The member's name, with the long-name table and the 4.4BSD extended
+    /// form already resolved.
+    pub name: &'a [u8],
+    /// The seconds-since-epoch the index records, which is zero for an archive
+    /// `ar` wrote in its default deterministic mode.
+    pub date: i64,
+    /// Where this member's 60-byte header begins, for a caller that means to
+    /// write into it.
+    pub position: u64,
+    /// The name came out of the fixed header field, which keeps only its first
+    /// [`NAME_KEPT`] bytes — so that is all of it a comparison may use.
+    pub truncated: bool,
+}
 
-    let mut file = std::fs::File::open(archive).ok()?;
+/// Why a walk of an archive's index stopped before it reached the end.
+///
+/// The two are kept apart because a caller that writes says two different
+/// things about them: an archive that is not there is a build that has not
+/// reached it yet, and one that does not parse is a file that is not an
+/// archive at all. A caller that only reads folds both into "no such member",
+/// which is what GNU Make's `ar_scan` reports with -1 and -2.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanFailure {
+    NoArchive,
+    NotAnArchive,
+}
+
+/// Bytes of the magic that opens an archive.
+const MAGIC: &[u8; 8] = b"!<arch>\n";
+/// Bytes of one member header.
+const HEADER: usize = 60;
+/// How much of a member's name the fixed header field keeps, which is all a
+/// short name is ever compared over.
+const NAME_KEPT: usize = 15;
+/// Where a member's date sits within its header.
+const DATE_OFFSET: u64 = 16;
+/// How wide the date field is. A date written into it is padded out to the
+/// whole width, so nothing of a longer previous date survives behind it.
+const DATE_FIELD: usize = 12;
+
+/// Walk an archive's index, offering each member to `visit` and stopping at
+/// the first answer it gives.
+///
+/// GNU Make's `ar_scan` (reference/gnumake/src/arscan.c), which is one walk
+/// with a callback over it and not three walks that happen to agree: the
+/// member names the front end globs against, the date the build compares, and
+/// the header a `-t` writes into are all read out of the same headers, and the
+/// format is delicate enough that a second reader of it is a second thing to
+/// remember when the format is wrong.
+///
+/// Only the SysV/GNU format `ar` writes here is read — the `!<arch>\n` magic,
+/// fixed 60-byte member headers, the `//` long-name table for names too long
+/// for the header, and 4.4BSD's `#1/LEN` extended names. A short read where a
+/// header would begin is the end of the archive; anything else that does not
+/// parse is [`ScanFailure::NotAnArchive`], which is `ar_scan`'s `goto invalid`.
+///
+/// The file is opened for writing when `write` is set, because a caller that
+/// means to write into a header must hold the same handle the walk found it
+/// with: reopening would be a second walk.
+fn ar_scan<T>(
+    archive: &Path,
+    write: bool,
+    mut visit: impl FnMut(&Member<'_>, &mut std::fs::File) -> Option<T>,
+) -> Result<Option<T>, ScanFailure> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(write)
+        .open(archive)
+        .map_err(|_| ScanFailure::NoArchive)?;
     let mut magic = [0u8; MAGIC.len()];
-    file.read_exact(&mut magic).ok()?;
-    if &magic != MAGIC {
-        return None;
+    if file.read_exact(&mut magic).is_err() || &magic != MAGIC {
+        return Err(ScanFailure::NotAnArchive);
     }
 
-    let mut found = Vec::new();
-    let mut long_names = Vec::new();
+    let mut long_names: Vec<u8> = Vec::new();
     let mut header = [0u8; HEADER];
+    let mut position = MAGIC.len() as u64;
     loop {
-        // A short read is the end of the archive rather than a failure: every
-        // member found before it is still a member.
+        // A short read where a header would start is the end of the archive
+        // rather than a failure: every member found before it is still one.
         if file.read_exact(&mut header).is_err() {
-            return Some(found);
+            return Ok(None);
         }
         if &header[58..60] != b"`\n" {
-            return Some(found);
+            return Err(ScanFailure::NotAnArchive);
         }
-        let size: i64 = parse_field(&header[48..58])?;
-        if size < 0 {
-            return Some(found);
-        }
+        let Some(size) = parse_field::<i64>(&header[48..58]).filter(|size| *size >= 0) else {
+            return Err(ScanFailure::NotAnArchive);
+        };
+        // Every member's data is padded to an even offset, so what the next
+        // header costs is its own width plus the data plus that pad byte.
+        let Some(entry) = u64::try_from(size)
+            .ok()
+            .and_then(|size| size.checked_add(HEADER as u64 + size % 2))
+        else {
+            return Err(ScanFailure::NotAnArchive);
+        };
+        let date = parse_field::<i64>(&header[16..28]).unwrap_or(0);
         let raw = trim_trailing(&header[..16]);
 
         // The long-name table is a member like any other, and is read for its
         // data rather than named as one.
         if raw == b"//" || raw == b"ARFILENAMES/" {
-            long_names.resize(usize::try_from(size).ok()?, 0);
-            file.read_exact(&mut long_names).ok()?;
-            skip_padding(&mut file, size)?;
+            let Ok(length) = usize::try_from(size) else {
+                return Err(ScanFailure::NotAnArchive);
+            };
+            long_names.resize(length, 0);
+            if file.read_exact(&mut long_names).is_err() {
+                return Err(ScanFailure::NotAnArchive);
+            }
+            position += entry;
+            if file.seek(SeekFrom::Start(position)).is_err() {
+                return Err(ScanFailure::NotAnArchive);
+            }
             continue;
         }
 
         let mut extended = Vec::new();
         let name: &[u8] = if raw.first() == Some(&b'/') || raw.first() == Some(&b' ') {
             // GNU `ar`: an offset into the long-name table.
-            let offset: usize = parse_field(&raw[1..])?;
-            let table = long_names.get(offset..)?;
+            let Some(table) = parse_field::<usize>(&raw[1..]).and_then(|at| long_names.get(at..))
+            else {
+                return Err(ScanFailure::NotAnArchive);
+            };
             let end = table
                 .iter()
                 .position(|byte| *byte == b'\n' || *byte == b'\0')
@@ -275,9 +347,13 @@ fn member_names(archive: &Path) -> Option<Vec<Bytes>> {
             trim_trailing_slash(&table[..end])
         } else if raw.starts_with(b"#1/") {
             // 4.4BSD: the real name is the first bytes of the member's data.
-            let length: usize = parse_field(&raw[3..])?;
+            let Some(length) = parse_field::<usize>(&raw[3..]) else {
+                return Err(ScanFailure::NotAnArchive);
+            };
             extended.resize(length, 0);
-            file.read_exact(&mut extended).ok()?;
+            if file.read_exact(&mut extended).is_err() {
+                return Err(ScanFailure::NotAnArchive);
+            }
             let end = extended
                 .iter()
                 .position(|byte| *byte == b'\0')
@@ -288,14 +364,148 @@ fn member_names(archive: &Path) -> Option<Vec<Bytes>> {
             trim_trailing_slash(raw)
         };
 
-        if !name.is_empty() {
-            found.push(Bytes::copy_from_slice(name));
+        let member = Member {
+            name,
+            date,
+            position,
+            truncated: extended.is_empty() && !raw.starts_with(b"/"),
+        };
+        if let Some(answer) = visit(&member, &mut file) {
+            return Ok(Some(answer));
         }
 
-        let consumed = i64::try_from(extended.len()).ok()?;
-        file.seek(SeekFrom::Current(size - consumed)).ok()?;
-        skip_padding(&mut file, size)?;
+        // Sought absolutely rather than stepped over: the 4.4BSD form has
+        // already taken its name out of the data, and a visitor that wrote into
+        // a header has moved the handle again, so where the next header begins
+        // is the only thing either of them still agrees about.
+        position += entry;
+        if file.seek(SeekFrom::Start(position)).is_err() {
+            return Err(ScanFailure::NotAnArchive);
+        }
     }
+}
+
+/// GNU Make's `ar_name_equal`. A name that came out of the fixed header field
+/// is compared over that field's width only, because that is all of it the
+/// archive kept, and the directory is dropped first — so `lib.a(d/foo.o)` asks
+/// about the entry named `foo.o`.
+fn name_matches(wanted: &[u8], member: &Member<'_>) -> bool {
+    let wanted = wanted
+        .iter()
+        .rposition(|byte| *byte == b'/')
+        .map_or(wanted, |slash| &wanted[slash + 1..]);
+    if !member.truncated {
+        return wanted == member.name;
+    }
+    wanted.get(..NAME_KEPT).unwrap_or(wanted) == member.name.get(..NAME_KEPT).unwrap_or(member.name)
+}
+
+/// Every member name the archive's index holds, in the order it holds them.
+///
+/// The one question the front end's globbing asks of the scan. An archive that
+/// does not parse is one with no members, which is what `ar_scan` reports for
+/// an invalid archive to a caller that only wanted to match names.
+fn member_names(archive: &Path) -> Option<Vec<Bytes>> {
+    let mut found = Vec::new();
+    let walked = ar_scan(archive, false, |member, _| {
+        if !member.name.is_empty() {
+            found.push(Bytes::copy_from_slice(member.name));
+        }
+        None::<()>
+    });
+    match walked {
+        Err(ScanFailure::NoArchive) => None,
+        // A malformed archive keeps whatever the walk read before it, which is
+        // every member `ar_scan` had reported by the time it gave up.
+        Err(ScanFailure::NotAnArchive) | Ok(_) => Some(found),
+    }
+}
+
+/// The seconds-since-epoch the index records for `member`, or `None` when the
+/// archive has no such member — including a member whose recorded date is zero.
+///
+/// GNU Make's `ar_member_date`, which folds "not found" and "date zero"
+/// together: `ar_scan` returns the first non-zero date a matching member has,
+/// and a return of zero or less becomes -1, which `f_mtime` reads as
+/// nonexistent. That is not a corner case on a modern Linux host — `ar`
+/// defaults to deterministic mode, which writes every member's date as zero, so
+/// every member of an archive built by plain `ar -rv` reads as out of date, and
+/// GNU Make 4.4.1 re-runs `$(AR) $(ARFLAGS)` on every invocation for exactly
+/// that reason.
+pub fn member_date(archive: &Path, member: &[u8]) -> Option<i64> {
+    ar_scan(archive, false, |found, _| {
+        (name_matches(member, found) && found.date > 0).then_some(found.date)
+    })
+    .ok()
+    .flatten()
+}
+
+/// Write the archive's own modification time into `member`'s index entry, which
+/// is the only way a member's date can be set: it is not a file, so there is
+/// nothing to `utime`.
+///
+/// GNU Make's `ar_member_touch` (reference/gnumake/src/arscan.c:923), which
+/// finds the header and formats a date into the 12-byte `ar_date` field in
+/// place. Three details of it are load-bearing and none of them is obvious:
+///
+/// * the date written is the ARCHIVE's, not the wall clock, and it is read
+///   before the write — so the member ends a touch fractionally older than the
+///   archive holding it, which is what GNU Make settles for and what a
+///   subsequent read then finds current;
+/// * the field is decimal seconds padded to its full width with spaces, because
+///   a shorter number left over from a longer one would leave the tail of the
+///   old date behind it;
+/// * on an archive `ar` wrote in its default deterministic mode every date is
+///   zero, so every member reads as absent — and a touch is then the only way a
+///   real date ever gets into that index at all.
+///
+/// Unlike [`member_date`], a member whose recorded date is zero still counts as
+/// found: a touch is precisely the thing that gives such a member a date.
+pub fn touch_member(archive: &Path, member: &[u8]) -> Result<(), TouchFailure> {
+    use std::io::Write as _;
+
+    let modified = std::fs::metadata(archive)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_secs());
+    let mut field = [b' '; DATE_FIELD];
+    let text = modified.to_string();
+    let written = text.as_bytes();
+    if written.len() <= DATE_FIELD {
+        field[..written.len()].copy_from_slice(written);
+    }
+
+    let touched = ar_scan(archive, true, |found, file| {
+        if !name_matches(member, found) {
+            return None;
+        }
+        Some(
+            file.seek(SeekFrom::Start(found.position + DATE_OFFSET))
+                .and_then(|_| file.write_all(&field)),
+        )
+    });
+    match touched {
+        Ok(Some(Ok(()))) => Ok(()),
+        Ok(Some(Err(_))) => Err(TouchFailure::NotAnArchive),
+        Ok(None) => Err(TouchFailure::NoMember),
+        Err(ScanFailure::NoArchive) => Err(TouchFailure::NoArchive),
+        Err(ScanFailure::NotAnArchive) => Err(TouchFailure::NotAnArchive),
+    }
+}
+
+/// Why a member's date could not be written.
+///
+/// The three are separate because GNU Make says three different things and
+/// distinguishing them is the whole information the diagnostic carries: a
+/// missing archive is a build that has not reached this yet, a missing member
+/// is a name that is wrong, and an unreadable one is a file that is not an
+/// archive at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TouchFailure {
+    NoArchive,
+    NotAnArchive,
+    NoMember,
 }
 
 /// An archive member header field, which is left-aligned ASCII padded with
@@ -321,14 +531,6 @@ const fn trim_trailing_slash(name: &[u8]) -> &[u8] {
         Some((b'/', rest)) => rest,
         _ => name,
     }
-}
-
-/// Every member's data is padded to an even offset.
-fn skip_padding(file: &mut std::fs::File, size: i64) -> Option<()> {
-    if size % 2 == 1 {
-        file.seek(SeekFrom::Current(1)).ok()?;
-    }
-    Some(())
 }
 
 /// The members of `archive` matching `pattern`, sorted, or `None` when the
@@ -524,13 +726,16 @@ mod tests {
 
         /// Built by `ar` on this host rather than by hand, so the reader is
         /// measured against the format that actually reaches it.
-        fn archive(&self, members: &[&str]) -> Vec<u8> {
+        ///
+        /// `ar` defaults to deterministic mode here, which writes every
+        /// member's date as zero; `-rcU` is what records a real one.
+        fn written(&self, flags: &str, members: &[&str]) -> std::path::PathBuf {
             for member in members {
                 std::fs::write(self.0.join(member), b"body\n").unwrap();
             }
             let path = self.0.join("lib.a");
             let ok = std::process::Command::new("ar")
-                .arg("-rc")
+                .arg(flags)
                 .arg(&path)
                 .args(members)
                 .current_dir(&self.0)
@@ -538,7 +743,13 @@ mod tests {
                 .unwrap()
                 .success();
             assert!(ok);
-            path.into_os_string().into_encoded_bytes()
+            path
+        }
+
+        fn archive(&self, members: &[&str]) -> Vec<u8> {
+            self.written("-rc", members)
+                .into_os_string()
+                .into_encoded_bytes()
         }
     }
 
@@ -617,6 +828,112 @@ mod tests {
                 b"*.o"
             ),
             None
+        );
+    }
+
+    /// The cell the deterministic default makes interesting: `ar` wrote every
+    /// date as zero, so every member reads as absent, and GNU Make refiles the
+    /// archive on every invocation because of it.
+    #[test]
+    fn a_deterministic_archive_records_no_date() {
+        let scratch = Scratch::new("deterministic-date");
+        let path = scratch.written("-rc", &["member.o", "a-very-long-member-name.o"]);
+        assert_eq!(member_date(&path, b"member.o"), None);
+    }
+
+    #[test]
+    fn a_dated_archive_answers_both_name_lengths() {
+        let scratch = Scratch::new("dated");
+        let path = scratch.written("-rcU", &["member.o", "a-very-long-member-name.o"]);
+        assert!(member_date(&path, b"member.o").is_some_and(|date| date > 0));
+        assert!(
+            member_date(&path, b"a-very-long-member-name.o").is_some_and(|date| date > 0),
+            "a name too long for the header comes out of the long-name table"
+        );
+        assert_eq!(member_date(&path, b"absent.o"), None);
+        assert!(
+            member_date(&path, b"sub/member.o").is_some(),
+            "the directory is dropped before the comparison, as ar_name_equal does"
+        );
+    }
+
+    #[test]
+    fn a_non_archive_answers_for_no_member() {
+        let scratch = Scratch::new("dateless");
+        let path = scratch.0.join("not-an-archive");
+        std::fs::write(&path, b"just bytes\n").unwrap();
+        assert_eq!(member_date(&path, b"member.o"), None);
+        assert_eq!(member_date(&scratch.0.join("absent.a"), b"m.o"), None);
+    }
+
+    /// A touch is the only thing that will ever put a real date into the index
+    /// of an archive `ar` wrote in its default mode, and the date it writes is
+    /// the archive's own rather than the wall clock's.
+    // [spec:ronin:req:make.semantics+1/test]
+    #[test]
+    fn a_touch_files_the_archives_own_date() {
+        let scratch = Scratch::new("touch-date");
+        let path = scratch.written("-rc", &["member.o", "a-very-long-member-name.o"]);
+        assert_eq!(member_date(&path, b"member.o"), None);
+
+        touch_member(&path, b"member.o").unwrap();
+
+        let archive_date = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let dated = member_date(&path, b"member.o").expect("the touch filed a date");
+        // GNU Make reads the archive's mtime before it writes, and writing then
+        // moves that mtime on, so the member ends fractionally behind the file
+        // holding it rather than level with it.
+        assert!(
+            dated > 0 && u64::try_from(dated).unwrap() <= archive_date,
+            "the member was dated {dated} against an archive of {archive_date}"
+        );
+        assert_eq!(
+            member_date(&path, b"a-very-long-member-name.o"),
+            None,
+            "a touch dated a member nobody asked about"
+        );
+    }
+
+    /// A name too long for the fixed header is found through the long-name
+    /// table, and the header the touch writes into is still that member's own —
+    /// which is the half of the walk a scan that only reads never exercises.
+    // [spec:ronin:req:make.semantics+1/test]
+    #[test]
+    fn a_touch_reaches_a_long_named_member() {
+        let scratch = Scratch::new("touch-long-name");
+        let path = scratch.written("-rc", &["member.o", "a-very-long-member-name.o"]);
+
+        touch_member(&path, b"a-very-long-member-name.o").unwrap();
+
+        assert!(member_date(&path, b"a-very-long-member-name.o").is_some_and(|date| date > 0));
+        assert_eq!(member_date(&path, b"member.o"), None);
+    }
+
+    /// The three ways a touch has nothing to write into, which are three
+    /// different things to say and not one.
+    // [spec:ronin:req:make.semantics+1/test]
+    #[test]
+    fn a_touch_says_why_it_failed() {
+        let scratch = Scratch::new("touch-failures");
+        let path = scratch.written("-rc", &["member.o"]);
+        assert_eq!(
+            touch_member(&path, b"absent.o"),
+            Err(TouchFailure::NoMember)
+        );
+        assert_eq!(
+            touch_member(&scratch.0.join("nope.a"), b"member.o"),
+            Err(TouchFailure::NoArchive)
+        );
+        let bad = scratch.0.join("bad.a");
+        std::fs::write(&bad, b"just bytes\n").unwrap();
+        assert_eq!(
+            touch_member(&bad, b"member.o"),
+            Err(TouchFailure::NotAnArchive)
         );
     }
 }
