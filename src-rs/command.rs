@@ -1045,6 +1045,107 @@ fn parse_command_prefixes(
     cmds.slice_ref(s)
 }
 
+/// What the `@`, `-` and `+` on one expanded recipe line say about it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct LinePrefixes {
+    echo: bool,
+    dash_prefixed: bool,
+    recursive_line: bool,
+}
+
+/// Read the prefixes off a recipe line as it is written, before expansion.
+///
+/// GNU Make's `chop_commands` runs at parse time over the unexpanded text and
+/// stores what it finds in the written line's `lines_flags`, which then seeds
+/// every line the expansion produces. So a prefix written in front of a
+/// `$(call …)` belongs to the whole call, while a prefix that came *out* of the
+/// call binds to its own line. kati's own `silent_multiline.mk` is the case
+/// that tells them apart against 4.4.1: `$(call cmd2)` and `@$(call cmd2)`
+/// expand to the same three lines, and Make echoes the trailing `echo bar` for
+/// the first and not for the second.
+///
+/// Returns whether the scan reached the end of what it read without meeting
+/// anything that is not a prefix — which is when the next piece of the line
+/// still counts as its beginning. A reference ends the run: GNU Make's scan
+/// stops at the `$` that starts one.
+fn scan_written_prefixes(value: &Value, prefixes: &mut LinePrefixes) -> bool {
+    match value {
+        Value::Literal(_, text) => parse_command_prefixes(
+            text.clone(),
+            &mut prefixes.echo,
+            &mut prefixes.dash_prefixed,
+            &mut prefixes.recursive_line,
+        )
+        .is_empty(),
+        Value::List(_, values) => values
+            .iter()
+            .all(|value| scan_written_prefixes(value, prefixes)),
+        _ => false,
+    }
+}
+
+/// The lines one written recipe line expanded into, each carrying the prefixes
+/// that apply to it.
+///
+/// GNU Make expands a written recipe line once and then hands the result to
+/// `start_job_command` one physical line at a time — `construct_command_argv`
+/// stops at the newline and leaves `command_ptr` on the next. That function
+/// reads `@`, `-` and `+` off the line in front of it, seeding them afresh from
+/// the written line's own flags every time, so a prefix produced by the
+/// expansion belongs to the expanded line it stands on rather than to the
+/// expansion. Probed against 4.4.1: `define multi / @echo hi / echo there /
+/// endef` run from one written line prints `hi`, `echo there`, `there` — Make
+/// echoes the second line, so the first line's `@` never reached it.
+///
+/// `+` is the exception, and it is GNU Make's exception rather than one of
+/// ours: the same function writes `COMMANDS_RECURSE` back into the written
+/// line's flags, under a comment in job.c admitting this marks more lines
+/// recursive than it should for exactly this shape. So a `+` reaches the rest
+/// of this expansion and stops at the end of it. Probed: `+touch a` above
+/// `touch b` in one expansion makes both files under `-n`, and the same two
+/// lines written out make only the first.
+struct ExpandedRecipeLines {
+    rest: Bytes,
+    /// What the written line already settled for every line of its expansion:
+    /// `-s` and any prefix written before the expansion for the echo and the
+    /// forgiveness, and those plus the unexpanded `$(MAKE)` scan for the
+    /// recursion.
+    written: LinePrefixes,
+}
+
+impl ExpandedRecipeLines {
+    fn new(expansion: Bytes, written: LinePrefixes) -> Self {
+        Self {
+            rest: expansion,
+            written,
+        }
+    }
+}
+
+impl Iterator for ExpandedRecipeLines {
+    type Item = (Bytes, LinePrefixes);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        let eol = find_end_of_line(&self.rest);
+        let line = eol.line.slice_ref(trim_left_space(&eol.line));
+        self.rest = eol.rest;
+        let mut prefixes = self.written;
+        let command = parse_command_prefixes(
+            line,
+            &mut prefixes.echo,
+            &mut prefixes.dash_prefixed,
+            &mut prefixes.recursive_line,
+        );
+        // A line that was nothing but a `+` still carries it, so the write-back
+        // happens before the caller decides there is no command here.
+        self.written.recursive_line = prefixes.recursive_line;
+        Some((command, prefixes))
+    }
+}
+
 pub struct CommandEvaluator<'a> {
     pub ev: &'a mut Evaluator,
     pub current_dep_node: Arc<Mutex<Option<Arc<Mutex<DepNode>>>>>,
@@ -1161,55 +1262,39 @@ impl<'a> CommandEvaluator<'a> {
             self.ev.expanded_make_in_command.clear();
             let cmds_buf = v.eval_to_buf(self.ev)?;
             let make_values = self.ev.expanded_make_in_command.clone();
-            let mut cmds = cmds_buf.clone();
-            let mut global_echo = !self.ev.session.flags.is_silent_mode;
             // `-i` and `.IGNORE` say a failure does not count, which is what
             // the `-` prefix says too — but only the prefix also relaxes the
             // shell, so the two are carried separately and joined at the end.
             let ignored_without_prefix = self.ev.session.flags.ignore_errors || node_ignores_errors;
-            let mut global_dash_prefixed = false;
-            // The classification is read from the recipe as written, so it has
-            // to be taken before anything is expanded away.
-            let mut global_recursive_line = references_make(&v, &self.ev.session);
-            cmds = parse_command_prefixes(
-                cmds,
-                &mut global_echo,
-                &mut global_dash_prefixed,
-                &mut global_recursive_line,
-            );
-            if cmds.is_empty() {
-                continue;
-            }
-            while !cmds.is_empty() {
-                let eol = find_end_of_line(&cmds);
-                let mut cmd = eol.line.slice_ref(trim_left_space(&eol.line));
-                cmds = eol.rest;
-
-                let mut echo = global_echo;
-                let mut dash_prefixed = global_dash_prefixed;
-                let mut recursive_line = global_recursive_line;
-                cmd =
-                    parse_command_prefixes(cmd, &mut echo, &mut dash_prefixed, &mut recursive_line);
-
+            let mut written = LinePrefixes {
+                echo: !self.ev.session.flags.is_silent_mode,
+                dash_prefixed: false,
+                // The classification is read from the recipe as written, so it
+                // has to be taken before anything is expanded away.
+                recursive_line: references_make(&v, &self.ev.session),
+            };
+            scan_written_prefixes(&v, &mut written);
+            let lines = ExpandedRecipeLines::new(cmds_buf, written);
+            for (cmd, prefixes) in lines {
                 if !cmd.is_empty() {
                     let recursive_make = lifted_invocations(&cmd, &make_values);
                     // Only a classified line is held to this. A `MAKE`-valued
                     // variable that GNU Make never classified is composed when
                     // the expansion makes that possible and otherwise left as
                     // written, exactly as 4.4.1 leaves it.
-                    let uncomposable_recursion = recursive_line
+                    let uncomposable_recursion = prefixes.recursive_line
                         && recursive_make.is_empty()
                         && make_values.iter().any(|make| spawns_make(&cmd, make));
-                    let shell_flag = self.ev.get_shell_flag(dash_prefixed)?;
+                    let shell_flag = self.ev.get_shell_flag(prefixes.dash_prefixed)?;
                     result.push(Command {
                         output: n.lock().recipe_output,
                         cmd,
-                        echo,
-                        ignore_error: ignored_without_prefix || dash_prefixed,
-                        dash_prefixed,
+                        echo: prefixes.echo,
+                        ignore_error: ignored_without_prefix || prefixes.dash_prefixed,
+                        dash_prefixed: prefixes.dash_prefixed,
                         shell_flag,
                         force_no_subshell: false,
-                        recursive_line,
+                        recursive_line: prefixes.recursive_line,
                         recursive_make,
                         uncomposable_recursion,
                     })
@@ -1253,8 +1338,9 @@ impl<'a> CommandEvaluator<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoCommand, AutoCommandVar, AutoCommandVariant, invokes_make, lifted_invocations,
-        references_make, spawns_make, unwrapped_command,
+        AutoCommand, AutoCommandVar, AutoCommandVariant, ExpandedRecipeLines, LinePrefixes,
+        invokes_make, lifted_invocations, references_make, scan_written_prefixes, spawns_make,
+        unwrapped_command,
     };
     use crate::expr::{ParseExprOpt, parse_expr};
     use crate::loc::Loc;
@@ -1462,6 +1548,195 @@ mod tests {
         // `V = MAKE`, so the name is computed rather than written.
         assert!(!classified(b"echo indirect $($(V))"));
         assert!(!classified(b"echo plain"));
+    }
+
+    /// Read one written line's expansion the way `eval` does: not silent, and
+    /// not classified recursive by the `$(MAKE)` scan over the written text.
+    fn expanded(text: &'static [u8]) -> Vec<(String, bool, bool, bool)> {
+        ExpandedRecipeLines::new(
+            Bytes::from_static(text),
+            LinePrefixes {
+                echo: true,
+                dash_prefixed: false,
+                recursive_line: false,
+            },
+        )
+        .map(|(cmd, prefixes)| {
+            (
+                String::from_utf8_lossy(&cmd).into_owned(),
+                prefixes.echo,
+                prefixes.dash_prefixed,
+                prefixes.recursive_line,
+            )
+        })
+        .collect()
+    }
+
+    /// GNU Make 4.4.1 with `define multi / @echo hi / echo there / endef` and
+    /// `all: ; $(multi)` prints `hi`, `echo there`, `there` — the second line is
+    /// echoed, so the first line's `@` did not reach it. `-` is the same shape
+    /// and the difference is a build rather than an echo: `-false` above a bare
+    /// `false` makes GNU ignore the first failure and stop on the second.
+    #[test]
+    fn silence_and_forgiveness_belong_to_the_expanded_line_they_are_written_on() {
+        assert_eq!(
+            expanded(b"@echo hi\necho there"),
+            vec![
+                ("echo hi".to_owned(), false, false, false),
+                ("echo there".to_owned(), true, false, false),
+            ]
+        );
+        assert_eq!(
+            expanded(b"-false\nfalse"),
+            vec![
+                ("false".to_owned(), true, true, false),
+                ("false".to_owned(), true, false, false),
+            ]
+        );
+        // Both at once, and in either order, still bind to their own line.
+        assert_eq!(
+            expanded(b"@-one\ntwo\n-@three"),
+            vec![
+                ("one".to_owned(), false, true, false),
+                ("two".to_owned(), true, false, false),
+                ("three".to_owned(), false, true, false),
+            ]
+        );
+    }
+
+    /// `+` is GNU Make's own exception: `start_job_command` writes
+    /// `COMMANDS_RECURSE` back into the written line's flags, so it reaches the
+    /// rest of this expansion. Probed against 4.4.1 under `-n`, where a
+    /// recursive line runs and an ordinary one does not: `+touch plus.out`
+    /// above `touch noplus.out` in one expansion makes both files, and the same
+    /// two lines written as two recipe lines make only `plus.out`.
+    #[test]
+    fn a_plus_reaches_the_rest_of_the_expansion_it_is_written_in() {
+        assert_eq!(
+            expanded(b"+touch plus.out\ntouch noplus.out"),
+            vec![
+                ("touch plus.out".to_owned(), true, false, true),
+                ("touch noplus.out".to_owned(), true, false, true),
+            ]
+        );
+        // A line that is nothing but the prefix still carries it, and leaves
+        // no command behind for the caller to run.
+        assert_eq!(
+            expanded(b"+\ntouch after.out"),
+            vec![
+                (String::new(), true, false, true),
+                ("touch after.out".to_owned(), true, false, true),
+            ]
+        );
+        // Nothing carries backwards: a `+` below a line does not reach it.
+        assert_eq!(
+            expanded(b"touch before.out\n+touch plus.out"),
+            vec![
+                ("touch before.out".to_owned(), true, false, false),
+                ("touch plus.out".to_owned(), true, false, true),
+            ]
+        );
+    }
+
+    /// Parse one recipe line as the makefile writes it, and read the prefixes
+    /// `chop_commands` would take off it.
+    fn written(text: &str) -> LinePrefixes {
+        let mut session = Session::new();
+        let value = parse_expr(
+            &mut session,
+            &mut Loc::default(),
+            Bytes::from(text.to_owned()),
+            ParseExprOpt::Command,
+        )
+        .expect("a parsable recipe line");
+        let mut prefixes = LinePrefixes {
+            echo: true,
+            dash_prefixed: false,
+            recursive_line: false,
+        };
+        scan_written_prefixes(&value, &mut prefixes);
+        prefixes
+    }
+
+    /// A prefix written in front of an expansion belongs to every line the
+    /// expansion produces, because GNU Make reads it at parse time and stores
+    /// it on the written line. kati's own `silent_multiline.mk` is what tells
+    /// this apart from a prefix the expansion produced: `$(call cmd2)` and
+    /// `@$(call cmd2)` expand to the same three lines, and 4.4.1 echoes the
+    /// trailing `echo bar` for the first and not for the second.
+    #[test]
+    fn a_prefix_written_before_an_expansion_belongs_to_the_whole_expansion() {
+        assert_eq!(
+            written("@$(call cmd)"),
+            LinePrefixes {
+                echo: false,
+                dash_prefixed: false,
+                recursive_line: false
+            }
+        );
+        assert_eq!(
+            written("\t-+@$(call cmd)"),
+            LinePrefixes {
+                echo: false,
+                dash_prefixed: true,
+                recursive_line: true
+            }
+        );
+        // The scan stops at the `$`, so a prefix the expansion carries is not
+        // this line's — it is read again, per line, once the text exists.
+        assert_eq!(
+            written("$(call cmd)"),
+            LinePrefixes {
+                echo: true,
+                dash_prefixed: false,
+                recursive_line: false
+            }
+        );
+        // A reference is not a prefix character even where its value is one.
+        assert_eq!(
+            written("$(AT)echo hi"),
+            LinePrefixes {
+                echo: true,
+                dash_prefixed: false,
+                recursive_line: false
+            }
+        );
+        assert_eq!(
+            written("echo @ - +"),
+            LinePrefixes {
+                echo: true,
+                dash_prefixed: false,
+                recursive_line: false
+            }
+        );
+    }
+
+    /// The seeds are what the written line already settled: `-s` silences every
+    /// expanded line without any of them saying so, and a written line the
+    /// `$(MAKE)` scan classified is recursive throughout.
+    #[test]
+    fn the_written_lines_own_flags_seed_every_line_of_its_expansion() {
+        let seeded = ExpandedRecipeLines::new(
+            Bytes::from_static(b"one\ntwo"),
+            LinePrefixes {
+                echo: false,
+                dash_prefixed: true,
+                recursive_line: true,
+            },
+        )
+        .map(|(_, prefixes)| prefixes)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            seeded,
+            vec![
+                LinePrefixes {
+                    echo: false,
+                    dash_prefixed: true,
+                    recursive_line: true
+                };
+                2
+            ]
+        );
     }
 
     #[test]
