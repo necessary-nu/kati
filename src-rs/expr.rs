@@ -62,9 +62,55 @@ pub enum ParseExprOpt {
     Func,
 }
 
+/// Text a read could not make a call or a reference out of.
+///
+/// GNU Make discovers all three of these while it EXPANDS a value, not while it
+/// reads one: `variable_expand_string` (expand.c) counts a reference's parens
+/// as it walks the text it is expanding, and `handle_function` (function.c)
+/// counts a call's parens and hands the count to `expand_builtin_function`,
+/// which is where the argument count is judged. So text that no expansion ever
+/// reaches is never judged at all, and a makefile is free to hold a call nobody
+/// calls.
+///
+/// A read here builds a [`Value`] eagerly, so the complaint has to be held in
+/// one until whatever holds it is expanded. That is what this is: a value whose
+/// only behaviour is to raise.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Unreadable {
+    /// A call whose closing `)` or `}` never arrived, carrying the function's
+    /// name and the close that was wanted.
+    UnterminatedCall(&'static [u8], u8),
+    /// A `$(` or `${` whose close never arrived and which named no function.
+    UnterminatedReference,
+}
+
+impl Unreadable {
+    fn raise<C: crate::session::Context>(self, ctx: &C, loc: &Loc) -> anyhow::Error {
+        match self {
+            Unreadable::UnterminatedCall(name, close) => crate::color_error_log(
+                ctx,
+                Some(loc),
+                format!(
+                    "*** unterminated call to function '{}': missing '{}'.",
+                    String::from_utf8_lossy(name),
+                    char::from(close)
+                ),
+            ),
+            Unreadable::UnterminatedReference => crate::color_error_log(
+                ctx,
+                Some(loc),
+                "*** unterminated variable reference.".to_string(),
+            ),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Value {
     Literal(Option<Loc>, Bytes),
+    /// A complaint the read held rather than made, raised if and when the text
+    /// holding it is expanded. See [`Unreadable`].
+    Unreadable(Loc, Unreadable),
     List(Option<Loc>, Vec<Arc<Value>>),
     SymRef(Loc, Symbol),
     VarRef(Loc, Arc<Value>),
@@ -159,6 +205,7 @@ impl Evaluable for Value {
                     }
                 }
             }
+            Value::Unreadable(loc, unreadable) => return Err(unreadable.raise(ev, loc)),
             Value::Func { loc, fi, args } => {
                 let _frame = ev.enter(FrameType::FunCall, Bytes::from_static(fi.name), loc.clone());
                 log!(
@@ -167,6 +214,31 @@ impl Evaluable for Value {
                     args
                 );
                 ev.eval_depth += 1;
+                // GNU Make counts the arguments in `expand_builtin_function`,
+                // which is to say inside the expansion and after
+                // `handle_function` has already expanded them -- so a call with
+                // too few of them has already run whatever its arguments do by
+                // the time it is refused. Which functions get that treatment is
+                // GNU Make's `expand_args`, and this flag is that column: it is
+                // exact rather than approximate here, because the only functions
+                // this complaint can reach are the ones wanting two arguments or
+                // more -- a call parses with at least one -- and every one of
+                // those carries the same value for it that GNU Make's table
+                // does.
+                if (args.len() as i16) < fi.min_arity {
+                    if fi.pre_expanded_args {
+                        for arg in args {
+                            arg.eval_to_buf(ev)?;
+                        }
+                    }
+                    error_loc!(
+                        ev,
+                        Some(loc),
+                        "*** insufficient number of arguments ({}) to function '{}'.",
+                        args.len(),
+                        String::from_utf8_lossy(fi.name)
+                    );
+                }
                 (fi.func)(args, ev, out)?;
                 ev.eval_depth -= 1;
             }
@@ -192,6 +264,9 @@ impl Evaluable for Value {
             Value::VarSubst {
                 name, pat, subst, ..
             } => name.is_func(names) || pat.is_func(names) || subst.is_func(names),
+            // Evaluating it raises, which is the one thing a caller asking this
+            // question is trying not to provoke.
+            Value::Unreadable(_, _) => true,
             Value::Literal(_, _) => false,
         }
     }
@@ -201,6 +276,7 @@ impl Value {
     pub fn loc(&self) -> Option<Loc> {
         match self {
             Value::Literal(loc, _) => loc.clone(),
+            Value::Unreadable(loc, _) => Some(loc.clone()),
             Value::List(loc, _) => loc.clone(),
             Value::SymRef(loc, _) => Some(loc.clone()),
             Value::VarRef(loc, _) => Some(loc.clone()),
@@ -290,6 +366,17 @@ fn skip_spaces(loc: &mut Loc, s: &[u8], terms: &[u8]) -> usize {
     s.len()
 }
 
+/// What reading a call's argument list found: the arguments, or that the text
+/// ran out before the close did.
+///
+/// The second is not raised here. GNU Make counts a call's parens in
+/// `handle_function`, which runs while the text is being expanded, so text no
+/// expansion reaches keeps its missing close to itself -- see [`Unreadable`].
+enum ParsedCall {
+    Args(Vec<Arc<Value>>),
+    Unterminated,
+}
+
 fn parse_func(
     session: &mut Session,
     loc: &mut Loc,
@@ -297,13 +384,14 @@ fn parse_func(
     s: Bytes,
     mut i: usize,
     mut terms: Vec<u8>,
-) -> Result<(usize, Vec<Arc<Value>>)> {
-    let start_loc = loc.clone();
+) -> Result<(usize, ParsedCall)> {
     terms.truncate(2);
     terms[1] = b',';
     i += skip_spaces(loc, &s[i..], &terms);
     if i == s.len() {
-        return Ok((i, vec![]));
+        // The text ended between the name and any argument, so the close never
+        // arrived either.
+        return Ok((i, ParsedCall::Unterminated));
     }
 
     let mut nargs = 1;
@@ -345,13 +433,7 @@ fn parse_func(
         args.push(val);
         i += n;
         if i == s.len() {
-            error_loc!(
-                session,
-                Some(&start_loc),
-                "*** unterminated call to function '{}': missing '{}'.",
-                String::from_utf8_lossy(fi.name),
-                char::from(terms[0])
-            );
+            return Ok((i, ParsedCall::Unterminated));
         }
         nargs += 1;
         if s[i] == terms[0] {
@@ -360,21 +442,13 @@ fn parse_func(
         }
         i += 1; // Should be ','.
         if i == s.len() {
-            break;
+            // A comma was the last thing in the text, so the close is missing
+            // rather than an argument being.
+            return Ok((i, ParsedCall::Unterminated));
         }
     }
 
-    if nargs <= fi.min_arity {
-        error_loc!(
-            session,
-            Some(&start_loc),
-            "*** insufficient number of arguments ({}) to function '{}'.",
-            nargs - 1,
-            String::from_utf8_lossy(fi.name)
-        );
-    }
-
-    Ok((i, args))
+    Ok((i, ParsedCall::Args(args)))
 }
 
 fn parse_dollar(
@@ -432,15 +506,18 @@ fn parse_dollar(
             // ${func ...}
             if let Value::Literal(_, lit) = &*vname {
                 if let Some(fi) = get_func_info(lit) {
-                    let (idx, args) = parse_func(session, loc, fi, s, i + 1, terms)?;
-                    return Ok((
-                        idx,
-                        Arc::new(Value::Func {
+                    let (idx, parsed) = parse_func(session, loc, fi, s, i + 1, terms)?;
+                    let value = match parsed {
+                        ParsedCall::Args(args) => Value::Func {
                             loc: start_loc,
                             fi,
                             args,
-                        }),
-                    ));
+                        },
+                        ParsedCall::Unterminated => {
+                            Value::Unreadable(start_loc, Unreadable::UnterminatedCall(fi.name, cp))
+                        }
+                    };
+                    return Ok((idx, Arc::new(value)));
                 } else {
                     kati_warn_loc!(
                         session,
@@ -522,11 +599,16 @@ fn parse_dollar(
             return Ok((s.len(), Arc::new(Value::SymRef(start_loc.clone(), sym))));
         }
 
-        error_loc!(
-            session,
-            Some(&start_loc),
-            "*** unterminated variable reference."
-        );
+        // Held rather than raised: GNU Make finds an unterminated reference in
+        // `variable_expand_string`, which only ever looks at text it is
+        // expanding. See [`Unreadable`].
+        return Ok((
+            s.len(),
+            Arc::new(Value::Unreadable(
+                start_loc,
+                Unreadable::UnterminatedReference,
+            )),
+        ));
     }
 }
 
@@ -1014,6 +1096,65 @@ mod tests {
         )
     }
 
+    /// Every shape a read cannot make a call out of is held rather than raised,
+    /// and each one raises GNU Make's own words when the text is expanded.
+    #[test]
+    fn a_call_a_read_cannot_finish_is_held_until_it_is_expanded() {
+        for (text, expected) in [
+            (
+                &b"$(subst a,b,c"[..],
+                "<unknown>:0: *** unterminated call to function 'subst': missing ')'.  Stop.",
+            ),
+            (
+                b"${subst a,b,c",
+                "<unknown>:0: *** unterminated call to function 'subst': missing '}'.  Stop.",
+            ),
+            // The text ran out between the name and the first argument, which
+            // is a missing close and not a missing argument. Read as a call
+            // with no arguments at all it would reach the function's own body,
+            // which indexes the list it is handed.
+            (
+                b"$(subst ",
+                "<unknown>:0: *** unterminated call to function 'subst': missing ')'.  Stop.",
+            ),
+            // A comma was the last thing in the text, likewise.
+            (
+                b"$(subst a,",
+                "<unknown>:0: *** unterminated call to function 'subst': missing ')'.  Stop.",
+            ),
+            (
+                b"$(NAME",
+                "<unknown>:0: *** unterminated variable reference.  Stop.",
+            ),
+            (
+                b"$(subst a)",
+                "<unknown>:0: *** insufficient number of arguments (1) to function 'subst'.  Stop.",
+            ),
+        ] {
+            let mut session = Session::new();
+            let mut loc = Loc::default();
+            let value = parse_expr(
+                &mut session,
+                &mut loc,
+                Bytes::from_static(text),
+                ParseExprOpt::Normal,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{:?} was refused by the read: {e}",
+                    String::from_utf8_lossy(text)
+                )
+            });
+            let mut ev = Evaluator::new(session);
+            assert_eq!(
+                value.eval_to_buf(&mut ev).unwrap_err().to_string(),
+                expected,
+                "{:?}",
+                String::from_utf8_lossy(text)
+            );
+        }
+    }
+
     #[test]
     fn test_ckati_end_paren() {
         // ckati does not error on lines like `ifeq (foo,$(BAR)` as parse_expr
@@ -1021,22 +1162,31 @@ mod tests {
         // ending `)`.
         let mut session = Session::new();
         let mut loc = Loc::default();
+        let (consumed, unread) = parse_expr_impl_ext(
+            &mut session,
+            &mut loc,
+            Bytes::from_static(b"$(BAR"),
+            None,
+            ParseExprOpt::Normal,
+            false,
+            false,
+        )
+        .unwrap();
+        // The read does not raise: it hands back the complaint to be made if and
+        // when something expands the text.
+        assert_eq!(consumed, 5);
+        let Value::Unreadable(held_loc, Unreadable::UnterminatedReference) = &*unread else {
+            panic!("expected a held complaint, got {unread:?}")
+        };
+        assert_eq!(held_loc, &Loc::default());
+        let mut ev = Evaluator::new(session);
         assert_eq!(
-            parse_expr_impl_ext(
-                &mut session,
-                &mut loc,
-                Bytes::from_static(b"$(BAR"),
-                None,
-                ParseExprOpt::Normal,
-                false,
-                false
-            )
-            .unwrap_err()
-            .to_string(),
+            unread.eval_to_buf(&mut ev).unwrap_err().to_string(),
             // GNU Make ends the diagnostic it dies on with `Stop.`, wherever it
             // was raised, and this is one it dies on.
             "<unknown>:0: *** unterminated variable reference.  Stop."
         );
+        let mut session = ev.session;
         let bar = session.intern("BAR");
         assert_eq!(
             parse_expr_impl_ext(

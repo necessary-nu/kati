@@ -568,6 +568,8 @@ pub fn expansion_can_reach_make(
 ) -> bool {
     match value {
         Value::Literal(_, _) => false,
+        // Expanding it raises rather than producing text, so it reaches nothing.
+        Value::Unreadable(_, _) => false,
         Value::SymRef(_, sym) => symbol_can_reach_make(*sym, ev, rule_vars, seen),
         Value::List(_, values) => values
             .iter()
@@ -668,6 +670,8 @@ pub fn is_blank_recipe_line(value: &Value) -> bool {
 pub fn references_new_inputs(value: &Value, names: &impl Interner) -> bool {
     match value {
         Value::Literal(_, _) => false,
+        // Expanding it raises rather than producing text, so it reaches nothing.
+        Value::Unreadable(_, _) => false,
         Value::SymRef(_, sym) => {
             matches!(sym.as_bytes(names).as_ref(), b"?" | b"?D" | b"?F")
         }
@@ -698,6 +702,8 @@ pub fn references_new_inputs(value: &Value, names: &impl Interner) -> bool {
 fn references_make(value: &Value, names: &impl Interner) -> bool {
     match value {
         Value::Literal(_, _) => false,
+        // Expanding it raises rather than producing text, so it reaches nothing.
+        Value::Unreadable(_, _) => false,
         Value::SymRef(_, sym) => sym.as_bytes(names).as_ref() == b"MAKE",
         Value::List(_, values) => values.iter().any(|value| references_make(value, names)),
         Value::VarRef(_, name) => references_make(name, names),
