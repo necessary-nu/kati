@@ -285,6 +285,29 @@ impl Variable {
         matches!(&self.value, InnerVar::Simple(_))
     }
 
+    /// Whether the value is worked out when the name is read rather than
+    /// stored: the shell status and the two name lists. There is no text here
+    /// for a `+=` to paste onto, and none for `$(value)` to hand back.
+    pub fn value_is_computed(&self) -> bool {
+        matches!(
+            &self.value,
+            InnerVar::ShellStatus | InnerVar::VariableNames { .. }
+        )
+    }
+
+    /// Whether reading this name regenerates its value whatever was last
+    /// written to it.
+    ///
+    /// GNU Make's `lookup_special_var` does exactly this, and for `.VARIABLES`
+    /// alone: the value is rebuilt from the variable table on any lookup after
+    /// the table changed, so an assignment that outranks the binding lands and
+    /// is then never consulted. `.SHELLSTATUS` is NOT one of these — there it
+    /// is an ordinary variable that every `$(shell)` redefines at override
+    /// origin, so an `override` write to it really does take.
+    pub fn regenerated_at_lookup(&self) -> bool {
+        matches!(&self.value, InnerVar::VariableNames { .. })
+    }
+
     /// Copy an existing value before appending, changing only the provenance
     /// of the assignment that will replace it if precedence permits.
     pub fn clone_for_assignment(
@@ -560,13 +583,20 @@ impl Variable {
         }))
     }
 
+    /// `.SHELLSTATUS`, which stands for the exit status of the last `$(shell)`.
+    ///
+    /// GNU Make has no readonly notion here: `func_shell_base` defines the name
+    /// afresh at `o_override` after every `$(shell)`, so a makefile line, a
+    /// command-line word and the environment all bounce off the ORIGIN LADDER
+    /// rather than off a refusal, and an `override` write really does take.
+    /// Standing at override origin is how that is said here.
     pub fn new_shell_status_var() -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(Self {
             loc: None,
             definition: None,
             origin: VarOrigin::Override,
             assign_op: Some(AssignOp::ColonEq),
-            readonly: true,
+            readonly: false,
             is_private: false,
             export: VarExport::Default,
             deprecated: None,
@@ -576,13 +606,20 @@ impl Variable {
         }))
     }
 
+    /// `.VARIABLES` and `.KATI_SYMBOLS`, whose value is the live name list.
+    ///
+    /// GNU Make regenerates `.VARIABLES` BY NAME at every lookup —
+    /// `lookup_special_var` overwrites `var->value` whenever the table has
+    /// changed since it last did — so what a makefile writes there is stored
+    /// and never read back, which is indistinguishable from being ignored. It
+    /// is not readonly there and a write to it does not stop the build.
     pub fn new_variable_names(name: &'static [u8], all: bool) -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(Self {
             loc: None,
             definition: None,
             origin: VarOrigin::Override,
             assign_op: Some(AssignOp::ColonEq),
-            readonly: true,
+            readonly: false,
             is_private: false,
             export: VarExport::Default,
             deprecated: None,
@@ -701,7 +738,9 @@ impl GlobalVars {
     /// interner preloads, so their handles are `const`.
     pub fn with_builtins() -> Self {
         let mut vars = Self::new();
-        vars.define(Symbol::SHELLSTATUS, Variable::new_shell_status_var());
+        // `.SHELLSTATUS` is deliberately NOT here: GNU Make defines it in
+        // `func_shell_base`, so it does not exist until a `$(shell)` has run.
+        // [`crate::session::Session::record_shell_status`] publishes it.
         vars.define(
             Symbol::RECIPEPREFIX,
             Variable::with_simple_string(Bytes::new(), VarOrigin::Default, None, None),
@@ -864,6 +903,7 @@ impl GlobalVars {
                 return Ok(());
             }
             carry_export_attribute(orig, &var);
+            carry_regenerated_value(orig, &var);
         }
         *entry = Some(var);
         Ok(())
@@ -940,6 +980,26 @@ fn carry_export_attribute(previous: &Var, replacement: &Var) {
     }
     let inherited = previous.read().export;
     replacement.write().export = inherited;
+}
+
+/// Keep the value of a name whose reads regenerate it.
+///
+/// GNU Make rebuilds `.VARIABLES` from the variable table inside
+/// `lookup_variable`, so a write that outranks the binding changes where the
+/// binding came from and never what the name answers — `override .VARIABLES =
+/// x` still reads back as the live list. Carrying the computed value onto the
+/// replacement is how that is said here, and it keeps the write's own origin,
+/// location and export attribute, which are the fields GNU Make does overwrite.
+fn carry_regenerated_value(previous: &Var, replacement: &Var) {
+    let regenerated = {
+        let previous = previous.read();
+        previous
+            .regenerated_at_lookup()
+            .then(|| previous.value.clone())
+    };
+    if let Some(value) = regenerated {
+        replacement.write().value = value;
+    }
 }
 
 pub struct Vars(pub Mutex<HashMap<Symbol, Var>>);
@@ -1124,11 +1184,47 @@ mod tests {
     #[test]
     fn test_builtins_are_scope_state() {
         let scope = GlobalVars::with_builtins();
-        assert!(scope.peek(Symbol::SHELLSTATUS).is_some());
+        assert!(scope.peek(Symbol::VARIABLES).is_some());
         assert!(scope.peek(Symbol::RECIPEPREFIX).is_some());
+        // `.SHELLSTATUS` is not among them: GNU Make defines it in
+        // `func_shell_base`, so it exists only once a `$(shell)` has run.
+        assert!(scope.peek(Symbol::SHELLSTATUS).is_none());
         // A scope without builtins: the name is interned all the same but has
         // no binding.
-        assert!(GlobalVars::new().peek(Symbol::SHELLSTATUS).is_none());
+        assert!(GlobalVars::new().peek(Symbol::RECIPEPREFIX).is_none());
+    }
+
+    /// A name whose reads regenerate it takes a write and still answers what
+    /// it computes — GNU Make's `lookup_special_var`, which is `.VARIABLES`
+    /// and, here, `.KATI_SYMBOLS` beside it. `.SHELLSTATUS` is not one: there
+    /// an `override` write really does replace what the name answers.
+    #[test]
+    fn a_write_lands_on_a_regenerated_name_without_changing_what_it_answers() {
+        let symtab = Symtab::new();
+        let mut scope = GlobalVars::with_builtins();
+        let written = || {
+            Variable::with_simple_string(
+                Bytes::from_static(b"xyzzy"),
+                VarOrigin::Override,
+                None,
+                None,
+            )
+        };
+        scope
+            .assign(&symtab, Symbol::VARIABLES, written(), true, None)
+            .unwrap();
+        let bound = scope.peek(Symbol::VARIABLES).expect("a binding");
+        assert!(bound.read().regenerated_at_lookup());
+        assert_eq!(bound.read().origin(), VarOrigin::Override);
+
+        // The live shell status is published by `record_shell_status`, so an
+        // assignment reaching this scope replaces what the name answers.
+        scope.define(Symbol::SHELLSTATUS, Variable::new_shell_status_var());
+        scope
+            .assign(&symtab, Symbol::SHELLSTATUS, written(), true, None)
+            .unwrap();
+        let bound = scope.peek(Symbol::SHELLSTATUS).expect("a binding");
+        assert!(!bound.read().value_is_computed());
     }
 
     #[test]

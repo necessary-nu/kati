@@ -824,7 +824,7 @@ fn shell_func_with(
         .answered(GroundQuestion::Shell, &cmd)
     {
         out.put_slice(&answered.answer);
-        ev.session.shell_status = answered.status;
+        ev.session.record_shell_status(answered.status)?;
         return Ok(());
     }
 
@@ -872,7 +872,7 @@ fn shell_func_with(
     ev.session
         .ground_journal
         .record(GroundQuestion::Shell, cmd, output, Some(exit_code));
-    ev.session.shell_status = Some(exit_code);
+    ev.session.record_shell_status(Some(exit_code))?;
     Ok(())
 }
 
@@ -900,7 +900,7 @@ fn shell_no_rerun_func(
         .answered(GroundQuestion::Shell, &cmd)
     {
         out.put_slice(&answered.answer);
-        ev.session.shell_status = answered.status;
+        ev.session.record_shell_status(answered.status)?;
         return Ok(());
     }
 
@@ -929,7 +929,7 @@ fn shell_no_rerun_func(
     ev.session
         .ground_journal
         .record(GroundQuestion::Shell, cmd, output, Some(exit_code));
-    ev.session.shell_status = Some(exit_code);
+    ev.session.record_shell_status(Some(exit_code))?;
     Ok(())
 }
 

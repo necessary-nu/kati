@@ -339,6 +339,25 @@ impl Session {
         self.symtab.intern(s)
     }
 
+    /// Record what a `$(shell)` exited with, and publish `.SHELLSTATUS`.
+    ///
+    /// GNU Make's `func_shell_base` ends with
+    /// `define_variable_cname (".SHELLSTATUS", buf, o_override, 0)`, so the
+    /// name does not exist at all until a `$(shell)` has run — a makefile is
+    /// free to write it before that and loses the precedence contest after —
+    /// and every later `$(shell)` redefines it at override origin over
+    /// whatever an `override` directive put there. Defining it here rather
+    /// than in the builtin catalogue is what says both.
+    pub fn record_shell_status(&mut self, status: Option<i32>) -> Result<()> {
+        self.shell_status = status;
+        self.set_global_var(
+            Symbol::SHELLSTATUS,
+            crate::var::Variable::new_shell_status_var(),
+            true,
+            None,
+        )
+    }
+
     /// Read a global variable without recording the read.
     pub fn peek_global_var(&self, sym: Symbol) -> Option<Var> {
         self.globals.peek(sym)

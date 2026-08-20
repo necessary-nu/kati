@@ -1382,7 +1382,15 @@ impl Evaluator {
                         Some(expanded) => expanded.is_empty(),
                         None => orig_rhs.is_empty(),
                     };
-                    if nothing_to_append {
+                    // A name whose value is worked out when it is read stores
+                    // no text for `+=` to paste onto. GNU Make pastes onto
+                    // whatever `.VARIABLES` last regenerated and `.SHELLSTATUS`
+                    // last recorded, and then regenerates or redefines it at the
+                    // next read — so a binding left standing is what that read
+                    // answers either way, and leaving it is what keeps the
+                    // append away from a value that cannot hold one.
+                    let computed = prev.read().value_is_computed();
+                    if nothing_to_append || computed {
                         // Appending nothing is not an assignment at all. GNU
                         // Make hands back the variable it looked up without
                         // redefining it, so no separator arrives, and the
