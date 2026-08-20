@@ -117,17 +117,8 @@ pub struct Evaluated {
 /// for, and where the run started. The tool defaults `-R` withholds are not
 /// here — they are a catalogue with origins of their own, installed by
 /// [`crate::builtins::install_default_variables`].
-fn read_bootstrap_makefile(
-    session: &mut Session,
-    targets: &[Symbol],
-) -> Result<Arc<Mutex<Vec<Stmt>>>> {
+fn read_bootstrap_makefile(session: &mut Session) -> Result<Arc<Mutex<Vec<Stmt>>>> {
     let mut bootstrap = BytesMut::new();
-    // The one place a GNU Make version is claimed, because Makefiles branch on
-    // it. It names the version this front end is measured against rather than
-    // the one the vendored Go harness pinned: a Makefile that tests
-    // `$(MAKE_VERSION)` for a feature must get the answer the oracle would
-    // give, or it takes a branch neither tool would have taken.
-    bootstrap.put_slice(b"MAKE_VERSION?=4.4.1\n");
     // What a Makefile is allowed to assume, and no more. Claiming a feature
     // that is not there is worse than claiming none: a Makefile branches on
     // this to decide whether it may use a construct, and GNU Make's test suite
@@ -167,23 +158,77 @@ fn read_bootstrap_makefile(
         bootstrap.put_slice(session.flags.subkati_args.join(OsStr::new(" ")).as_bytes());
         bootstrap.put_u8(b'\n');
     }
-    // Only when a goal word was given, because GNU Make defines this name from
-    // inside the branch of `handle_non_switch_argument` (main.c) that enters a
-    // goal target: with no goal there is no name at all, and `ifdef
-    // MAKECMDGOALS` is how a Makefile asks whether it was invoked bare. Binding
-    // it to the empty string instead answers that question `yes` every time.
-    if !targets.is_empty() {
-        bootstrap.put_slice(b"MAKECMDGOALS?=");
-        bootstrap.put(join_symbols(&*session, targets, b" "));
-        bootstrap.put_u8(b'\n');
-    }
-
-    bootstrap.put_slice(b"CURDIR:=");
-    bootstrap.put_slice(std::env::current_dir()?.as_os_str().as_bytes());
-    bootstrap.put_u8(b'\n');
-
     let filename = session.intern("*bootstrap*");
     crate::parser::parse_buf(session, &bootstrap.freeze(), Loc { filename, line: 0 })
+}
+
+/// Define the names GNU Make works out for itself, at the rank and the flavour
+/// its own `define_variable_cname` calls give them.
+///
+/// These are not bootstrap makefile lines and cannot be, because no makefile
+/// line says what those calls say. GNU Make defines every one of them SIMPLE —
+/// the last argument to `define_variable_cname` is 0 — and Make's syntax has no
+/// spelling for "simple, at this rank, and only where nothing outranks it":
+/// `?=` makes a recursive variable and `:=` claims the name whatever holds it.
+/// A Makefile sees the difference through `$(flavor)` and `$(value)`, and for
+/// these names both are branch-worthy: `$(value MAKE_VERSION)` is the version
+/// when the binding is simple and the same text only by coincidence when it is
+/// recursive.
+///
+/// # Errors
+///
+/// Returns the working directory the process could not read, which is the same
+/// failure GNU Make dies on before it reads anything.
+fn install_worked_out_variables(ev: &mut Evaluator, targets: &[Symbol]) -> Result<()> {
+    // `define_variable_cname ("MAKE_VERSION", buf, o_default, 0)` in
+    // `define_automatic_variables`. The one place a GNU Make version is claimed,
+    // because Makefiles branch on it: it names the version this front end is
+    // measured against rather than the one the vendored Go harness pinned, or a
+    // Makefile testing `$(MAKE_VERSION)` for a feature takes a branch neither
+    // tool would have taken.
+    claim_at_default(
+        &mut ev.session,
+        "MAKE_VERSION",
+        Bytes::from_static(b"4.4.1"),
+    );
+    // `define_variable_cname ("MAKECMDGOALS", value, o_default, 0)`, reached
+    // from inside the branch of `handle_non_switch_argument` (main.c) that
+    // enters a goal target — so an invocation that named no goal defines no
+    // such name, and `ifeq ($(origin MAKECMDGOALS),undefined)` is how a
+    // Makefile asks whether it was invoked bare. (`ifdef` cannot ask: it tests
+    // for a non-empty value, which an absent name and an empty one both fail.)
+    if !targets.is_empty() {
+        let goals = join_symbols(&ev.session, targets, b" ");
+        claim_at_default(&mut ev.session, "MAKECMDGOALS", goals);
+    }
+    // `define_variable_cname ("CURDIR", current_directory, o_file, 0)` in
+    // `main`, at FILE rank and not default. The distinction is the whole point
+    // of the call: a Makefile's own `CURDIR = x` is a peer replacing it rather
+    // than an override standing over it, and `$(origin CURDIR)` — which is what
+    // a Makefile asks before deciding whether to trust the answer — says so.
+    // Going through the ladder rather than defining outright is what keeps an
+    // `-e` environment and a command-line write above it, as they are there.
+    let curdir = Bytes::from(std::env::current_dir()?.as_os_str().as_bytes().to_vec());
+    let sym = ev.session.intern("CURDIR");
+    let var = Variable::with_simple_string(curdir, VarOrigin::File, None, None);
+    ev.session.set_global_var(sym, var, false, None)
+}
+
+/// Bind `name` to a simple value at default rank, leaving whatever outranks a
+/// default exactly as it stands.
+///
+/// [`crate::builtins::claimable`] is the same test GNU Make's
+/// `define_variable_cname` applies with `o_default`: another default may be
+/// replaced, and an environment, command-line, `override` or Makefile binding
+/// may not.
+fn claim_at_default(session: &mut Session, name: &str, value: Bytes) {
+    let Some(sym) = crate::builtins::claimable(session, name) else {
+        return;
+    };
+    session.globals.define(
+        sym,
+        Variable::with_simple_string(value, VarOrigin::Default, None, None),
+    );
 }
 
 /// Read one Makefile the command line named, into the session already open.
@@ -269,7 +314,28 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
         let val = Arc::new(Value::Literal(None, v.clone()));
         let frame = ev.current_frame();
         let sym = ev.session.intern(k.as_bytes().to_vec());
-        let var = Variable::new_recursive(val, origin, Some(frame), None, v);
+        // One name arrives simple where every other imported name is recursive.
+        // GNU Make defines it a second time once the environment is in scope —
+        // `define_variable_cname (MAKELEVEL_NAME, buf, o_env, 0)` in
+        // `define_automatic_variables` — writing back the depth it parsed, at
+        // the environment's own rank and with the recursive flag off.
+        //
+        // That second define is also why the name reads `environment override`
+        // under `-e` while an ordinary imported name still reads `environment`:
+        // `define_variable_in_set` lifts an INCOMING `o_env` define to
+        // `o_env_override` when `-e` is in force, and only a name Make defines
+        // over again is ever incoming. Saying both here rather than defining
+        // twice is the same thing said once.
+        let var = if k.as_bytes() == b"MAKELEVEL" {
+            let origin = if ev.session.flags.environment_overrides {
+                VarOrigin::EnvironmentOverride
+            } else {
+                origin
+            };
+            Variable::with_simple_string(v, origin, Some(frame), None)
+        } else {
+            Variable::new_recursive(val, origin, Some(frame), None, v)
+        };
         // Everything culled from the environment is exported by default, and
         // GNU Make records that on the variable rather than deriving it from
         // the origin — which is why a makefile that replaces the name keeps
@@ -553,7 +619,13 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
     install_default_goal(&mut ev)?;
     install_makefiles_variable(&mut ev)?;
 
-    let bootstrap_asts = read_bootstrap_makefile(&mut ev.session, &targets)?;
+    // The names GNU Make works out for itself, before the bootstrap Makefile so
+    // that a line in it could still outrank one — none does today, and the
+    // ordering is what makes that a fact about the text rather than an accident
+    // of where the call sits.
+    install_worked_out_variables(&mut ev, &targets)?;
+
+    let bootstrap_asts = read_bootstrap_makefile(&mut ev.session)?;
     {
         let _frame = ev.enter(
             FrameType::Phase,
