@@ -2648,6 +2648,71 @@ impl Evaluator {
         });
     }
 
+    /// Which files one word of an `include` line reaches, and if none, why.
+    ///
+    /// This is a question the ground answers, so a read repeating itself over
+    /// the same text is told what the first read was told: a makefile a staged
+    /// child has since written is one GNU Make's single read never saw, and a
+    /// pass that opened it would be compiling a makefile the build never had.
+    /// The names are recorded NUL-separated, like the glob a prerequisite word
+    /// takes. No names is recorded as a leading NUL followed by the reason — a
+    /// name is never empty, so nothing else can begin that way.
+    ///
+    /// A name the read did not get, and why. GNU Make treats every such name
+    /// alike: it never globs a plain `include` at all, it calls `fopen` and
+    /// keeps whatever errno that left (read.c:347), so a directory component
+    /// with no search permission arrives as `Permission denied` on the name and
+    /// is deferred to the update exactly as absence is. Reporting it here would
+    /// end the run ahead of the Makefiles the read still had to remake.
+    fn include_names(&mut self, pat: &Bytes) -> (Vec<Bytes>, Option<String>) {
+        if let Some(answered) = self
+            .session
+            .ground_journal
+            .answered(crate::session::GroundQuestion::Include, pat)
+        {
+            if answered.answer.first() == Some(&0) {
+                let reason = String::from_utf8_lossy(&answered.answer[1..]).into_owned();
+                return (Vec::new(), Some(reason));
+            }
+            return (
+                answered
+                    .answer
+                    .split(|byte| *byte == 0)
+                    .map(|name| answered.answer.slice_ref(name))
+                    .collect(),
+                None,
+            );
+        }
+
+        let globbed = self.session.glob(pat.clone());
+        let (files, unread) = match globbed.as_ref() {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (Vec::new(), Some(absent())),
+            Err(err) => (Vec::new(), Some(crate::strerror(err))),
+            Ok(files) if files.is_empty() => (Vec::new(), Some(absent())),
+            Ok(files) => (files.clone(), None),
+        };
+
+        let mut answer = BytesMut::new();
+        if let Some(reason) = &unread {
+            answer.put_u8(0);
+            answer.put_slice(reason.as_bytes());
+        } else {
+            for (position, name) in files.iter().enumerate() {
+                if position > 0 {
+                    answer.put_u8(0);
+                }
+                answer.put_slice(name);
+            }
+        }
+        self.session.ground_journal.record(
+            crate::session::GroundQuestion::Include,
+            pat.clone(),
+            answer.freeze(),
+            None,
+        );
+        (files, unread)
+    }
+
     pub fn eval_include(&mut self, stmt: &IncludeStmt) -> Result<()> {
         self.loc = Some(stmt.loc());
         self.rule_state = RuleState::None;
@@ -2656,29 +2721,11 @@ impl Evaluator {
         for pat in word_scanner(&pats) {
             let pat = pats.slice_ref(pat);
             let pat = self.at_include_dirs(pat);
-            let files = self.session.glob(pat.clone());
-
-            // A name the read did not get, and why. GNU Make treats every such
-            // name alike: it never globs a plain `include` at all, it calls
-            // `fopen` and keeps whatever errno that left (read.c:347), so a
-            // directory component with no search permission arrives as
-            // `Permission denied` on the name and is deferred to the update
-            // exactly as absence is. Reporting it here would end the run ahead
-            // of the Makefiles the read still had to remake.
-            let unread = match files.as_ref() {
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(absent()),
-                Err(err) => Some(crate::strerror(err)),
-                Ok(files) if files.is_empty() => Some(absent()),
-                Ok(_) => None,
-            };
+            let (files, unread) = self.include_names(&pat);
             if let Some(reason) = unread {
                 self.note_unread_include(pat, stmt.should_exist, Some(stmt.loc()), &reason);
                 continue;
             }
-            let Ok(files) = files.as_ref() else {
-                continue;
-            };
-            let files = files.clone();
 
             for fname in &files {
                 if !stmt.should_exist

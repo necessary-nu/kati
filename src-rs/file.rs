@@ -72,6 +72,9 @@ impl Makefile {
         filename: &OsStr,
         buf: Bytes,
     ) -> Result<Arc<Self>> {
+        session
+            .makefiles
+            .note_source(filename.to_os_string(), buf.clone());
         let filename = session.intern(filename.as_bytes().to_vec());
         let stmts = parse_file(session, &buf, filename)?;
         Ok(Arc::new(Self { filename, stmts }))

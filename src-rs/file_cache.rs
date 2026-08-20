@@ -33,6 +33,13 @@ use crate::{
 pub struct MakefileCache {
     cache: HashMap<OsString, Option<Arc<Makefile>>>,
     supplied: HashMap<OsString, Bytes>,
+    /// The bytes this session got for every makefile it read, by name.
+    ///
+    /// A read repeated over the same text has to be given the same text. A
+    /// makefile a staged child has rewritten since is not the makefile GNU
+    /// Make's one read saw, so the front end takes these out when a read ends
+    /// and supplies them to the read that repeats it.
+    sources: HashMap<OsString, Bytes>,
     extra_file_deps: HashSet<OsString>,
 }
 
@@ -47,6 +54,7 @@ impl MakefileCache {
         Self {
             cache: HashMap::new(),
             supplied: HashMap::new(),
+            sources: HashMap::new(),
             extra_file_deps: HashSet::new(),
         }
     }
@@ -58,6 +66,17 @@ impl MakefileCache {
     /// Supply a makefile's bytes without requiring a filesystem path.
     pub fn supply(&mut self, filename: OsString, contents: Bytes) {
         self.supplied.insert(filename, contents);
+    }
+
+    /// Record the bytes a makefile was read as, for the read that repeats this
+    /// one.
+    pub(crate) fn note_source(&mut self, filename: OsString, contents: Bytes) {
+        self.sources.insert(filename, contents);
+    }
+
+    /// Every makefile this session read, with the bytes it read.
+    pub fn sources(&self) -> impl Iterator<Item = (&OsString, &Bytes)> {
+        self.sources.iter()
     }
 
     /// Every file the session read, which is what the regeneration stamp

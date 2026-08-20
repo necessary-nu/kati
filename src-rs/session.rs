@@ -67,6 +67,14 @@ pub enum GroundQuestion {
     /// One target or prerequisite word holding `?`, `*` or `[`, matched
     /// against the filesystem where GNU Make's `parse_file_seq` matches it.
     Glob,
+    /// Which files one word of an `include` line reaches.
+    ///
+    /// Here for a different reason than the rest: this is not a value handed to
+    /// an expansion, it is what the read IS. GNU Make reads once, so a makefile
+    /// that only appears once a staged child has written it was never part of
+    /// the read at all, and a repeated read that opened it would be compiling a
+    /// makefile the build never had.
+    Include,
 }
 
 /// One question a read asked the ground, and the answer it was given.
@@ -334,6 +342,21 @@ impl Session {
     pub fn supply_makefile(&mut self, filename: OsString, contents: Vec<u8>) {
         self.makefiles
             .supply(filename, bytes::Bytes::from(contents));
+    }
+
+    /// Every makefile this session read, with the bytes it read, for a read
+    /// that repeats this one.
+    ///
+    /// A staging pass re-reads a unit over text that has not moved while the
+    /// ground under it has — the staged work is what moved it — so a makefile a
+    /// staged child has rewritten, or removed, must still read as the text GNU
+    /// Make's one read had. Handing these back to `supply_makefile` on the next
+    /// pass is how that is said.
+    pub fn read_sources(&self) -> Vec<(OsString, Vec<u8>)> {
+        self.makefiles
+            .sources()
+            .map(|(name, contents)| (name.clone(), contents.to_vec()))
+            .collect()
     }
 
     /// A session with default flags.
