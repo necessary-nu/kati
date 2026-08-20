@@ -485,8 +485,10 @@ fn recipe_steps(
         // can be decided about: `construct_command_argv` reads the FINISHED
         // text, and the placeholder is not it. Such a line goes to a shell,
         // which is where the scheduler's substitution lands and is what the
-        // whole recipe did before it was one line at a time.
-        direct: memmem::find(&text, crate::command::DEFERRED_NEW_INPUTS_REFERENCE)
+        // whole recipe did before it was one line at a time. The test is the
+        // prefix the three references share, because `$?` and its two path
+        // forms are each deferred under a name of their own.
+        direct: memmem::find(&text, crate::command::DEFERRED_NEW_INPUTS_PREFIX)
             .is_none()
             .then(|| {
                 crate::simple_command::direct_argv(&text, shell, &shell_flags, flags.one_shell)

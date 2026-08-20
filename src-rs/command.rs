@@ -33,7 +33,32 @@ use crate::{
     var::{Variable, Vars},
 };
 
+/// The name a scheduler substitutes the real `$?` list for, and the two it
+/// substitutes that list's directory and file halves for.
+///
+/// `$?` has no value while a graph is being constructed: which prerequisites
+/// are newer than the target is settled after the prerequisites have been
+/// made, which is later than any expansion here. So the recipe carries a name
+/// and the destination binds it.
+///
+/// The `D` and `F` forms need names of their own rather than a `dir`/`notdir`
+/// taken off the first: applied here they would read the placeholder — one
+/// word, no separator in it — and answer `.` and the placeholder itself.
+/// GNU Make binds all three from the same list in `set_file_variables`, so
+/// all three are deferred to the one destination that has the list.
+pub const NEW_INPUTS_VARIABLE: &[u8] = b"KATI_NEW_INPUTS";
+/// The `$(?D)` half of the same list.
+pub const NEW_INPUTS_DIRECTORIES_VARIABLE: &[u8] = b"KATI_NEW_INPUTS_D";
+/// The `$(?F)` half of the same list.
+pub const NEW_INPUTS_FILENAMES_VARIABLE: &[u8] = b"KATI_NEW_INPUTS_F";
+
 pub(crate) const DEFERRED_NEW_INPUTS_REFERENCE: &[u8] = b"${KATI_NEW_INPUTS}";
+pub(crate) const DEFERRED_NEW_INPUTS_DIRECTORIES_REFERENCE: &[u8] = b"${KATI_NEW_INPUTS_D}";
+pub(crate) const DEFERRED_NEW_INPUTS_FILENAMES_REFERENCE: &[u8] = b"${KATI_NEW_INPUTS_F}";
+
+/// What all three references begin with, for a reader that only needs to know
+/// whether a line still holds one of them.
+pub(crate) const DEFERRED_NEW_INPUTS_PREFIX: &[u8] = b"${KATI_NEW_INPUTS";
 
 /// The date a prerequisite is compared by, which for `lib.a(member.o)` comes
 /// out of the archive's index rather than off a file of that name.
@@ -94,6 +119,19 @@ enum AutoCommandVariant {
     F,
 }
 
+/// Whether an automatic variable's expansion produced the value itself or a
+/// reference the destination binds later.
+///
+/// The distinction only matters to the `D` and `F` forms: halving a name is
+/// this expansion's work, and halving a reference is not work at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bound {
+    /// The bytes written are the value.
+    Now,
+    /// The bytes written are a reference the destination substitutes.
+    Late,
+}
+
 impl AutoCommand {
     /// The character GNU Make names this automatic variable with.
     fn name_char(&self) -> char {
@@ -148,12 +186,29 @@ impl AutoCommandVar {
         }
     }
 
+    /// The reference this form leaves behind when the list it names is the
+    /// destination's to bind rather than this expansion's to compute.
+    const fn deferred_reference(&self) -> &'static [u8] {
+        match self.variant {
+            AutoCommandVariant::None => DEFERRED_NEW_INPUTS_REFERENCE,
+            AutoCommandVariant::D => DEFERRED_NEW_INPUTS_DIRECTORIES_REFERENCE,
+            AutoCommandVariant::F => DEFERRED_NEW_INPUTS_FILENAMES_REFERENCE,
+        }
+    }
+
     pub fn eval(&self, ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
         match self.variant {
-            AutoCommandVariant::None => self.eval_impl(ev, out)?,
+            AutoCommandVariant::None => {
+                self.eval_impl(ev, out)?;
+            }
             AutoCommandVariant::D => {
                 let mut buf = BytesMut::new();
-                self.eval_impl(ev, &mut buf)?;
+                if self.eval_impl(ev, &mut buf)? == Bound::Late {
+                    // The reference stands for the directory halves already.
+                    // Halving it again would halve the placeholder.
+                    out.put_slice(&buf);
+                    return Ok(());
+                }
                 let buf = Bytes::from(buf);
                 let mut ww = WordWriter::new(out);
                 for tok in word_scanner(&buf) {
@@ -163,7 +218,10 @@ impl AutoCommandVar {
             }
             AutoCommandVariant::F => {
                 let mut buf = BytesMut::new();
-                self.eval_impl(ev, &mut buf)?;
+                if self.eval_impl(ev, &mut buf)? == Bound::Late {
+                    out.put_slice(&buf);
+                    return Ok(());
+                }
                 let buf = Bytes::from(buf);
                 let mut ww = WordWriter::new(out);
                 for tok in word_scanner(&buf) {
@@ -174,7 +232,7 @@ impl AutoCommandVar {
         Ok(())
     }
 
-    fn eval_impl(&self, ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
+    fn eval_impl(&self, ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<Bound> {
         let current_dep_node = self.current_dep_node.lock();
         let current_dep_node = current_dep_node.as_ref().unwrap().lock();
         let names = &ev.session.symtab;
@@ -302,8 +360,9 @@ impl AutoCommandVar {
                     // this value when the edge is launched; doing a second
                     // shell-side timestamp test would move the snapshot past
                     // the prerequisite boundary.
-                    out.put_slice(DEFERRED_NEW_INPUTS_REFERENCE);
+                    out.put_slice(self.deferred_reference());
                     *found_new_inputs.lock() = true;
+                    return Ok(Bound::Late);
                 } else if let Some(action) = &current_dep_node.grouped_double_action {
                     let mut oldest_member = None;
                     let mut missing_member = action.has_phony_member;
@@ -334,7 +393,13 @@ impl AutoCommandVar {
                 } else if ev.avoid_io {
                     let mut delayed = None;
                     // Check timestamps using the shell at the start of rule execution
-                    // instead.
+                    // instead. The name here is a shell variable the prologue
+                    // below exports, not one a destination binds, so this is
+                    // deliberately the base reference under every form: a `D`
+                    // or `F` name would be one the shell never heard of. The
+                    // caller halves the reference text as it always did, which
+                    // is wrong the way GNU Make counts it and is what a
+                    // generated `build.ninja` has always said.
                     out.put_slice(DEFERRED_NEW_INPUTS_REFERENCE);
                     if !*found_new_inputs.lock() {
                         let mut def = BytesMut::new();
@@ -373,7 +438,7 @@ impl AutoCommandVar {
                 }
             }
         }
-        Ok(())
+        Ok(Bound::Now)
     }
 }
 
