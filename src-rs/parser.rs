@@ -14,16 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use anyhow::Result;
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use memchr::{memchr, memchr2, memchr3};
 use parking_lot::Mutex;
 
 use crate::{
     collect_stats, error_loc,
-    expr::{ParseExprOpt, parse_expr, parse_expr_impl, parse_expr_impl_ext},
+    expr::{ParseExprOpt, parse_expr},
     loc::Loc,
     session::Session,
     stmt::{
@@ -41,6 +42,130 @@ use crate::{
 
 /// What introduces a recipe line before `.RECIPEPREFIX` says otherwise.
 const RECIPE_PREFIX_DEFAULT: u8 = b'\t';
+
+/// Where an `ifeq`/`ifneq` condition's two compared strings sit in the text
+/// after the directive, and where whatever follows the condition begins.
+struct IfeqCondition {
+    lhs: Range<usize>,
+    rhs: Range<usize>,
+    /// First byte after the condition's close that is not a blank. Equal to the
+    /// line's length when the condition ends the line.
+    rest: usize,
+}
+
+/// A blank in GNU Make's reader: `ISBLANK`, which is a space or a tab and
+/// nothing else.
+fn is_blank(c: u8) -> bool {
+    c == b' ' || c == b'\t'
+}
+
+/// GNU Make's `NEXT_TOKEN`: the offset of the first byte at or after `i` that
+/// is not a blank.
+fn skip_blanks(s: &[u8], mut i: usize) -> usize {
+    while i < s.len() && is_blank(s[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// Splits an `ifeq`/`ifneq` condition the way `conditional_line` does
+/// (reference/gnumake/src/read.c).
+///
+/// The first byte picks the form — `(` the parenthesised one, a quote the
+/// quoted one — and the condition's close is then found by scanning FORWARD,
+/// counting nested parens, rather than by reading the line's last byte. So a
+/// line whose last byte is not the close is not a different form: it is this
+/// form with trailing text after it, which the caller warns about rather than
+/// refusing over. `None` is the invalid syntax GNU returns -1 for: a close that
+/// never arrives, or an opener that is neither a paren nor a quote.
+fn split_ifeq_condition(s: &[u8]) -> Option<IfeqCondition> {
+    let termin = match *s.first()? {
+        b'(' => b',',
+        quote @ (b'"' | b'\'') => quote,
+        _ => return None,
+    };
+
+    // The first string runs to the terminator. Inside the parenthesised form a
+    // comma only ends it at paren depth zero, so a comma belonging to a nested
+    // call stays part of the string.
+    let lhs_start = 1;
+    let mut i = lhs_start;
+    if termin == b',' {
+        let mut depth = 0i32;
+        while i < s.len() {
+            match s[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b',' if depth <= 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+    } else {
+        while i < s.len() && s[i] != termin {
+            i += 1;
+        }
+    }
+    if i >= s.len() {
+        return None;
+    }
+
+    let mut lhs_end = i;
+    if termin == b',' {
+        // Blanks between the first string and the comma belong to neither.
+        while lhs_end > lhs_start && is_blank(s[lhs_end - 1]) {
+            lhs_end -= 1;
+        }
+    }
+    i += 1;
+
+    // What closes the second string: the matching paren for the parenthesised
+    // form, and for the quoted one the next non-blank byte, which has to be a
+    // quote of its own.
+    if termin != b',' {
+        i = skip_blanks(s, i);
+    }
+    let close = if termin == b',' { b')' } else { *s.get(i)? };
+    if close != b')' && close != b'"' && close != b'\'' {
+        return None;
+    }
+
+    let rhs_start;
+    if close == b')' {
+        // Blanks before the second string are skipped; blanks after it are not.
+        rhs_start = skip_blanks(s, i);
+        i = rhs_start;
+        let mut depth = 0i32;
+        while i < s.len() {
+            match s[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    if depth <= 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    } else {
+        i += 1;
+        rhs_start = i;
+        while i < s.len() && s[i] != close {
+            i += 1;
+        }
+    }
+    if i >= s.len() {
+        return None;
+    }
+
+    Some(IfeqCondition {
+        lhs: lhs_start..lhs_end,
+        rhs: rhs_start..i,
+        rest: skip_blanks(s, i + 1),
+    })
+}
 
 struct IfState {
     stmt: Arc<IfStmt>,
@@ -465,7 +590,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn parse_ifeq(&mut self, mut line: Bytes, directive: &[u8]) -> Result<()> {
+    fn parse_ifeq(&mut self, line: Bytes, directive: &[u8]) -> Result<()> {
         let loc = self.loc.clone();
         let op = if directive[2] == b'n' {
             CondOp::Ifneq
@@ -473,116 +598,34 @@ impl<'a> Parser<'a> {
             CondOp::Ifeq
         };
 
-        if line.is_empty() {
+        let Some(condition) = split_ifeq_condition(&line) else {
             error_loc!(
                 &*self.session,
                 Some(&self.loc),
                 "*** invalid syntax in conditional."
             );
-        }
+        };
 
         let mut mutable_loc = loc.clone();
-        let lhs;
-        let rhs;
-        if line.first() == Some(&b'(') && line.last() == Some(&b')') {
-            line = line.slice(1..line.len() - 1);
-            let terms = vec![b','];
-            let mut n;
-            (n, lhs) = parse_expr_impl(
-                self.session,
-                &mut mutable_loc,
-                line.clone(),
-                Some(&terms),
-                ParseExprOpt::Normal,
-                true,
-            )?;
-            line.advance(n);
-            if line.first() != Some(&b',') {
-                error_loc!(
-                    &*self.session,
-                    Some(&self.loc),
-                    "*** invalid syntax in conditional."
-                );
-            }
-            line = line.slice_ref(trim_left_space(&line[1..]));
-            (n, rhs) = parse_expr_impl_ext(
-                self.session,
-                &mut mutable_loc,
-                line.clone(),
-                None,
-                ParseExprOpt::Normal,
-                false,
-                true,
-            )?;
-            line = line.slice_ref(trim_left_space(&line[n.min(line.len())..]));
-        } else {
-            if line.is_empty() {
-                error_loc!(
-                    &*self.session,
-                    Some(&self.loc),
-                    "*** invalid syntax in conditional."
-                );
-            }
-            let quote = line[0];
-            if quote != b'\'' && quote != b'"' {
-                error_loc!(
-                    &*self.session,
-                    Some(&self.loc),
-                    "*** invalid syntax in conditional."
-                );
-            }
-            let Some(end) = memchr(quote, &line[1..]) else {
-                error_loc!(
-                    &*self.session,
-                    Some(&self.loc),
-                    "*** invalid syntax in conditional."
-                );
-            };
-            lhs = parse_expr(
-                self.session,
-                &mut mutable_loc,
-                line.slice(1..end + 1),
-                ParseExprOpt::Normal,
-            )?;
+        let lhs = parse_expr(
+            self.session,
+            &mut mutable_loc,
+            line.slice(condition.lhs),
+            ParseExprOpt::Normal,
+        )?;
+        let rhs = parse_expr(
+            self.session,
+            &mut mutable_loc,
+            line.slice(condition.rhs),
+            ParseExprOpt::Normal,
+        )?;
 
-            line = line.slice_ref(trim_left_space(&line[end + 2..]));
-
-            if line.is_empty() {
-                error_loc!(
-                    &*self.session,
-                    Some(&self.loc),
-                    "*** invalid syntax in conditional."
-                );
-            }
-            let quote = line[0];
-            if quote != b'\'' && quote != b'"' {
-                error_loc!(
-                    &*self.session,
-                    Some(&self.loc),
-                    "*** invalid syntax in conditional."
-                );
-            }
-            let Some(end) = memchr(quote, &line[1..]) else {
-                error_loc!(
-                    &*self.session,
-                    Some(&self.loc),
-                    "*** invalid syntax in conditional."
-                );
-            };
-            rhs = parse_expr(
-                self.session,
-                &mut mutable_loc,
-                line.slice(1..end + 1),
-                ParseExprOpt::Normal,
-            )?;
-            line = line.slice_ref(trim_left_space(&line[end + 2..]));
-        }
-
-        if !line.is_empty() {
+        if condition.rest < line.len() {
             warn_loc!(
                 &*self.session,
                 Some(&self.loc),
-                "extraneous text after 'ifeq' directive"
+                "extraneous text after '{}' directive",
+                String::from_utf8_lossy(directive)
             )
         }
 

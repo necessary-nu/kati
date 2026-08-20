@@ -315,46 +315,125 @@ class Parser {
     EnterIf(stmt);
   }
 
-  bool ParseIfEqCond(std::string_view s, IfStmt* stmt) {
-    if (s.empty()) {
+  // A blank in GNU Make's reader: `ISBLANK`, which is a space or a tab and
+  // nothing else.
+  static bool IsBlank(char c) { return c == ' ' || c == '\t'; }
+
+  // GNU Make's `NEXT_TOKEN`: the offset of the first byte at or after `i` that
+  // is not a blank.
+  static size_t SkipBlanks(std::string_view s, size_t i) {
+    while (i < s.size() && IsBlank(s[i]))
+      i++;
+    return i;
+  }
+
+  // Splits an `ifeq`/`ifneq` condition the way `conditional_line` does
+  // (reference/gnumake/src/read.c).
+  //
+  // The first byte picks the form -- `(` the parenthesised one, a quote the
+  // quoted one -- and the condition's close is then found by scanning FORWARD,
+  // counting nested parens, rather than by reading the line's last byte. So a
+  // line whose last byte is not the close is not a different form: it is this
+  // form with trailing text after it, which the caller warns about rather than
+  // refusing over. False is the invalid syntax GNU returns -1 for: a close that
+  // never arrives, or an opener that is neither a paren nor a quote.
+  static bool SplitIfEqCond(std::string_view s,
+                            std::string_view* lhs,
+                            std::string_view* rhs,
+                            size_t* rest) {
+    if (s.empty())
       return false;
+
+    char termin;
+    if (s[0] == '(')
+      termin = ',';
+    else if (s[0] == '"' || s[0] == '\'')
+      termin = s[0];
+    else
+      return false;
+
+    // The first string runs to the terminator. Inside the parenthesised form a
+    // comma only ends it at paren depth zero, so a comma belonging to a nested
+    // call stays part of the string.
+    const size_t lhs_start = 1;
+    size_t i = lhs_start;
+    if (termin == ',') {
+      int depth = 0;
+      for (; i < s.size(); i++) {
+        if (s[i] == '(')
+          depth++;
+        else if (s[i] == ')')
+          depth--;
+        else if (s[i] == ',' && depth <= 0)
+          break;
+      }
+    } else {
+      while (i < s.size() && s[i] != termin)
+        i++;
     }
+    if (i >= s.size())
+      return false;
+
+    size_t lhs_end = i;
+    if (termin == ',') {
+      // Blanks between the first string and the comma belong to neither.
+      while (lhs_end > lhs_start && IsBlank(s[lhs_end - 1]))
+        lhs_end--;
+    }
+    i++;
+
+    // What closes the second string: the matching paren for the parenthesised
+    // form, and for the quoted one the next non-blank byte, which has to be a
+    // quote of its own.
+    if (termin != ',')
+      i = SkipBlanks(s, i);
+    const char close = termin == ',' ? ')' : (i < s.size() ? s[i] : '\0');
+    if (close != ')' && close != '"' && close != '\'')
+      return false;
+
+    size_t rhs_start;
+    if (close == ')') {
+      // Blanks before the second string are skipped; blanks after it are not.
+      rhs_start = SkipBlanks(s, i);
+      i = rhs_start;
+      int depth = 0;
+      for (; i < s.size(); i++) {
+        if (s[i] == '(') {
+          depth++;
+        } else if (s[i] == ')') {
+          if (depth <= 0)
+            break;
+          depth--;
+        }
+      }
+    } else {
+      i++;
+      rhs_start = i;
+      while (i < s.size() && s[i] != close)
+        i++;
+    }
+    if (i >= s.size())
+      return false;
+
+    *lhs = s.substr(lhs_start, lhs_end - lhs_start);
+    *rhs = s.substr(rhs_start, i - rhs_start);
+    *rest = SkipBlanks(s, i + 1);
+    return true;
+  }
+
+  bool ParseIfEqCond(std::string_view s,
+                     IfStmt* stmt,
+                     std::string_view directive) {
+    std::string_view lhs, rhs;
+    size_t rest = 0;
+    if (!SplitIfEqCond(s, &lhs, &rhs, &rest))
+      return false;
 
     Loc mutable_loc(loc_);
-    if (s[0] == '(' && s[s.size() - 1] == ')') {
-      s = s.substr(1, s.size() - 2);
-      char terms[] = {',', '\0'};
-      size_t n;
-      stmt->lhs =
-          ParseExprImpl(&mutable_loc, s, terms, ParseExprOpt::NORMAL, &n, true);
-      if (s[n] != ',')
-        return false;
-      s = TrimLeftSpace(s.substr(n + 1));
-      stmt->rhs =
-          ParseExprImpl(&mutable_loc, s, NULL, ParseExprOpt::NORMAL, &n);
-      s = TrimLeftSpace(s.substr(std::min(n, s.size())));
-    } else {
-      for (int i = 0; i < 2; i++) {
-        if (s.empty())
-          return false;
-        char quote = s[0];
-        if (quote != '\'' && quote != '"')
-          return false;
-        size_t end = s.find(quote, 1);
-        if (end == std::string::npos)
-          return false;
-        Value* v =
-            ParseExpr(&mutable_loc, s.substr(1, end - 1), ParseExprOpt::NORMAL);
-        if (i == 0)
-          stmt->lhs = v;
-        else
-          stmt->rhs = v;
-        s = TrimLeftSpace(s.substr(end + 1));
-      }
-    }
-    if (!s.empty()) {
-      WARN_LOC(loc_, "extraneous text after 'ifeq' directive");
-      return true;
+    stmt->lhs = ParseExpr(&mutable_loc, lhs, ParseExprOpt::NORMAL);
+    stmt->rhs = ParseExpr(&mutable_loc, rhs, ParseExprOpt::NORMAL);
+    if (rest < s.size()) {
+      WARN_LOC(loc_, "extraneous text after '%.*s' directive", SPF(directive));
     }
     return true;
   }
@@ -364,7 +443,7 @@ class Parser {
     stmt->set_loc(loc_);
     stmt->op = directive[2] == 'n' ? CondOp::IFNEQ : CondOp::IFEQ;
 
-    if (!ParseIfEqCond(line, stmt)) {
+    if (!ParseIfEqCond(line, stmt, directive)) {
       Error("*** invalid syntax in conditional.");
       return;
     }
