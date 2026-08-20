@@ -349,10 +349,19 @@ class Parser {
   // form with trailing text after it, which the caller warns about rather than
   // refusing over. False is the invalid syntax GNU returns -1 for: a close that
   // never arrives, or an opener that is neither a paren nor a quote.
+  //
+  // `*lhs` is set whenever the first string was read, false or not, because
+  // `conditional_line` expands it the moment it has found its end and goes
+  // looking for the second string's close afterwards -- so every way of failing
+  // from there on has already run whatever the first string does, and the
+  // caller has to be able to run it too.
   static bool SplitIfEqCond(std::string_view s,
                             std::string_view* lhs,
                             std::string_view* rhs,
                             size_t* rest) {
+    *lhs = std::string_view();
+    *rhs = std::string_view();
+
     if (s.empty())
       return false;
 
@@ -393,6 +402,9 @@ class Parser {
         lhs_end--;
     }
     i++;
+    // From here down the first string is read, and every refusal below carries
+    // it.
+    *lhs = s.substr(lhs_start, lhs_end - lhs_start);
 
     // What closes the second string: the matching paren for the parenthesised
     // form, and for the quoted one the next non-blank byte, which has to be a
@@ -427,7 +439,6 @@ class Parser {
     if (i >= s.size())
       return false;
 
-    *lhs = s.substr(lhs_start, lhs_end - lhs_start);
     *rhs = s.substr(rhs_start, i - rhs_start);
     *rest = SkipBlanks(s, i + 1);
     return true;
@@ -443,8 +454,9 @@ class Parser {
     std::string_view lhs, rhs;
     size_t rest = 0;
     if (!SplitIfEqCond(s, &lhs, &rhs, &rest)) {
+      // `lhs` is whatever the split read before it gave up, because the
+      // evaluator has to expand it before it says the condition cannot be read.
       stmt->complaint = CondComplaint::UNREADABLE;
-      lhs = rhs = std::string_view();
     } else if (rest < s.size()) {
       stmt->complaint = CondComplaint::EXTRANEOUS_TEXT;
     }

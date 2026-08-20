@@ -590,10 +590,17 @@ void Evaluator::EvalIf(const IfStmt* stmt) {
       // Reading the condition is this statement's own work, not the read's,
       // because GNU Make does not look at a condition inside a branch it is
       // ignoring. Nothing below runs unless this statement was reached.
+      //
+      // The first string is expanded before the condition is refused, because
+      // `conditional_line` expands it the moment it has found its end and only
+      // then goes looking for the second string's close. Both of its
+      // `return -1` paths below that line therefore run with the expansion
+      // already done, side effects and all. A split that never read a first
+      // string leaves an empty expression here, and expanding one does nothing.
+      const std::string&& lhs = stmt->lhs->Eval(this);
       if (stmt->complaint == CondComplaint::UNREADABLE) {
         Error("*** invalid syntax in conditional.");
       }
-      const std::string&& lhs = stmt->lhs->Eval(this);
       // Between the two expansions, which is where GNU says it:
       // `conditional_line` expands the first string, then finds the second
       // string's close, then reaches `EXTRATEXT`, and only then expands the

@@ -68,6 +68,22 @@ fn skip_blanks(s: &[u8], mut i: usize) -> usize {
     i
 }
 
+/// What splitting an `ifeq`/`ifneq` condition found.
+enum SplitCondition {
+    /// Both strings, and where whatever follows the close begins.
+    Read(IfeqCondition),
+    /// The invalid syntax GNU returns -1 for, carrying the first string when
+    /// the split had already read it.
+    ///
+    /// Which of the two it is decides what has happened by the time the
+    /// complaint is made. `conditional_line` expands the first string the
+    /// moment it has found its end, and goes looking for the second string's
+    /// close afterwards — so every way of failing from there on has already run
+    /// whatever the first string does, and every way of failing before it has
+    /// run nothing.
+    Invalid { lhs: Option<Range<usize>> },
+}
+
 /// Splits an `ifeq`/`ifneq` condition the way `conditional_line` does
 /// (reference/gnumake/src/read.c).
 ///
@@ -76,13 +92,17 @@ fn skip_blanks(s: &[u8], mut i: usize) -> usize {
 /// counting nested parens, rather than by reading the line's last byte. So a
 /// line whose last byte is not the close is not a different form: it is this
 /// form with trailing text after it, which the caller warns about rather than
-/// refusing over. `None` is the invalid syntax GNU returns -1 for: a close that
-/// never arrives, or an opener that is neither a paren nor a quote.
-fn split_ifeq_condition(s: &[u8]) -> Option<IfeqCondition> {
-    let termin = match *s.first()? {
+/// refusing over.
+fn split_ifeq_condition(s: &[u8]) -> SplitCondition {
+    // Nothing is read yet, so nothing GNU Make would have expanded has been.
+    let unread = SplitCondition::Invalid { lhs: None };
+    let Some(first) = s.first() else {
+        return unread;
+    };
+    let termin = match *first {
         b'(' => b',',
         quote @ (b'"' | b'\'') => quote,
-        _ => return None,
+        _ => return unread,
     };
 
     // The first string runs to the terminator. Inside the parenthesised form a
@@ -107,7 +127,9 @@ fn split_ifeq_condition(s: &[u8]) -> Option<IfeqCondition> {
         }
     }
     if i >= s.len() {
-        return None;
+        // The first string's own terminator never arrived, so GNU Make has not
+        // reached the expansion below it.
+        return unread;
     }
 
     let mut lhs_end = i;
@@ -118,6 +140,9 @@ fn split_ifeq_condition(s: &[u8]) -> Option<IfeqCondition> {
         }
     }
     i += 1;
+    // From here down the first string is read, and GNU Make expands it before
+    // it looks for anything else — so every refusal below carries it.
+    let lhs = lhs_start..lhs_end;
 
     // What closes the second string: the matching paren for the parenthesised
     // form, and for the quoted one the next non-blank byte, which has to be a
@@ -125,9 +150,16 @@ fn split_ifeq_condition(s: &[u8]) -> Option<IfeqCondition> {
     if termin != b',' {
         i = skip_blanks(s, i);
     }
-    let close = if termin == b',' { b')' } else { *s.get(i)? };
+    let close = if termin == b',' {
+        b')'
+    } else {
+        match s.get(i) {
+            Some(close) => *close,
+            None => return SplitCondition::Invalid { lhs: Some(lhs) },
+        }
+    };
     if close != b')' && close != b'"' && close != b'\'' {
-        return None;
+        return SplitCondition::Invalid { lhs: Some(lhs) };
     }
 
     let rhs_start;
@@ -157,11 +189,11 @@ fn split_ifeq_condition(s: &[u8]) -> Option<IfeqCondition> {
         }
     }
     if i >= s.len() {
-        return None;
+        return SplitCondition::Invalid { lhs: Some(lhs) };
     }
 
-    Some(IfeqCondition {
-        lhs: lhs_start..lhs_end,
+    SplitCondition::Read(IfeqCondition {
+        lhs,
         rhs: rhs_start..i,
         rest: skip_blanks(s, i + 1),
     })
@@ -614,12 +646,19 @@ impl<'a> Parser<'a> {
         // The statement stands either way, because an unreadable condition is
         // still a conditional as far as the `endif` closing it is concerned.
         let (lhs_text, rhs_text, complaint) = match split_ifeq_condition(&line) {
-            Some(condition) => (
+            SplitCondition::Read(condition) => (
                 line.slice(condition.lhs),
                 line.slice(condition.rhs),
                 (condition.rest < line.len()).then_some(CondComplaint::ExtraneousText),
             ),
-            None => (Bytes::new(), Bytes::new(), Some(CondComplaint::Unreadable)),
+            // The first string still reaches the statement when the split read
+            // it, because the evaluator has to expand it before it says the
+            // condition cannot be read.
+            SplitCondition::Invalid { lhs } => (
+                lhs.map_or_else(Bytes::new, |lhs| line.slice(lhs)),
+                Bytes::new(),
+                Some(CondComplaint::Unreadable),
+            ),
         };
 
         let mut mutable_loc = loc.clone();
@@ -1130,6 +1169,68 @@ mod tests {
         assert!(
             outer.contains("t=2") && outer.contains("f=0"),
             "the inner conditional and `X := 1` sit inside the outer branch: {outer}"
+        );
+    }
+
+    /// Which refusals carry a first string and which do not, which is the
+    /// whole of what decides whether the expansion has happened when the
+    /// condition is refused.
+    ///
+    /// `conditional_line` expands the first string as soon as it has found its
+    /// end, so the two ways of giving up above that line hand back nothing and
+    /// the three below it hand back what was read.
+    #[test]
+    fn a_refusal_carries_the_first_string_it_had_already_read() {
+        let read = |text: &'static [u8]| match split_ifeq_condition(text) {
+            SplitCondition::Read(condition) => {
+                Some(String::from_utf8_lossy(&text[condition.lhs]).into_owned())
+            }
+            SplitCondition::Invalid { lhs } => {
+                lhs.map(|lhs| String::from_utf8_lossy(&text[lhs]).into_owned())
+            }
+        };
+
+        // Refused above the expansion: nothing has been read.
+        assert_eq!(read(b""), None, "no opener at all");
+        assert_eq!(read(b"junk"), None, "an opener that is neither");
+        assert_eq!(
+            read(b"(a b"),
+            None,
+            "the first string's comma never arrives"
+        );
+        assert_eq!(
+            read(b"\"a b"),
+            None,
+            "the first string's quote never arrives"
+        );
+
+        // Refused below it: the first string is read and must be expanded.
+        assert_eq!(
+            read(b"\"a\""),
+            Some("a".to_owned()),
+            "text ends after the close quote"
+        );
+        assert_eq!(
+            read(b"\"a\" b"),
+            Some("a".to_owned()),
+            "a second terminator that is neither"
+        );
+        assert_eq!(
+            read(b"(a,b"),
+            Some("a".to_owned()),
+            "the second string's close never arrives"
+        );
+
+        // Read: the same first string, by the ordinary road.
+        assert_eq!(
+            read(b"(a ,b)"),
+            Some("a".to_owned()),
+            "blanks before the comma belong to neither"
+        );
+        assert_eq!(
+            read(b"\"a\" \"b\""),
+            Some("a".to_owned()),
+            "the quoted form"
         );
     }
 
