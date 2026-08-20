@@ -345,6 +345,19 @@ fn skip_folded(loc: &mut Loc, s: &[u8], mut at: usize) -> usize {
     }
 }
 
+/// Whether this byte ends a function name where GNU Make ends one.
+///
+/// `lookup_function` (function.c) walks the name over `MAP_USERFUNC` and then
+/// insists the byte it stopped on is in `MAP_NUL|MAP_SPACE` -- a NUL, or any
+/// character `isspace` accepts. So a space is not special: a tab, a newline, a
+/// carriage return, a vertical tab and a form feed all name a call too, and so
+/// does running out of text. The backslash is here because a continuation
+/// arrives at this decision unfolded, and the newline it stands for is one of
+/// the six.
+fn ends_a_function_name(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b'\\')
+}
+
 fn skip_spaces(loc: &mut Loc, s: &[u8], terms: &[u8]) -> usize {
     let mut i = 0;
     while i < s.len() {
@@ -468,7 +481,10 @@ fn parse_dollar(
         return Ok((2, Arc::new(Value::SymRef(start_loc.clone(), sym))));
     };
 
-    let mut terms = vec![cp, b':', b' '];
+    // Every byte that ends a name for `lookup_function`, so the scan stops
+    // where GNU Make's does. `terms.truncate(2)` below drops the whole tail of
+    // them at once, exactly as it dropped the single space before.
+    let mut terms = vec![cp, b':', b' ', b'\t', b'\n', 0x0b, 0x0c, b'\r'];
     let mut i = 2;
     loop {
         let (n, vname) = parse_expr_impl(
@@ -482,6 +498,33 @@ fn parse_dollar(
         i += n;
 
         let t: &[u8] = &s[i..];
+        // A name the scan ended is a call if it spells one. GNU Make asks the
+        // same question first: `variable_expand_string` (expand.c) tries
+        // `handle_function` before it goes looking for the close, which is why
+        // `$(subst)` -- a name ended by the close itself -- is a reference and
+        // `$(subst` at the end of the text is a call.
+        let name_ended = t.first().is_none_or(|c| ends_a_function_name(*c));
+        if name_ended
+            && let Value::Literal(_, lit) = &*vname
+            && let Some(fi) = get_func_info(lit)
+        {
+            // Step over the byte that ended the name. Where the text ran out
+            // there is no byte to step over.
+            let args_at = i + usize::from(!t.is_empty());
+            let (idx, parsed) = parse_func(session, loc, fi, s, args_at, terms)?;
+            let value = match parsed {
+                ParsedCall::Args(args) => Value::Func {
+                    loc: start_loc,
+                    fi,
+                    args,
+                },
+                ParsedCall::Unterminated => {
+                    Value::Unreadable(start_loc, Unreadable::UnterminatedCall(fi.name, cp))
+                }
+            };
+            return Ok((idx, Arc::new(value)));
+        }
+
         if t.first() == Some(&cp) || (end_paren && t.is_empty() && cp == b')') {
             if let Value::Literal(_, lit) = &*vname {
                 let sym = session.intern(lit.clone());
@@ -502,34 +545,18 @@ fn parse_dollar(
             return Ok((i + 1, Arc::new(Value::VarRef(start_loc, vname))));
         }
 
-        if t.first() == Some(&b' ') || t.first() == Some(&b'\\') {
-            // ${func ...}
+        if name_ended && !t.is_empty() {
             if let Value::Literal(_, lit) = &*vname {
-                if let Some(fi) = get_func_info(lit) {
-                    let (idx, parsed) = parse_func(session, loc, fi, s, i + 1, terms)?;
-                    let value = match parsed {
-                        ParsedCall::Args(args) => Value::Func {
-                            loc: start_loc,
-                            fi,
-                            args,
-                        },
-                        ParsedCall::Unterminated => {
-                            Value::Unreadable(start_loc, Unreadable::UnterminatedCall(fi.name, cp))
-                        }
-                    };
-                    return Ok((idx, Arc::new(value)));
-                } else {
-                    kati_warn_loc!(
-                        session,
-                        Some(&start_loc),
-                        "*warning*: unknown make function {lit:?}: {}",
-                        String::from_utf8_lossy(&s)
-                    );
-                }
+                kati_warn_loc!(
+                    session,
+                    Some(&start_loc),
+                    "*warning*: unknown make function {lit:?}: {}",
+                    String::from_utf8_lossy(&s)
+                );
             }
 
-            // Not a function. Drop ' ' from |terms| and parse it
-            // again. This is inefficient, but this code path should be
+            // Not a function. Drop the name terminators from |terms| and parse
+            // it again. This is inefficient, but this code path should be
             // rarely used.
             terms.truncate(2);
             i = 2;
@@ -1152,6 +1179,83 @@ mod tests {
                 "{:?}",
                 String::from_utf8_lossy(text)
             );
+        }
+    }
+
+    /// Which byte after a name makes the name a call.
+    ///
+    /// GNU Make's `lookup_function` ends the name at a NUL or at anything
+    /// `isspace` accepts, and `variable_expand_string` asks it before it goes
+    /// looking for the close -- so the six whitespace bytes and the end of the
+    /// text all name a call, and the close paren and the comma, which end a
+    /// name for every other purpose, do not.
+    #[test]
+    fn a_name_is_a_call_wherever_gnu_make_ends_one() {
+        for (text, expected) in [
+            (&b"$(subst a,b,aaa)"[..], Ok("bbb")),
+            (b"$(subst\ta,b,aaa)", Ok("bbb")),
+            (b"$(subst\na,b,aaa)", Ok("bbb")),
+            (b"$(subst\x0ba,b,aaa)", Ok("bbb")),
+            (b"$(subst\x0ca,b,aaa)", Ok("bbb")),
+            (b"$(subst\ra,b,aaa)", Ok("bbb")),
+            // The close ends the name without being whitespace, so this reads
+            // as a reference to an unset variable called `subst` rather than
+            // as a call with no arguments at all.
+            (b"$(subst)", Ok("")),
+            // A comma likewise -- the whole of `subst,a,b,aaa` is the name.
+            (b"$(subst,a,b,aaa)", Ok("")),
+            // The end of the text ends the name, and the close it wanted is
+            // then plainly missing.
+            (
+                b"$(subst",
+                Err("<unknown>:0: *** unterminated call to function 'subst': missing ')'.  Stop."),
+            ),
+            (
+                b"${subst",
+                Err("<unknown>:0: *** unterminated call to function 'subst': missing '}'.  Stop."),
+            ),
+            // A name that is not a function's, ended the same way, is the
+            // reference it looks like.
+            (
+                b"$(substx",
+                Err("<unknown>:0: *** unterminated variable reference.  Stop."),
+            ),
+            (
+                b"$(sub",
+                Err("<unknown>:0: *** unterminated variable reference.  Stop."),
+            ),
+            // The name ran into a comma rather than into the end of the text,
+            // so `lookup_function` never accepted it and the missing close is
+            // the reference's.
+            (
+                b"$(subst,a,b",
+                Err("<unknown>:0: *** unterminated variable reference.  Stop."),
+            ),
+        ] {
+            let mut session = Session::new();
+            let mut loc = Loc::default();
+            let value = parse_expr(
+                &mut session,
+                &mut loc,
+                Bytes::from_static(text),
+                ParseExprOpt::Normal,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{:?} was refused by the read: {e}",
+                    String::from_utf8_lossy(text)
+                )
+            });
+            let mut ev = Evaluator::new(session);
+            let got = value
+                .eval_to_buf(&mut ev)
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .map_err(|e| e.to_string());
+            let got = match &got {
+                Ok(text) => Ok(text.as_str()),
+                Err(text) => Err(text.as_str()),
+            };
+            assert_eq!(got, expected, "{:?}", String::from_utf8_lossy(text));
         }
     }
 

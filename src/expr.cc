@@ -416,7 +416,12 @@ Value* ParseDollar(Loc* loc, std::string_view s, size_t* index_out) {
     return new SymRef(start_loc, Intern(s.substr(1, 1)));
   }
 
-  char terms[] = {cp, ':', ' ', 0};
+  // Every byte that ends a name for GNU Make's `lookup_function`
+  // (function.c): a name is walked over MAP_USERFUNC and must stop on
+  // MAP_NUL|MAP_SPACE, so a tab, a newline, a carriage return, a vertical tab
+  // and a form feed all name a call exactly as a space does. `terms[2] = 0`
+  // below drops the whole tail of them at once, as it dropped the space.
+  char terms[] = {cp, ':', ' ', '\t', '\n', '\v', '\f', '\r', 0};
   for (size_t i = 2;;) {
     size_t n;
     Value* vname =
@@ -442,7 +447,7 @@ Value* ParseDollar(Loc* loc, std::string_view s, size_t* index_out) {
       return new VarRef(start_loc, vname);
     }
 
-    if (s[i] == ' ' || s[i] == '\\') {
+    if (isspace(static_cast<unsigned char>(s[i])) || s[i] == '\\') {
       // ${func ...}
       if (vname->IsLiteral()) {
         Literal* lit = static_cast<Literal*>(vname);
