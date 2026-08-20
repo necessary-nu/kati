@@ -1254,6 +1254,7 @@ impl<'a> CommandEvaluator<'a> {
         }
         let node_ignores_errors = n.lock().is_ignore_error;
         self.ev.is_evaluating_command = true;
+        self.ev.session.ground_journal.suspend(true);
         *self.current_dep_node.lock() = Some(n.clone());
         *self.found_new_inputs.lock() = false;
         self.ev.deferred_new_inputs_filter_out.clear();
@@ -1330,6 +1331,7 @@ impl<'a> CommandEvaluator<'a> {
 
         self.ev.current_scope = None;
         self.ev.is_evaluating_command = false;
+        self.ev.session.ground_journal.suspend(false);
 
         Ok(result)
     }

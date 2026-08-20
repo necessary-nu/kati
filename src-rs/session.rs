@@ -46,6 +46,158 @@ use crate::{
     var::{GlobalVars, Var, VarOrigin},
 };
 
+/// Which of a read's questions the ground answers, rather than the text.
+///
+/// Every one of these takes a value from outside the Makefile and hands it to
+/// the expansion that asked, so a second read over the same text can neither
+/// skip it nor be given nothing. `$(abspath)` is deliberately absent: it is
+/// spelling, not a question — it never touches the filesystem, and it answers
+/// the same on every pass by construction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GroundQuestion {
+    /// `$(shell)`, `!=` and `KATI_shell_no_rerun`.
+    Shell,
+    /// `$(wildcard)`.
+    Wildcard,
+    /// `$(realpath)`.
+    RealPath,
+    /// `$(file < name)`.
+    FileRead,
+    /// One target or prerequisite word holding `?`, `*` or `[`, matched
+    /// against the filesystem where GNU Make's `parse_file_seq` matches it.
+    Glob,
+}
+
+/// One question a read asked the ground, and the answer it was given.
+#[derive(Clone, Debug)]
+pub struct GroundAnswer {
+    pub question: GroundQuestion,
+    /// What was asked, already expanded — the command, the pattern, the words.
+    /// Kept so a replay can tell that the read it is answering is still the
+    /// read it recorded.
+    pub asked: Bytes,
+    /// The bytes the call put into the expansion that asked for it.
+    pub answer: Bytes,
+    /// `.SHELLSTATUS`, for the one question that leaves one.
+    pub status: Option<i32>,
+}
+
+/// The answers one read got from outside itself, in the order it asked for
+/// them.
+///
+/// A front end that compiles a recursive child into its parent's graph reads
+/// the parent again once the child's inputs are on the ground, and by then the
+/// ground has moved — the staged work is what moved it. GNU Make asks once,
+/// before any recipe has run, so its answers are the answers to the ground the
+/// build started with. Holding the questions back is not available the way it
+/// is for `$(info)`: the expansion that asked has to be handed something. So
+/// the first read's answers are kept and handed back.
+///
+/// KEYED BY POSITION, not by text. The same command written twice in one
+/// makefile is two questions and runs twice on the first read; a `$(shell)`
+/// inside a `$(foreach)` is one question per iteration. Only the order they
+/// were asked in identifies them, and the order is the same because the text
+/// is the same and every answer that could have changed it is replayed too.
+/// What is recorded beside each answer is the question, and that is a check
+/// rather than a key: if the read asks something else where the record says it
+/// asked this, the sequence has stopped meaning anything.
+///
+/// WHEN IT RUNS OUT, or when that check fails, the replay stops for the rest
+/// of this read and every remaining question goes to the ground. Resyncing
+/// would mean handing back an answer from a call site that is not the one
+/// asking. Stopping is exactly what the front end did before it recorded
+/// anything, so a read that diverges is no worse off than it was.
+#[derive(Default)]
+pub struct GroundJournal {
+    recorded: Vec<GroundAnswer>,
+    replaying: Vec<GroundAnswer>,
+    at: usize,
+    diverged: bool,
+    suspended: bool,
+}
+
+impl GroundJournal {
+    /// Hand this read the answers an earlier read of the same text was given.
+    pub fn replay(&mut self, answers: Vec<GroundAnswer>) {
+        self.replaying = answers;
+        self.at = 0;
+        self.diverged = false;
+    }
+
+    /// End the read: hand back what it asked and was told, for the read after
+    /// it, and stop replaying.
+    ///
+    /// Stopping matters as much as handing back. The session outlives the read
+    /// when a recipe is expanded as its edge launches, and a `$(shell)` in a
+    /// recipe is a command that runs — it is not part of any read, so nothing
+    /// left in the journal may answer for it.
+    pub fn close_read(&mut self) -> Vec<GroundAnswer> {
+        self.replaying = Vec::new();
+        self.at = 0;
+        self.diverged = false;
+        std::mem::take(&mut self.recorded)
+    }
+
+    /// Whether the replay stopped short of the end of what it was given.
+    pub const fn diverged(&self) -> bool {
+        self.diverged
+    }
+
+    /// Set while a recipe is expanded, which is not part of any read.
+    ///
+    /// GNU Make expands a recipe when it runs it, so what the recipe asks is
+    /// asked of the ground as it stands then. This front end has one case
+    /// where that matters and it is the reason recursive Make can be compiled
+    /// at all: a `$(MAKE)` line whose argument is `$(shell cat stamp)` cannot
+    /// be read until `stamp` has been staged, so the pass after the staging is
+    /// the pass that asks — and it must get the new answer, not the empty one
+    /// the pass before it got. Neither answered nor recorded, because a
+    /// recorded one would also move every later question out of its place.
+    pub fn suspend(&mut self, suspended: bool) {
+        self.suspended = suspended;
+    }
+
+    /// The answer an earlier read got to this same question, if it is still
+    /// the same question in the same place.
+    pub(crate) fn answered(
+        &mut self,
+        question: GroundQuestion,
+        asked: &Bytes,
+    ) -> Option<GroundAnswer> {
+        if self.diverged || self.suspended {
+            return None;
+        }
+        let recorded = self.replaying.get(self.at)?;
+        if recorded.question != question || recorded.asked != asked {
+            self.diverged = true;
+            return None;
+        }
+        self.at += 1;
+        let answered = recorded.clone();
+        self.recorded.push(answered.clone());
+        Some(answered)
+    }
+
+    /// What the ground has just said, for the reads after this one.
+    pub(crate) fn record(
+        &mut self,
+        question: GroundQuestion,
+        asked: Bytes,
+        answer: Bytes,
+        status: Option<i32>,
+    ) {
+        if self.suspended {
+            return;
+        }
+        self.recorded.push(GroundAnswer {
+            question,
+            asked,
+            answer,
+            status,
+        });
+    }
+}
+
 /// What a diagnostic, a statistics site, or a flag test needs to be reachable
 /// from: an interner to render symbols with, the flags, and the statistics
 /// registry.
@@ -99,6 +251,9 @@ pub struct Session {
     /// Everything `$(shell)`, `$(file)`, and the find emulator did, for the
     /// regeneration stamp.
     pub command_results: Vec<CommandResult>,
+    /// What this read asked the ground, and what an earlier read of the same
+    /// text was told.
+    pub ground_journal: GroundJournal,
     /// Environment variables an evaluation read.
     pub used_env_vars: HashSet<Symbol>,
     /// Variables an evaluation read without finding a binding.
@@ -171,6 +326,7 @@ impl Session {
             find_emulator: OnceLock::new(),
             find_node_count: AtomicUsize::new(0),
             command_results: Vec::new(),
+            ground_journal: GroundJournal::default(),
             used_env_vars: HashSet::new(),
             used_undefined_vars: HashSet::new(),
             shell_status: None,
@@ -373,6 +529,56 @@ mod tests {
         let sym = a.session.symtab.intern("NEVER_DEFINED_ANYWHERE");
         assert!(a.session.used_undefined_vars.contains(&sym));
         assert!(b.session.used_undefined_vars.is_empty());
+    }
+
+    /// A repeated read is answered by position, and the question recorded
+    /// beside each answer is the check that the positions still mean anything.
+    // [spec:ronin:req:make.semantics+1/test]
+    #[test]
+    fn a_repeated_read_is_answered_in_order() {
+        let mut ev = Evaluator::new(Session::new());
+        eval_in(&mut ev, "SHELL := /bin/sh\n").unwrap();
+        // The same command written twice runs twice, so the record has two
+        // entries for it and they are told apart by where they stand.
+        expand(
+            &mut ev,
+            "$(shell echo one)$(shell echo one)$(shell echo two)",
+        )
+        .unwrap();
+        let first = ev.session.ground_journal.close_read();
+        assert_eq!(first.len(), 3);
+
+        ev.session.ground_journal.replay(first.clone());
+        assert_eq!(
+            expand(&mut ev, "$(shell echo one)").unwrap().as_ref(),
+            b"one"
+        );
+        // Asked out of order, the second question does not match what stands
+        // in its place, so the replay stops and the ground answers the rest.
+        assert_eq!(
+            expand(&mut ev, "$(shell echo three)").unwrap().as_ref(),
+            b"three"
+        );
+        assert!(ev.session.ground_journal.diverged());
+        // And it stays stopped: resyncing would hand back an answer belonging
+        // to a call site that is not the one asking.
+        assert_eq!(
+            expand(&mut ev, "$(shell echo one)").unwrap().as_ref(),
+            b"one"
+        );
+        let second = ev.session.ground_journal.close_read();
+        assert_eq!(second.len(), 3);
+
+        // Closing the read ends the replay. A recipe expanded as its edge
+        // launches uses this same session, and a `$(shell)` there is a command
+        // that runs rather than part of any read.
+        ev.session.ground_journal.replay(first);
+        ev.session.ground_journal.close_read();
+        assert_eq!(
+            expand(&mut ev, "$(shell echo fresh)").unwrap().as_ref(),
+            b"fresh"
+        );
+        assert!(!ev.session.ground_journal.diverged());
     }
 
     /// A `$(shell)` in one session sets only that session's `.SHELLSTATUS` and

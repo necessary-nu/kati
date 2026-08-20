@@ -43,7 +43,7 @@ use crate::{
     loc::Loc,
     log,
     parser::parse_buf,
-    session::Session,
+    session::{GroundQuestion, Session},
     strutil::{
         Pattern, WordWriter, escape_printf_b, format_for_command_substitution,
         format_for_shell_assignment, has_path_prefix, is_space_byte, normalize_path,
@@ -420,7 +420,20 @@ fn wildcard_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) 
     collect_stats!(ev, "func wildcard time");
     // Note GNU make does not delay the execution of $(wildcard) so we
     // do not need to check avoid_io here.
-    let mut ww = WordWriter::new(out);
+    if let Some(answered) = ev
+        .session
+        .ground_journal
+        .answered(GroundQuestion::Wildcard, &pat)
+    {
+        out.put_slice(&answered.answer);
+        return Ok(());
+    }
+    // Written into a buffer of its own rather than straight out, because the
+    // answer is what a later read of this same text is handed. A fresh
+    // `WordWriter` produces the same bytes either way: the separating space
+    // goes before every word but the writer's first.
+    let mut answer = BytesMut::new();
+    let mut ww = WordWriter::new(&mut answer);
     for tok in word_scanner(&pat) {
         let tok = pat.slice_ref(tok);
         let files = ev.session.glob(tok);
@@ -430,6 +443,11 @@ fn wildcard_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) 
             }
         }
     }
+    let answer = answer.freeze();
+    out.put_slice(&answer);
+    ev.session
+        .ground_journal
+        .record(GroundQuestion::Wildcard, pat, answer, None);
     Ok(())
 }
 
@@ -505,13 +523,27 @@ fn addprefix_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut)
 /// shell syntax where the Makefile asked for a pathname.
 fn realpath_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
     let text = args[0].eval_to_buf(ev)?;
-    let mut ww = WordWriter::new(out);
+    if let Some(answered) = ev
+        .session
+        .ground_journal
+        .answered(GroundQuestion::RealPath, &text)
+    {
+        out.put_slice(&answered.answer);
+        return Ok(());
+    }
+    let mut answer = BytesMut::new();
+    let mut ww = WordWriter::new(&mut answer);
     for tok in word_scanner(&text) {
         let tok = <OsStr as OsStrExt>::from_bytes(tok);
         if let Ok(path) = std::fs::canonicalize(tok) {
             ww.write(path.as_os_str().as_bytes());
         }
     }
+    let answer = answer.freeze();
+    out.put_slice(&answer);
+    ev.session
+        .ground_journal
+        .record(GroundQuestion::RealPath, text, answer, None);
     Ok(())
 }
 
@@ -782,6 +814,20 @@ fn shell_func_with(
         return Ok(());
     }
 
+    // The command this read would run was run by the read before it, over this
+    // same text, and its output is what that expansion was handed. Running it
+    // again would perform the effect twice — GNU Make performs it once, on the
+    // ground the build started with.
+    if let Some(answered) = ev
+        .session
+        .ground_journal
+        .answered(GroundQuestion::Shell, &cmd)
+    {
+        out.put_slice(&answered.answer);
+        ev.session.shell_status = answered.status;
+        return Ok(());
+    }
+
     let loc = ev.loc.clone().unwrap_or_default();
     let shell = ev.get_shell()?;
     // GNU Make passes no command flags here (`func_shell` hands
@@ -817,12 +863,15 @@ fn shell_func_with(
             },
             shell,
             shellflag,
-            cmd,
+            cmd: cmd.clone(),
             find: fc,
-            result: output,
+            result: output.clone(),
             loc,
         })
     }
+    ev.session
+        .ground_journal
+        .record(GroundQuestion::Shell, cmd, output, Some(exit_code));
     ev.session.shell_status = Some(exit_code);
     Ok(())
 }
@@ -843,6 +892,16 @@ fn shell_no_rerun_func(
             ev.loc.as_ref(),
             "KATI_shell_no_rerun provides no benefit over regular $(shell) inside of a rule."
         );
+    }
+
+    if let Some(answered) = ev
+        .session
+        .ground_journal
+        .answered(GroundQuestion::Shell, &cmd)
+    {
+        out.put_slice(&answered.answer);
+        ev.session.shell_status = answered.status;
+        return Ok(());
     }
 
     let loc = ev.loc.clone().unwrap_or_default();
@@ -867,6 +926,9 @@ fn shell_no_rerun_func(
         Trailing::Drop,
     )?;
     out.put_slice(&output);
+    ev.session
+        .ground_journal
+        .record(GroundQuestion::Shell, cmd, output, Some(exit_code));
     ev.session.shell_status = Some(exit_code);
     Ok(())
 }
@@ -1251,6 +1313,15 @@ fn file_read_func(
     // Opening and reading are kept apart because GNU Make reports them apart,
     // and a directory is where that shows: opening one succeeds and reading it
     // does not, so `$(file < adir)` fails as a `read:` rather than an `open:`.
+    let asked = Bytes::from(filename.as_bytes().to_vec());
+    if let Some(answered) = ev
+        .session
+        .ground_journal
+        .answered(GroundQuestion::FileRead, &asked)
+    {
+        out.put_slice(&answered.answer);
+        return Ok(());
+    }
     let mut file = match File::open(filename) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1260,12 +1331,18 @@ fn file_read_func(
                     op: CommandOp::ReadMissing,
                     shell: Bytes::new(),
                     shellflag: Bytes::new(),
-                    cmd: Bytes::from(filename.as_bytes().to_vec()),
+                    cmd: asked.clone(),
                     find: None,
                     result: Bytes::new(),
                     loc,
                 })
             }
+            // A file that was not there is an answer too, and the read after
+            // this one must be told the same thing rather than find the file
+            // the staged work has since written.
+            ev.session
+                .ground_journal
+                .record(GroundQuestion::FileRead, asked, Bytes::new(), None);
             return Ok(());
         }
         Err(err) => error_loc!(
@@ -1306,13 +1383,16 @@ fn file_read_func(
             op: CommandOp::Read,
             shell: Bytes::new(),
             shellflag: Bytes::new(),
-            cmd: Bytes::from(filename.as_bytes().to_vec()),
+            cmd: asked.clone(),
             find: None,
             result: buf.clone(),
             loc,
         })
     }
     out.put_slice(&buf);
+    ev.session
+        .ground_journal
+        .record(GroundQuestion::FileRead, asked, buf, None);
     Ok(())
 }
 

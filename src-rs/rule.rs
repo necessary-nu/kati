@@ -370,9 +370,49 @@ fn glob_word_on_disk(session: &mut Session, word: Bytes, into: &mut Vec<Bytes>) 
         into.push(word);
         return;
     }
-    match session.glob(word.clone()).as_ref() {
-        Ok(paths) if !paths.is_empty() => into.extend(paths.iter().cloned()),
-        _ => into.push(word),
+    // A name matched against the filesystem is a question the ground answers,
+    // so a read repeating itself over the same text is told what the first
+    // read was told. The names are recorded NUL-separated rather than
+    // space-separated, because a filename may hold a space and this record is
+    // not something a Makefile ever reads; an empty answer is no matches at
+    // all, which is the pattern standing as it was written.
+    if let Some(answered) = session
+        .ground_journal
+        .answered(crate::session::GroundQuestion::Glob, &word)
+    {
+        if answered.answer.is_empty() {
+            into.push(word);
+        } else {
+            into.extend(
+                answered
+                    .answer
+                    .split(|byte| *byte == 0)
+                    .map(|name| answered.answer.slice_ref(name)),
+            );
+        }
+        return;
+    }
+    let matched = match session.glob(word.clone()).as_ref() {
+        Ok(paths) if !paths.is_empty() => paths.clone(),
+        _ => Vec::new(),
+    };
+    let mut answer = bytes::BytesMut::new();
+    for (position, name) in matched.iter().enumerate() {
+        if position > 0 {
+            bytes::BufMut::put_u8(&mut answer, 0);
+        }
+        bytes::BufMut::put_slice(&mut answer, name);
+    }
+    session.ground_journal.record(
+        crate::session::GroundQuestion::Glob,
+        word.clone(),
+        answer.freeze(),
+        None,
+    );
+    if matched.is_empty() {
+        into.push(word);
+    } else {
+        into.extend(matched);
     }
 }
 
