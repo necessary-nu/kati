@@ -45,13 +45,22 @@ impl PhonyAliases {
     }
 }
 
+/// The longest a single path component may be.
+///
+/// Written out rather than read from `libc`, which offers `NAME_MAX` on Linux
+/// alone: ext4, APFS, and HFS+ all stop a component at the same 255 bytes, so
+/// the number is not the part that varies by host. `PATH_MAX` below stays
+/// `libc`'s for the opposite reason — it really does vary (4096 on Linux, 1024
+/// on Apple), and a name the running host cannot address is exactly what an
+/// alias stands in for.
+const NAME_MAX: usize = 255;
+
 fn unaddressable(path: &[u8]) -> bool {
     let path_max = usize::try_from(libc::PATH_MAX).expect("PATH_MAX is positive");
-    let name_max = usize::try_from(libc::NAME_MAX).expect("NAME_MAX is positive");
     path.len() >= path_max
         || path
             .split(|byte| *byte == b'/')
-            .any(|name| name.len() > name_max)
+            .any(|name| name.len() > NAME_MAX)
 }
 
 fn stable_hash(bytes: &[u8]) -> u64 {
@@ -70,9 +79,8 @@ mod tests {
     // [spec:ronin:req:make.compiler-boundary/test]
     #[test]
     fn detects_unaddressable_paths() {
-        let name_max = usize::try_from(libc::NAME_MAX).unwrap();
-        assert!(!unaddressable(&vec![b'x'; name_max]));
-        assert!(unaddressable(&vec![b'x'; name_max + 1]));
+        assert!(!unaddressable(&vec![b'x'; NAME_MAX]));
+        assert!(unaddressable(&vec![b'x'; NAME_MAX + 1]));
 
         let path_max = usize::try_from(libc::PATH_MAX).unwrap();
         let path = [b"x/".repeat(path_max / 2), vec![b'x'; path_max % 2]].concat();
@@ -83,7 +91,7 @@ mod tests {
     #[test]
     fn avoids_real_target_collisions() {
         let mut names = Symtab::new();
-        let logical = names.intern(vec![b'x'; usize::try_from(libc::NAME_MAX).unwrap() + 1]);
+        let logical = names.intern(vec![b'x'; NAME_MAX + 1]);
         let base = format!("{PREFIX}{:016x}", stable_hash(&names.name(logical)));
         let collision = names.intern(base.clone().into_bytes());
         let occupied = HashSet::from([logical, collision]);
