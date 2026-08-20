@@ -154,9 +154,12 @@ fn read_bootstrap_makefile(session: &mut Session) -> Result<Arc<Mutex<Vec<Stmt>>
     if session.flags.generate_ninja {
         bootstrap.put_slice(format!("MAKE?=make -j{}\n", session.flags.num_jobs.max(1)).as_bytes());
     } else {
-        bootstrap.put_slice(b"MAKE?=");
-        bootstrap.put_slice(session.flags.subkati_args.join(OsStr::new(" ")).as_bytes());
-        bootstrap.put_u8(b'\n');
+        // `define_variable_cname ("MAKE", "$(MAKE_COMMAND)", o_default, 1)`:
+        // a reference and not the path, which is what makes a makefile's own
+        // write to MAKE_COMMAND change the program `$(MAKE)` names. It also
+        // keeps the path out of makefile text, where a `#` or a `$` in it
+        // would have been read as syntax.
+        bootstrap.put_slice(b"MAKE?=$(MAKE_COMMAND)\n");
     }
     let filename = session.intern("*bootstrap*");
     crate::parser::parse_buf(session, &bootstrap.freeze(), Loc { filename, line: 0 })
@@ -201,6 +204,39 @@ fn install_worked_out_variables(ev: &mut Evaluator, targets: &[Symbol]) -> Resul
         let goals = join_symbols(&ev.session, targets, b" ");
         claim_at_default(&mut ev.session, "MAKECMDGOALS", goals);
     }
+    // `define_variable_cname ("MAKE_HOST", make_host, o_default, 0)`, beside
+    // MAKE_VERSION in the same function. See [`make_host`] for what Ronin
+    // answers there and why, since GNU's value is baked by its configure run
+    // and there is nothing to copy.
+    claim_at_default(&mut ev.session, "MAKE_HOST", Bytes::from(make_host()));
+    // `define_variable_cname (".LOADED", "", o_default, 0)` in `main`, before
+    // anything is read and whether or not anything is ever loaded. It is empty
+    // here for good rather than for now: `load` is not a directive this parser
+    // knows, so no object can join the list. GNU's is empty on any makefile
+    // that loads nothing, which is every makefile in the corpus.
+    claim_at_default(&mut ev.session, ".LOADED", Bytes::new());
+    // `define_variable_cname ("MAKE_COMMAND", argv[0], o_default, 0)` in
+    // `main`, immediately before `MAKE` is defined as the REFERENCE
+    // `$(MAKE_COMMAND)` — which is why a makefile replacing MAKE_COMMAND
+    // changes what `$(MAKE)` runs, and why the bootstrap's `MAKE?=` line names
+    // the reference rather than the path.
+    let command = Bytes::from(
+        ev.session
+            .flags
+            .subkati_args
+            .join(OsStr::new(" "))
+            .as_bytes()
+            .to_vec(),
+    );
+    claim_at_default(&mut ev.session, "MAKE_COMMAND", command);
+    // The search path `-I` built, in the spelling `construct_include_path`
+    // (read.c) records: every directory stat'ed, the ones that are not there
+    // left out, and trailing slashes discarded. GNU's list ends with the
+    // built-in default path and this one does not, because this evaluator does
+    // not search there — the variable says what a search would do, and saying
+    // more than that would be a claim about a search that never happens.
+    let dirs = include_directories(&ev.session);
+    claim_at_default(&mut ev.session, ".INCLUDE_DIRS", dirs);
     // `define_variable_cname ("CURDIR", current_directory, o_file, 0)` in
     // `main`, at FILE rank and not default. The distinction is the whole point
     // of the call: a Makefile's own `CURDIR = x` is a peer replacing it rather
@@ -212,6 +248,72 @@ fn install_worked_out_variables(ev: &mut Evaluator, targets: &[Symbol]) -> Resul
     let sym = ev.session.intern("CURDIR");
     let var = Variable::with_simple_string(curdir, VarOrigin::File, None, None);
     ev.session.set_global_var(sym, var, false, None)
+}
+
+/// The host this Make is running on, in the triple shape `MAKE_HOST` carries.
+///
+/// GNU Make answers with the triple its own configure run recorded —
+/// `x86_64-pc-linux-gnu` on the oracle — so there is no value to copy, only a
+/// decision to take. A makefile reads this name to find out what platform it is
+/// on: `$(findstring mingw32,...)`, `cygwin`, `darwin`, `linux`. So the fields
+/// that have to be true are the architecture and the system, and the decision
+/// recorded here is that they name the host the run is ON rather than the host
+/// the binary was built on. Nothing else would be true of the run, and a
+/// makefile branching on it is asking about the run.
+///
+/// The vendor field is autoconf's own guess and nothing branches on it. It is
+/// spelled the way `config.guess` spells it — `apple` on Apple systems, `pc`
+/// for the x86 family elsewhere, `unknown` otherwise — so that a makefile
+/// pattern written against a real triple still matches one from here.
+fn make_host() -> String {
+    let arch = std::env::consts::ARCH;
+    let vendor = if cfg!(target_vendor = "apple") {
+        "apple"
+    } else if matches!(arch, "x86" | "x86_64") {
+        "pc"
+    } else {
+        "unknown"
+    };
+    // autoconf's name for each system is Rust's, except for Apple's.
+    let system = match std::env::consts::OS {
+        "macos" | "ios" => "darwin",
+        other => other,
+    };
+    // The C library joins the triple only where more than one is usual.
+    let abi = if system == "linux" {
+        if cfg!(target_env = "musl") {
+            "-musl"
+        } else {
+            "-gnu"
+        }
+    } else {
+        ""
+    };
+    format!("{arch}-{vendor}-{system}{abi}")
+}
+
+/// The include search path in the spelling `.INCLUDE_DIRS` records.
+///
+/// `construct_include_path` (read.c) stats every `-I` directory as the switches
+/// are decoded and keeps only the ones that are there, discarding trailing
+/// slashes. Both rules are visible: `-I nosuchdir` leaves the list unchanged
+/// and `-I inc/` joins it as `inc`.
+fn include_directories(session: &Session) -> Bytes {
+    let mut list = BytesMut::new();
+    for dir in &session.flags.include_dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut bytes = dir.as_os_str().as_bytes();
+        while bytes.len() > 1 && bytes.ends_with(b"/") {
+            bytes = &bytes[..bytes.len() - 1];
+        }
+        if !list.is_empty() {
+            list.put_u8(b' ');
+        }
+        list.put_slice(bytes);
+    }
+    list.freeze()
 }
 
 /// Bind `name` to a simple value at default rank, leaving whatever outranks a
