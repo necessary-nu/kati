@@ -1043,6 +1043,19 @@ impl Evaluator {
 
         let value = self.eval_var(lhs)?;
         let decoded = decoder(&previous, &value, &protected).map_err(anyhow::Error::msg)?;
+        // Said where the write is, as GNU Make's `decode_switches` says it, and
+        // said once: a staging pass reading the same text again is repeating a
+        // read that already spoke.
+        if !self.repeats_a_finished_read() {
+            for complaint in &decoded.complaints {
+                crate::warn_loc!(
+                    &self.session,
+                    None,
+                    "{}",
+                    String::from_utf8_lossy(complaint)
+                );
+            }
+        }
         let overrides = self.session.intern("MAKEOVERRIDES");
         let (value, original) =
             makeflags_value(decoded.makeflags.clone(), has_overrides, overrides);

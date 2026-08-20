@@ -71,6 +71,15 @@ pub struct DecodedMakeflags {
     pub environment_overrides: bool,
     pub no_builtin_rules: bool,
     pub no_builtin_variables: bool,
+    /// What the write had to say about a switch it dropped rather than died of.
+    ///
+    /// GNU Make's `decode_switches` complains about an empty string argument,
+    /// or a job count that is not a positive integer, whatever origin the word
+    /// came from — only the dying afterwards is the command line's alone. A
+    /// makefile's own write to `MAKEFLAGS` therefore says something and carries
+    /// on, and these are the lines it says. Rendered by the frontend, which
+    /// owns the option grammar; raised by the evaluator, which owns the moment.
+    pub complaints: Vec<Bytes>,
 }
 
 /// Decode one evaluated Makefile assignment into GNU Make's switch table.
