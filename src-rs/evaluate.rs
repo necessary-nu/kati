@@ -36,7 +36,7 @@ use parking_lot::Mutex;
 
 use crate::dep::{NamedDepNode, RegenerationRoot, make_dep};
 use crate::eval::{Evaluator, FrameType};
-use crate::expr::Value;
+use crate::expr::{ParseExprOpt, Value, parse_expr};
 use crate::file::Source;
 use crate::loc::Loc;
 use crate::session::Session;
@@ -119,27 +119,13 @@ pub struct Evaluated {
 /// [`crate::builtins::install_default_variables`].
 fn read_bootstrap_makefile(session: &mut Session) -> Result<Arc<Mutex<Vec<Stmt>>>> {
     let mut bootstrap = BytesMut::new();
-    // What a Makefile is allowed to assume, and no more. Claiming a feature
-    // that is not there is worse than claiming none: a Makefile branches on
-    // this to decide whether it may use a construct, and GNU Make's test suite
-    // skips a case it names. An honest short list makes a build take the
-    // portable path; a generous one makes it take a path that then misbehaves.
-    // Simple assignment rather than `?=`, because it is a statement about the
-    // program and not a default the makefile may prefer to set.
-    let features = EVALUATOR_FEATURES
-        .iter()
-        .map(|feature| (*feature).to_owned())
-        .chain(session.flags.extra_features.iter().cloned())
-        .collect::<Vec<_>>()
-        .join(" ");
-    bootstrap.put_slice(b".FEATURES := ");
-    bootstrap.put_slice(features.as_bytes());
-    bootstrap.put_u8(b'\n');
     bootstrap.put_slice(b"KATI?=ckati\n");
-    // `SHELL` is not here and cannot be: no makefile line says what
-    // [`stand_the_shell`] says, and the line that used to stand in for it — a
-    // plain `SHELL=/bin/sh` — got the rank and the flavour wrong in both of the
-    // two cases GNU Make distinguishes.
+    // Three names that used to be lines here are not any more, because no
+    // makefile line says what GNU Make's own call for each of them says:
+    // `SHELL` (see [`stand_the_shell`]), `.FEATURES` and `MAKE` (see
+    // [`install_worked_out_variables`]). `KATI` stays, because it is kati's own
+    // name and a `?=` is exactly what it means: a default the makefile may
+    // prefer to set.
     // TODO: Add more builtin vars.
 
     // GNU Make's `set_default_suffixes`, which is the whole of the built-in
@@ -153,16 +139,6 @@ fn read_bootstrap_makefile(session: &mut Session) -> Result<Arc<Mutex<Vec<Stmt>>
         bootstrap.put_slice(crate::builtin_rules::default_suffix_list().as_bytes());
         bootstrap.put_u8(b'\n');
     }
-    if session.flags.generate_ninja {
-        bootstrap.put_slice(format!("MAKE?=make -j{}\n", session.flags.num_jobs.max(1)).as_bytes());
-    } else {
-        // `define_variable_cname ("MAKE", "$(MAKE_COMMAND)", o_default, 1)`:
-        // a reference and not the path, which is what makes a makefile's own
-        // write to MAKE_COMMAND change the program `$(MAKE)` names. It also
-        // keeps the path out of makefile text, where a `#` or a `$` in it
-        // would have been read as syntax.
-        bootstrap.put_slice(b"MAKE?=$(MAKE_COMMAND)\n");
-    }
     let filename = session.intern("*bootstrap*");
     crate::parser::parse_buf(session, &bootstrap.freeze(), Loc { filename, line: 0 })
 }
@@ -171,14 +147,15 @@ fn read_bootstrap_makefile(session: &mut Session) -> Result<Arc<Mutex<Vec<Stmt>>
 /// its own `define_variable_cname` calls give them.
 ///
 /// These are not bootstrap makefile lines and cannot be, because no makefile
-/// line says what those calls say. GNU Make defines every one of them SIMPLE —
-/// the last argument to `define_variable_cname` is 0 — and Make's syntax has no
-/// spelling for "simple, at this rank, and only where nothing outranks it":
-/// `?=` makes a recursive variable and `:=` claims the name whatever holds it.
-/// A Makefile sees the difference through `$(flavor)` and `$(value)`, and for
-/// these names both are branch-worthy: `$(value MAKE_VERSION)` is the version
-/// when the binding is simple and the same text only by coincidence when it is
-/// recursive.
+/// line says what those calls say. All but one are SIMPLE — the last argument
+/// to `define_variable_cname` is 0, and `MAKE` is the one given a 1 — and
+/// Make's syntax has no spelling for "at this rank, and only where nothing
+/// outranks it, and promoting the environment's binding if `-e` lifted it":
+/// `?=` declines a bound name without promoting anything, and `:=` claims the
+/// name whatever holds it, at file rank. A Makefile sees all three differences
+/// through `$(flavor)`, `$(value)` and `$(origin)`, and for these names each is
+/// branch-worthy: `$(value MAKE_VERSION)` is the version when the binding is
+/// simple and the same text only by coincidence when it is recursive.
 ///
 /// # Errors
 ///
@@ -216,12 +193,34 @@ fn install_worked_out_variables(ev: &mut Evaluator, targets: &[Symbol]) -> Resul
     // here for good rather than for now: `load` is not a directive this parser
     // knows, so no object can join the list. GNU's is empty on any makefile
     // that loads nothing, which is every makefile in the corpus.
-    claim_at_default(&mut ev.session, ".LOADED", Bytes::new());
+    //
+    // main.c:1436, which is ahead of `decode_switches` — so `-e` is not yet in
+    // force when this one is written and an inherited `.LOADED` keeps its plain
+    // `environment` rank.
+    claim_before_the_switches(&mut ev.session, ".LOADED", Bytes::new());
+    // What a Makefile is allowed to assume, and no more. Claiming a feature
+    // that is not there is worse than claiming none: a Makefile branches on
+    // this to decide whether it may use a construct, and GNU Make's test suite
+    // skips a case it names. An honest short list makes a build take the
+    // portable path; a generous one makes it take a path that then misbehaves.
+    //
+    // `define_variable_cname (".FEATURES", features, o_default, 0)` at
+    // main.c:1475, which is ahead of `decode_switches` as well — and at DEFAULT
+    // rank, so an inherited `.FEATURES` outranks it and keeps its value, which
+    // is what the bootstrap's `:=` line could not say: that assignment stood at
+    // file rank and took the name from the environment.
+    let features = EVALUATOR_FEATURES
+        .iter()
+        .map(|feature| (*feature).to_owned())
+        .chain(ev.session.flags.extra_features.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    claim_before_the_switches(&mut ev.session, ".FEATURES", Bytes::from(features));
     // `define_variable_cname ("MAKE_COMMAND", argv[0], o_default, 0)` in
     // `main`, immediately before `MAKE` is defined as the REFERENCE
     // `$(MAKE_COMMAND)` — which is why a makefile replacing MAKE_COMMAND
-    // changes what `$(MAKE)` runs, and why the bootstrap's `MAKE?=` line names
-    // the reference rather than the path.
+    // changes what `$(MAKE)` runs, and why the `MAKE` claim below names the
+    // reference rather than the path.
     let command = Bytes::from(
         ev.session
             .flags
@@ -231,6 +230,22 @@ fn install_worked_out_variables(ev: &mut Evaluator, targets: &[Symbol]) -> Resul
             .to_vec(),
     );
     claim_at_default(&mut ev.session, "MAKE_COMMAND", command);
+    // `define_variable_cname ("MAKE", "$(MAKE_COMMAND)", o_default, 1)`, the
+    // one name here whose trailing flag is a 1: `MAKE` is RECURSIVE, and that
+    // is what makes it a reference rather than a copy. It was a bootstrap
+    // `MAKE?=` line, and a `?=` is the one assignment GNU Make declines
+    // without promoting — `do_variable_definition` returns on a name already
+    // bound before it reaches `define_variable_in_set` — so an inherited `MAKE`
+    // read `environment` under `-e` where GNU says `environment override`.
+    let make = if ev.session.flags.generate_ninja {
+        // Generating a build file rather than running one: there is no
+        // `MAKE_COMMAND` a child could re-run, so `$(MAKE)` names the tool the
+        // generated file will be built with, at this run's job budget.
+        Bytes::from(format!("make -j{}", ev.session.flags.num_jobs.max(1)))
+    } else {
+        Bytes::from_static(b"$(MAKE_COMMAND)")
+    };
+    claim_recursive_at_default(&mut ev.session, "MAKE", make)?;
     // The search path `-I` built, in the spelling `construct_include_path`
     // (read.c) records: every directory stat'ed, the ones that are not there
     // left out, and trailing slashes discarded. GNU's list ends with the
@@ -387,6 +402,45 @@ fn claim_at_default(session: &mut Session, name: &str, value: Bytes) {
     );
 }
 
+/// The same, for a name GNU Make defines before it has read its switches, where
+/// `-e` is not yet in force and the environment's binding is not promoted.
+///
+/// See [`crate::builtins::claimable_before_the_switches`] for which names those
+/// are and why the distinction is a fact about the write rather than the name.
+fn claim_before_the_switches(session: &mut Session, name: &str, value: Bytes) {
+    let Some(sym) = crate::builtins::claimable_before_the_switches(session, name) else {
+        return;
+    };
+    session.globals.define(
+        sym,
+        Variable::with_simple_string(value, VarOrigin::Default, None, None),
+    );
+}
+
+/// Bind `name` to a RECURSIVE expression at default rank, on the same terms.
+///
+/// The trailing argument to `define_variable_cname` is the recursive flag, and
+/// `MAKE` is the one name here that is given a 1. A Makefile can see the
+/// difference through `$(flavor)` and `$(value)`, and for this name it is the
+/// whole point: `$(value MAKE)` reads back `$(MAKE_COMMAND)`, so a Makefile
+/// that replaces `MAKE_COMMAND` changes the program `$(MAKE)` runs.
+///
+/// # Errors
+///
+/// Returns a parse failure for the expression, which is a defect here.
+fn claim_recursive_at_default(session: &mut Session, name: &str, text: Bytes) -> Result<()> {
+    let Some(sym) = crate::builtins::claimable(session, name) else {
+        return Ok(());
+    };
+    let mut loc = Loc::default();
+    let parsed = parse_expr(session, &mut loc, text.clone(), ParseExprOpt::Normal)?;
+    session.globals.define(
+        sym,
+        Variable::new_recursive(parsed, VarOrigin::Default, None, None, text),
+    );
+    Ok(())
+}
+
 /// Read one Makefile the command line named, into the session already open.
 ///
 /// A Makefile that is not there is not the end of the read: GNU Make says so
@@ -470,24 +524,28 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
         let val = Arc::new(Value::Literal(None, v.clone()));
         let frame = ev.current_frame();
         let sym = ev.session.intern(k.as_bytes().to_vec());
-        // One name arrives simple where every other imported name is recursive.
-        // GNU Make defines it a second time once the environment is in scope —
-        // `define_variable_cname (MAKELEVEL_NAME, buf, o_env, 0)` in
-        // `define_automatic_variables` — writing back the depth it parsed, at
-        // the environment's own rank and with the recursive flag off.
+        // Two of these names are ones GNU Make writes into the environment and
+        // then defines a second time, once the environment is in scope, at the
+        // environment's OWN rank: `define_variable_cname (MAKELEVEL_NAME, buf,
+        // o_env, 0)` in `define_automatic_variables`, writing back the depth it
+        // parsed with the recursive flag off, and `define_variable_cname
+        // ("MFLAGS", flagstring, o_env, 1)` in `define_makeflags`, writing back
+        // the switches spelled as a command line.
         //
-        // That second define is also why the name reads `environment override`
-        // under `-e` while an ordinary imported name still reads `environment`:
+        // That second define is why these two read `environment override` under
+        // `-e` while an ordinary imported name still reads `environment`.
         // `define_variable_in_set` lifts an INCOMING `o_env` define to
-        // `o_env_override` when `-e` is in force, and only a name Make defines
-        // over again is ever incoming. Saying both here rather than defining
-        // twice is the same thing said once.
+        // `o_env_override` when `-e` is in force — and lifts the binding
+        // already in the slot with it, so the two ranks are equal and the write
+        // lands. Only a name Make defines over again is ever incoming. Saying
+        // that here rather than defining twice is the same thing said once.
+        let defined_over_again = matches!(k.as_bytes(), b"MAKELEVEL" | b"MFLAGS");
+        let origin = if defined_over_again && ev.session.flags.environment_overrides {
+            VarOrigin::EnvironmentOverride
+        } else {
+            origin
+        };
         let var = if k.as_bytes() == b"MAKELEVEL" {
-            let origin = if ev.session.flags.environment_overrides {
-                VarOrigin::EnvironmentOverride
-            } else {
-                origin
-            };
             Variable::with_simple_string(v, origin, Some(frame), None)
         } else {
             Variable::new_recursive(val, origin, Some(frame), None, v)
@@ -552,7 +610,13 @@ fn install_compiler_invocation_variables(ev: &mut Evaluator) {
             command_variables,
             Variable::with_simple_string(make_overrides.clone(), VarOrigin::Automatic, None, None),
         );
-        if ev.session.peek_global_var(overrides).is_none() {
+        // Through the claim rather than a bare `is_none`, so that an inherited
+        // `MAKEOVERRIDES` is promoted under `-e` on the way to declining this
+        // write — as GNU Make's `define_variable_cname` inside the same
+        // `if (command_variables != 0)` does. Without a command-line assignment
+        // there is no define at all, and an inherited one stays `environment`
+        // in both tools.
+        if crate::builtins::claimable(&mut ev.session, "MAKEOVERRIDES").is_some() {
             ev.session.globals.define(
                 overrides,
                 Variable::new_recursive(
@@ -641,14 +705,19 @@ fn install_default_goal(ev: &mut Evaluator) -> Result<()> {
 /// catalogue: `make -R` still answers `default` here and still reads what the
 /// variable names.
 fn install_makefiles_variable(ev: &mut Evaluator) -> Result<()> {
-    let sym = ev.session.intern("MAKEFILES");
     // The environment has already been imported, and GNU Make's write is an
     // ordinary ranked one that a stronger origin declines — so an inherited
-    // `MAKEFILES` keeps its value and its origin. The attribute is set either
-    // way, because `define_variable_cname` hands back whichever variable now
-    // holds the name and `v->export = v_ifset` is written on that one.
-    if let Some(existing) = ev.session.peek_global_var(sym) {
-        existing.write().export = VarExport::IfSet;
+    // `MAKEFILES` keeps its value and its origin, and under `-e` is promoted on
+    // the way to being declined, like any other name Make defines over. The
+    // attribute is set either way, because `define_variable_cname` hands back
+    // whichever variable now holds the name and `v->export = v_ifset` is
+    // written on that one.
+    let claim = crate::builtins::claimable(&mut ev.session, "MAKEFILES");
+    let sym = ev.session.intern("MAKEFILES");
+    if claim.is_none() {
+        if let Some(existing) = ev.session.peek_global_var(sym) {
+            existing.write().export = VarExport::IfSet;
+        }
         return Ok(());
     }
     let var = Variable::with_simple_string(Bytes::new(), VarOrigin::Default, None, None);

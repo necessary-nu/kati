@@ -207,13 +207,61 @@ const POSIX_VARIABLES: &[(&str, &str)] = &[
     ("ARFLAGS", "-rv"),
 ];
 
-/// The name, if a default may still claim it.
+/// The name, if a default may still claim it — and, under `-e`, the moment the
+/// environment's binding is lifted over the makefile.
 ///
 /// GNU Make defines these through the ordinary origin ladder, and `default` is
 /// the bottom of it: anything the environment, the command line, an `override`
 /// or the Makefile itself has already said outranks a default and keeps its
 /// value. Another default does not, which is how `.POSIX:` replaces `CC`.
+///
+/// The promotion is part of the same act, and it happens whether or not the
+/// definition then lands. `define_variable_in_set` (variable.c) lifts the
+/// binding it is ABOUT to write over, and only then compares the ranks:
+///
+/// ```text
+/// if (! HASH_VACANT (v))
+///   {
+///     if (env_overrides && v->origin == o_env)
+///       /* V came from in the environment.  Since it was defined
+///          before the switches were parsed, it wasn't affected by -e.  */
+///       v->origin = o_env_override;
+///     if ((int) origin >= (int) v->origin)
+///       { ...write... }
+///   }
+/// ```
+///
+/// So `-e` does not promote the environment. It promotes exactly the names Make
+/// itself defines over, and the promoted rank is what `$(origin)` answers for
+/// the rest of the run. A name nothing ever defines over is still `environment`
+/// under `-e`, which is why an eager promotion of the whole environment would be
+/// wrong — and why `-R`, which withholds the catalogue, leaves an inherited `CC`
+/// reading `environment` while `MAKE_VERSION`, defined outside the catalogue,
+/// still reads `environment override`.
 pub(crate) fn claimable(session: &mut Session, name: &str) -> Option<Symbol> {
+    let sym = session.intern(name.as_bytes().to_vec());
+    if session.flags.environment_overrides {
+        session.globals.note_environment_outranks_the_makefile(sym);
+    }
+    match session.peek_global_var(sym) {
+        Some(existing) if existing.read().origin() != VarOrigin::Default => None,
+        _ => Some(sym),
+    }
+}
+
+/// The same test for a name GNU Make defines before it has read its switches.
+///
+/// `env_overrides` is still zero at that point, so the promotion above does not
+/// happen and the environment's binding keeps its plain `environment` rank for
+/// the rest of the run. Two names are written there — `.LOADED` and
+/// `.FEATURES`, at main.c:1436 and main.c:1475, both ahead of `decode_switches`
+/// at main.c:1624 — and the three that [`crate::var::GlobalVars::with_builtins`]
+/// binds are earlier still, ahead of the environment itself.
+///
+/// A name defined here is not exempt for good: `.POSIX:` writes `.SHELLFLAGS`
+/// again while the makefile is being read, and that write promotes like any
+/// other. It is the write that carries the answer, not the name.
+pub(crate) fn claimable_before_the_switches(session: &mut Session, name: &str) -> Option<Symbol> {
     let sym = session.intern(name.as_bytes().to_vec());
     match session.peek_global_var(sym) {
         Some(existing) if existing.read().origin() != VarOrigin::Default => None,
