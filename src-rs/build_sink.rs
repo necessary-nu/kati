@@ -255,6 +255,24 @@ pub struct SinkRule<'a> {
     /// before it runs the rule. Nothing else about the edge is deferred: its
     /// shape is settled here as it always was.
     pub deferred_recipe: Option<DeferredRecipeId>,
+    /// The processes the recipe behind [`Self::command`] really is, in
+    /// written order, for a sink that can run several.
+    ///
+    /// GNU Make runs each command line of a recipe as its own process, and
+    /// [`Self::command`] is the whole recipe assembled into one script for a
+    /// destination that can only hold one. A destination that can launch them
+    /// separately does, and the assembled script stays as the edge's name —
+    /// what a progress line, a log entry and a `-n` all want.
+    ///
+    /// Empty when the recipe's own shape makes the split unsound rather than
+    /// merely unwanted: a script the depfile extraction rewrote, a recipe
+    /// composed into child graphs whose edge does not run the whole of it, and
+    /// a recipe of nothing. A sink is free to refuse the split for reasons of
+    /// its own on top of that — a line too long to be an argument is one.
+    ///
+    /// A recipe the sink asked to have deferred carries its steps on the
+    /// expansion instead, where the text finally exists.
+    pub steps: &'a [crate::ninja::RecipeStep],
     /// Recursive `$(MAKE)` invocations extracted from the recipe in their
     /// written order. A graph sink compiles these as semantic subninjas rather
     /// than handing nested Make processes to its executor.

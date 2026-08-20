@@ -481,7 +481,17 @@ fn recipe_steps(
     script: &Bytes,
 ) -> Vec<RecipeStep> {
     let step = |text: Bytes, shell_flags: Bytes, ignore_error: bool| RecipeStep {
-        direct: crate::simple_command::direct_argv(&text, shell, &shell_flags, flags.one_shell),
+        // A line still holding a value the scheduler binds is not a line this
+        // can be decided about: `construct_command_argv` reads the FINISHED
+        // text, and the placeholder is not it. Such a line goes to a shell,
+        // which is where the scheduler's substitution lands and is what the
+        // whole recipe did before it was one line at a time.
+        direct: memmem::find(&text, crate::command::DEFERRED_NEW_INPUTS_REFERENCE)
+            .is_none()
+            .then(|| {
+                crate::simple_command::direct_argv(&text, shell, &shell_flags, flags.one_shell)
+            })
+            .flatten(),
         text,
         shell: shell.clone(),
         shell_flags,
@@ -1388,6 +1398,8 @@ impl<'a> NinjaGenerator<'a> {
                     // Absent for the same reason: the scope is read when the
                     // recipe is expanded, and arrives on the expansion.
                     recipe_environment: &[],
+                    // As are the steps: there are no lines yet to be one per.
+                    steps: &[],
                     deferred_recipe: Some(deferred),
                     subninjas: &[],
                     residual_command: None,
@@ -1541,12 +1553,33 @@ impl<'a> NinjaGenerator<'a> {
                 Some(scope) => crate::export::scoped_environment(self.ce.ev, scope)?,
                 None => Vec::new(),
             };
+            // The launches this recipe really is, for a sink that can run
+            // several — the same list a deferred recipe carries on its
+            // expansion, made here because this recipe was read here.
+            //
+            // Withheld where the edge does not run the assembled script as
+            // written: a depfile extraction rewrites it and names a file off
+            // it, and a recipe composed into child graphs runs in segments
+            // that are not these lines. In both cases the script is what the
+            // edge is, and the steps would be a different program.
+            let steps = if depfile.is_some() || contains_recursive {
+                Vec::new()
+            } else {
+                recipe_steps(
+                    &self.ce.ev.session.flags,
+                    &translated,
+                    &self.shell,
+                    &script_flags,
+                    &script,
+                )
+            };
             sink.declare_rule(
                 &self.ce.ev.session,
                 &SinkRule {
                     id,
                     shell: &self.shell,
                     recipe_environment: &recipe_environment,
+                    steps: &steps,
                     shell_flags: &script_flags,
                     command: if too_long_for_argv {
                         SinkCommand::ResponseFile(&script)
@@ -2871,6 +2904,7 @@ mod tests {
                     shell_flags: b"-c",
                     command,
                     recipe_environment: &[],
+                    steps: &[],
                     deferred_recipe: None,
                     subninjas: &[],
                     residual_command: None,
