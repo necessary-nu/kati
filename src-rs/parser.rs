@@ -1172,6 +1172,65 @@ mod tests {
         );
     }
 
+    /// How many `endif`s an `else if...` whose condition cannot be read takes.
+    ///
+    /// GNU Make has two answers and picks between them while it reads.
+    /// `conditional_line` (reference/gnumake/src/read.c) recurses into the text
+    /// after an `else`, and the recursion does `o = conditionals->if_cmds++`
+    /// before it looks at the condition. On the success path the `else` gives
+    /// that level straight back with `--conditionals->if_cmds`; on the `< 0`
+    /// path it reaches `EXTRATEXT()` instead, which prints and returns, so the
+    /// level stays and the rest of the file is one `endif` short. But a
+    /// condition inside a branch that is already being ignored is never read at
+    /// all -- the recursion's own `for (i = 0; i < o; ++i) if (ignoring[i])`
+    /// returns 1 before the condition is touched -- so the same text takes one
+    /// `endif` when the `else` arm is dead and two when it is live.
+    ///
+    /// Which one is decided by the value of the enclosing condition, and this
+    /// reader compiles the whole file before it evaluates any of it. It has to
+    /// answer once, and it answers with the dead-arm reading: one `endif`
+    /// closes the `else` and the conditional the `else` carried.
+    ///
+    /// The reason is the direction of the disagreement rather than a count of
+    /// cells. This reading refuses a file GNU Make builds -- the one written
+    /// with the second `endif` that GNU Make's refusal path leaves room for --
+    /// and never builds a file GNU Make refuses. The other reading trades those
+    /// round, and contradicts `an-else-if-under-a-taken-branch-is-not-read` and
+    /// `a-second-endif-after-an-unread-else-if-is-extraneous` in the port
+    /// corpus while it is at it.
+    #[test]
+    fn an_unreadable_else_if_is_closed_by_the_endif_that_closes_the_else() {
+        let mut session = Session::new();
+        let stmts = parse_buf(
+            &mut session,
+            &Bytes::from_static(b"ifeq (a,a)\nelse ifeq (x,y junk\nendif\nX := 1\n"),
+            Loc::default(),
+        )
+        .expect("the read carries on past a condition it cannot split");
+        {
+            let top = stmts.lock();
+            assert_eq!(
+                top.len(),
+                2,
+                "the one conditional and `X := 1` after it: {top:?}"
+            );
+        }
+
+        // And so the `endif` GNU Make would have wanted for the level its
+        // refusal left standing has nothing to close here.
+        let mut session = Session::new();
+        let refused = parse_buf(
+            &mut session,
+            &Bytes::from_static(b"ifeq (a,a)\nelse ifeq (x,y junk\nendif\nendif\nX := 1\n"),
+            Loc::default(),
+        )
+        .expect_err("a second endif closes nothing");
+        assert!(
+            refused.to_string().contains("extraneous 'endif'"),
+            "{refused}"
+        );
+    }
+
     /// Which refusals carry a first string and which do not, which is the
     /// whole of what decides whether the expansion has happened when the
     /// condition is refused.
