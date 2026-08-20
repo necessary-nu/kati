@@ -398,9 +398,10 @@ class Parser {
   void ParseEndif(std::string_view line, std::string_view) {
     if (!CheckIfStack("endif"))
       return;
+    // GNU Make's EXTRATEXT is `error`, which prints and returns; only the
+    // `endif` with no conditional open beside it is `fatal`.
     if (!line.empty()) {
-      Error("extraneous text after 'endif' directive");
-      return;
+      WARN_LOC(loc_, "extraneous text after 'endif' directive");
     }
     int num_nest = if_stack_.top().num_nest;
     for (int i = 0; i <= num_nest; i++) {

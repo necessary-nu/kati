@@ -624,8 +624,13 @@ impl<'a> Parser<'a> {
 
     fn parse_endif(&mut self, line: Bytes) -> Result<()> {
         self.check_if_stack("endif")?;
+        // Complained about and then read anyway. GNU Make's `conditional_line`
+        // says this through `EXTRATEXT`, which is `error` — the call that
+        // prints and returns — where the `endif` with no conditional open
+        // beside it is `EXTRACMD`, which is `fatal`. Two spellings, one line
+        // apart in read.c, and only the second ends the read.
         if !line.is_empty() {
-            error_loc!(
+            warn_loc!(
                 &*self.session,
                 Some(&self.loc),
                 "extraneous text after 'endif' directive"
