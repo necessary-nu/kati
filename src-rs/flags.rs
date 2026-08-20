@@ -216,19 +216,16 @@ pub struct Flags {
     /// never does.
     pub extra_features: Vec<String>,
 
-    /// Where `-I` says to look for an `include` the working directory does not
-    /// have, in the order given.
-    pub include_dirs: Vec<PathBuf>,
-
-    /// `-I -`: search nothing but what a later `-I` names.
+    /// What every `-I` named, in the order given and in the spelling the switch
+    /// table stores.
     ///
-    /// The switch forgets the directories before it, which the front end does
-    /// by clearing the list above — and it also turns off the built-in default
-    /// search path for the rest of the run, which nothing in a list of
-    /// directories can say. `construct_include_path` (read.c) keeps that as a
-    /// `disable` flag it never clears, so `make -I - -I inc` searches `inc`
-    /// alone rather than `inc` and the defaults.
-    pub no_default_include_dirs: bool,
+    /// The switch table's own list rather than a search path: a bare `-` is an
+    /// entry in it, not a state, because `construct_include_path` (read.c)
+    /// reads the list from the start on every call and reaches the `-` where it
+    /// was written. That is what makes `-I inc -I - -I inc` search nothing at
+    /// all — the second `inc` is de-duplicated away before it is ever stored,
+    /// so the reset has nothing after it to restore.
+    pub include_dirs: Vec<PathBuf>,
 
     /// `.EXPORT_ALL_VARIABLES`: every variable the Makefile defined reaches the
     /// recipe's environment without being named.

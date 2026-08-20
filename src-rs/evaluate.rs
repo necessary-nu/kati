@@ -338,18 +338,32 @@ const DEFAULT_INCLUDE_DIRECTORIES: &[&str] =
 /// there, with trailing slashes discarded — `-I nosuchdir` leaves the list
 /// unchanged and `-I inc/` joins it as `inc`. Then the built-in default
 /// directories go on the END, under the same test, so a `-I` always wins over
-/// them; unless an `-I -` turned them off, which it does for the rest of the
-/// run rather than merely restarting the list.
+/// them; unless an `-I -` turned them off.
 ///
-/// Nothing is de-duplicated: `make -I /usr/include` names that directory twice,
-/// once from the switch and once from the default path, and GNU Make lists it
-/// twice.
+/// `-` IS AN ENTRY IN THE LIST rather than a state the switch table remembers,
+/// which is what makes its position readable here: it empties the path built so
+/// far and turns the built-in directories off for good, and a `-I` after it
+/// starts the list again with the defaults still off. The distinction is
+/// observable because the switch table de-duplicates what it stores — a second
+/// `-I -` is dropped as a duplicate and so resets nothing, and a `-I inc`
+/// repeated across a `-I -` is dropped too and so does not come back.
+///
+/// Nothing is de-duplicated HERE: `make -I /usr/include` names that directory
+/// twice, once from the switch and once from the default path, and GNU Make
+/// lists it twice.
 fn construct_include_path(ev: &Evaluator) -> Vec<PathBuf> {
+    let home = own_home(&ev.session);
     let mut path = Vec::new();
+    let mut disable = false;
     for dir in &ev.session.flags.include_dirs {
-        push_directory(&mut path, tilde_expand(&ev.session, dir));
+        if dir.as_os_str().as_bytes() == b"-" {
+            disable = true;
+            path.clear();
+            continue;
+        }
+        push_directory(&mut path, tilde_expand(home.as_deref(), dir));
     }
-    if !ev.session.flags.no_default_include_dirs {
+    if !disable {
         for dir in DEFAULT_INCLUDE_DIRECTORIES {
             push_directory(&mut path, PathBuf::from(dir));
         }
@@ -370,30 +384,39 @@ fn push_directory(path: &mut Vec<PathBuf>, dir: PathBuf) {
     path.push(PathBuf::from(OsStr::from_bytes(bytes).to_owned()));
 }
 
-/// `~` as GNU Make's `tilde_expand` (read.c) expands it, which is the one
-/// rewriting a `-I` directory gets before it is stat'ed.
+/// `~` as GNU Make's `tilde_expand` (read.c) expands it.
 ///
-/// `~` and `~/...` become `HOME` and the rest of the path. Anything else — and
-/// a `~` with no `HOME` behind it — is left exactly as it stands, which then
+/// GNU Make reaches this function from two places and so does this one: the
+/// switch table canonicalises every file name a switch gave through
+/// `expand_command_line_file`, and `construct_include_path` expands a search
+/// directory again before it stats it. Both are here rather than one being
+/// copied, because a second spelling of this rule is a second answer.
+///
+/// `~` and `~/...` become `home` and the rest of the path. Anything else — and
+/// a `~` with no home behind it — is left exactly as it stands, which then
 /// fails the directory test and drops out of the search path, so it is not an
 /// error but an entry that was never there.
 ///
 /// GNU reads `$(HOME)` as a variable and falls back to `getenv`; here it is the
-/// environment either way, because this runs before any makefile could have
-/// written the name — measured, with a makefile assigning `HOME` that GNU Make
-/// also ignores.
+/// environment either way, because both callers run before any makefile could
+/// have written the name — measured, with a makefile assigning `HOME` that GNU
+/// Make also ignores.
 ///
-/// THE ONE FORM THAT IS NOT HERE is `~user`, and its absence is a decision
-/// rather than an omission. GNU Make answers it out of the passwd database, and
-/// the passwd database is the name service: `getpwnam` on a miss reaches
-/// `libnss_systemd`, which glibc has to `dlopen`. Ronin is linked
-/// `+crt-static` (.cargo/config.toml) and ships a static-pie binary, where that
-/// `dlopen` is unsupported — it segfaults inside the module rather than
-/// failing, which was measured before this was written. A build tool that
-/// crashes on `-I ~somebody` is worse than one that does not know whose home
-/// that is, and what it does instead is what GNU Make itself does for a user it
-/// cannot resolve: leave the word alone and let the directory test drop it.
-fn tilde_expand(session: &Session, dir: &Path) -> PathBuf {
+/// THE ONE FORM THAT IS NOT HERE is `~user`. GNU Make answers it out of the
+/// passwd database; this does not, and leaves the word alone — which is what
+/// GNU Make itself does for a user IT cannot resolve, so the word fails the
+/// directory test and drops out of the search path rather than erroring.
+///
+/// It is unimplemented rather than unimplementable. An earlier note here read
+/// that `getpwnam` on a miss reaches `libnss_systemd`, which glibc has to
+/// `dlopen`, and that the resulting segfault made `~user` impossible under
+/// `+crt-static`. The crash is real on a static-glibc build and is glibc's own
+/// documented NSS limitation; static glibc is not a configuration this ships
+/// in. The shipped static link is musl, whose `getpwnam` reads the files
+/// directly and cannot fail this way. So the recorded blocker was an artifact
+/// of one development host, and whoever wants `~user` is free to add it.
+#[must_use]
+pub fn tilde_expand(home: Option<&[u8]>, dir: &Path) -> PathBuf {
     let bytes = dir.as_os_str().as_bytes();
     let Some(rest) = bytes.strip_prefix(b"~") else {
         return dir.to_owned();
@@ -401,10 +424,10 @@ fn tilde_expand(session: &Session, dir: &Path) -> PathBuf {
     if !rest.is_empty() && !rest.starts_with(b"/") {
         return dir.to_owned();
     }
-    let Some(home) = own_home(session).filter(|home| !home.is_empty()) else {
+    let Some(home) = home.filter(|home| !home.is_empty()) else {
         return dir.to_owned();
     };
-    let mut expanded = home;
+    let mut expanded = home.to_vec();
     expanded.extend_from_slice(rest);
     PathBuf::from(OsString::from_vec(expanded))
 }
