@@ -247,14 +247,6 @@ fn install_worked_out_variables(ev: &mut Evaluator, targets: &[Symbol]) -> Resul
         Bytes::from_static(b"$(MAKE_COMMAND)")
     };
     claim_recursive_at_default(&mut ev.session, "MAKE", make)?;
-    // The search path `-I` built, in the spelling `construct_include_path`
-    // (read.c) records: every directory stat'ed, the ones that are not there
-    // left out, and trailing slashes discarded. GNU's list ends with the
-    // built-in default path and this one does not, because this evaluator does
-    // not search there — the variable says what a search would do, and saying
-    // more than that would be a claim about a search that never happens.
-    let dirs = include_directories(&ev.session);
-    claim_at_default(&mut ev.session, ".INCLUDE_DIRS", dirs);
     // `define_variable_cname ("CURDIR", current_directory, o_file, 0)` in
     // `main`, at FILE rank and not default. The distinction is the whole point
     // of the call: a Makefile's own `CURDIR = x` is a peer replacing it rather
@@ -351,11 +343,24 @@ const DEFAULT_INCLUDE_DIRECTORIES: &[&str] =
 /// Nothing is de-duplicated HERE: `make -I /usr/include` names that directory
 /// twice, once from the switch and once from the default path, and GNU Make
 /// lists it twice.
-fn construct_include_path(ev: &Evaluator) -> Vec<PathBuf> {
-    let home = own_home(&ev.session);
+pub(crate) fn construct_include_path(session: &mut Session) {
+    session.include_path = search_path(session);
+    // The same list, published. It is one list rather than two — the search
+    // reads it and `.INCLUDE_DIRS` publishes it — so the variable is an answer
+    // about the search rather than a second opinion about it. At DEFAULT rank,
+    // as `do_variable_definition (... o_default, f_simple)` puts it, so a
+    // makefile that assigned the name itself keeps its own value through every
+    // rebuild of the path.
+    let dirs = include_directories(session);
+    claim_at_default(session, ".INCLUDE_DIRS", dirs);
+}
+
+/// The search path itself, without publishing it.
+fn search_path(session: &Session) -> Vec<PathBuf> {
+    let home = own_home(session);
     let mut path = Vec::new();
     let mut disable = false;
-    for dir in &ev.session.flags.include_dirs {
+    for dir in &session.flags.include_dirs {
         if dir.as_os_str().as_bytes() == b"-" {
             disable = true;
             path.clear();
@@ -970,10 +975,8 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
 
     // GNU Make's `construct_include_path` (main.c:1831), in its place: after
     // the environment, because a `-I ~` reads `HOME` out of it, and before
-    // anything can include a file. It is one list rather than two — the search
-    // reads it and `.INCLUDE_DIRS` publishes it — so the variable is an answer
-    // about the search rather than a second opinion about it.
-    ev.session.include_path = construct_include_path(&ev);
+    // anything can include a file.
+    construct_include_path(&mut ev.session);
 
     // The names GNU Make works out for itself, before the bootstrap Makefile so
     // that a line in it could still outrank one — none does today, and the

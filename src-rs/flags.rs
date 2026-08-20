@@ -56,6 +56,15 @@ pub struct DecodedMakeflags {
     pub carried: Bytes,
     /// The same switches in command-line spelling.
     pub mflags: Bytes,
+    /// The switch table's `-I` list as the write left it.
+    ///
+    /// A list rather than a bit, because `reset_makeflags` (main.c) calls
+    /// `construct_include_path (include_dirs ? include_dirs->list : NULL)` on
+    /// every write: a makefile's `MAKEFLAGS += -I dir` has to reach the search
+    /// before the next `include`, and a `-I -` it writes has to turn the
+    /// built-in directories off there and then. The frontend replays the whole
+    /// table, so this is the accumulated list and not the addition.
+    pub include_dirs: Vec<PathBuf>,
     pub is_dry_run: bool,
     pub is_silent_mode: bool,
     pub ignore_errors: bool,

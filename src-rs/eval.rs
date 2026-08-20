@@ -1064,6 +1064,13 @@ impl Evaluator {
         self.session.flags.environment_overrides = decoded.environment_overrides;
         self.session.flags.no_builtin_rules = decoded.no_builtin_rules;
         self.session.flags.no_builtin_variables = decoded.no_builtin_variables;
+        // `construct_include_path (include_dirs ? include_dirs->list : NULL)`,
+        // the middle of `reset_makeflags`'s three calls (main.c:3126). The
+        // search path is not a startup fact: a makefile writing `MAKEFLAGS`
+        // may have named a directory an `include` two lines later needs, or
+        // written a `-I -` that turns the built-in ones off from here on.
+        self.session.flags.include_dirs = decoded.include_dirs;
+        crate::evaluate::construct_include_path(&mut self.session);
         if let Some(state) = &mut self.session.flags.makeflags_assignment {
             state.effective = decoded.carried;
         }
