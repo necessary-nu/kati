@@ -227,6 +227,11 @@ pub struct TranslatedLine {
     /// The line was written with a `-` prefix, or `-i`/`.IGNORE` is in force:
     /// its failure is reported and the recipe carries on past it.
     pub ignore_error: bool,
+    /// GNU Make's `COMMANDS_RECURSE` for this line: a `+` prefix, or an
+    /// unexpanded `$(MAKE)` reference. What the destination does with it is the
+    /// destination's — the classification itself is read from the recipe long
+    /// before anything decides to pretend.
+    pub recursive_line: bool,
     /// The flags the shell for this line takes.
     pub shell_flag: Bytes,
     /// kati's own `.KATI_DEPFILE`-adjacent request that the line not be put in
@@ -263,6 +268,15 @@ pub struct RecipeStep {
     /// A nonzero status from this step is an error Make was told to ignore:
     /// it is not the recipe's answer and the steps after it still run.
     pub ignore_error: bool,
+    /// GNU Make's `COMMANDS_RECURSE` for this step: it was written with a `+`,
+    /// or its unexpanded text named `$(MAKE)`.
+    ///
+    /// `start_job_command` (job.c) tests it three times, once for each of the
+    /// switches that would otherwise stand in for running the line: `-n`, `-t`
+    /// and `-q` each step aside for a step that carries it. Under `.ONESHELL`
+    /// the whole recipe is one step and the marker is the first written line's,
+    /// which is where GNU Make reads the prefixes off the assembled script.
+    pub recursive_line: bool,
     /// The argument list to exec with no shell in between, when nothing in the
     /// line needs one.
     ///
@@ -480,25 +494,27 @@ fn recipe_steps(
     script_flags: &Bytes,
     script: &Bytes,
 ) -> Vec<RecipeStep> {
-    let step = |text: Bytes, shell_flags: Bytes, ignore_error: bool| RecipeStep {
-        // A line still holding a value the scheduler binds is not a line this
-        // can be decided about: `construct_command_argv` reads the FINISHED
-        // text, and the placeholder is not it. Such a line goes to a shell,
-        // which is where the scheduler's substitution lands and is what the
-        // whole recipe did before it was one line at a time. The test is the
-        // prefix the three references share, because `$?` and its two path
-        // forms are each deferred under a name of their own.
-        direct: memmem::find(&text, crate::command::DEFERRED_NEW_INPUTS_PREFIX)
-            .is_none()
-            .then(|| {
-                crate::simple_command::direct_argv(&text, shell, &shell_flags, flags.one_shell)
-            })
-            .flatten(),
-        text,
-        shell: shell.clone(),
-        shell_flags,
-        ignore_error,
-    };
+    let step =
+        |text: Bytes, shell_flags: Bytes, ignore_error: bool, recursive_line: bool| RecipeStep {
+            // A line still holding a value the scheduler binds is not a line this
+            // can be decided about: `construct_command_argv` reads the FINISHED
+            // text, and the placeholder is not it. Such a line goes to a shell,
+            // which is where the scheduler's substitution lands and is what the
+            // whole recipe did before it was one line at a time. The test is the
+            // prefix the three references share, because `$?` and its two path
+            // forms are each deferred under a name of their own.
+            direct: memmem::find(&text, crate::command::DEFERRED_NEW_INPUTS_PREFIX)
+                .is_none()
+                .then(|| {
+                    crate::simple_command::direct_argv(&text, shell, &shell_flags, flags.one_shell)
+                })
+                .flatten(),
+            text,
+            shell: shell.clone(),
+            shell_flags,
+            ignore_error,
+            recursive_line,
+        };
     if flags.one_shell {
         if script.is_empty() {
             return Vec::new();
@@ -507,6 +523,15 @@ fn recipe_steps(
             script.clone(),
             script_flags.clone(),
             translated.wholly_ignored,
+            // The first written line's, because `.ONESHELL` hands the whole
+            // recipe to one shell and GNU Make reads the prefixes off the front
+            // of what it hands over. Probed against 4.4.1: a `+` on the first
+            // line runs the whole script under `-t`, and one on the second line
+            // does not.
+            translated
+                .kept()
+                .next()
+                .is_some_and(|line| line.recursive_line),
         )];
     }
     translated
@@ -516,6 +541,7 @@ fn recipe_steps(
                 line.text.clone(),
                 line.shell_flag.clone(),
                 line.ignore_error,
+                line.recursive_line,
             )
         })
         .collect()
@@ -1198,6 +1224,7 @@ impl<'a> NinjaGenerator<'a> {
                 ignore_error: c.ignore_error,
                 shell_flag: c.shell_flag.clone(),
                 force_no_subshell: c.force_no_subshell,
+                recursive_line: c.recursive_line,
             }));
         }
         TranslatedRecipe {
