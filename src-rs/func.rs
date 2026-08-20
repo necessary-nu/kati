@@ -1192,6 +1192,9 @@ fn deferred_output(message: &[u8], suffix: &[u8]) -> Bytes {
 
 fn info_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> Result<()> {
     let a = args[0].eval_to_buf(ev)?;
+    if ev.repeats_a_finished_read() {
+        return Ok(());
+    }
     if ev.defers_output_to_the_recipe() {
         ev.delayed_output_commands.push(deferred_output(&a, b""));
     } else {
@@ -1202,6 +1205,9 @@ fn info_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> 
 
 fn warning_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> Result<()> {
     let a = args[0].eval_to_buf(ev)?;
+    if ev.repeats_a_finished_read() {
+        return Ok(());
+    }
     if ev.defers_output_to_the_recipe() {
         let mut message = BytesMut::new();
         let loc = ev.loc.clone().unwrap_or_default();
@@ -1317,6 +1323,13 @@ fn file_write_func(
     text: Bytes,
     rerun: bool,
 ) -> Result<()> {
+    // The write this read would perform was performed by the read before it,
+    // over this same text. `$(file >> log,pass)` appends one line to `log`
+    // however many passes the compilation takes, which is the one line GNU
+    // Make's single read appends.
+    if ev.repeats_a_finished_read() {
+        return Ok(());
+    }
     {
         let opened = File::options()
             .write(true)

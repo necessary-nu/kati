@@ -3031,6 +3031,23 @@ impl Evaluator {
         self.avoid_io && self.output_evaluation == OutputEvaluation::RecipeCommand
     }
 
+    /// Whether what a read does on the way through has been done already.
+    ///
+    /// A front end that compiles a recursive child into its parent's graph
+    /// reads the whole makefile again once the parent's staged work exists,
+    /// because until it does the child's makefile cannot be read at all. The
+    /// text has not moved, so the second read would say and write exactly what
+    /// the first one said and wrote. GNU Make has no such pass, so a Makefile
+    /// that could see the repeat would be seeing this front end rather than
+    /// its own build. See [`Flags::is_repeated_read`](crate::flags::Flags).
+    ///
+    /// Only what a call does is held back. What a call answers is not: a
+    /// `$(shell)` or a `$(wildcard)` has to hand a value to the expansion that
+    /// asked, and there is nothing to hand back but the answer this read gets.
+    pub fn repeats_a_finished_read(&self) -> bool {
+        self.session.flags.is_repeated_read
+    }
+
     pub fn get_shell(&mut self) -> Result<Bytes> {
         self.eval_var(Symbol::SHELL)
     }

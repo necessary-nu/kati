@@ -95,6 +95,23 @@ pub struct Flags {
     pub generate_ninja: bool,
     pub generate_empty_ninja: bool,
     pub is_dry_run: bool,
+    /// Whether this unit's makefile was already read, over this same text, on
+    /// an earlier pass of the same compilation.
+    ///
+    /// A front end that compiles a recursive child into its parent's graph
+    /// cannot read the child's makefile until the parent's staged work is on
+    /// the ground, so it reads everything again once that work exists. GNU
+    /// Make has no such pass — it reads once, before any recipe runs — and a
+    /// Makefile must not be able to tell that this one happened. What a read
+    /// does on the way through therefore happens on the first read of a
+    /// makefile and not on the repeats: `$(info)` says its piece once,
+    /// `$(warning)` warns once, and `$(file >>)` appends one line, all with
+    /// the values the first read had, which are the values GNU Make's one read
+    /// would have had.
+    ///
+    /// This is not what `-s` is. `$(info)` is a Makefile speaking rather than
+    /// a recipe being echoed, and `-s` leaves it alone.
+    pub is_repeated_read: bool,
     pub is_silent_mode: bool,
     pub is_syntax_check_only: bool,
     pub regen: bool,
