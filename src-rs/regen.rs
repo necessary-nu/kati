@@ -425,8 +425,11 @@ impl StampChecker {
 
         collect_stats_with_slow_report!(session, "shell time (regen)", &sr.cmd);
         let (_status, output) = run_command(
-            sr.shell.as_bytes(),
-            sr.shellflag.as_bytes(),
+            crate::fileutil::ShellToReadWith {
+                program: sr.shell.as_bytes(),
+                flag: sr.shellflag.as_bytes(),
+                stand_in: session.flags.default_shell_program.as_deref(),
+            },
             &cmd,
             // Replaying a recorded `$(shell)` to see whether it still answers
             // the same thing happens without an evaluation to ask for a scope,
@@ -435,7 +438,6 @@ impl StampChecker {
             crate::fileutil::RedirectStderr::DevNull,
             "",
             &session.diagnostics,
-            session.flags.default_shell_program.as_deref(),
         )?;
         let output = format_for_command_substitution(output);
         if sr.result != output {

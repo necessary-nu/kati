@@ -679,14 +679,16 @@ fn shell_func_impl(
 
     collect_stats_with_slow_report!(session, "func shell time", OsStr::from_bytes(cmd));
     let (status, output) = run_command(
-        shell,
-        shellflag,
+        crate::fileutil::ShellToReadWith {
+            program: shell,
+            flag: shellflag,
+            stand_in: session.flags.default_shell_program.as_deref(),
+        },
         cmd,
         environment,
         RedirectStderr::None,
         &crate::diagnostic_prefix(session),
         crate::session::Context::diagnostics(session),
-        session.flags.default_shell_program.as_deref(),
     )?;
     let output = Bytes::from(match trailing {
         Trailing::Drop => format_for_command_substitution(output),

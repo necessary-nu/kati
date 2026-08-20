@@ -177,8 +177,11 @@ impl<'a> Executor<'a> {
             }
             if !self.ce.ev.session.flags.is_dry_run {
                 let (status, output) = run_command(
-                    &self.shell,
-                    &command.shell_flag,
+                    crate::fileutil::ShellToReadWith {
+                        program: &self.shell,
+                        flag: &command.shell_flag,
+                        stand_in: self.ce.ev.session.flags.default_shell_program.as_deref(),
+                    },
                     &command.cmd,
                     // This executor applied the exported set to its own
                     // environment before the first recipe started.
@@ -186,7 +189,6 @@ impl<'a> Executor<'a> {
                     RedirectStderr::Stdout,
                     &crate::diagnostic_prefix(&self.ce.ev.session),
                     &self.ce.ev.session.diagnostics,
-                    self.ce.ev.session.flags.default_shell_program.as_deref(),
                 )?;
                 // The command was waited for, so whatever it did to the
                 // filesystem is what the next recipe's expansion has to see.

@@ -76,6 +76,17 @@ fn system_message(error: &std::io::Error) -> String {
     .to_owned()
 }
 
+/// Which shell reads a command, in the three parts that always travel
+/// together: `$(SHELL)`, the `$(.SHELLFLAGS)` it takes ahead of the command,
+/// and the executable standing in for the default shell where the build
+/// declared one.
+#[derive(Clone, Copy)]
+pub struct ShellToReadWith<'a> {
+    pub program: &'a [u8],
+    pub flag: &'a [u8],
+    pub stand_in: Option<&'a Path>,
+}
+
 /// Run one command and read back what it wrote.
 ///
 /// `environment` is what Make's export set says about the child: a name bound
@@ -85,15 +96,18 @@ fn system_message(error: &std::io::Error) -> String {
 /// never touched reaches the child as the bytes this process was started with,
 /// unexpanded.
 pub fn run_command(
-    shell: &[u8],
-    shellflag: &[u8],
+    shell: ShellToReadWith<'_>,
     cmd: &Bytes,
     environment: &[(Bytes, Option<Bytes>)],
     redirect_stderr: RedirectStderr,
     diagnostic_prefix: &str,
     diagnostics: &crate::diagnostics::Diagnostics,
-    default_shell_program: Option<&Path>,
 ) -> Result<(ExitStatus, Vec<u8>)> {
+    let ShellToReadWith {
+        program: shell,
+        flag: shellflag,
+        stand_in: default_shell_program,
+    } = shell;
     // A line with no shell syntax in it is exec'd directly, exactly as GNU
     // Make's `construct_command_argv_internal` does — so a program that is not
     // there is reported against its own name and by whoever went looking,
