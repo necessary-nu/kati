@@ -34,6 +34,15 @@ use bytes::Bytes;
 /// embedding Make frontend owns the option grammar. This value is the narrow
 /// boundary between them: kati never grows a second GNU Make option parser.
 pub struct DecodedMakeflags {
+    /// The words of the write that bound a name rather than setting a switch.
+    ///
+    /// GNU Make reads these through the same `handle_non_switch_argument` as a
+    /// command line's, and `try_variable_definition` then defines each at the
+    /// origin the write carried — `o_file` for a Makefile's own. So they are
+    /// ordinary Makefile assignments made where the write stands, and the
+    /// evaluator applies them: the frontend owns the splitting, kati owns what
+    /// an assignment means.
+    pub assignments: Vec<Bytes>,
     /// `MAKEFLAGS` before the optional `MAKEOVERRIDES` reference.
     pub makeflags: Bytes,
     /// The switch table the next assignment is decoded over.

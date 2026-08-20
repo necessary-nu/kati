@@ -1067,7 +1067,51 @@ impl Evaluator {
         if let Some(state) = &mut self.session.flags.makeflags_assignment {
             state.effective = decoded.carried;
         }
+        // Last, so a write that binds `MAKEFLAGS` itself leaves the global the
+        // nested normalisation produced rather than the one this call was
+        // holding: `set_global_var` replaces the binding, and the handle above
+        // would be writing into a variable the table no longer names.
+        for word in decoded.assignments {
+            self.apply_makeflags_assignment(&word)?;
+        }
         Ok(())
+    }
+
+    /// Define what one word of a `MAKEFLAGS` write named.
+    ///
+    /// GNU Make reads the word with `try_variable_definition`, which is
+    /// `parse_variable_definition` — the same scanner a Makefile line goes
+    /// through — followed by an ordinary definition at the origin the write
+    /// carried. So the whole grammar comes along: `:=` is simple, `+=` appends
+    /// to what the name already holds, `?=` declines to speak over a value,
+    /// `!=` runs a shell, and a word the scanner rejects is not a definition at
+    /// all and is dropped. `a:b=c` is that last case — a `:` outside an
+    /// operator ends the scan — and GNU Make leaves `a:b` undefined.
+    ///
+    /// The word is evaluated as the statement it is rather than defined by
+    /// hand, because a definition made here is a definition: an origin ladder
+    /// decides whether it lands, `export` carries, and a name it binds may be
+    /// `MAKEFLAGS` again.
+    fn apply_makeflags_assignment(&mut self, word: &Bytes) -> Result<()> {
+        let Some(definition) = scan_variable_definition(word, 0) else {
+            return Ok(());
+        };
+        let mut loc = self.loc.clone().unwrap_or_default();
+        let name = parse_expr(
+            &mut self.session,
+            &mut loc,
+            word.slice(definition.name),
+            ParseExprOpt::Normal,
+        )?;
+        let orig_rhs = word.slice(definition.value_start..);
+        let rhs = parse_expr(
+            &mut self.session,
+            &mut loc,
+            orig_rhs.clone(),
+            ParseExprOpt::Normal,
+        )?;
+        let statement = AssignStmt::new(loc, name, rhs, orig_rhs, definition.op, None, false);
+        self.eval_assign(&statement)
     }
 
     pub fn new(session: Session) -> Self {
