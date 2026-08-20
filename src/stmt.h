@@ -117,10 +117,33 @@ struct CommandStmt : public Stmt {
   virtual std::string DebugString() const;
 };
 
+// What reading an `ifeq`/`ifneq` condition found, and did not say.
+//
+// GNU Make's `conditional_line` (reference/gnumake/src/read.c) decides it is
+// ignoring BEFORE it reaches either the `ifdef` arm or the `ifeq` arm, so a
+// condition inside a branch that is not being taken is never split, never
+// expanded and never complained about -- it is only counted, so that the
+// `endif` closing it can be found. kati reads a whole makefile into statements
+// before it evaluates any of them, so the reading has to happen where GNU's
+// does: what the split found is carried on the statement and said when, and
+// only if, the statement is reached.
+enum struct CondComplaint {
+  // The split read the condition and nothing followed its close.
+  NONE,
+  // The condition's close never arrived. GNU returns -1 and its caller is
+  // `fatal`: `*** invalid syntax in conditional.`
+  UNREADABLE,
+  // Text followed the condition's close. GNU's `EXTRATEXT` is `error` -- it
+  // prints and the read carries on.
+  EXTRANEOUS_TEXT,
+};
+
 struct IfStmt : public Stmt {
   CondOp op;
   Value* lhs;
   Value* rhs;
+  // What the split owed this statement, held until the statement is reached.
+  CondComplaint complaint = CondComplaint::NONE;
   std::vector<Stmt*> true_stmts;
   std::vector<Stmt*> false_stmts;
 

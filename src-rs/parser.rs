@@ -28,8 +28,8 @@ use crate::{
     loc::Loc,
     session::Session,
     stmt::{
-        AssignDirective, AssignModifiers, AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt,
-        IfStmt, IncludeStmt, RuleStmt, Stmt, UndefineStmt, VpathStmt,
+        AssignDirective, AssignModifiers, AssignOp, AssignStmt, CommandStmt, CondComplaint, CondOp,
+        ExportStmt, IfStmt, IncludeStmt, ParseErrorStmt, RuleStmt, Stmt, UndefineStmt, VpathStmt,
     },
     strutil::{
         find_end_of_line, find_outside_paren, find_outside_reference,
@@ -271,7 +271,16 @@ impl<'a> Parser<'a> {
         if !self.if_stack.is_empty() {
             let mut loc = self.loc.clone();
             loc.line += 1;
-            error_loc!(&*self.session, Some(&loc), "*** missing 'endif'.");
+            // Said where GNU Make says it: at the end of the read, once every
+            // line above has been read and everything those lines do has
+            // happened. It stands at the FILE's level rather than in whichever
+            // branch was still open, because GNU checks `conditionals->if_cmds`
+            // whether or not it was ignoring — and standing there is also what
+            // lets a conditional whose own condition could not be read speak
+            // first, which is the order a one-pass read produces.
+            self.stmts
+                .lock()
+                .push(ParseErrorStmt::new(loc, "*** missing 'endif'.".to_string()));
         }
         if self.define_name.is_some() {
             let mut loc = self.loc.clone();
@@ -584,7 +593,7 @@ impl<'a> Parser<'a> {
         };
         let mut mutable_loc = loc.clone();
         let lhs = parse_expr(self.session, &mut mutable_loc, line, ParseExprOpt::Normal)?;
-        let stmt = IfStmt::new(loc, op, lhs, None);
+        let stmt = IfStmt::new(loc, op, lhs, None, None);
         self.out_stmts.lock().push(stmt.clone());
         self.enter_if(stmt);
         Ok(())
@@ -598,38 +607,36 @@ impl<'a> Parser<'a> {
             CondOp::Ifeq
         };
 
-        let Some(condition) = split_ifeq_condition(&line) else {
-            error_loc!(
-                &*self.session,
-                Some(&self.loc),
-                "*** invalid syntax in conditional."
-            );
+        // Neither what the split found nor what followed the condition is said
+        // here. GNU Make would not have looked at this line's condition at all
+        // unless the branch around it is being taken, so both are carried on
+        // the statement and reach the evaluator, which is where GNU decides.
+        // The statement stands either way, because an unreadable condition is
+        // still a conditional as far as the `endif` closing it is concerned.
+        let (lhs_text, rhs_text, complaint) = match split_ifeq_condition(&line) {
+            Some(condition) => (
+                line.slice(condition.lhs),
+                line.slice(condition.rhs),
+                (condition.rest < line.len()).then_some(CondComplaint::ExtraneousText),
+            ),
+            None => (Bytes::new(), Bytes::new(), Some(CondComplaint::Unreadable)),
         };
 
         let mut mutable_loc = loc.clone();
         let lhs = parse_expr(
             self.session,
             &mut mutable_loc,
-            line.slice(condition.lhs),
+            lhs_text,
             ParseExprOpt::Normal,
         )?;
         let rhs = parse_expr(
             self.session,
             &mut mutable_loc,
-            line.slice(condition.rhs),
+            rhs_text,
             ParseExprOpt::Normal,
         )?;
 
-        if condition.rest < line.len() {
-            warn_loc!(
-                &*self.session,
-                Some(&self.loc),
-                "extraneous text after '{}' directive",
-                String::from_utf8_lossy(directive)
-            )
-        }
-
-        let stmt = IfStmt::new(loc, op, lhs, Some(rhs));
+        let stmt = IfStmt::new(loc, op, lhs, Some(rhs), complaint);
         self.out_stmts.lock().push(stmt.clone());
         self.enter_if(stmt);
         Ok(())
@@ -1101,6 +1108,30 @@ fn ends_with_reference_dollar(text: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A condition the split cannot read is still a conditional, because the
+    /// `endif` that closes it has to find it. GNU Make counts the nesting of a
+    /// branch it is ignoring without reading a byte of any condition in it, so
+    /// the statements after the inner `endif` belong to the outer branch and
+    /// the ones after the outer `endif` belong to the file.
+    #[test]
+    fn an_unreadable_condition_still_holds_its_nesting_open() {
+        let mut session = Session::new();
+        let stmts = parse_buf(
+            &mut session,
+            &Bytes::from_static(b"ifeq (x,y)\nifeq (a,a junk\nendif\nX := 1\nendif\nY := 2\n"),
+            Loc::default(),
+        )
+        .expect("the read carries on past a condition it cannot split");
+
+        let top = stmts.lock();
+        assert_eq!(top.len(), 2, "the outer conditional and `Y := 2` after it");
+        let outer = format!("{:?}", top[0]);
+        assert!(
+            outer.contains("t=2") && outer.contains("f=0"),
+            "the inner conditional and `X := 1` sit inside the outer branch: {outer}"
+        );
+    }
 
     #[test]
     fn test_get_directive() {

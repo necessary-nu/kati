@@ -587,7 +587,21 @@ void Evaluator::EvalIf(const IfStmt* stmt) {
     }
     case CondOp::IFEQ:
     case CondOp::IFNEQ: {
+      // Reading the condition is this statement's own work, not the read's,
+      // because GNU Make does not look at a condition inside a branch it is
+      // ignoring. Nothing below runs unless this statement was reached.
+      if (stmt->complaint == CondComplaint::UNREADABLE) {
+        Error("*** invalid syntax in conditional.");
+      }
       const std::string&& lhs = stmt->lhs->Eval(this);
+      // Between the two expansions, which is where GNU says it:
+      // `conditional_line` expands the first string, then finds the second
+      // string's close, then reaches `EXTRATEXT`, and only then expands the
+      // second.
+      if (stmt->complaint == CondComplaint::EXTRANEOUS_TEXT) {
+        WARN_LOC(stmt->loc(), "extraneous text after '%s' directive",
+                 stmt->op == CondOp::IFEQ ? "ifeq" : "ifneq");
+      }
       const std::string&& rhs = stmt->rhs->Eval(this);
       is_true = ((lhs == rhs) == (stmt->op == CondOp::IFEQ));
       break;

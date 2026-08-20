@@ -236,6 +236,26 @@ impl CommandStmt {
     }
 }
 
+/// What reading an `ifeq`/`ifneq` condition found, and did not say.
+///
+/// GNU Make's `conditional_line` (reference/gnumake/src/read.c) decides it is
+/// ignoring BEFORE it reaches either the `ifdef` arm or the `ifeq` arm, so a
+/// condition inside a branch that is not being taken is never split, never
+/// expanded and never complained about — it is only counted, so that the
+/// `endif` closing it can be found. kati reads a whole makefile into statements
+/// before it evaluates any of them, so the reading has to happen where GNU's
+/// does: what the split found is carried here and said when, and only if, the
+/// statement is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CondComplaint {
+    /// The condition's close never arrived. GNU returns -1 and its caller is
+    /// `fatal`: `*** invalid syntax in conditional.`
+    Unreadable,
+    /// Text followed the condition's close. GNU's `EXTRATEXT` is `error` — it
+    /// prints and the read carries on.
+    ExtraneousText,
+}
+
 pub struct IfStmt {
     loc: Loc,
     orig: Bytes,
@@ -243,6 +263,8 @@ pub struct IfStmt {
     pub op: CondOp,
     pub lhs: Arc<Value>,
     pub rhs: Option<Arc<Value>>,
+    /// What the split owed this statement, held until the statement is reached.
+    pub complaint: Option<CondComplaint>,
     pub true_stmts: Arc<Mutex<Vec<Stmt>>>,
     pub false_stmts: Arc<Mutex<Vec<Stmt>>>,
 }
@@ -275,13 +297,20 @@ impl Debug for IfStmt {
 }
 
 impl IfStmt {
-    pub fn new(loc: Loc, op: CondOp, lhs: Arc<Value>, rhs: Option<Arc<Value>>) -> Arc<IfStmt> {
+    pub fn new(
+        loc: Loc,
+        op: CondOp,
+        lhs: Arc<Value>,
+        rhs: Option<Arc<Value>>,
+        complaint: Option<CondComplaint>,
+    ) -> Arc<IfStmt> {
         Arc::new(IfStmt {
             loc,
             orig: Bytes::new(),
             op,
             lhs,
             rhs,
+            complaint,
             true_stmts: Arc::new(Mutex::new(Vec::new())),
             false_stmts: Arc::new(Mutex::new(Vec::new())),
         })
@@ -370,6 +399,48 @@ impl ExportStmt {
             expr,
             is_export,
             is_bare,
+        })
+    }
+}
+
+/// A complaint the read has to make, held as a statement so that it is made
+/// where GNU Make makes it.
+///
+/// GNU Make reads and evaluates one line at a time, so a complaint the read
+/// raises comes after everything the lines above it did. kati reads a whole
+/// makefile into statements first, so a complaint raised where it is FOUND
+/// would come before all of that — and, worse, before a complaint an earlier
+/// line owes. Standing in the statement list puts it back in its place.
+pub struct ParseErrorStmt {
+    loc: Loc,
+    orig: Bytes,
+    pub msg: String,
+}
+
+impl Statement for ParseErrorStmt {
+    fn loc(&self) -> Loc {
+        self.loc.clone()
+    }
+    fn orig(&self) -> Bytes {
+        self.orig.clone()
+    }
+    fn eval(&self, ev: &mut Evaluator) -> Result<()> {
+        error_loc!(ev, Some(&self.loc), "{}", self.msg);
+    }
+}
+
+impl Debug for ParseErrorStmt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ParseErrorStmt({}, loc={:?})", self.msg, self.loc)
+    }
+}
+
+impl ParseErrorStmt {
+    pub fn new(loc: Loc, msg: String) -> Arc<ParseErrorStmt> {
+        Arc::new(ParseErrorStmt {
+            loc,
+            orig: Bytes::new(),
+            msg,
         })
     }
 }

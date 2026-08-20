@@ -37,8 +37,8 @@ use crate::rule::{Rule, glob_word};
 use crate::session::{Context, Session};
 use crate::stats::StatsRegistry;
 use crate::stmt::{
-    AssignModifiers, AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt, IncludeStmt,
-    RuleStmt, Statement, UndefineStmt, VpathStmt,
+    AssignModifiers, AssignOp, AssignStmt, CommandStmt, CondComplaint, CondOp, ExportStmt, IfStmt,
+    IncludeStmt, RuleStmt, Statement, UndefineStmt, VpathStmt,
 };
 use crate::strutil::{
     Pattern, find_percent, is_space_byte, strip_recipe_prefix_continuations, trim_leading_curdir,
@@ -2415,7 +2415,34 @@ impl Evaluator {
                 }
             }
             CondOp::Ifeq | CondOp::Ifneq => {
+                // Reading the condition is this statement's own work, not the
+                // read's, because GNU Make does not look at a condition inside
+                // a branch it is ignoring. Nothing below runs unless this
+                // statement was reached.
+                if stmt.complaint == Some(CondComplaint::Unreadable) {
+                    error_loc!(
+                        self,
+                        self.loc.as_ref(),
+                        "*** invalid syntax in conditional."
+                    );
+                }
                 let lhs = stmt.lhs.eval_to_buf(self)?;
+                // Between the two expansions, which is where GNU says it:
+                // `conditional_line` expands the first string, then finds the
+                // second string's close, then reaches `EXTRATEXT`, and only
+                // then expands the second.
+                if stmt.complaint == Some(CondComplaint::ExtraneousText) {
+                    warn_loc!(
+                        self,
+                        self.loc.as_ref(),
+                        "extraneous text after '{}' directive",
+                        if stmt.op == CondOp::Ifeq {
+                            "ifeq"
+                        } else {
+                            "ifneq"
+                        }
+                    );
+                }
                 let rhs = stmt
                     .rhs
                     .as_ref()

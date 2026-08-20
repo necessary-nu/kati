@@ -75,8 +75,20 @@ class Parser {
       l_ = e + 1;
     }
 
-    if (!if_stack_.empty())
-      ERROR_LOC(Loc(loc_.filename, loc_.lineno + 1), "*** missing 'endif'.");
+    // Said where GNU Make says it: at the end of the read, once every line
+    // above has been read and everything those lines do has happened. It
+    // stands at the FILE's level rather than in whichever branch was still
+    // open, because GNU checks `conditionals->if_cmds` whether or not it was
+    // ignoring -- and standing there is also what lets a conditional whose own
+    // condition could not be read speak first, which is the order a one-pass
+    // read produces.
+    if (!if_stack_.empty()) {
+      ParseErrorStmt* stmt = new ParseErrorStmt();
+      stmt->set_loc(Loc(loc_.filename, loc_.lineno + 1));
+      stmt->msg = "*** missing 'endif'.";
+      stmts_->push_back(stmt);
+      parse_errors.push_back(stmt);
+    }
     if (!define_name_.empty())
       ERROR_LOC(Loc(loc_.filename, define_start_line_),
                 "*** missing 'endef', unterminated 'define'.");
@@ -421,21 +433,25 @@ class Parser {
     return true;
   }
 
-  bool ParseIfEqCond(std::string_view s,
-                     IfStmt* stmt,
-                     std::string_view directive) {
+  // Reads the condition onto the statement without saying anything about it.
+  // GNU Make would not have looked at this line's condition at all unless the
+  // branch around it is being taken, so both what the split found and what
+  // followed the condition are carried on the statement and reach the
+  // evaluator, which is where GNU decides.
+  void ParseIfEqCond(std::string_view s,
+                     IfStmt* stmt) {
     std::string_view lhs, rhs;
     size_t rest = 0;
-    if (!SplitIfEqCond(s, &lhs, &rhs, &rest))
-      return false;
+    if (!SplitIfEqCond(s, &lhs, &rhs, &rest)) {
+      stmt->complaint = CondComplaint::UNREADABLE;
+      lhs = rhs = std::string_view();
+    } else if (rest < s.size()) {
+      stmt->complaint = CondComplaint::EXTRANEOUS_TEXT;
+    }
 
     Loc mutable_loc(loc_);
     stmt->lhs = ParseExpr(&mutable_loc, lhs, ParseExprOpt::NORMAL);
     stmt->rhs = ParseExpr(&mutable_loc, rhs, ParseExprOpt::NORMAL);
-    if (rest < s.size()) {
-      WARN_LOC(loc_, "extraneous text after '%.*s' directive", SPF(directive));
-    }
-    return true;
   }
 
   void ParseIfeq(std::string_view line, std::string_view directive) {
@@ -443,10 +459,10 @@ class Parser {
     stmt->set_loc(loc_);
     stmt->op = directive[2] == 'n' ? CondOp::IFNEQ : CondOp::IFEQ;
 
-    if (!ParseIfEqCond(line, stmt, directive)) {
-      Error("*** invalid syntax in conditional.");
-      return;
-    }
+    // The statement stands even when its condition could not be read, because
+    // an unreadable condition is still a conditional as far as the `endif`
+    // closing it is concerned.
+    ParseIfEqCond(line, stmt);
 
     out_stmts_->push_back(stmt);
     EnterIf(stmt);
