@@ -223,7 +223,13 @@ impl Variable {
             InnerVar::Recursive { .. } => "recursive",
             InnerVar::AutoCommand(_, a) => a.flavor(),
             InnerVar::ShellStatus => "simple",
-            InnerVar::VariableNames { .. } => "kati_variable_names",
+            // GNU Make defines `.VARIABLES` with `define_variable_cname
+            // (".VARIABLES", "", o_default, 0)` and then sets a `special` bit
+            // on the struct; the flavour it reports is the one that
+            // definition gave it, and a lookup only overwrites the value. So
+            // it is `simple` there, and `$(flavor)` has four answers — this
+            // was a fifth that no makefile branching on it can have expected.
+            InnerVar::VariableNames { .. } => "simple",
         }
     }
     /// Whether the variable's text — what was written, before any expansion —
@@ -283,6 +289,24 @@ impl Variable {
     }
     pub fn immediate_eval(&self) -> bool {
         matches!(&self.value, InnerVar::Simple(_))
+    }
+
+    /// Whether this binding is one of the base automatic variables a rule's
+    /// own recipe reads — `$@`, `$<`, `$?` and the rest, but not the `D` and
+    /// `F` forms taken off them.
+    ///
+    /// GNU Make binds the base forms in the FILE's variable set
+    /// (`set_file_variables`, src/commands.c) rather than in the global one,
+    /// so they are visible to the recipe and invisible to everything that
+    /// walks the global table. The `D` and `F` forms are bound once at startup
+    /// in the global set and ARE visible there — measured, GNU's `.VARIABLES`
+    /// holds `@D` and `@F` and never `@`. `.VARIABLES` walks the global table
+    /// alone, which is why this one has to leave the base forms out by hand.
+    pub fn is_base_automatic_command(&self) -> bool {
+        match &self.value {
+            InnerVar::AutoCommand(_, a) => a.is_base_form(),
+            _ => false,
+        }
     }
 
     /// Whether the value is worked out when the name is read rather than
@@ -608,16 +632,27 @@ impl Variable {
 
     /// `.VARIABLES` and `.KATI_SYMBOLS`, whose value is the live name list.
     ///
-    /// GNU Make regenerates `.VARIABLES` BY NAME at every lookup —
-    /// `lookup_special_var` overwrites `var->value` whenever the table has
-    /// changed since it last did — so what a makefile writes there is stored
-    /// and never read back, which is indistinguishable from being ignored. It
-    /// is not readonly there and a write to it does not stop the build.
+    /// GNU Make regenerates `.VARIABLES` at every lookup — `lookup_special_var`
+    /// overwrites `var->value` whenever the table has changed since it last
+    /// did — so what a makefile writes there is stored and never read back,
+    /// which is indistinguishable from being ignored. It is not readonly there
+    /// and a write to it does not stop the build.
+    ///
+    /// The origin is `default`, exactly as GNU Make's own
+    /// `define_variable_cname (".VARIABLES", "", o_default, 0)` makes it, and
+    /// that is what keeps the rest of the ladder honest: a makefile's write
+    /// lands and reads back as `file` while [`carry_regenerated_value`] keeps
+    /// the live list answering, and an `undefine` outranks `default` and takes
+    /// the name away for good. GNU's regeneration does not resume after that,
+    /// because the `special` bit lived on a struct the `undefine` freed — a
+    /// name redefined afterwards is an ordinary variable holding whatever was
+    /// written to it, which is what carrying the value rather than the name
+    /// reproduces here.
     pub fn new_variable_names(name: &'static [u8], all: bool) -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(Self {
             loc: None,
             definition: None,
-            origin: VarOrigin::Override,
+            origin: VarOrigin::Default,
             assign_op: Some(AssignOp::ColonEq),
             readonly: false,
             is_private: false,
@@ -652,7 +687,10 @@ impl Evaluable for Variable {
             }
             InnerVar::VariableNames { all, .. } => {
                 let mut ww = WordWriter::new(out);
-                let symbols = ev.session.global_var_names(|var| !var.read().obsolete());
+                let symbols = ev.session.global_var_names(|var| {
+                    let var = var.read();
+                    !var.obsolete() && !var.is_base_automatic_command()
+                });
                 for (sym, entry) in symbols {
                     if !*all
                         && let Some(var) = ev.session.peek_global_var(sym)

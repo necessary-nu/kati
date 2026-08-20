@@ -174,6 +174,19 @@ impl AutoCommandVar {
         }
     }
 
+    /// Whether this is the base form — `$@`, `$?`, `$<` — rather than one of
+    /// the `D`/`F` forms taken off it.
+    ///
+    /// The two are defined in different places in GNU Make and the difference
+    /// is visible from `.VARIABLES`: `set_file_variables` binds the base forms
+    /// in the FILE's own variable set as the recipe is prepared, while
+    /// `define_automatic_variables` binds each `D` and `F` form once, at
+    /// startup, in the global set. So the global name list holds `@D` and `@F`
+    /// and never `@`.
+    pub const fn is_base_form(&self) -> bool {
+        matches!(self.variant, AutoCommandVariant::None)
+    }
+
     /// How `$(flavor)` names this automatic variable.
     ///
     /// The same split: a base form was defined as a simple variable holding the
