@@ -650,7 +650,6 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
         .unwrap_or_else(|| std::env::vars_os().collect());
     for (k, v) in environment {
         let v = Bytes::from(v.as_bytes().to_vec());
-        let val = Arc::new(Value::Literal(None, v.clone()));
         let frame = ev.current_frame();
         let sym = ev.session.intern(k.as_bytes().to_vec());
         // Two of these names are ones GNU Make writes into the environment and
@@ -674,10 +673,32 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
         } else {
             origin
         };
+        // The environment's own entry is RECURSIVE, and that is the whole of
+        // what a value holding a `$` means here: `define_variable_in_set (name,
+        // len, value, o_env, 1)` in `main`, the trailing 1 being the recursive
+        // flag. So an environment value is makefile text, parsed here and
+        // expanded at every reference like any `NAME = text` — which is where
+        // `$(words a b c)` becomes `3`, `$$` halves to one `$`, and a name the
+        // makefile defines is reachable from a value the invocation supplied.
+        //
+        // Parsing is not expanding. The expression is built once and evaluated
+        // only when something reads the name, so an environment value carrying
+        // `$(shell)` runs its command per reference and not at all if nothing
+        // refers to it, and one whose call is left unterminated is a held
+        // `Unreadable` that raises where it is read rather than at startup.
+        // GNU Make is lazy for the same reason and by the same construction.
+        //
+        // `MAKELEVEL` is the exception, and it is GNU Make's: `main` defines it
+        // over again from the depth it parsed, `define_variable_cname
+        // (MAKELEVEL_NAME, buf, o_env, 0)`, with the recursive flag off. So the
+        // one environment name whose value is a number stays simple even when
+        // the invocation put an expression there.
         let var = if k.as_bytes() == b"MAKELEVEL" {
             Variable::with_simple_string(v, origin, Some(frame), None)
         } else {
-            Variable::new_recursive(val, origin, Some(frame), None, v)
+            let mut loc = Loc::default();
+            let parsed = parse_expr(&mut ev.session, &mut loc, v.clone(), ParseExprOpt::Normal)?;
+            Variable::new_recursive(parsed, origin, Some(frame), None, v)
         };
         // Everything culled from the environment is exported by default, and
         // GNU Make records that on the variable rather than deriving it from
