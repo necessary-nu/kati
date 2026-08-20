@@ -277,16 +277,19 @@ fn sort_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
 /// `what` names the argument and the function, and is the whole of the message
 /// up to the colon, because GNU builds these diagnostics the same way.
 fn parse_numeric(text: &[u8], what: &str, ev: &mut Evaluator) -> Result<i64> {
+    // GNU Make raises every one of these at `*expanding_var`, so a bad number
+    // inside a `define` names the `define` and not the body line.
+    let at = ev.expanding_var_loc();
     let trimmed = trim_space(text);
     if trimmed.is_empty() {
-        error_loc!(ev, ev.loc.as_ref(), "*** {what}: empty value.");
+        error_loc!(ev, at.as_ref(), "*** {what}: empty value.");
     }
     let negative = trimmed[0] == b'-';
     let digits = &trimmed[usize::from(negative || trimmed[0] == b'+')..];
     if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         error_loc!(
             ev,
-            ev.loc.as_ref(),
+            at.as_ref(),
             "*** {what}: '{}'.",
             String::from_utf8_lossy(text)
         );
@@ -307,7 +310,7 @@ fn parse_numeric(text: &[u8], what: &str, ev: &mut Evaluator) -> Result<i64> {
         let Some(stepped) = stepped else {
             error_loc!(
                 ev,
-                ev.loc.as_ref(),
+                at.as_ref(),
                 "*** {what}: '{}' out of range.",
                 String::from_utf8_lossy(text)
             );
@@ -321,9 +324,10 @@ fn word_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
     let n_str = args[0].eval_to_buf(ev)?;
     let mut n = parse_numeric(&n_str, "invalid first argument to 'word' function", ev)?;
     if n < 1 {
+        let at = ev.expanding_var_loc();
         error_loc!(
             ev,
-            ev.loc.as_ref(),
+            at.as_ref(),
             "*** first argument to 'word' function must be greater than 0."
         );
     }
@@ -347,13 +351,15 @@ fn wordlist_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) 
     if si < 1 {
         // The value as read, not as written: GNU prints the number it parsed,
         // so `$(wordlist 000,…)` is refused as '0'.
-        error_loc!(ev, ev.loc.as_ref(), "*** {bad_first}: '{si}'.");
+        let at = ev.expanding_var_loc();
+        error_loc!(ev, at.as_ref(), "*** {bad_first}: '{si}'.");
     }
 
     let e_str = args[1].eval_to_buf(ev)?;
     let ei = parse_numeric(&e_str, bad_second, ev)?;
     if ei < 0 {
-        error_loc!(ev, ev.loc.as_ref(), "*** {bad_second}: '{ei}'.");
+        let at = ev.expanding_var_loc();
+        error_loc!(ev, at.as_ref(), "*** {bad_second}: '{ei}'.");
     }
 
     let text = args[2].eval_to_buf(ev)?;
@@ -959,9 +965,10 @@ fn call_builtin(
         return Ok(());
     }
     if (args.len() as i16) < fi.min_arity {
+        let at = ev.expanding_var_loc();
         error_loc!(
             ev,
-            ev.loc.as_ref(),
+            at.as_ref(),
             "*** insufficient number of arguments ({}) to function '{}'.",
             args.len(),
             String::from_utf8_lossy(fi.name)
@@ -1046,7 +1053,17 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
         let loc = ev.loc.clone().unwrap_or_default();
         let _frame = ev.enter(FrameType::Call, func_name_buf, loc);
         if let Some(func) = func {
-            func.read().eval(ev, out)?;
+            // GNU Make's `func_call` builds the text `$(NAME)` and expands
+            // THAT, so the body is reached through an ordinary reference and
+            // installs the same diagnostic location an ordinary reference
+            // would -- the variable's own, not the call site's. Only the
+            // location: `func_call` deliberately does not mark the variable as
+            // expanding, which is what lets `$(call)` recurse.
+            let body = func.read();
+            ev.enter_expanding_var(body.expansion_loc());
+            let result = body.eval(ev, out);
+            ev.leave_expanding_var();
+            result?;
         }
         Ok(())
     })?;
@@ -1121,11 +1138,12 @@ impl MakeInt {
     /// GNU Make's `parse_textint`. `ordinal` names which argument this is, for
     /// the diagnostic a non-numeric one dies with.
     fn parse(text: &Bytes, ordinal: &str, ev: &mut Evaluator) -> Result<MakeInt> {
+        let at = ev.expanding_var_loc();
         let trimmed = trim_space(text);
         if trimmed.is_empty() {
             error_loc!(
                 ev,
-                ev.loc.as_ref(),
+                at.as_ref(),
                 "*** non-numeric {ordinal} argument to 'intcmp' function: empty value."
             );
         }
@@ -1139,7 +1157,7 @@ impl MakeInt {
         if end == 0 || end != digits.len() {
             error_loc!(
                 ev,
-                ev.loc.as_ref(),
+                at.as_ref(),
                 "*** non-numeric {ordinal} argument to 'intcmp' function: '{}'.",
                 String::from_utf8_lossy(text)
             );
@@ -1485,16 +1503,19 @@ fn file_func_impl(
     let filename = trim_space(&arg);
 
     if filename.is_empty() {
-        error_loc!(ev, ev.loc.as_ref(), "*** Missing filename");
+        let at = ev.expanding_var_loc();
+        error_loc!(ev, at.as_ref(), "*** Missing filename");
     }
 
     if filename[0] == b'<' {
         let filename = trim_left_space(&filename[1..]);
         if filename.is_empty() {
-            error_loc!(ev, ev.loc.as_ref(), "*** Missing filename");
+            let at = ev.expanding_var_loc();
+            error_loc!(ev, at.as_ref(), "*** Missing filename");
         }
         if args.len() > 1 {
-            error_loc!(ev, ev.loc.as_ref(), "*** invalid argument");
+            let at = ev.expanding_var_loc();
+            error_loc!(ev, at.as_ref(), "*** invalid argument");
         }
 
         let filename = <OsStr as OsStrExt>::from_bytes(filename);
@@ -1503,7 +1524,8 @@ fn file_func_impl(
         let append = filename.starts_with(b">>");
         let filename = trim_left_space(&filename[if append { 2 } else { 1 }..]);
         if filename.is_empty() {
-            error_loc!(ev, ev.loc.as_ref(), "*** Missing filename");
+            let at = ev.expanding_var_loc();
+            error_loc!(ev, at.as_ref(), "*** Missing filename");
         }
 
         let mut text = BytesMut::new();
@@ -1517,9 +1539,10 @@ fn file_func_impl(
         let filename = <OsStr as OsStrExt>::from_bytes(filename);
         file_write_func(ev, filename, append, text.freeze(), rerun)?;
     } else {
+        let at = ev.expanding_var_loc();
         error_loc!(
             ev,
-            ev.loc.as_ref(),
+            at.as_ref(),
             "*** Invalid file operation: {}.  Stop.",
             String::from_utf8_lossy(filename)
         );

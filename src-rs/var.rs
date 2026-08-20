@@ -222,6 +222,27 @@ impl Variable {
     pub fn loc(&self) -> &Option<Loc> {
         &self.loc
     }
+
+    /// Where a diagnostic raised while expanding this variable points.
+    ///
+    /// GNU Make's `recursively_expand_for_file` (expand.c) installs
+    /// `&v->fileinfo` as `expanding_var` only `if (v->fileinfo.filenm)`, and a
+    /// `fileinfo` is filled in only for a variable a makefile defined. The
+    /// command line, the environment, the built-in catalogue and the automatic
+    /// variables all carry a null one, so expanding any of those leaves the
+    /// location wherever it already was -- which is the line the reference was
+    /// written on. `VarOrigin` is that same distinction here: the two origins
+    /// below are the ones a makefile line produces.
+    pub fn expansion_loc(&self) -> Option<&Loc> {
+        match self.origin {
+            VarOrigin::File | VarOrigin::Override => self.loc.as_ref(),
+            VarOrigin::Default
+            | VarOrigin::Environment
+            | VarOrigin::EnvironmentOverride
+            | VarOrigin::CommandLine
+            | VarOrigin::Automatic => None,
+        }
+    }
     pub fn origin(&self) -> VarOrigin {
         self.origin
     }

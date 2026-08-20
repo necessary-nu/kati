@@ -856,6 +856,26 @@ pub struct Evaluator {
     /// as it is marked: whatever put it here holds the `Arc` until it takes it
     /// out again.
     expanding_vars: HashSet<usize>,
+    /// The location a diagnostic raised inside an expansion carries, as a
+    /// stack of the variables an expansion is currently inside.
+    ///
+    /// GNU Make's `expanding_var` (expand.c). It points at `reading_file` until
+    /// `recursively_expand_for_file` puts the variable being expanded there --
+    /// `&v->fileinfo`, which is where the variable was DEFINED and not where
+    /// the text inside it was written. That is the whole of why a `define`'s
+    /// body names the `define` line: the body spans lines and the binding does
+    /// not.
+    ///
+    /// `None` in an entry means the variable had no location of its own to
+    /// install, so whatever was already there stands -- see
+    /// [`Variable::expansion_loc`]. An empty stack means nothing is being
+    /// expanded through a reference, and the location is the one being read.
+    ///
+    /// Separate from `expanding_vars` above, because GNU Make keeps them
+    /// separate: `v->expanding` is the recursion guard and `expanding_var` is
+    /// the diagnostic's location, and `$(call)` installs the second without the
+    /// first.
+    expanding_var_locs: Vec<Option<Loc>>,
 
     rule_state: RuleState,
     /// Whether `.SECONDEXPANSION` has been read yet. It applies only to rules
@@ -1146,6 +1166,7 @@ impl Evaluator {
             pattern_rule_var_order: Vec::new(),
             rules: Vec::new(),
             expanding_vars: HashSet::new(),
+            expanding_var_locs: Vec::new(),
 
             rule_state: RuleState::None,
             second_expansion: false,
@@ -3012,7 +3033,15 @@ impl Evaluator {
                     // that the expansion it is nested inside put in.
                     return Ok(Some(self.inherited_binding(name)));
                 }
-                let loc = var.read().loc().clone();
+                // GNU Make installs this variable as `expanding_var` and then
+                // finds the recursion, so the diagnostic already carries the
+                // variable's own location -- and the location standing before
+                // it where the variable has none of its own.
+                let loc = var
+                    .read()
+                    .expansion_loc()
+                    .cloned()
+                    .or_else(|| self.expanding_var_loc());
                 error_loc!(
                     self,
                     loc.as_ref(),
@@ -3032,6 +3061,36 @@ impl Evaluator {
     /// environment recursion answers with was never marked at all.
     pub fn var_eval_complete(&mut self, var: &Var) {
         self.expanding_vars.remove(&var_identity(var));
+    }
+
+    /// Note that an expansion has entered a variable, for the location its
+    /// diagnostics carry. See [`Self::expanding_var_locs`].
+    ///
+    /// `installed` is the entered variable's own [`Variable::expansion_loc`].
+    /// It is passed rather than read from the variable so the caller's existing
+    /// read guard does the work: this runs on every variable reference a build
+    /// expands, which is one of the hottest paths there is.
+    pub fn enter_expanding_var(&mut self, installed: Option<&Loc>) {
+        let installed = match installed {
+            Some(loc) => Some(loc.clone()),
+            None => self.expanding_var_locs.last().cloned().flatten(),
+        };
+        self.expanding_var_locs.push(installed);
+    }
+
+    /// The other half of [`Self::enter_expanding_var`].
+    pub fn leave_expanding_var(&mut self) {
+        self.expanding_var_locs.pop();
+    }
+
+    /// Where a diagnostic raised inside an expansion points: GNU Make's
+    /// `*expanding_var`.
+    pub fn expanding_var_loc(&self) -> Option<Loc> {
+        self.expanding_var_locs
+            .last()
+            .cloned()
+            .flatten()
+            .or_else(|| self.loc.clone())
     }
 
     /// What this name held in the environment the invocation was started with,

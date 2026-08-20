@@ -142,6 +142,10 @@ impl Evaluable for Value {
                     ev.is_evaluating_command && sym.as_bytes(&ev.session).as_ref() == b"MAKE";
                 if let Some(var) = ev.lookup_var_for_eval(sym)? {
                     let v = var.read();
+                    // The reference is where GNU Make installs the location a
+                    // diagnostic raised inside the value will carry --
+                    // `recursively_expand_for_file` in expand.c.
+                    ev.enter_expanding_var(v.expansion_loc());
                     v.used(ev, &sym)?;
                     if is_make {
                         let expanded = v.eval_to_buf(ev)?;
@@ -153,6 +157,7 @@ impl Evaluable for Value {
                     let loc = ev.loc.clone();
                     v.check_current_referencing_file(&ev.session, &loc, sym)?;
                     drop(v);
+                    ev.leave_expanding_var();
                     ev.var_eval_complete(&var);
                 }
             }
@@ -165,6 +170,10 @@ impl Evaluable for Value {
                     ev.is_evaluating_command && sym.as_bytes(&ev.session).as_ref() == b"MAKE";
                 if let Some(var) = ev.lookup_var_for_eval(sym)? {
                     let v = var.read();
+                    // The reference is where GNU Make installs the location a
+                    // diagnostic raised inside the value will carry --
+                    // `recursively_expand_for_file` in expand.c.
+                    ev.enter_expanding_var(v.expansion_loc());
                     v.used(ev, &sym)?;
                     if is_make {
                         let expanded = v.eval_to_buf(ev)?;
@@ -176,6 +185,7 @@ impl Evaluable for Value {
                     let loc = ev.loc.clone();
                     v.check_current_referencing_file(&ev.session, &loc, sym)?;
                     drop(v);
+                    ev.leave_expanding_var();
                     ev.var_eval_complete(&var);
                 }
             }
@@ -192,10 +202,14 @@ impl Evaluable for Value {
                 let pat_str = pat.eval_to_buf(ev)?;
                 let subst = subst.eval_to_buf(ev)?;
                 ev.eval_depth -= 1;
-                if let Some(v) = v {
-                    let v = v.read();
+                if let Some(var) = v {
+                    let v = var.read();
+                    // `$(V:a=b)` reaches V's value through `recursively_expand`
+                    // as well, so it installs the location too.
+                    ev.enter_expanding_var(v.expansion_loc());
                     v.used(ev, &sym)?;
                     let value = v.eval_to_buf(ev)?;
+                    ev.leave_expanding_var();
                     let mut ww = WordWriter::new(out);
                     let pat = Pattern::new(pat_str);
                     for tok in word_scanner(&value) {
@@ -205,7 +219,13 @@ impl Evaluable for Value {
                     }
                 }
             }
-            Value::Unreadable(loc, unreadable) => return Err(unreadable.raise(ev, loc)),
+            // Raised where GNU Make raises it: `variable_expand_string` and
+            // `handle_function` both die at `*expanding_var`, which names the
+            // binding being expanded rather than the text inside it.
+            Value::Unreadable(loc, unreadable) => {
+                let at = ev.expanding_var_loc().unwrap_or_else(|| loc.clone());
+                return Err(unreadable.raise(ev, &at));
+            }
             Value::Func { loc, fi, args } => {
                 let _frame = ev.enter(FrameType::FunCall, Bytes::from_static(fi.name), loc.clone());
                 log!(
@@ -231,9 +251,10 @@ impl Evaluable for Value {
                             arg.eval_to_buf(ev)?;
                         }
                     }
+                    let at = ev.expanding_var_loc().unwrap_or_else(|| loc.clone());
                     error_loc!(
                         ev,
-                        Some(loc),
+                        Some(&at),
                         "*** insufficient number of arguments ({}) to function '{}'.",
                         args.len(),
                         String::from_utf8_lossy(fi.name)
