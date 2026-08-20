@@ -319,6 +319,27 @@ impl Pattern {
         s.clone()
     }
 
+    /// Fill this pattern's stem into a STATIC PATTERN rule's prerequisite.
+    ///
+    /// GNU Make's `enter_prereqs` (file.c) compresses the percent escaping into
+    /// a COPY of the prerequisite and throws the copy away when no wildcard
+    /// survived it — `percent = find_percent (nm); if (percent) ... dp->name =
+    /// ...` — so a prerequisite pattern that is not a pattern reaches the build
+    /// spelt exactly as the makefile wrote it, backslash and all. `a.o b.o:
+    /// %.o: \%.c` reads the file called `\%.c`, not the one called `%.c`.
+    ///
+    /// [`Pattern::append_subst`] is the other way round on purpose:
+    /// `func_patsubst` runs `find_percent` over the replacement IN PLACE and
+    /// uses what it left either way, which is why `$(patsubst abc,\%,abc)` is
+    /// a literal percent. The two callers want different answers from the same
+    /// compression, so the branch belongs here rather than in the primitive.
+    pub fn append_subst_prerequisite(&self, s: &Bytes, subst: &Bytes) -> Bytes {
+        if find_percent(subst.clone()).1.is_none() {
+            return subst.clone();
+        }
+        self.append_subst(s, subst)
+    }
+
     pub fn append_subst_ref(&self, s: &Bytes, subst: &Bytes) -> Bytes {
         if self.percent_index.is_some() {
             return self.append_subst(s, subst);
@@ -333,7 +354,7 @@ impl Pattern {
     }
 }
 
-/// Fill the first `%` of a pattern rule's prerequisite with `stem`, behind
+/// Fill the first `%` of an IMPLICIT rule's prerequisite with `stem`, behind
 /// `directory`.
 ///
 /// The stem and the directory arrive separately rather than being measured off
@@ -347,10 +368,19 @@ impl Pattern {
 /// takes neither the stem nor the directory. That asymmetry is GNU Make's:
 /// `pattern_search` writes the directory prefix only on the branch that found a
 /// percent to replace.
+///
+/// The `%` is found with a RAW search and the text is never compressed, because
+/// that is what `pattern_search` does — `const char *cp = strchr (nptr, '%')`,
+/// with no `find_percent` anywhere on the path. `record_files` deliberately
+/// skips `enter_prereqs` for a pattern rule ("We don't want to enter pattern
+/// rules at all"), so an implicit rule's prerequisite reaches the search
+/// exactly as the makefile wrote it and the search knows nothing about
+/// escaping: `%.o: \%.c` looks for `\a.c` when it makes `a.o`, and `%.o:
+/// \\%.c` looks for `\\a.c`. A static pattern rule's prerequisite is the
+/// other question and is [`Pattern::append_subst_prerequisite`].
 pub fn substitute_stem(prerequisite: &Bytes, directory: &[u8], stem: &[u8]) -> Bytes {
-    let (prerequisite, percent) = find_percent(prerequisite.clone());
-    let Some(at) = percent else {
-        return prerequisite;
+    let Some(at) = memchr(b'%', prerequisite) else {
+        return prerequisite.clone();
     };
     let mut ret = BytesMut::with_capacity(directory.len() + prerequisite.len() + stem.len());
     ret.put_slice(directory);
@@ -990,6 +1020,53 @@ mod test {
                 String::from_utf8_lossy(family)
             );
         }
+    }
+
+    /// A prerequisite pattern that holds no wildcard is one name, and the two
+    /// rule forms disagree about which name — because GNU Make asks the
+    /// question in two places that do not share a routine.
+    #[test]
+    fn an_escaped_prerequisite_is_one_name_in_each_rule_form() {
+        let pattern = Pattern::new(Bytes::from_static(b"%.o"));
+        let made = Bytes::from_static(b"a.o");
+        let of = |text: &'static [u8]| {
+            String::from_utf8(
+                pattern
+                    .append_subst_prerequisite(&made, &Bytes::from_static(text))
+                    .to_vec(),
+            )
+            .unwrap()
+        };
+        // A static pattern rule: `enter_prereqs` throws away the compressed
+        // copy when no wildcard survived it, so the name stands as written.
+        assert_eq!(of(b"\\%.c"), "\\%.c");
+        // One that does hold a wildcard is compressed and filled in.
+        assert_eq!(of(b"\\\\%.c"), "\\a.c");
+        assert_eq!(of(b"%.c"), "a.c");
+        assert_eq!(of(b"fixed.c"), "fixed.c");
+        // `$(patsubst)` is the other way round on the very same text: the
+        // compression is done in place and used either way.
+        assert_eq!(
+            String::from_utf8(
+                Pattern::new(Bytes::from_static(b"abc"))
+                    .append_subst(&Bytes::from_static(b"abc"), &Bytes::from_static(b"\\%"))
+                    .to_vec()
+            )
+            .unwrap(),
+            "%"
+        );
+
+        // An implicit rule: `pattern_search` finds the `%` with a raw
+        // `strchr` and never compresses anything, so the backslash is a byte
+        // of the name it goes looking for.
+        let stem = |text: &'static [u8]| {
+            String::from_utf8(substitute_stem(&Bytes::from_static(text), b"", b"a").to_vec())
+                .unwrap()
+        };
+        assert_eq!(stem(b"\\%.c"), "\\a.c");
+        assert_eq!(stem(b"\\\\%.c"), "\\\\a.c");
+        assert_eq!(stem(b"%.c"), "a.c");
+        assert_eq!(stem(b"fixed.c"), "fixed.c");
     }
 
     #[test]

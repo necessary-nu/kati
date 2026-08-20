@@ -773,7 +773,9 @@ fn apply_output_pattern(
     let pat = Pattern::new(r.output_patterns[0].as_bytes(&*session));
     let output_str = output.as_bytes(&*session);
     for input in inputs {
-        let buf = pat.append_subst(&output_str, &input.as_bytes(&*session));
+        // `enter_prereqs` and not `patsubst`: a prerequisite pattern that holds
+        // no wildcard is left exactly as the makefile wrote it.
+        let buf = pat.append_subst_prerequisite(&output_str, &input.as_bytes(&*session));
         ret.push(session.intern(buf));
     }
     ret
