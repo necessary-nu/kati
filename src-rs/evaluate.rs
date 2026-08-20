@@ -136,8 +136,10 @@ fn read_bootstrap_makefile(session: &mut Session) -> Result<Arc<Mutex<Vec<Stmt>>
     bootstrap.put_slice(features.as_bytes());
     bootstrap.put_u8(b'\n');
     bootstrap.put_slice(b"KATI?=ckati\n");
-    // Overwrite $SHELL environment variable.
-    bootstrap.put_slice(b"SHELL=/bin/sh\n");
+    // `SHELL` is not here and cannot be: no makefile line says what
+    // [`stand_the_shell`] says, and the line that used to stand in for it — a
+    // plain `SHELL=/bin/sh` — got the rank and the flavour wrong in both of the
+    // two cases GNU Make distinguishes.
     // TODO: Add more builtin vars.
 
     // GNU Make's `set_default_suffixes`, which is the whole of the built-in
@@ -314,6 +316,58 @@ fn include_directories(session: &Session) -> Bytes {
         list.put_slice(bytes);
     }
     list.freeze()
+}
+
+/// Stand `SHELL` where GNU Make stands it, which is not where the environment
+/// put it.
+///
+/// `define_automatic_variables` (variable.c) offers the built-in shell at
+/// default rank and then refuses to let the environment's answer survive:
+///
+/// ```text
+/// v = define_variable_cname ("SHELL", default_shell, o_default, 0);
+/// /* Don't let SHELL come from the environment.  */
+/// if (*v->value == '\0' || v->origin == o_env || v->origin == o_env_override)
+///   { v->origin = o_file; v->value = xstrdup (default_shell); }
+/// ```
+///
+/// Two different pairs of answers come out of that one call site, and a
+/// makefile can see both. With no `SHELL` in the environment the offer lands
+/// and the name stands `default` and SIMPLE. With one, the offer is declined
+/// and the block rewrites the rank and the text while leaving the import's
+/// recursive flavour alone, so the name stands `file` and RECURSIVE — at a rank
+/// a makefile's own `SHELL =` is a peer of and may replace, and one that `-e`
+/// cannot lift, because the rank `-e` promotes an environment binding to is a
+/// rank this block then overwrites.
+///
+/// The empty test is not about the environment at all. A binding of any rank
+/// whose text is empty — `make SHELL=` — stands back at the built-in shell,
+/// which is what keeps a recipe running when one arrives.
+///
+/// Called where GNU Make calls it: after the command line has been read, so a
+/// command-line `SHELL=` is the binding this sees, and before the first
+/// makefile, so a makefile's own assignment is a peer replacing it. What sits
+/// between those two points in GNU Make sits between them here too — an
+/// expansion during the command line reads the environment's shell in both
+/// tools, because neither has stood this one yet.
+fn stand_the_shell(session: &mut Session) {
+    let shell = Bytes::from_static(crate::simple_command::DEFAULT_SHELL);
+    claim_at_default(session, "SHELL", shell.clone());
+    let sym = session.intern("SHELL");
+    let Some(var) = session.peek_global_var(sym) else {
+        return;
+    };
+    let came_from_the_environment = {
+        let held = var.read();
+        held.string(session).is_ok_and(|text| text.is_empty())
+            || matches!(
+                held.origin(),
+                VarOrigin::Environment | VarOrigin::EnvironmentOverride
+            )
+    };
+    if came_from_the_environment {
+        var.write().restate_at(VarOrigin::File, shell);
+    }
 }
 
 /// Bind `name` to a simple value at default rank, leaving whatever outranks a
@@ -758,6 +812,10 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
         }
         ev.capture_command_line_environment();
     }
+    // GNU Make's `define_automatic_variables` runs after `decode_switches` has
+    // entered the command line's own variables and before `read_all_makefiles`,
+    // and this is that point: the command line has been read, no makefile has.
+    stand_the_shell(&mut ev.session);
     ev.in_toplevel_makefile();
 
     {

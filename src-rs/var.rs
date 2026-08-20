@@ -193,6 +193,32 @@ impl Variable {
         };
     }
 
+    /// Rewrite what this binding holds and the rank it stands at, leaving its
+    /// flavour, its export attribute and its definition site alone.
+    ///
+    /// GNU Make reaches into a variable this way in one place only: the refusal
+    /// in `define_automatic_variables` (variable.c) to let `SHELL` come from
+    /// the environment assigns `v->origin` and `v->value` outright rather than
+    /// defining the name a second time. Defining again would not do either job.
+    /// The rank it would write is below the one already in the slot, so the
+    /// write would be declined; and the flavour it would install is not the one
+    /// the name goes on to have, because what stands there is still the
+    /// environment's recursive import with different text in it.
+    pub fn restate_at(&mut self, origin: VarOrigin, text: Bytes) {
+        self.origin = origin;
+        self.value = match &self.value {
+            // A recursive binding holds its text and expands it afresh every
+            // time it is read, so replacing the text is the whole of the
+            // change — the same thing GNU Make's `v->value = xstrdup (...)`
+            // does to a variable whose `recursive` flag is set.
+            InnerVar::Recursive { .. } => InnerVar::Recursive {
+                v: Arc::new(Value::Literal(None, text.clone())),
+                orig: text,
+            },
+            _ => InnerVar::Simple(text.to_vec()),
+        };
+    }
+
     pub fn loc(&self) -> &Option<Loc> {
         &self.loc
     }
