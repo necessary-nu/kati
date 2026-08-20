@@ -209,6 +209,8 @@ impl GroundJournal {
 pub trait Context: Interner {
     fn flags(&self) -> &Flags;
     fn stats(&self) -> &StatsRegistry;
+    /// Where a non-fatal diagnostic raised against this context is written.
+    fn diagnostics(&self) -> &crate::diagnostics::Diagnostics;
 }
 
 /// One Make evaluation's state, in one owned value.
@@ -280,6 +282,15 @@ pub struct Session {
     /// a later directive for the same pattern extends it rather than replacing
     /// it.
     pub vpaths: Vec<(crate::strutil::Pattern, Vec<Bytes>)>,
+    /// Where this session's non-fatal diagnostics are written.
+    ///
+    /// Shared with every other session of the same compilation, because a
+    /// recursive `$(MAKE)` composed into its parent's graph is another session
+    /// and what it says belongs to the one invocation that asked. The default
+    /// writes each diagnostic to standard error where it is raised, which is
+    /// what the fork's own binary does; a front end that collects them replaces
+    /// it before the read.
+    pub diagnostics: std::sync::Arc<crate::diagnostics::Diagnostics>,
     /// `.SUFFIXES` as the whole read left it, in the order it was written, each
     /// entry keeping its leading dot.
     ///
@@ -343,6 +354,7 @@ impl Session {
             used_undefined_vars: HashSet::new(),
             shell_status: None,
             vpaths: Vec::new(),
+            diagnostics: std::sync::Arc::new(crate::diagnostics::Diagnostics::to_stderr()),
             suffixes: Vec::new(),
         }
     }
@@ -470,6 +482,9 @@ impl Context for Session {
     }
     fn stats(&self) -> &StatsRegistry {
         &self.stats
+    }
+    fn diagnostics(&self) -> &crate::diagnostics::Diagnostics {
+        &self.diagnostics
     }
 }
 

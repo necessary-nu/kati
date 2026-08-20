@@ -91,6 +91,7 @@ pub fn run_command(
     environment: &[(Bytes, Option<Bytes>)],
     redirect_stderr: RedirectStderr,
     diagnostic_prefix: &str,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(ExitStatus, Vec<u8>)> {
     // A line with no shell syntax in it is exec'd directly, exactly as GNU
     // Make's `construct_command_argv_internal` does — so a program that is not
@@ -160,7 +161,10 @@ pub fn run_command(
         // shell is what failed to find the program, and it says so itself.
         Err(error) if direct.is_some() => {
             let name = String::from_utf8_lossy(args[0].as_bytes()).into_owned();
-            eprintln!("{diagnostic_prefix}{name}: {}", system_message(&error));
+            diagnostics.write_line(&format!(
+                "{diagnostic_prefix}{name}: {}",
+                system_message(&error)
+            ));
             // POSIX's status for a command that could not be run, which is what
             // GNU Make's child reports for the same failure.
             return Ok((ExitStatus::from_raw(COMMAND_NOT_FOUND << 8), Vec::new()));

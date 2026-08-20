@@ -1002,6 +1002,9 @@ impl Context for Evaluator {
     fn stats(&self) -> &StatsRegistry {
         &self.session.stats
     }
+    fn diagnostics(&self) -> &crate::diagnostics::Diagnostics {
+        &self.session.diagnostics
+    }
 }
 
 impl Evaluator {

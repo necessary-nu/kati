@@ -51,6 +51,7 @@ pub mod builtin_rules;
 pub mod builtins;
 pub mod command;
 pub mod dep;
+pub mod diagnostics;
 pub mod eval;
 pub mod evaluate;
 pub mod exec;
@@ -232,7 +233,11 @@ fn color_error_log(
 }
 
 fn color_warn_log(ctx: &impl crate::session::Context, loc: Option<&crate::loc::Loc>, msg: String) {
-    eprintln!("{}", color_warn_text(ctx, loc, msg));
+    // Written to the descriptor the session was handed rather than to the
+    // process's standard error: a compilation is a value, and so is everything
+    // it had to say. The default descriptor still writes it straight through.
+    ctx.diagnostics()
+        .write_line(&color_warn_text(ctx, loc, msg));
 }
 
 /// The same diagnostic [`color_warn_log`] prints, returned instead of printed.
