@@ -24,7 +24,7 @@ use std::{
 };
 
 use anyhow::Result;
-use bytes::{BufMut, Bytes};
+use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
 
 use crate::{
@@ -143,7 +143,7 @@ pub enum InnerVar {
     Recursive { v: Arc<Value>, orig: Bytes },
     AutoCommand(Symbol, AutoCommandVar),
     ShellStatus,
-    VariableNames { name: Bytes, all: bool },
+    VariableNames { all: bool },
 }
 
 /// The pieces of a recursive value that `+=` has appended to, in order.
@@ -501,7 +501,17 @@ impl Variable {
             } else {
                 Vec::new()
             }),
-            InnerVar::VariableNames { name, .. } => Cow::Borrowed(name),
+            // The list, and not the name. GNU Make's `.VARIABLES` is a SIMPLE
+            // variable whose value `lookup_special_var` rebuilds as it is read,
+            // so its stored text and its expansion are the same bytes by
+            // construction and `$(value .VARIABLES)` is the list. Handing back
+            // the name instead made this the one variable whose unexpanded text
+            // was neither what it held nor what it produced.
+            InnerVar::VariableNames { all } => {
+                let mut names = BytesMut::new();
+                write_variable_names(session, *all, &mut names);
+                Cow::Owned(names.to_vec())
+            }
         })
     }
 
@@ -648,7 +658,7 @@ impl Variable {
     /// name redefined afterwards is an ordinary variable holding whatever was
     /// written to it, which is what carrying the value rather than the name
     /// reproduces here.
-    pub fn new_variable_names(name: &'static [u8], all: bool) -> Arc<RwLock<Self>> {
+    pub fn new_variable_names(all: bool) -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(Self {
             loc: None,
             definition: None,
@@ -660,11 +670,37 @@ impl Variable {
             deprecated: None,
             obsolete: None,
             visibility_prefix: None,
-            value: InnerVar::VariableNames {
-                name: Bytes::from_static(name),
-                all,
-            },
+            value: InnerVar::VariableNames { all },
         }))
+    }
+}
+
+/// Write the live name list `.VARIABLES` and `.KATI_SYMBOLS` answer with.
+///
+/// One loop for both readers, because GNU Make has one: `lookup_special_var`
+/// rebuilds the stored value, and the expansion then reads that value, so the
+/// text `$(value)` sees and the words `$(.VARIABLES)` produces cannot differ
+/// there. Writing it twice here is what let them differ.
+///
+/// `all` is the whole of what separates the two names. `.VARIABLES` takes every
+/// binding; `.KATI_SYMBOLS` leaves out the ones whose value calls a function,
+/// which is kati's own name and kati's own rule for it. Both leave out the BASE
+/// automatic variables, which GNU Make's list also leaves out — `$@` and its
+/// siblings live in the FILE's variable set, and this walks the global table.
+fn write_variable_names(session: &Session, all: bool, out: &mut dyn BufMut) {
+    let mut ww = WordWriter::new(out);
+    let symbols = session.global_var_names(|var| {
+        let var = var.read();
+        !var.obsolete() && !var.is_base_automatic_command()
+    });
+    for (sym, entry) in symbols {
+        if !all
+            && let Some(var) = session.peek_global_var(sym)
+            && var.read().is_func(&session.symtab)
+        {
+            continue;
+        }
+        ww.write(&entry);
     }
 }
 
@@ -685,22 +721,7 @@ impl Evaluable for Variable {
                     out.put_slice(format!("{status}").as_bytes());
                 }
             }
-            InnerVar::VariableNames { all, .. } => {
-                let mut ww = WordWriter::new(out);
-                let symbols = ev.session.global_var_names(|var| {
-                    let var = var.read();
-                    !var.obsolete() && !var.is_base_automatic_command()
-                });
-                for (sym, entry) in symbols {
-                    if !*all
-                        && let Some(var) = ev.session.peek_global_var(sym)
-                        && var.read().is_func(&ev.session.symtab)
-                    {
-                        continue;
-                    }
-                    ww.write(&entry);
-                }
-            }
+            InnerVar::VariableNames { all } => write_variable_names(&ev.session, *all, out),
         }
         Ok(())
     }
@@ -793,14 +814,8 @@ impl GlobalVars {
             Symbol::SHELLFLAGS,
             Variable::with_simple_string(Bytes::from_static(b"-c"), VarOrigin::Default, None, None),
         );
-        vars.define(
-            Symbol::VARIABLES,
-            Variable::new_variable_names(b".VARIABLES", true),
-        );
-        vars.define(
-            Symbol::KATI_SYMBOLS,
-            Variable::new_variable_names(b".KATI_SYMBOLS", false),
-        );
+        vars.define(Symbol::VARIABLES, Variable::new_variable_names(true));
+        vars.define(Symbol::KATI_SYMBOLS, Variable::new_variable_names(false));
         vars
     }
 
