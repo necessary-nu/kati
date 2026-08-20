@@ -652,13 +652,15 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
         let v = Bytes::from(v.as_bytes().to_vec());
         let frame = ev.current_frame();
         let sym = ev.session.intern(k.as_bytes().to_vec());
-        // Two of these names are ones GNU Make writes into the environment and
-        // then defines a second time, once the environment is in scope, at the
-        // environment's OWN rank: `define_variable_cname (MAKELEVEL_NAME, buf,
-        // o_env, 0)` in `define_automatic_variables`, writing back the depth it
-        // parsed with the recursive flag off, and `define_variable_cname
+        // Three of these names are ones GNU Make writes into the environment
+        // and then defines a second time, once the environment is in scope, at
+        // the environment's OWN rank: `define_variable_cname (MAKELEVEL_NAME,
+        // buf, o_env, 0)` in `define_automatic_variables`, writing back the
+        // depth it parsed with the recursive flag off; `define_variable_cname
         // ("MFLAGS", flagstring, o_env, 1)` in `define_makeflags`, writing back
-        // the switches spelled as a command line.
+        // the switches spelled as a command line; and `define_variable_cname
+        // (GNUMAKEFLAGS_NAME, "", o_env, 0)` in `main`, emptying the stream
+        // whose switches have just been folded into `MAKEFLAGS`.
         //
         // That second define is why these two read `environment override` under
         // `-e` while an ordinary imported name still reads `environment`.
@@ -667,7 +669,7 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
         // already in the slot with it, so the two ranks are equal and the write
         // lands. Only a name Make defines over again is ever incoming. Saying
         // that here rather than defining twice is the same thing said once.
-        let defined_over_again = matches!(k.as_bytes(), b"MAKELEVEL" | b"MFLAGS");
+        let defined_over_again = matches!(k.as_bytes(), b"MAKELEVEL" | b"MFLAGS" | b"GNUMAKEFLAGS");
         let origin = if defined_over_again && ev.session.flags.environment_overrides {
             VarOrigin::EnvironmentOverride
         } else {
@@ -688,12 +690,15 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
         // `Unreadable` that raises where it is read rather than at startup.
         // GNU Make is lazy for the same reason and by the same construction.
         //
-        // `MAKELEVEL` is the exception, and it is GNU Make's: `main` defines it
-        // over again from the depth it parsed, `define_variable_cname
-        // (MAKELEVEL_NAME, buf, o_env, 0)`, with the recursive flag off. So the
-        // one environment name whose value is a number stays simple even when
-        // the invocation put an expression there.
-        let var = if k.as_bytes() == b"MAKELEVEL" {
+        // Two names are the exception, and they are GNU Make's: the two of the
+        // three above whose second define carries a recursive flag of 0.
+        // `MAKELEVEL` is written back from the depth `main` parsed, so the one
+        // environment name whose value is a number stays simple even when the
+        // invocation put an expression there; `GNUMAKEFLAGS` is written back
+        // empty, so what a `$` in it could have meant never arises. `MFLAGS`
+        // is not among them — its second define passes 1 — and it is the
+        // reason this is a list of names rather than a rule about switches.
+        let var = if matches!(k.as_bytes(), b"MAKELEVEL" | b"GNUMAKEFLAGS") {
             Variable::with_simple_string(v, origin, Some(frame), None)
         } else {
             let mut loc = Loc::default();
@@ -714,6 +719,42 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
         };
         ev.session.set_global_var(sym, var, false, None)?;
     }
+    Ok(())
+}
+
+/// Read `GNUMAKEFLAGS` a second time, once the last makefile has been read.
+///
+/// GNU Make's `main` does this immediately after `read_all_makefiles`: whatever
+/// the name holds by then is decoded as switches at the makefile's own rank,
+/// and the name is emptied again so nothing reads it twice — this time at
+/// `o_override`, which is why `$(origin GNUMAKEFLAGS)` answers `override` to a
+/// recipe whatever the invocation was given and whether or not a makefile ever
+/// wrote the name. The emptying is unconditional where the startup one is
+/// guarded, so the name exists from here on even in a run that was handed none.
+///
+/// A frontend that supplies no switch grammar has no second stream to read, and
+/// this leaves the name exactly as the makefiles left it.
+fn decode_gnumakeflags_after_read(ev: &mut Evaluator) -> Result<()> {
+    if ev.session.flags.makeflags_assignment.is_none() {
+        return Ok(());
+    }
+    let name = ev.session.intern("GNUMAKEFLAGS");
+    let value = ev.eval_var(name)?;
+    if !value.is_empty() {
+        ev.fold_switches_into_makeflags(&value, None)?;
+    }
+    // The export attribute travels with the name rather than with the value:
+    // GNU Make redefines the binding in place, so one that arrived from the
+    // environment keeps handing its children an empty value and one this line
+    // invented reaches no child at all.
+    let exported = ev
+        .session
+        .globals
+        .peek(name)
+        .map_or(VarExport::Default, |var| var.read().export);
+    let emptied = Variable::with_simple_string(Bytes::new(), VarOrigin::Override, None, None);
+    emptied.write().export = exported;
+    ev.session.globals.define(name, emptied);
     Ok(())
 }
 
@@ -1064,6 +1105,19 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
         }
     }
 
+    // The environment's second option stream is read a second time here, over
+    // whatever the makefiles left in it, and emptied again: `decode_env_switches
+    // (STRING_SIZE_TUPLE (GNUMAKEFLAGS_NAME), o_env)` followed by
+    // `define_variable_cname (GNUMAKEFLAGS_NAME, "", o_override, 0)`, main.c
+    // just after `read_all_makefiles` and before the catalogue is withdrawn —
+    // so a `-R` written here still takes the catalogue away below.
+    //
+    // `MAKEFLAGS` has no second read of its own because it never needed one:
+    // GNU Make's `set_special_var` intercepts every write to that name as it
+    // happens, which is what `normalize_makeflags_assignment` is. `GNUMAKEFLAGS`
+    // is not a special variable, so its whole effect is decided once, here, by
+    // what it holds when the last makefile has been read.
+    decode_gnumakeflags_after_read(&mut ev)?;
     // A Makefile's own `MAKEFLAGS += -rR` is decoded where it is written, but
     // GNU Make withdraws the catalogue only once the whole read is over. The
     // difference is visible: `$(origin CC)` on the next line still answers

@@ -1044,6 +1044,24 @@ impl Evaluator {
         if !assigned || lhs.as_bytes(&self.session).as_ref() != b"MAKEFLAGS" {
             return Ok(());
         }
+        let value = self.eval_var(lhs)?;
+        self.fold_switches_into_makeflags(&value, Some(variable))
+    }
+
+    /// Read one option stream's text into the switch table and republish
+    /// `MAKEFLAGS` from what the table then holds.
+    ///
+    /// This is GNU Make's `decode_env_switches` followed by `define_makeflags`,
+    /// and it happens at two sites: where a Makefile writes `MAKEFLAGS`, which
+    /// `set_special_var` (variable.c) intercepts as it happens, and once after
+    /// the whole read over whatever `GNUMAKEFLAGS` holds by then (main.c:2086).
+    /// `binding` is the write's own handle at the first site and nothing at the
+    /// second, where the name being read is not the name being written.
+    pub(crate) fn fold_switches_into_makeflags(
+        &mut self,
+        value: &Bytes,
+        binding: Option<&Var>,
+    ) -> Result<()> {
         let Some((decoder, previous, protected, has_overrides)) = self
             .session
             .flags
@@ -1061,8 +1079,7 @@ impl Evaluator {
             return Ok(());
         };
 
-        let value = self.eval_var(lhs)?;
-        let decoded = decoder(&previous, &value, &protected).map_err(anyhow::Error::msg)?;
+        let decoded = decoder(&previous, value, &protected).map_err(anyhow::Error::msg)?;
         // Said where the write is, as GNU Make's `decode_switches` says it, and
         // said once: a staging pass reading the same text again is repeating a
         // read that already spoke.
@@ -1077,9 +1094,17 @@ impl Evaluator {
             }
         }
         let overrides = self.session.intern("MAKEOVERRIDES");
-        let (value, original) =
+        let (published, original) =
             makeflags_value(decoded.makeflags.clone(), has_overrides, overrides);
-        variable.write().replace_recursive_value(value, original);
+        let makeflags = self.session.intern("MAKEFLAGS");
+        if let Some(variable) = binding
+            .cloned()
+            .or_else(|| self.session.globals.peek(makeflags))
+        {
+            variable
+                .write()
+                .replace_recursive_value(published, original);
+        }
 
         let mflags = self.session.intern("MFLAGS");
         let mflags_value = Arc::new(Value::Literal(None, decoded.mflags.clone()));
