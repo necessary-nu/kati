@@ -110,6 +110,14 @@ pub struct MakeflagsAssignment {
 // [spec:ronin:req:make.no-ambient-state]
 #[derive(Default)]
 pub struct Flags {
+    /// The program to run in place of `/bin/sh`, when the tool this was
+    /// compiled into carries a shell of its own.
+    ///
+    /// A `$(shell)` call and a recipe line are the same language, so a front
+    /// end whose build will run recipes under its own shell reads them with
+    /// that shell too. Left `None` — which is what `rkati` leaves it — the
+    /// machine's `/bin/sh` runs them, as it always did.
+    pub default_shell_program: Option<std::path::PathBuf>,
     pub detect_android_echo: bool,
     pub detect_depfiles: bool,
     pub dump_kati_stamp: bool,

@@ -51,6 +51,31 @@ use bytes::Bytes;
 /// is willing to stand in for.
 pub const DEFAULT_SHELL: &[u8] = b"/bin/sh";
 
+/// The process that runs the shell spelled `named`.
+///
+/// Where `named` is the default shell and `stand_in` names a program, the
+/// stand-in is what runs and `named` is its `argv[0]`. dash prefixes its
+/// diagnostics with `argv[0]` exactly as written, so carrying the spelling
+/// through is what makes a substituted shell say what the shell it replaced
+/// would have said. Anything else — a `SHELL` the Makefile set, the `/bin/sh`
+/// wrapping a complicated one — is spawned as named.
+pub fn shell_process(
+    named: &std::ffi::OsStr,
+    stand_in: Option<&std::path::Path>,
+) -> std::process::Command {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
+
+    if named.as_bytes() == DEFAULT_SHELL
+        && let Some(stand_in) = stand_in
+    {
+        let mut command = std::process::Command::new(stand_in);
+        command.arg0(named);
+        return command;
+    }
+    std::process::Command::new(named)
+}
+
 /// Characters that mean something to a shell, so a line holding one of them is
 /// the shell's errand. GNU Make's `sh_chars` for a Unix-ish host.
 ///

@@ -21,7 +21,7 @@ use std::{
     collections::HashMap,
     ffi::{CStr, CString, OsStr},
     path::Path,
-    process::{Command, ExitStatus},
+    process::ExitStatus,
     slice,
     sync::Arc,
     time::SystemTime,
@@ -92,6 +92,7 @@ pub fn run_command(
     redirect_stderr: RedirectStderr,
     diagnostic_prefix: &str,
     diagnostics: &crate::diagnostics::Diagnostics,
+    default_shell_program: Option<&Path>,
 ) -> Result<(ExitStatus, Vec<u8>)> {
     // A line with no shell syntax in it is exec'd directly, exactly as GNU
     // Make's `construct_command_argv_internal` does — so a program that is not
@@ -131,7 +132,10 @@ pub fn run_command(
 
     log!("run_command({args:?})");
 
-    let mut cmd = Command::new(args[0]);
+    // The shell is in program position here, so the build's own shell can
+    // stand in for the default one — for the `$(SHELL)` a plain call names and
+    // for the `/bin/sh` wrapping a complicated one alike.
+    let mut cmd = crate::simple_command::shell_process(args[0], default_shell_program);
     cmd.args(&args[1..]);
     for (name, value) in environment {
         let name = <OsStr as OsStrExt>::from_bytes(name);
