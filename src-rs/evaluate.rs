@@ -167,9 +167,16 @@ fn read_bootstrap_makefile(
         bootstrap.put_slice(session.flags.subkati_args.join(OsStr::new(" ")).as_bytes());
         bootstrap.put_u8(b'\n');
     }
-    bootstrap.put_slice(b"MAKECMDGOALS?=");
-    bootstrap.put(join_symbols(&*session, targets, b" "));
-    bootstrap.put_u8(b'\n');
+    // Only when a goal word was given, because GNU Make defines this name from
+    // inside the branch of `handle_non_switch_argument` (main.c) that enters a
+    // goal target: with no goal there is no name at all, and `ifdef
+    // MAKECMDGOALS` is how a Makefile asks whether it was invoked bare. Binding
+    // it to the empty string instead answers that question `yes` every time.
+    if !targets.is_empty() {
+        bootstrap.put_slice(b"MAKECMDGOALS?=");
+        bootstrap.put(join_symbols(&*session, targets, b" "));
+        bootstrap.put_u8(b'\n');
+    }
 
     bootstrap.put_slice(b"CURDIR:=");
     bootstrap.put_slice(std::env::current_dir()?.as_os_str().as_bytes());
@@ -311,23 +318,30 @@ fn install_compiler_invocation_variables(ev: &mut Evaluator) {
             .unwrap_or(false);
 
     let command_variables = ev.session.intern("-*-command-variables-*-");
-    ev.session.globals.define(
-        command_variables,
-        Variable::with_simple_string(make_overrides.clone(), VarOrigin::Automatic, None, None),
-    );
-
     let overrides = ev.session.intern("MAKEOVERRIDES");
-    if ev.session.peek_global_var(overrides).is_none() {
+    // Both names exist only where a command-line assignment put one there. GNU
+    // Make defines the pair inside `if (command_variables != 0)` in
+    // `define_makeflags` (main.c), so `$(origin MAKEOVERRIDES)` answering
+    // `undefined` is how a Makefile asks whether anything outranked it — an
+    // assignment arriving in an inherited `MAKEFLAGS` counts, because that is
+    // where the table it fills comes from in a child.
+    if !make_overrides.is_empty() {
         ev.session.globals.define(
-            overrides,
-            Variable::new_recursive(
-                Arc::new(Value::SymRef(Loc::default(), command_variables)),
-                VarOrigin::Default,
-                None,
-                None,
-                Bytes::from_static(b"${-*-command-variables-*-}"),
-            ),
+            command_variables,
+            Variable::with_simple_string(make_overrides.clone(), VarOrigin::Automatic, None, None),
         );
+        if ev.session.peek_global_var(overrides).is_none() {
+            ev.session.globals.define(
+                overrides,
+                Variable::new_recursive(
+                    Arc::new(Value::SymRef(Loc::default(), command_variables)),
+                    VarOrigin::Default,
+                    None,
+                    None,
+                    Bytes::from_static(b"${-*-command-variables-*-}"),
+                ),
+            );
+        }
     }
 
     let has_overrides = !make_overrides.is_empty() || inherited_overrides;
