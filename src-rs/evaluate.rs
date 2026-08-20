@@ -28,6 +28,7 @@ limitations under the License.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -309,26 +310,126 @@ fn make_host() -> String {
     format!("{arch}-{vendor}-{system}{abi}")
 }
 
-/// The include search path in the spelling `.INCLUDE_DIRS` records.
+/// The directories an `include` falls back to when no `-I` named one, and no
+/// makefile ever asks for.
 ///
-/// `construct_include_path` (read.c) stats every `-I` directory as the switches
-/// are decoded and keeps only the ones that are there, discarding trailing
-/// slashes. Both rules are visible: `-I nosuchdir` leaves the list unchanged
-/// and `-I inc/` joins it as `inc`.
+/// `default_include_directories` (read.c:103) is the configure-time
+/// `INCLUDEDIR` followed by these three, and `construct_include_path` keeps
+/// whichever of them are on disk — which is why the oracle answers with two of
+/// them on this host.
+///
+/// THE DECISION, and it is one rather than a value to copy, the way `MAKE_HOST`
+/// was. GNU Make's `INCLUDEDIR` is `$(includedir)` from its own `configure`
+/// run: the place that installation puts headers. Ronin has no configure step
+/// and installs no include tree of its own, so there is nothing honest to
+/// prepend — a path named after this program would name a directory nothing
+/// ever puts a makefile fragment in. What is left is the convention, which is
+/// exactly the list GNU Make ships when it is built without an `INCLUDEDIR`,
+/// and that is what the oracle is: its `-DINCLUDEDIR` is commented out of the
+/// build, so it answers `/usr/local/include /usr/include` for the same reason
+/// this does rather than by being matched.
+const DEFAULT_INCLUDE_DIRECTORIES: &[&str] =
+    &["/usr/gnu/include", "/usr/local/include", "/usr/include"];
+
+/// The include search path, in the order and the spelling
+/// `construct_include_path` (read.c) builds it.
+///
+/// Every `-I` directory is tilde-expanded, stat'ed, and kept only if it is
+/// there, with trailing slashes discarded — `-I nosuchdir` leaves the list
+/// unchanged and `-I inc/` joins it as `inc`. Then the built-in default
+/// directories go on the END, under the same test, so a `-I` always wins over
+/// them; unless an `-I -` turned them off, which it does for the rest of the
+/// run rather than merely restarting the list.
+///
+/// Nothing is de-duplicated: `make -I /usr/include` names that directory twice,
+/// once from the switch and once from the default path, and GNU Make lists it
+/// twice.
+fn construct_include_path(ev: &Evaluator) -> Vec<PathBuf> {
+    let mut path = Vec::new();
+    for dir in &ev.session.flags.include_dirs {
+        push_directory(&mut path, tilde_expand(&ev.session, dir));
+    }
+    if !ev.session.flags.no_default_include_dirs {
+        for dir in DEFAULT_INCLUDE_DIRECTORIES {
+            push_directory(&mut path, PathBuf::from(dir));
+        }
+    }
+    path
+}
+
+/// Keep `dir` if it is a directory, in the spelling GNU Make records: trailing
+/// slashes discarded, and nothing else touched.
+fn push_directory(path: &mut Vec<PathBuf>, dir: PathBuf) {
+    if !dir.is_dir() {
+        return;
+    }
+    let mut bytes = dir.as_os_str().as_bytes();
+    while bytes.len() > 1 && bytes.ends_with(b"/") {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    path.push(PathBuf::from(OsStr::from_bytes(bytes).to_owned()));
+}
+
+/// `~` as GNU Make's `tilde_expand` (read.c) expands it, which is the one
+/// rewriting a `-I` directory gets before it is stat'ed.
+///
+/// `~` and `~/...` become `HOME` and the rest of the path. Anything else — and
+/// a `~` with no `HOME` behind it — is left exactly as it stands, which then
+/// fails the directory test and drops out of the search path, so it is not an
+/// error but an entry that was never there.
+///
+/// GNU reads `$(HOME)` as a variable and falls back to `getenv`; here it is the
+/// environment either way, because this runs before any makefile could have
+/// written the name — measured, with a makefile assigning `HOME` that GNU Make
+/// also ignores.
+///
+/// THE ONE FORM THAT IS NOT HERE is `~user`, and its absence is a decision
+/// rather than an omission. GNU Make answers it out of the passwd database, and
+/// the passwd database is the name service: `getpwnam` on a miss reaches
+/// `libnss_systemd`, which glibc has to `dlopen`. Ronin is linked
+/// `+crt-static` (.cargo/config.toml) and ships a static-pie binary, where that
+/// `dlopen` is unsupported — it segfaults inside the module rather than
+/// failing, which was measured before this was written. A build tool that
+/// crashes on `-I ~somebody` is worse than one that does not know whose home
+/// that is, and what it does instead is what GNU Make itself does for a user it
+/// cannot resolve: leave the word alone and let the directory test drop it.
+fn tilde_expand(session: &Session, dir: &Path) -> PathBuf {
+    let bytes = dir.as_os_str().as_bytes();
+    let Some(rest) = bytes.strip_prefix(b"~") else {
+        return dir.to_owned();
+    };
+    if !rest.is_empty() && !rest.starts_with(b"/") {
+        return dir.to_owned();
+    }
+    let Some(home) = own_home(session).filter(|home| !home.is_empty()) else {
+        return dir.to_owned();
+    };
+    let mut expanded = home;
+    expanded.extend_from_slice(rest);
+    PathBuf::from(OsString::from_vec(expanded))
+}
+
+/// `HOME` as this invocation was given it.
+fn own_home(session: &Session) -> Option<Vec<u8>> {
+    match &session.invocation_environment {
+        Some(environment) => environment
+            .iter()
+            .rev()
+            .find(|(name, _)| name.as_bytes() == b"HOME")
+            .map(|(_, value)| value.as_bytes().to_vec()),
+        None => std::env::var_os("HOME").map(std::ffi::OsString::into_vec),
+    }
+}
+
+/// The search path as `.INCLUDE_DIRS` spells it: the directories, space
+/// separated.
 fn include_directories(session: &Session) -> Bytes {
     let mut list = BytesMut::new();
-    for dir in &session.flags.include_dirs {
-        if !dir.is_dir() {
-            continue;
-        }
-        let mut bytes = dir.as_os_str().as_bytes();
-        while bytes.len() > 1 && bytes.ends_with(b"/") {
-            bytes = &bytes[..bytes.len() - 1];
-        }
+    for dir in &session.include_path {
         if !list.is_empty() {
             list.put_u8(b' ');
         }
-        list.put_slice(bytes);
+        list.put_slice(dir.as_os_str().as_bytes());
     }
     list.freeze()
 }
@@ -843,6 +944,13 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
 
     install_default_goal(&mut ev)?;
     install_makefiles_variable(&mut ev)?;
+
+    // GNU Make's `construct_include_path` (main.c:1831), in its place: after
+    // the environment, because a `-I ~` reads `HOME` out of it, and before
+    // anything can include a file. It is one list rather than two — the search
+    // reads it and `.INCLUDE_DIRS` publishes it — so the variable is an answer
+    // about the search rather than a second opinion about it.
+    ev.session.include_path = construct_include_path(&ev);
 
     // The names GNU Make works out for itself, before the bootstrap Makefile so
     // that a line in it could still outrank one — none does today, and the

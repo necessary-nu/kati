@@ -29,6 +29,7 @@ limitations under the License.
 use std::{
     collections::HashSet,
     ffi::{OsStr, OsString},
+    path::PathBuf,
     sync::{OnceLock, atomic::AtomicUsize},
 };
 
@@ -215,6 +216,16 @@ pub trait Context: Interner {
 pub struct Session {
     /// The parsed command line. A value, not a read of the process arguments.
     pub flags: Flags,
+    /// The directories an `include` is searched for in, in order.
+    ///
+    /// Not the same list as `flags.include_dirs`, and deliberately so: this is
+    /// what `construct_include_path` (read.c) builds out of it — every `-I`
+    /// directory tilde-expanded and stat'ed, the ones that are not there left
+    /// out and trailing slashes discarded, with the built-in default
+    /// directories on the end. `.INCLUDE_DIRS` publishes this list, and the
+    /// search reads this list, so the variable is an answer about the search
+    /// rather than a second opinion.
+    pub include_path: Vec<PathBuf>,
     /// The environment this invocation imports, when its caller is another
     /// compiler session rather than the ambient process.
     ///
@@ -316,6 +327,7 @@ impl Session {
     fn from_parts(flags: Flags, symtab: Symtab) -> Self {
         Self {
             flags,
+            include_path: Vec::new(),
             invocation_environment: None,
             symtab,
             globals: GlobalVars::with_builtins(),

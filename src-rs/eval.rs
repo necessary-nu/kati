@@ -2498,21 +2498,24 @@ impl Evaluator {
         Ok(())
     }
 
-    /// Where `-I` found the file, or the name as written.
+    /// Where the include search path found the file, or the name as written.
     ///
     /// Only when the working directory does not have it: GNU Make searches the
-    /// path after failing, not instead of looking.
+    /// path after failing to open the name as given, not instead of trying it
+    /// (`eval_makefile`, read.c). The name it hands back is the JOINED one, and
+    /// that matters beyond the read: a makefile found down the path is entered
+    /// under that path, so it is that path a rule has to name to remake it.
     fn at_include_dirs(&self, pat: Bytes) -> Bytes {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
         use std::path::Path;
 
-        if self.session.flags.include_dirs.is_empty()
+        if self.session.include_path.is_empty()
             || pat.starts_with(b"/")
             || Path::new(OsStr::from_bytes(&pat)).exists()
         {
             return pat;
         }
-        for dir in &self.session.flags.include_dirs {
+        for dir in &self.session.include_path {
             let candidate = dir.join(OsStr::from_bytes(&pat));
             if candidate.exists() {
                 return Bytes::from(candidate.into_os_string().into_vec());
