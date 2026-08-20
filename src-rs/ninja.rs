@@ -1158,15 +1158,61 @@ impl<'a> NinjaGenerator<'a> {
         if make.is_empty() {
             return command.to_vec();
         }
-        let mut written = Vec::with_capacity(command.len());
-        let mut rest = command;
-        while let Some(at) = rest.windows(make.len()).position(|window| window == make) {
-            written.extend_from_slice(&rest[..at]);
-            written.extend_from_slice(REFERENCE);
-            rest = &rest[at + make.len()..];
+        // Only where the value stands as a word of its own. It is a program
+        // name, so anything a path or a name could be made of on either side of
+        // it says this occurrence is part of something longer — a directory
+        // called `nomakefile` holds the word `make` and is not one.
+        const fn joins_a_word(byte: u8) -> bool {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/')
         }
-        written.extend_from_slice(rest);
+        let mut written = Vec::with_capacity(command.len());
+        let mut at = 0;
+        while at < command.len() {
+            let Some(found) = command[at..]
+                .windows(make.len())
+                .position(|window| window == make)
+                .map(|found| at + found)
+            else {
+                break;
+            };
+            let after = found + make.len();
+            let bounded = command[..found]
+                .last()
+                .is_none_or(|byte| !joins_a_word(*byte))
+                && command.get(after).is_none_or(|byte| !joins_a_word(*byte));
+            if bounded {
+                written.extend_from_slice(&command[at..found]);
+                written.extend_from_slice(REFERENCE);
+                at = after;
+            } else {
+                written.extend_from_slice(&command[at..after]);
+                at = after;
+            }
+        }
+        written.extend_from_slice(&command[at.min(command.len())..]);
         written
+    }
+
+    /// Where a recipe line was written, as a report has to name it: the unit's
+    /// own prefix in front of the file and line the reader recorded.
+    ///
+    /// One function because the census and the invocations handed to the sink
+    /// must name the same line the same way — a report that spelled the two
+    /// differently would read as two places.
+    fn written_at(session: &crate::session::Session, command: &Command) -> Option<String> {
+        command.loc.as_ref().map(|loc| {
+            let written = loc.display(session).to_string();
+            // An absolute name already says which file it is, and a unit read
+            // from the root has nothing in front of it.
+            if session.unit_prefix.is_empty() || written.starts_with('/') {
+                written
+            } else {
+                format!(
+                    "{}/{written}",
+                    String::from_utf8_lossy(&session.unit_prefix)
+                )
+            }
+        })
     }
 
     /// Write what this recipe's lines were classified as into the session's
@@ -1186,19 +1232,7 @@ impl<'a> NinjaGenerator<'a> {
             return;
         }
         for command in commands {
-            let location = command.loc.as_ref().map(|loc| {
-                let written = loc.display(session).to_string();
-                // An absolute name already says which file it is, and a unit
-                // read from the root has nothing in front of it.
-                if session.unit_prefix.is_empty() || written.starts_with('/') {
-                    written
-                } else {
-                    format!(
-                        "{}/{written}",
-                        String::from_utf8_lossy(&session.unit_prefix)
-                    )
-                }
-            });
+            let location = Self::written_at(session, command);
             for invocation in &command.recursive_make {
                 session.census.record(crate::census::Invocation {
                     location: location.clone(),
@@ -1583,11 +1617,29 @@ impl<'a> NinjaGenerator<'a> {
             let subninja_storage = if composable_subninjas {
                 nn.commands
                     .iter()
-                    .flat_map(|command| command.recursive_make.iter())
-                    .map(|invocation| {
+                    .flat_map(|command| {
+                        // Rendered per line rather than per invocation, and only
+                        // for a caller that asked for a report: a build drops it
+                        // and would be paying for an interner lookup and a
+                        // string it never reads.
+                        let location = self
+                            .ce
+                            .ev
+                            .session
+                            .census
+                            .is_recording()
+                            .then(|| Self::written_at(&self.ce.ev.session, command))
+                            .flatten();
+                        command
+                            .recursive_make
+                            .iter()
+                            .map(move |invocation| (invocation, location.clone()))
+                    })
+                    .map(|(invocation, location)| {
                         (
                             Self::translate_command(invocation.command.clone()),
                             invocation.make.clone(),
+                            location,
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1635,20 +1687,23 @@ impl<'a> NinjaGenerator<'a> {
             let subninjas = subninja_storage
                 .iter()
                 .zip(&preceding_storage)
-                .map(|((command, make), (preceding, preceding_ignore_errors))| {
-                    crate::build_sink::SinkSubninja {
-                        command,
-                        make,
-                        preceding: (!preceding.is_empty()).then(|| {
-                            if preceding.len() > 100 * 1000 {
-                                SinkCommand::ResponseFile(preceding)
-                            } else {
-                                SinkCommand::Inline(preceding)
-                            }
-                        }),
-                        preceding_ignore_errors: *preceding_ignore_errors,
-                    }
-                })
+                .map(
+                    |((command, make, location), (preceding, preceding_ignore_errors))| {
+                        crate::build_sink::SinkSubninja {
+                            command,
+                            make,
+                            preceding: (!preceding.is_empty()).then(|| {
+                                if preceding.len() > 100 * 1000 {
+                                    SinkCommand::ResponseFile(preceding)
+                                } else {
+                                    SinkCommand::Inline(preceding)
+                                }
+                            }),
+                            preceding_ignore_errors: *preceding_ignore_errors,
+                            location: location.as_deref(),
+                        }
+                    },
+                )
                 .collect::<Vec<_>>();
             let (residual_script, residual_ignore_errors) = Self::residual_segment(
                 &self.ce.ev.session.flags,
@@ -2490,6 +2545,46 @@ pub fn emit_build(
 mod tests {
     use super::*;
     use crate::symtab::Symtab;
+
+    /// A census names the child a recipe line selects, with the `MAKE`
+    /// reference written back where the path it expanded to stands — and only
+    /// where that path stands as a word of its own.
+    ///
+    /// The value is a program name, so an occurrence with a path character on
+    /// either side of it belongs to something longer. A directory called
+    /// `nomakefile` is the case that says so, and it comes from a real tree.
+    #[test]
+    fn a_make_reference_is_written_back_only_where_the_value_is_a_word() {
+        let written = |command: &str, make: &str| {
+            String::from_utf8(NinjaGenerator::written_as_make_reference(
+                command.as_bytes(),
+                make.as_bytes(),
+            ))
+            .unwrap()
+        };
+
+        assert_eq!(written("make -C sub all", "make"), "$(MAKE) -C sub all");
+        assert_eq!(
+            written("cd sub && make all", "make"),
+            "cd sub && $(MAKE) all"
+        );
+        assert_eq!(
+            written("cd nomakefile/ && make all", "make"),
+            "cd nomakefile/ && $(MAKE) all"
+        );
+        assert_eq!(
+            written("cd makefiles && make", "make"),
+            "cd makefiles && $(MAKE)"
+        );
+        assert_eq!(
+            written("/usr/bin/make -C sub", "/usr/bin/make"),
+            "$(MAKE) -C sub"
+        );
+        // Every word of it, not just the first.
+        assert_eq!(written("make && make", "make"), "$(MAKE) && $(MAKE)");
+        // A value nothing set writes nothing back.
+        assert_eq!(written("cd sub && make all", ""), "cd sub && make all");
+    }
 
     /// Drive a writer over one always-dirty edge whose names need escaping.
     fn write_phony_edge(phony_output: bool) -> String {

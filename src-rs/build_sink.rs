@@ -211,6 +211,13 @@ pub struct SinkSubninja<'a> {
     pub preceding: Option<SinkCommand<'a>>,
     /// Whether every line in [`Self::preceding`] ignores failure.
     pub preceding_ignore_errors: bool,
+    /// The Makefile and line the recipe line was written on, rendered here for
+    /// the same reason [`crate::census::Invocation::location`] is: the file
+    /// name lives in an interner the sink does not hold.
+    ///
+    /// `None` when nobody asked for a report, because rendering it costs an
+    /// interner lookup and a string a build would drop.
+    pub location: Option<&'a str>,
 }
 
 /// The half of a Make dependency node that Ninja binds to a `rule`.

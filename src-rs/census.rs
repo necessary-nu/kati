@@ -25,6 +25,19 @@ pub enum Disposition {
     /// There is no one invocation to name — that is what the reason says —
     /// and the location names the line.
     Nested(NestingReason),
+    /// Composed, and then there was no makefile where it pointed.
+    ///
+    /// Recorded by whoever went to read the child rather than by the classifier
+    /// above, because the classifier settles what the recipe line IS and this is
+    /// what happened when the compiler acted on that: the directory named here
+    /// exists and holds none of the names a Make reads. It follows the
+    /// [`Disposition::Composed`] entry for the same line rather than replacing
+    /// it, because both are true and the first is what the compiler decided.
+    MissingMakefile {
+        /// Where the invocation pointed, as a reader would write it: relative
+        /// to the build's root where it sits under one.
+        directory: String,
+    },
 }
 
 /// Why an invocation the compiler could see was not composed.
