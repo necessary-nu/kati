@@ -423,7 +423,7 @@ impl DeferredRecipes {
         // child to compose cannot grow one now.
         if commands
             .iter()
-            .any(|command| !command.recursive_make.is_empty() || command.uncomposable_recursion)
+            .any(|command| !command.recursive_make.is_empty() || command.uncomposable_recursion())
         {
             anyhow::bail!(
                 "recipe for {} reached a recursive Make invocation the compiler could not see before expanding it",
@@ -1145,6 +1145,88 @@ impl<'a> NinjaGenerator<'a> {
     /// which is the `set +e` in [`Self::gen_shell_script`]. When every line is
     /// prefixed there is nothing to accommodate and the relaxed flags govern.
     ///
+    /// One lifted invocation with the `MAKE` reference written back where the
+    /// path it expanded to now stands.
+    ///
+    /// `$(MAKE)` expands to this executable's own absolutized path, which is
+    /// the right thing to run and the wrong thing to read: it is the same
+    /// twenty-odd bytes on every line of a report, it differs between machines,
+    /// and it says nothing the reader did not already know. What the Makefile
+    /// wrote is what a report about the Makefile shows.
+    fn written_as_make_reference(command: &[u8], make: &[u8]) -> Vec<u8> {
+        const REFERENCE: &[u8] = b"$(MAKE)";
+        if make.is_empty() {
+            return command.to_vec();
+        }
+        let mut written = Vec::with_capacity(command.len());
+        let mut rest = command;
+        while let Some(at) = rest.windows(make.len()).position(|window| window == make) {
+            written.extend_from_slice(&rest[..at]);
+            written.extend_from_slice(REFERENCE);
+            rest = &rest[at + make.len()..];
+        }
+        written.extend_from_slice(rest);
+        written
+    }
+
+    /// Write what this recipe's lines were classified as into the session's
+    /// census, for a caller that asked for one.
+    ///
+    /// Here rather than at the moment each line was classified, because one of
+    /// the answers is not a fact about a line at all: a `.ONESHELL` recipe of
+    /// several lines shares one shell, so lines that would each have composed
+    /// on their own nest together, and only the recipe knows that.
+    ///
+    /// The disposition written here is the one acted on three lines below, and
+    /// not a second reading of the same recipe. That is the whole value of
+    /// recording it: a census that could differ from the build would be
+    /// describing a different build.
+    fn record_census(session: &crate::session::Session, commands: &[Command], composable: bool) {
+        if !session.census.is_recording() {
+            return;
+        }
+        for command in commands {
+            let location = command.loc.as_ref().map(|loc| {
+                let written = loc.display(session).to_string();
+                // An absolute name already says which file it is, and a unit
+                // read from the root has nothing in front of it.
+                if session.unit_prefix.is_empty() || written.starts_with('/') {
+                    written
+                } else {
+                    format!(
+                        "{}/{written}",
+                        String::from_utf8_lossy(&session.unit_prefix)
+                    )
+                }
+            });
+            for invocation in &command.recursive_make {
+                session.census.record(crate::census::Invocation {
+                    location: location.clone(),
+                    disposition: if composable {
+                        crate::census::Disposition::Composed {
+                            command: Self::written_as_make_reference(
+                                &invocation.command,
+                                &invocation.make,
+                            ),
+                        }
+                    } else {
+                        crate::census::Disposition::Nested(
+                            crate::census::NestingReason::SharedShell,
+                        )
+                    },
+                });
+            }
+            // A line with nothing lifted out of it is in the census only when
+            // it starts a Make anyway, which is exactly what `nesting` names.
+            if let Some(reason) = command.nesting {
+                session.census.record(crate::census::Invocation {
+                    location,
+                    disposition: crate::census::Disposition::Nested(reason),
+                });
+            }
+        }
+    }
+
     /// `.ONESHELL` is the case where one invocation is not an approximation,
     /// and GNU Make reads the first line's prefix for it.
     fn script_shell_flags(flags: &Flags, commands: &[Command]) -> Bytes {
@@ -1497,6 +1579,7 @@ impl<'a> NinjaGenerator<'a> {
                     .commands
                     .iter()
                     .all(|command| command.recursive_make.is_empty());
+            Self::record_census(&self.ce.ev.session, &nn.commands, composable_subninjas);
             let subninja_storage = if composable_subninjas {
                 nn.commands
                     .iter()
@@ -2601,7 +2684,8 @@ mod tests {
                 force_no_subshell: false,
                 recursive_line: false,
                 recursive_make: Vec::new(),
-                uncomposable_recursion: false,
+                nesting: None,
+                loc: None,
             })
             .collect();
         let flags = Flags {
@@ -2719,7 +2803,8 @@ mod tests {
                 force_no_subshell: false,
                 recursive_line: false,
                 recursive_make: Vec::new(),
-                uncomposable_recursion: false,
+                nesting: None,
+                loc: None,
             })
             .collect();
         let flags = Flags::default();
@@ -2760,7 +2845,8 @@ mod tests {
                 force_no_subshell: false,
                 recursive_line: false,
                 recursive_make: Vec::new(),
-                uncomposable_recursion: false,
+                nesting: None,
+                loc: None,
             })
             .collect();
         let script_flags = NinjaGenerator::script_shell_flags(flags, &commands);
@@ -2860,7 +2946,8 @@ mod tests {
             force_no_subshell: false,
             recursive_line: false,
             recursive_make: Vec::new(),
-            uncomposable_recursion: false,
+            nesting: None,
+            loc: None,
         })
         .collect();
         let mut description = None;

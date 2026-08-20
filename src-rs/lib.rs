@@ -49,6 +49,7 @@ pub mod archive;
 pub mod build_sink;
 pub mod builtin_rules;
 pub mod builtins;
+pub mod census;
 pub mod command;
 pub mod dep;
 pub mod diagnostics;

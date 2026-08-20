@@ -291,6 +291,23 @@ pub struct Session {
     /// what the fork's own binary does; a front end that collects them replaces
     /// it before the read.
     pub diagnostics: std::sync::Arc<crate::diagnostics::Diagnostics>,
+    /// Where this session records what it decided about each recursive
+    /// invocation it classified.
+    ///
+    /// Shared with every other session of the same compilation for the reason
+    /// the diagnostics descriptor is: a composed child is another session, and
+    /// what it classified belongs to the invocation that asked. The default
+    /// records nothing, because a build acts on each classification and has no
+    /// use for it afterwards.
+    pub census: std::sync::Arc<crate::census::Census>,
+    /// Where this unit's Makefiles sit relative to the compilation's root,
+    /// for a census that has to say which `Makefile` a line is in.
+    ///
+    /// A recursive child is read from its own directory, so the name it opens
+    /// its Makefile under is the same `Makefile` its parent opened — and a
+    /// report naming both `Makefile:44` would be pointing at two files with
+    /// one name. Empty for the root, which is already where it says it is.
+    pub unit_prefix: Vec<u8>,
     /// `.SUFFIXES` as the whole read left it, in the order it was written, each
     /// entry keeping its leading dot.
     ///
@@ -355,6 +372,8 @@ impl Session {
             shell_status: None,
             vpaths: Vec::new(),
             diagnostics: std::sync::Arc::new(crate::diagnostics::Diagnostics::to_stderr()),
+            census: std::sync::Arc::new(crate::census::Census::ignored()),
+            unit_prefix: Vec::new(),
             suffixes: Vec::new(),
         }
     }

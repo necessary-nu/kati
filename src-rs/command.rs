@@ -507,14 +507,32 @@ pub struct Command {
     /// A recursion this compiler can see but cannot turn into a child
     /// compilation: the line is classified recursive and starts a Make process
     /// somewhere a shell begins a command, but not in a position
-    /// [`invokes_make`] can lift out as one static invocation.
+    /// [`invokes_make`] can lift out as one static invocation. `None` for
+    /// every other line, recursive or not.
     ///
     /// A line like this carries no [`Self::recursive_make`], so a recipe that
     /// splits its other lines into child graphs would read this one as
     /// ordinary residual work and leave it to start a nested Make beside them.
     /// Naming it lets the compiler decline to split the recipe at all, which
     /// is the rule the split already claimed to follow.
-    pub uncomposable_recursion: bool,
+    ///
+    /// The reason travels with the fact because a report about the build has
+    /// to say why this line nests, and working it out again later from the
+    /// recipe text would be a second reading that could disagree with the one
+    /// the build acted on.
+    pub nesting: Option<crate::census::NestingReason>,
+    /// Where this line was written, for a report that has to point at it. The
+    /// rule's own location names where the target was defined, which is a
+    /// different line as soon as a recipe has more than one.
+    pub loc: Option<crate::loc::Loc>,
+}
+
+impl Command {
+    /// Whether this line names a recursion the compiler could not lift out.
+    #[must_use]
+    pub const fn uncomposable_recursion(&self) -> bool {
+        self.nesting.is_some()
+    }
 }
 
 /// Whether an unexpanded recipe references `MAKE` the way GNU Make's own
@@ -749,6 +767,20 @@ fn command_segments(command: &[u8]) -> Vec<&[u8]> {
     segments
 }
 
+/// The shell words that stand in front of a command without being one.
+///
+/// A segment beginning with one of these has a command after it, in the
+/// position the shell reads as a command position: `then make x` starts a
+/// Make and `echo then make x` does not, and the difference is that `then` is
+/// a reserved word only where a command may begin — which, after a `;`, is
+/// exactly where [`command_segments`] has just cut.
+///
+/// `fi`, `done`, `esac` and `elif`'s closing siblings are absent on purpose:
+/// nothing follows them but the end of the construct.
+const COMMAND_PRECEDERS: [&[u8]; 11] = [
+    b"if", b"then", b"elif", b"else", b"while", b"until", b"do", b"!", b"time", b"{", b"(",
+];
+
 /// Whether one expanded `MAKE` value starts a process anywhere in the line.
 ///
 /// Wider than [`invokes_make`], which asks the narrower question of whether
@@ -759,8 +791,9 @@ fn command_segments(command: &[u8]) -> Vec<&[u8]> {
 fn spawns_make(command: &[u8], make: &[u8]) -> bool {
     command_segments(command).into_iter().any(|segment| {
         let mut segment = segment.trim_ascii_start();
-        // A leading `VAR=value` sequence, and `env` or `exec` before the
-        // program, are the shell's way of saying the same command differently.
+        // A leading `VAR=value` sequence, `env` or `exec` before the program,
+        // and the reserved words a construct puts in front of a command are
+        // all the shell's ways of saying the same command differently.
         while let Some(word) = segment
             .split(|byte| byte.is_ascii_whitespace())
             .next()
@@ -768,6 +801,12 @@ fn spawns_make(command: &[u8], make: &[u8]) -> bool {
             .filter(|word| {
                 *word == b"env"
                     || *word == b"exec"
+                    // A recipe line written across several source lines keeps
+                    // its continuations, and a `\` alone in front of the
+                    // newline is one: the command after it begins where the
+                    // shell says a command begins.
+                    || *word == b"\\"
+                    || COMMAND_PRECEDERS.contains(word)
                     || word.split(|byte| *byte == b'=').next().is_some_and(|name| {
                         name.len() < word.len() && !name.is_empty() && !name.contains(&b'/')
                     })
@@ -936,6 +975,29 @@ pub fn lifted_invocations(line: &Bytes, make_values: &[Bytes]) -> Vec<LiftedInvo
         return invocations;
     }
     lifted(whole).into_iter().collect()
+}
+
+/// Why a line that starts a nested Make was not lifted out as one child.
+///
+/// Asked where the decision is made and answered from the shape the line
+/// actually has, so a report about the build carries the compiler's own reason
+/// rather than a second reading of the same recipe.
+///
+/// The two answers are the two sides of what [`invokes_make`] refuses. A line
+/// with more than one place a shell begins a command has a construct standing
+/// between it and the invocation — an `if`, a `;`, a `||`, a pipeline — and
+/// what the compiler lifts is a line that IS an invocation, not a line that
+/// holds one somewhere. A line with one such place was refused for what is
+/// written in the command position instead: an assignment or `env` prefix, a
+/// redirection, a glob, an expansion the resolver will not read as an
+/// argument list.
+#[must_use]
+pub fn nesting_reason(line: &[u8]) -> crate::census::NestingReason {
+    if command_segments(unwrapped_command(line)).len() > 1 {
+        crate::census::NestingReason::ThroughAConstruct
+    } else {
+        crate::census::NestingReason::NotAnArgumentList
+    }
 }
 
 /// Split a command where a shell would run the next part only if this one won.
@@ -1361,9 +1423,10 @@ impl<'a> CommandEvaluator<'a> {
                     // variable that GNU Make never classified is composed when
                     // the expansion makes that possible and otherwise left as
                     // written, exactly as 4.4.1 leaves it.
-                    let uncomposable_recursion = prefixes.recursive_line
+                    let nesting = (prefixes.recursive_line
                         && recursive_make.is_empty()
-                        && make_values.iter().any(|make| spawns_make(&cmd, make));
+                        && make_values.iter().any(|make| spawns_make(&cmd, make)))
+                    .then(|| nesting_reason(&cmd));
                     let shell_flag = self.ev.get_shell_flag(prefixes.dash_prefixed)?;
                     result.push(Command {
                         output: n.lock().recipe_output,
@@ -1375,7 +1438,8 @@ impl<'a> CommandEvaluator<'a> {
                         force_no_subshell: false,
                         recursive_line: prefixes.recursive_line,
                         recursive_make,
-                        uncomposable_recursion,
+                        nesting,
+                        loc: self.ev.loc.clone(),
                     })
                 }
             }
@@ -1398,7 +1462,8 @@ impl<'a> CommandEvaluator<'a> {
                     force_no_subshell: true,
                     recursive_line: false,
                     recursive_make: Vec::new(),
-                    uncomposable_recursion: false,
+                    nesting: None,
+                    loc: node.loc.clone(),
                 })
             }
             // Prepend |output_commands|.
@@ -1419,8 +1484,8 @@ impl<'a> CommandEvaluator<'a> {
 mod tests {
     use super::{
         AutoCommand, AutoCommandVar, AutoCommandVariant, ExpandedRecipeLines, LinePrefixes,
-        invokes_make, lifted_invocations, references_make, scan_written_prefixes, spawns_make,
-        unwrapped_command,
+        invokes_make, lifted_invocations, nesting_reason, references_make, scan_written_prefixes,
+        spawns_make, unwrapped_command,
     };
     use crate::expr::{ParseExprOpt, parse_expr};
     use crate::loc::Loc;
@@ -1831,5 +1896,30 @@ mod tests {
         assert!(!spawns_make(b"echo 'a; make b'", b"make"));
         assert!(!spawns_make(b"printf '%s' make", b"make"));
         assert!(!spawns_make(b"echo done > make", b"make"));
+    }
+
+    /// The reason a line nests is the reason a report gives for it, so it has
+    /// to tell the two apart: a construct standing between the line and the
+    /// invocation, against a line that is one command written in a way the
+    /// resolver will not read as an argument list.
+    #[test]
+    fn a_nesting_line_says_why_it_nests() {
+        use crate::census::NestingReason::{NotAnArgumentList, ThroughAConstruct};
+
+        assert_eq!(
+            nesting_reason(b"if test x = y; then make sub; fi"),
+            ThroughAConstruct
+        );
+        assert_eq!(
+            nesting_reason(b"test -d sub && make -C sub"),
+            ThroughAConstruct
+        );
+        assert_eq!(nesting_reason(b"true || make fallback"), ThroughAConstruct);
+        assert_eq!(nesting_reason(b"cd sub; make child"), ThroughAConstruct);
+
+        assert_eq!(nesting_reason(b"V=1 make child"), NotAnArgumentList);
+        assert_eq!(nesting_reason(b"env V=1 make child"), NotAnArgumentList);
+        assert_eq!(nesting_reason(b"make child > log"), NotAnArgumentList);
+        assert_eq!(nesting_reason(b"make child *.o"), NotAnArgumentList);
     }
 }
