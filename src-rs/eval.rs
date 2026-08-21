@@ -152,31 +152,50 @@ struct RuleTargets {
     disagreeing: usize,
 }
 
+/// Where GNU Make keeps the `--eval` fragments `MAKEFLAGS` names.
+///
+/// `define_variable_cname ("-*-eval-flags-*-", value, o_automatic, 0)` in
+/// `main` (main.c). Spelled so nothing a makefile could write reaches it, and
+/// automatic so nothing a makefile does write can replace it — which is why
+/// `undefine -*-eval-flags-*-` and an assignment to the name both leave it
+/// exactly as it was.
+pub(crate) const EVAL_FLAGS_NAME: &str = "-*-eval-flags-*-";
+
 /// A canonical switch prefix, optionally retaining GNU Make's recursive
 /// command-line override suffix.
-fn makeflags_value(
+pub(crate) fn makeflags_value(
     makeflags: Bytes,
+    has_evals: bool,
     has_overrides: bool,
+    eval_flags: Symbol,
     overrides: Symbol,
 ) -> (Arc<Value>, Bytes) {
-    if !has_overrides {
+    if !has_evals && !has_overrides {
         return (Arc::new(Value::Literal(None, makeflags.clone())), makeflags);
     }
-
-    let mut prefix = BytesMut::from(makeflags.as_ref());
-    prefix.put_slice(b" -- ");
-    let mut original = prefix.clone();
-    original.put_slice(b"$(MAKEOVERRIDES)");
-    (
-        Arc::new(Value::List(
-            None,
-            vec![
-                Arc::new(Value::Literal(None, prefix.freeze())),
-                Arc::new(Value::SymRef(Loc::default(), overrides)),
-            ],
-        )),
-        original.freeze(),
-    )
+    // GNU Make's `define_makeflags` writes a literal `$(-*-eval-flags-*-)`
+    // where the fragments would go and a literal `$(MAKEOVERRIDES)` after a
+    // `--` where the assignments would, in that order. Built here as the same
+    // two things: a value that names them, and the text `$(value MAKEFLAGS)`
+    // reads back.
+    let mut parts = Vec::new();
+    let mut original = BytesMut::new();
+    let mut literal = BytesMut::from(makeflags.as_ref());
+    if has_evals {
+        literal.put_slice(b" ");
+        original.put_slice(&literal);
+        original.put_slice(b"$(-*-eval-flags-*-)");
+        parts.push(Arc::new(Value::Literal(None, literal.split().freeze())));
+        parts.push(Arc::new(Value::SymRef(Loc::default(), eval_flags)));
+    }
+    if has_overrides {
+        literal.put_slice(b" -- ");
+        original.put_slice(&literal);
+        original.put_slice(b"$(MAKEOVERRIDES)");
+        parts.push(Arc::new(Value::Literal(None, literal.split().freeze())));
+        parts.push(Arc::new(Value::SymRef(Loc::default(), overrides)));
+    }
+    (Arc::new(Value::List(None, parts)), original.freeze())
 }
 
 struct HybridRuleText {
@@ -1062,7 +1081,7 @@ impl Evaluator {
         value: &Bytes,
         binding: Option<&Var>,
     ) -> Result<()> {
-        let Some((decoder, previous, protected, has_overrides)) = self
+        let Some((decoder, previous, protected, has_overrides, has_evals)) = self
             .session
             .flags
             .makeflags_assignment
@@ -1073,6 +1092,7 @@ impl Evaluator {
                     state.effective.clone(),
                     state.protected.clone(),
                     state.has_overrides,
+                    state.has_evals,
                 )
             })
         else {
@@ -1093,9 +1113,23 @@ impl Evaluator {
                 );
             }
         }
+        // The reference is re-derived on every write and the variable behind it
+        // never is, which is GNU Make's shape rather than an oversight of it:
+        // `define_makeflags` asks `if (eval_strings)` and writes the reference,
+        // while `-*-eval-flags-*-` is defined once in `main` from the fragments
+        // the invocation carried. So the answer is sticky in one direction — a
+        // makefile can make `MAKEFLAGS` name the variable and cannot make it
+        // stop naming it, and cannot change what the name holds.
+        let eval_flags = self.session.intern(EVAL_FLAGS_NAME);
+        let has_evals = has_evals || !decoded.eval_flags.is_empty();
         let overrides = self.session.intern("MAKEOVERRIDES");
-        let (published, original) =
-            makeflags_value(decoded.makeflags.clone(), has_overrides, overrides);
+        let (published, original) = makeflags_value(
+            decoded.makeflags.clone(),
+            has_evals,
+            has_overrides,
+            eval_flags,
+            overrides,
+        );
         let makeflags = self.session.intern("MAKEFLAGS");
         if let Some(variable) = binding
             .cloned()
@@ -1134,6 +1168,7 @@ impl Evaluator {
         crate::evaluate::construct_include_path(&mut self.session);
         if let Some(state) = &mut self.session.flags.makeflags_assignment {
             state.effective = decoded.carried;
+            state.has_evals = has_evals;
         }
         // Last, so a write that binds `MAKEFLAGS` itself leaves the global the
         // nested normalisation produced rather than the one this call was

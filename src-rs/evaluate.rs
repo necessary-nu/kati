@@ -788,7 +788,10 @@ fn install_compiler_invocation_variables(ev: &mut Evaluator) {
             })
             .unwrap_or(false);
 
+    let eval_flags_text = ev.session.flags.eval_flags.clone();
+    let has_evals = !eval_flags_text.is_empty();
     let command_variables = ev.session.intern("-*-command-variables-*-");
+    let eval_flags = ev.session.intern(crate::eval::EVAL_FLAGS_NAME);
     let overrides = ev.session.intern("MAKEOVERRIDES");
     // Both names exist only where a command-line assignment put one there. GNU
     // Make defines the pair inside `if (command_variables != 0)` in
@@ -821,33 +824,38 @@ fn install_compiler_invocation_variables(ev: &mut Evaluator) {
         }
     }
 
+    // The `--eval` fragments live in a variable of their own, which
+    // `MAKEFLAGS` names rather than contains. `o_automatic`, as GNU Make's
+    // `define_variable_cname ("-*-eval-flags-*-", value, o_automatic, 0)` is,
+    // and SIMPLE — which is the whole reason a fragment's `$$` survives being
+    // read back through `$(MAKEFLAGS)`: substituting a simple variable's bytes
+    // does not expand them a second time. The variable exists only where the
+    // invocation carried a fragment, exactly as GNU Make's `if (eval_strings)`
+    // guard has it, and it is never written again.
+    //
+    // After the command-line pair rather than before, because that is the order
+    // GNU Make defines them in — `define_makeflags` at main.c:2036, then the
+    // fragments at 2072 — and `$(.VARIABLES)` is a list in the order names
+    // arrived.
+    if has_evals {
+        ev.session.globals.define(
+            eval_flags,
+            Variable::with_simple_string(eval_flags_text, VarOrigin::Automatic, None, None),
+        );
+    }
+
     let has_overrides = !make_overrides.is_empty() || inherited_overrides;
     if let Some(state) = &mut ev.session.flags.makeflags_assignment {
         state.has_overrides = has_overrides;
+        state.has_evals = has_evals;
         // Before a Makefile has written to it, the accumulated table is exactly
         // what argv and the environment supplied — which is `protected`, and
         // not the published `MAKEFLAGS`: the two differ by the switches the
         // table carries without publishing.
         state.effective = state.protected.clone();
     }
-    let (value, original) = if has_overrides {
-        let mut prefix = BytesMut::from(makeflags.as_ref());
-        prefix.put_slice(b" -- ");
-        let mut original = prefix.clone();
-        original.put_slice(b"$(MAKEOVERRIDES)");
-        (
-            Arc::new(Value::List(
-                None,
-                vec![
-                    Arc::new(Value::Literal(None, prefix.freeze())),
-                    Arc::new(Value::SymRef(Loc::default(), overrides)),
-                ],
-            )),
-            original.freeze(),
-        )
-    } else {
-        (Arc::new(Value::Literal(None, makeflags.clone())), makeflags)
-    };
+    let (value, original) =
+        crate::eval::makeflags_value(makeflags, has_evals, has_overrides, eval_flags, overrides);
     let makeflags = ev.session.intern("MAKEFLAGS");
     // GNU Make defines this one at the rank `-e` gives the environment rather
     // than at the makefile's (main.c, `env_overrides ? o_env_override :

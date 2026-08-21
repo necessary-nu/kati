@@ -43,8 +43,17 @@ pub struct DecodedMakeflags {
     /// evaluator applies them: the frontend owns the splitting, kati owns what
     /// an assignment means.
     pub assignments: Vec<Bytes>,
-    /// `MAKEFLAGS` before the optional `MAKEOVERRIDES` reference.
+    /// `MAKEFLAGS` before the `-*-eval-flags-*-` and `MAKEOVERRIDES`
+    /// references, which is the switch table alone.
     pub makeflags: Bytes,
+    /// The `--eval` fragments this write's own text carried, quoted and joined.
+    ///
+    /// Read only for whether it is empty. GNU Make's `decode_switches` appends
+    /// a `--eval` from any origin to `eval_strings`, which is what makes
+    /// `define_makeflags` write the `$(-*-eval-flags-*-)` reference — but the
+    /// variable that reference names was defined once at startup and is not
+    /// touched again, so a fragment a makefile writes is named and not held.
+    pub eval_flags: Bytes,
     /// The switch table the next assignment is decoded over.
     ///
     /// Not the same text as [`Self::makeflags`], because GNU Make's table
@@ -99,6 +108,19 @@ pub struct MakeflagsAssignment {
     /// Command-line overrides make `$(MAKEOVERRIDES)` a permanent recursive
     /// suffix of `MAKEFLAGS`, even if the Makefile later empties it.
     pub has_overrides: bool,
+    /// Whether a `--eval` has been seen at all, which is what decides that
+    /// `MAKEFLAGS` names `$(-*-eval-flags-*-)`.
+    ///
+    /// Sticky, and deliberately not the same question as whether the variable
+    /// exists. GNU Make's `eval_strings` is a list that is only ever appended
+    /// to — by the command line, by an inherited `MAKEFLAGS`, and by a
+    /// makefile's own write — and `define_makeflags` writes the reference
+    /// whenever it is non-empty. The variable behind it is defined once, from
+    /// the fragments the INVOCATION carried, and never again. So a makefile
+    /// that writes a `--eval` of its own makes `MAKEFLAGS` name a variable
+    /// that does not hold it, and a makefile that writes `MAKEFLAGS` away
+    /// cannot take the invocation's fragments off it.
+    pub has_evals: bool,
 }
 
 /// Everything the command line says, as a value.
@@ -211,6 +233,16 @@ pub struct Flags {
     /// environment string. `None` preserves standalone kati's inherited
     /// environment behavior.
     pub makeflags: Option<Bytes>,
+    /// The `--eval` fragments this invocation was given, quoted as
+    /// `MAKEFLAGS` carries them and joined by one space, or empty for an
+    /// invocation given none.
+    ///
+    /// Held apart from [`Self::makeflags`] because GNU Make holds them apart:
+    /// its `MAKEFLAGS` carries the text `$(-*-eval-flags-*-)` where these
+    /// would go and the fragments live in a variable of that name. The switch
+    /// table proper never contains one, which is also why `MFLAGS` — written
+    /// in `define_makeflags` before the reference is appended — does not.
+    pub eval_flags: Bytes,
     pub make_overrides: Option<Bytes>,
     /// How an embedding Make frontend handles writes to `MAKEFLAGS`.
     /// Standalone kati leaves this absent and retains its historical behavior.
