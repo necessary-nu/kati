@@ -80,13 +80,19 @@ enum RuleScopeKind {
 struct RuleScopes {
     /// Every matching pattern's scope, weakest first.
     patterns: Vec<Arc<Vars>>,
-    /// The target's own target-specific scope, strongest of all.
-    own: Option<Arc<Vars>>,
+    /// The target's own target-specific scopes, weakest first and stronger
+    /// than every pattern.
+    ///
+    /// More than one only where the directory search merged two declared
+    /// targets into one file: GNU Make's `rehash_file` calls
+    /// `merge_variable_set_lists`, so the merged target reads both sets and the
+    /// found name's wins a name they both bind.
+    own: Vec<Arc<Vars>>,
 }
 
 impl RuleScopes {
     fn is_empty(&self) -> bool {
-        self.patterns.is_empty() && self.own.is_none()
+        self.patterns.is_empty() && self.own.is_empty()
     }
 
     /// Weakest first, which is the order they must be installed in.
@@ -1527,6 +1533,15 @@ struct DepBuilder<'a> {
     /// is planned, which is the first moment anything asks whether the name
     /// can be remade here at all.
     searched_at: HashMap<Symbol, Symbol>,
+    /// For a found path the search took over a name that was declared too: the
+    /// name the search was for.
+    ///
+    /// GNU Make's `rehash_file` retains the file object already standing at the
+    /// found path and merges the searched name's into it, so one object is left
+    /// and it answers to the found name. What the searched name declared is
+    /// still part of it — its prerequisites, its variables, and its recipe when
+    /// the found name has none — which is what this records.
+    merged_from: HashMap<Symbol, Symbol>,
     implicit_outputs_var_name: Symbol,
     ninja_pool_var_name: Symbol,
     validations_var_name: Symbol,
@@ -1620,6 +1635,7 @@ impl<'a> DepBuilder<'a> {
             gpaths: Vec::new(),
             gpath_origin: HashMap::new(),
             searched_at: HashMap::new(),
+            merged_from: HashMap::new(),
             implicit_outputs_var_name,
             ninja_pool_var_name,
             validations_var_name,
@@ -2481,7 +2497,7 @@ impl<'a> DepBuilder<'a> {
         let targets = targets
             .into_iter()
             .map(|target| self.at_gpath(target))
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         self.ev.goals.clone_from(&targets);
         let mut nodes = Vec::new();
         for target in targets {
@@ -2754,7 +2770,7 @@ impl<'a> DepBuilder<'a> {
     /// A prerequisite with a rule of its own is left alone: it is going to be
     /// built here, so where an older copy of it might be lying is not a
     /// question worth asking.
-    fn resolve_vpaths(&mut self, n: &Arc<Mutex<DepNode>>) {
+    fn resolve_vpaths(&mut self, n: &Arc<Mutex<DepNode>>) -> Result<()> {
         let (inputs, order_only) = {
             let n = n.lock();
             (n.actual_inputs.clone(), n.actual_order_only_inputs.clone())
@@ -2769,13 +2785,14 @@ impl<'a> DepBuilder<'a> {
                 .chain(&order_only)
                 .any(|input| input.as_bytes(&self.ev.session).starts_with(b"-l"))
         {
-            return;
+            return Ok(());
         }
-        let inputs = self.at_vpaths(inputs);
-        let order_only = self.at_vpaths(order_only);
+        let inputs = self.at_vpaths(inputs)?;
+        let order_only = self.at_vpaths(order_only)?;
         let mut n = n.lock();
         n.actual_inputs = inputs;
         n.actual_order_only_inputs = order_only;
+        Ok(())
     }
 
     /// The prerequisites already recorded for a target, which is what `$<` and
@@ -3087,7 +3104,7 @@ impl<'a> DepBuilder<'a> {
     ///
     /// Resolved first and interned after, because finding the file needs the
     /// session to read and naming the result needs it to write.
-    fn at_vpaths(&mut self, inputs: Vec<Symbol>) -> Vec<Symbol> {
+    fn at_vpaths(&mut self, inputs: Vec<Symbol>) -> Result<Vec<Symbol>> {
         inputs
             .into_iter()
             .map(|input| self.at_found_name(input))
@@ -3102,16 +3119,129 @@ impl<'a> DepBuilder<'a> {
     /// the name is only for as long as nothing has to remake it, which is not
     /// a question the read can answer: the name is kept and the found path is
     /// recorded beside it for the build to choose between.
-    fn at_found_name(&mut self, name: Symbol) -> Symbol {
+    fn at_found_name(&mut self, name: Symbol) -> Result<Symbol> {
         match self.at_vpath(name) {
-            Some((found, true)) => self.take_found_name(name, found, true),
+            Some((found, true)) => Ok(self.take_found_name(name, found, true)),
             Some((found, false)) => {
                 let found = self.ev.session.intern(found);
+                // Two names the Makefile declared separately, which the search
+                // has just found to be one file. GNU Make keeps the object
+                // standing at the found path and merges the searched name's
+                // into it, so what is left answers to the found name — a
+                // replacement here, not a second name for the build to choose
+                // between.
+                if self.declares_a_target(found) && self.is_declared(name) {
+                    self.merge_into_found_name(name, found)?;
+                    return Ok(found);
+                }
                 self.searched_at.insert(name, found);
-                name
+                Ok(name)
             }
-            None => self.at_library(name),
+            None => Ok(self.at_library(name)),
         }
+    }
+
+    /// Make one target of the two names the search found to be one file.
+    ///
+    /// GNU Make's `rehash_file` (`file.c`), which retains the object already
+    /// standing at the found path — TO_FILE — and merges the searched name's
+    /// into it. The recipe is TO_FILE's if it has one, and the searched name's
+    /// is dropped with a diagnostic saying so; a TO_FILE with no recipe adopts
+    /// the searched name's instead and says nothing. Prerequisites are
+    /// concatenated with TO_FILE's first, the variable set lists are merged,
+    /// and `phony` is merged from both. Renaming across the `:` / `::` divide
+    /// is refused outright.
+    fn merge_into_found_name(&mut self, written: Symbol, found: Symbol) -> Result<()> {
+        if self.merged_from.contains_key(&found) {
+            return Ok(());
+        }
+        if self.phony.contains(&written) {
+            self.phony.insert(found);
+        }
+        self.merged_from.insert(found, written);
+        let Some(from) = self.rules.get(&written).cloned() else {
+            return Ok(());
+        };
+        let Some(to) = self.rules.get(&found).cloned() else {
+            // The found name is a target because something declared it
+            // `.PHONY` and for no other reason, so there is no object with a
+            // recipe to retain: what the searched name declared is the whole of
+            // the merged one.
+            self.rules.insert(found, from);
+            return Ok(());
+        };
+        let (from_rules, from_double, from_primary, from_implicit, from_validations) = {
+            let from = from.lock();
+            (
+                from.rules.clone(),
+                from.is_double_colon,
+                from.primary_rule.clone(),
+                from.implicit_outputs.clone(),
+                from.validations.clone(),
+            )
+        };
+        let mut to = to.lock();
+        let keep_commands = to.primary_rule.is_none();
+        if !keep_commands && from_primary.is_some() {
+            let at = from_primary
+                .as_ref()
+                .map(|rule| rule.cmd_loc.clone().unwrap_or_else(|| rule.loc.clone()));
+            warn_loc!(
+                self.ev,
+                at.as_ref(),
+                "Recipe was specified for file '{}' at {},",
+                written.display(&self.ev.session),
+                at.clone().unwrap_or_default().display(&self.ev.session)
+            );
+            warn_loc!(
+                self.ev,
+                at.as_ref(),
+                "but '{}' is now considered the same file as '{}'.",
+                written.display(&self.ev.session),
+                found.display(&self.ev.session)
+            );
+            warn_loc!(
+                self.ev,
+                at.as_ref(),
+                "Recipe for '{}' will be ignored in favor of the one for '{}'.",
+                written.display(&self.ev.session),
+                found.display(&self.ev.session)
+            );
+        }
+        if to.is_double_colon && !from_double {
+            error_loc!(
+                self.ev,
+                None,
+                "*** can't rename single-colon '{}' to double-colon '{}'.",
+                written.display(&self.ev.session),
+                found.display(&self.ev.session)
+            );
+        }
+        if !to.is_double_colon && from_double {
+            error_loc!(
+                self.ev,
+                None,
+                "*** can't rename double-colon '{}' to single-colon '{}'.",
+                written.display(&self.ev.session),
+                found.display(&self.ev.session)
+            );
+        }
+        for rule in from_rules {
+            let rule = if keep_commands || rule.cmds.is_empty() {
+                rule
+            } else {
+                let mut stripped = (*rule).clone();
+                stripped.cmds.clear();
+                Arc::new(stripped)
+            };
+            to.rules.push(rule);
+        }
+        if keep_commands {
+            to.primary_rule = from_primary;
+        }
+        to.implicit_outputs.extend(from_implicit);
+        to.validations.extend(from_validations);
+        Ok(())
     }
 
     /// A prerequisite and its node, once planning the node has said whether the
@@ -3258,19 +3388,25 @@ impl<'a> DepBuilder<'a> {
     ///
     /// For a caller that reaches a name directly rather than through the rule
     /// that wanted it, and so has no prerequisite of its own to rewrite.
-    fn at_gpath(&mut self, name: Symbol) -> Symbol {
+    fn at_gpath(&mut self, name: Symbol) -> Result<Symbol> {
         match self.at_vpath(name) {
-            Some((found, true)) => self.take_found_name(name, found, true),
+            Some((found, true)) => Ok(self.take_found_name(name, found, true)),
             Some((found, false)) => {
                 // A goal reaches the search without a prerequisite list to be
                 // rewritten in, and it is still a name the search answered
                 // about: `make out.o` with `build/out.o` current remakes
-                // nothing and with it stale remakes `out.o` here.
+                // nothing and with it stale remakes `out.o` here, and a goal
+                // whose found path is a declared target is the same one file
+                // two names were written for.
                 let found = self.ev.session.intern(found);
+                if self.declares_a_target(found) && self.is_declared(name) {
+                    self.merge_into_found_name(name, found)?;
+                    return Ok(found);
+                }
                 self.searched_at.insert(name, found);
-                name
+                Ok(name)
             }
-            None => name,
+            None => Ok(name),
         }
     }
 
@@ -3421,6 +3557,16 @@ impl<'a> DepBuilder<'a> {
     /// recipe, and which `.PHONY` sets for every name it lists.
     fn declares_a_target(&self, name: Symbol) -> bool {
         self.rules.contains_key(&name) || self.phony.contains(&name)
+    }
+
+    /// Whether the Makefile said anything about `name` that the merge has to
+    /// carry: a rule, `.PHONY`, or a target-specific binding.
+    ///
+    /// Wider than [`Self::declares_a_target`] because `rehash_file` merges the
+    /// variable set lists whether or not either object had a recipe, and
+    /// `record_target_var` is enough to put an object in the table.
+    fn is_declared(&self, name: Symbol) -> bool {
+        self.declares_a_target(name) || self.rule_vars.contains_key(&name)
     }
 
     /// The same question over a name that may never have been interned, which
@@ -3828,6 +3974,25 @@ impl<'a> DepBuilder<'a> {
             .cloned()
     }
 
+    /// Every target-specific scope a name reads, weakest first, given the one
+    /// it declared for itself.
+    ///
+    /// One for every name but a merged one. GNU Make's `rehash_file` merges the
+    /// two file objects' variable set LISTS rather than their contents, and the
+    /// retained object's list goes in front — so the found name's binding wins
+    /// a name both declared, and the searched name's is still there for one
+    /// only it declared.
+    fn merged_scopes(&self, o: Symbol, own: Option<Arc<Vars>>) -> Vec<Arc<Vars>> {
+        let mut scopes = Vec::new();
+        if let Some(written) = self.merged_from.get(&o)
+            && let Some(vars) = self.rule_vars.get(written)
+        {
+            scopes.push(vars.clone());
+        }
+        scopes.extend(own);
+        scopes
+    }
+
     /// The name a target's rule and its own variables were declared under.
     ///
     /// GNU Make renames one file object, so what was declared for the name as
@@ -4029,7 +4194,7 @@ impl<'a> DepBuilder<'a> {
             node.actual_order_only_inputs.extend(order_only);
         }
 
-        self.resolve_vpaths(&action);
+        self.resolve_vpaths(&action)?;
         self.take_out_waits(&action);
         {
             let mut node = action.lock();
@@ -4753,7 +4918,7 @@ impl<'a> DepBuilder<'a> {
             return Ok(Some(PickedRuleInfo {
                 merger: Some(rule_merger.clone()),
                 pattern_rule: None,
-                vars: Self::scopes_for(&patterns, vars),
+                vars: Self::scopes_for(&patterns, self.merged_scopes(output, vars)),
             }));
         }
 
@@ -4836,7 +5001,7 @@ impl<'a> DepBuilder<'a> {
             return Ok(Some(PickedRuleInfo {
                 merger: rule_merger,
                 pattern_rule: None,
-                vars: Self::scopes_for(&patterns, vars),
+                vars: Self::scopes_for(&patterns, self.merged_scopes(output, vars)),
             }));
         }
         // Make's step 7, and the last thing it tries. Only for a target with no
@@ -4846,12 +5011,12 @@ impl<'a> DepBuilder<'a> {
         Ok(default_rule.map(|rule| PickedRuleInfo {
             merger: None,
             pattern_rule: Some(rule),
-            vars: Self::scopes_for(&patterns, vars),
+            vars: Self::scopes_for(&patterns, self.merged_scopes(output, vars)),
         }))
     }
 
     /// The matching patterns, then the target's own scope on top of them.
-    fn scopes_for(patterns: &[Arc<Vars>], own: Option<Arc<Vars>>) -> RuleScopes {
+    fn scopes_for(patterns: &[Arc<Vars>], own: Vec<Arc<Vars>>) -> RuleScopes {
         RuleScopes {
             patterns: patterns.to_vec(),
             own,
@@ -4863,7 +5028,8 @@ impl<'a> DepBuilder<'a> {
     /// picked rule to go with it.
     fn applicable_rule_vars(&self, output: Symbol) -> RuleScopes {
         let patterns = self.matching_pattern_vars(output);
-        Self::scopes_for(&patterns, self.lookup_rule_vars(output))
+        let own = self.lookup_rule_vars(output);
+        Self::scopes_for(&patterns, self.merged_scopes(output, own))
     }
 
     /// Install `scopes` into the rule scope, weakest first, and record the
@@ -5056,7 +5222,7 @@ impl<'a> DepBuilder<'a> {
             return Ok(Some(PickedRuleInfo {
                 merger: rule_merger.clone(),
                 pattern_rule: Some(pattern_rule),
-                vars: Self::scopes_for(patterns, vars.clone()),
+                vars: Self::scopes_for(patterns, self.merged_scopes(output, vars.clone())),
             }));
         }
 
@@ -5105,7 +5271,7 @@ impl<'a> DepBuilder<'a> {
             return Ok(Some(PickedRuleInfo {
                 merger: rule_merger.clone(),
                 pattern_rule: Some(irule),
-                vars: Self::scopes_for(patterns, vars),
+                vars: Self::scopes_for(patterns, self.merged_scopes(output, vars)),
             }));
         }
         Ok(None)
@@ -5356,7 +5522,7 @@ impl<'a> DepBuilder<'a> {
                 .extend(grouped_peer_order_only);
             (visible_inputs, visible_order_only)
         };
-        self.resolve_vpaths(&n);
+        self.resolve_vpaths(&n)?;
         let (grouped_peer_inputs, grouped_peer_order_only) = {
             let mut node = n.lock();
             let grouped_peer_inputs = node.actual_inputs.split_off(visible_inputs);
