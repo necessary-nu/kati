@@ -17,10 +17,17 @@ limitations under the License.
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
-use std::{collections::HashSet, fmt::Debug, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    sync::Arc,
+};
 
 use crate::{
-    build_sink::{FileEvaluation, NewInputsTiming, OutputEvaluation, ShellEvaluation},
+    build_sink::{
+        FileEvaluation, NewInputsTiming, OutputEvaluation, SettledName, SettledNameView,
+        ShellEvaluation,
+    },
     dep::DepNode,
     eval::Evaluator,
     exec::ExecStatus,
@@ -59,6 +66,19 @@ pub(crate) const DEFERRED_NEW_INPUTS_FILENAMES_REFERENCE: &[u8] = b"${KATI_NEW_I
 /// What all three references begin with, for a reader that only needs to know
 /// whether a line still holds one of them.
 pub(crate) const DEFERRED_NEW_INPUTS_PREFIX: &[u8] = b"${KATI_NEW_INPUTS";
+
+/// What a settled-name reference is spelt with, before the number that tells
+/// one prerequisite's from another's.
+///
+/// A recipe the compiler has to read for itself — a recursive `$(MAKE)`, an
+/// automatic depfile, a grouped `::` action, a `$?` whose value the scheduler
+/// binds — is expanded while the graph is being built, which is before the
+/// build has decided whether a prerequisite the directory search answered
+/// about has to be remade. Until that is decided the prerequisite has two
+/// names and neither can be written down, so the recipe carries one of these
+/// and the destination substitutes the spelling it settled on. Every other
+/// prerequisite is written the way it always was.
+const SETTLED_NAME_PREFIX: &[u8] = b"KATI_SETTLED_";
 
 /// The date a prerequisite is compared by, which for `lib.a(member.o)` comes
 /// out of the archive's index rather than off a file of that name.
@@ -209,6 +229,84 @@ impl AutoCommandVar {
         }
     }
 
+    /// Which part of a name this form reads.
+    const fn settled_view(&self) -> SettledNameView {
+        match self.variant {
+            AutoCommandVariant::None => SettledNameView::Whole,
+            AutoCommandVariant::D => SettledNameView::Directory,
+            AutoCommandVariant::F => SettledNameView::Filename,
+        }
+    }
+
+    /// This form's answer for one name that is where it is written.
+    ///
+    /// The same halving [`Self::eval`] does over the whole value, done a word
+    /// at a time because the value this one is part of holds references as
+    /// well as names, and a reference has no halves to take.
+    fn viewed(&self, name: &Bytes) -> Bytes {
+        match self.variant {
+            AutoCommandVariant::None => name.clone(),
+            AutoCommandVariant::D => dirname(name),
+            AutoCommandVariant::F => name.slice_ref(basename(name)),
+        }
+    }
+
+    /// A reference for each prerequisite this expansion is about to name that
+    /// the build has not settled the spelling of yet.
+    ///
+    /// Empty unless the destination binds late values — a manifest cannot, so
+    /// nothing crosses into one — and empty for every recipe whose
+    /// prerequisites are all where they are written, which is nearly every one.
+    /// One reference per prerequisite and form, reused where the same recipe
+    /// reads the same prerequisite twice.
+    fn settled_references(
+        &self,
+        ev: &mut Evaluator,
+        node: &Arc<Mutex<DepNode>>,
+        words: &[Symbol],
+    ) -> HashMap<Symbol, Bytes> {
+        let mut references = HashMap::new();
+        if ev.new_inputs_timing != NewInputsTiming::SchedulerBoundary || ev.function_depth > 0 {
+            return references;
+        }
+        let searched = node.lock().searched_inputs.clone();
+        if searched.is_empty() {
+            return references;
+        }
+        let view = self.settled_view();
+        for word in words {
+            if !searched.iter().any(|(input, _)| input == word) || references.contains_key(word) {
+                continue;
+            }
+            let held = node
+                .lock()
+                .settled_names
+                .iter()
+                .find(|settled| settled.input == *word && settled.view == view)
+                .map(|settled| settled.variable);
+            let variable = match held {
+                Some(variable) => variable,
+                None => {
+                    let index = node.lock().settled_names.len();
+                    let mut name = BytesMut::from(SETTLED_NAME_PREFIX);
+                    name.put_slice(index.to_string().as_bytes());
+                    let variable = ev.session.intern(name.freeze());
+                    node.lock().settled_names.push(SettledName {
+                        variable,
+                        input: *word,
+                        view,
+                    });
+                    variable
+                }
+            };
+            let mut reference = BytesMut::from(&b"${"[..]);
+            reference.put_slice(&variable.as_bytes(&ev.session));
+            reference.put_slice(b"}");
+            references.insert(*word, reference.freeze());
+        }
+        references
+    }
+
     pub fn eval(&self, ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
         match self.variant {
             AutoCommandVariant::None => {
@@ -247,7 +345,23 @@ impl AutoCommandVar {
 
     fn eval_impl(&self, ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<Bound> {
         let current_dep_node = self.current_dep_node.lock();
-        let current_dep_node = current_dep_node.as_ref().unwrap().lock();
+        let current_dep_node = current_dep_node.as_ref().unwrap();
+        // Settled before the node is read, because minting a reference needs
+        // the session to write and reading a name needs it to read. The words
+        // are this form's own: `$<` names one prerequisite and `$|` names none
+        // of the ordinary ones, so neither mints a reference the other's list
+        // would have wanted.
+        let words = {
+            let node = current_dep_node.lock();
+            match self.typ {
+                AutoCommand::Less => node.actual_inputs.first().copied().into_iter().collect(),
+                AutoCommand::Hat | AutoCommand::Plus => node.actual_inputs.clone(),
+                AutoCommand::Bar => node.actual_order_only_inputs.clone(),
+                _ => Vec::new(),
+            }
+        };
+        let references = self.settled_references(ev, current_dep_node, &words);
+        let current_dep_node = current_dep_node.lock();
         let names = &ev.session.symtab;
         // How the build spells a prerequisite the directory search answered
         // about. Every automatic variable that names prerequisites reads
@@ -255,6 +369,25 @@ impl AutoCommandVar {
         // the file objects whose names `update_file_1` has already settled.
         let settled = &ev.settled_names;
         let spelt = |name: Symbol| settled.get(&name).copied().unwrap_or(name).as_bytes(names);
+        // A prerequisite the build has still to choose a name for reaches the
+        // recipe as a reference; every other one reaches it as itself. Where
+        // any reference is written the halving this form asks for is done here,
+        // a word at a time, because `eval` cannot halve a reference.
+        let held = |name: Symbol| references.get(&name).cloned();
+        // The halving is done here only where a reference was written, because
+        // then `eval` is told the value is bound and does not halve it again.
+        // A value of nothing but names is left whole and halved there, exactly
+        // as it always was.
+        let viewed = |name: Bytes| {
+            if references.is_empty() {
+                name
+            } else {
+                self.viewed(&name)
+            }
+        };
+        let word = |name: Symbol| {
+            held(name).unwrap_or_else(|| viewed(crate::archive::member_or_whole(&spelt(name))))
+        };
 
         match &self.typ {
             AutoCommand::At => {
@@ -275,7 +408,7 @@ impl AutoCommandVar {
             }
             AutoCommand::Less => {
                 if let Some(ai) = current_dep_node.actual_inputs.first() {
-                    out.put_slice(&crate::archive::member_or_whole(&spelt(*ai)))
+                    out.put_slice(&word(*ai))
                 }
             }
             AutoCommand::Hat => {
@@ -283,14 +416,14 @@ impl AutoCommandVar {
                 let mut ww = WordWriter::new(out);
                 for ai in current_dep_node.actual_inputs.iter() {
                     if seen.insert(*ai) {
-                        ww.write(&crate::archive::member_or_whole(&spelt(*ai)))
+                        ww.write(&word(*ai))
                     }
                 }
             }
             AutoCommand::Plus => {
                 let mut ww = WordWriter::new(out);
                 for ai in current_dep_node.actual_inputs.iter() {
-                    ww.write(&crate::archive::member_or_whole(&spelt(*ai)))
+                    ww.write(&word(*ai))
                 }
             }
             AutoCommand::Bar => {
@@ -298,7 +431,7 @@ impl AutoCommandVar {
                 let mut ww = WordWriter::new(out);
                 for oi in current_dep_node.actual_order_only_inputs.iter() {
                     if seen.insert(*oi) {
-                        ww.write(&spelt(*oi))
+                        ww.write(&held(*oi).unwrap_or_else(|| viewed(spelt(*oi))))
                     }
                 }
             }
@@ -463,7 +596,13 @@ impl AutoCommandVar {
                 }
             }
         }
-        Ok(Bound::Now)
+        // A value holding a reference has had this form applied to it already,
+        // word by word, so `eval` must not apply it a second time.
+        Ok(if references.is_empty() {
+            Bound::Now
+        } else {
+            Bound::Late
+        })
     }
 }
 

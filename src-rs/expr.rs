@@ -260,7 +260,10 @@ impl Evaluable for Value {
                         String::from_utf8_lossy(fi.name)
                     );
                 }
-                (fi.func)(args, ev, out)?;
+                ev.function_depth += 1;
+                let called = (fi.func)(args, ev, out);
+                ev.function_depth -= 1;
+                called?;
                 ev.eval_depth -= 1;
             }
         }

@@ -548,6 +548,17 @@ pub struct DepNode {
     /// path while nothing is here, and whatever reads the target spells it
     /// this way for as long as it is not remade.
     pub searched_at: Option<Symbol>,
+    /// The prerequisites of this node the directory search answered about, each
+    /// paired with where it found them.
+    ///
+    /// [`Self::searched_at`] is this node's own second place to look, and a
+    /// recipe reads its PREREQUISITES' — so the pair is recorded here as each
+    /// prerequisite is planned. A recipe the compiler had to read for itself
+    /// cannot spell such a prerequisite at all, because which of its two names
+    /// stands is settled by the build; see [`Self::settled_names`].
+    pub searched_inputs: Vec<(Symbol, Symbol)>,
+    /// The references such a recipe left behind, for the destination to fill in.
+    pub settled_names: Vec<crate::build_sink::SettledName>,
     /// Each name this target bound in its own right, and whether that binding
     /// survives into what a target inheriting from this one reads.
     ///
@@ -603,6 +614,8 @@ impl DepNode {
             stem: None,
             planning_parent: None,
             searched_at: None,
+            searched_inputs: Vec::new(),
+            settled_names: Vec::new(),
             own_rule_vars: Vec::new(),
             loc: None,
         }))
@@ -3294,6 +3307,23 @@ impl<'a> DepBuilder<'a> {
         Ok((found, planned))
     }
 
+    /// Note where the search found a prerequisite this node keeps its own
+    /// spelling for.
+    ///
+    /// Only for a name the search answered about AND that something here can
+    /// remake, because that is the only case where two names are still in play:
+    /// a name nothing can remake was replaced by the found path in
+    /// [`Self::at_settled_name`] and has one name again.
+    fn record_searched_input(&self, n: &Arc<Mutex<DepNode>>, input: Symbol) {
+        let Some(found) = self.searched_at.get(&input).copied() else {
+            return;
+        };
+        let mut node = n.lock();
+        if !node.searched_inputs.iter().any(|(name, _)| *name == input) {
+            node.searched_inputs.push((input, found));
+        }
+    }
+
     /// One `-lNAME` prerequisite, replaced by the library it refers to.
     ///
     /// GNU Make reaches `library_search` from `f_mtime`, as the last resort
@@ -4265,11 +4295,13 @@ impl<'a> DepBuilder<'a> {
         let actual_inputs = action.lock().actual_inputs.clone();
         for input in actual_inputs.into_iter().chain(extra_compared) {
             let dependency = self.build_plan(input, Some(trigger))?;
+            self.record_searched_input(&action, input);
             action.lock().deps.push((input, dependency));
         }
         let actual_order_only_inputs = action.lock().actual_order_only_inputs.clone();
         for input in actual_order_only_inputs.into_iter().chain(extra_order_only) {
             let dependency = self.build_plan(input, Some(trigger))?;
+            self.record_searched_input(&action, input);
             action.lock().order_onlys.push((input, dependency));
         }
         unbind(scoped_vars);
@@ -5707,6 +5739,7 @@ impl<'a> DepBuilder<'a> {
             if position < visible_prerequisites {
                 n.lock().actual_inputs[position] = input;
             }
+            self.record_searched_input(&n, input);
             n.lock().deps.push((input, c.clone()));
 
             let mut is_phony = c.lock().is_phony;
@@ -5745,6 +5778,7 @@ impl<'a> DepBuilder<'a> {
             if position < visible_order_only {
                 n.lock().actual_order_only_inputs[position] = input;
             }
+            self.record_searched_input(&n, input);
             n.lock().order_onlys.push((input, c));
         }
 

@@ -100,6 +100,39 @@ pub enum RecipeExpansion {
     Launch,
 }
 
+/// Which part of a name a settled-name reference stands for.
+///
+/// The three forms GNU Make reads a prerequisite in: the name, the directory
+/// it carries, and the name with that directory taken off.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettledNameView {
+    /// The whole name.
+    Whole,
+    /// `$(<D)` and its neighbours: the directory the name carries.
+    Directory,
+    /// `$(<F)` and its neighbours: the name with the directory taken off.
+    Filename,
+}
+
+/// One name a recipe read before the build could not spell, and the name it
+/// carries instead.
+///
+/// A prerequisite the directory search answered about has two names, and which
+/// of them stands is settled by whether the build has to remake it — later than
+/// any expansion the compiler performs. A recipe the compiler had to read for
+/// itself therefore cannot hold the prerequisite's name at all, so it holds
+/// [`Self::variable`] and the destination substitutes the spelling it settled
+/// on. Nothing here reads either name: the pair is carried, not interpreted.
+#[derive(Debug)]
+pub struct SettledName {
+    /// The name the command reads the spelling from.
+    pub variable: Symbol,
+    /// The prerequisite it stands for.
+    pub input: Symbol,
+    /// Which part of that prerequisite's settled name to substitute.
+    pub view: SettledNameView,
+}
+
 /// Names a recipe left unexpanded for the destination to expand at launch.
 pub type DeferredRecipeId = usize;
 
@@ -398,6 +431,14 @@ pub struct SinkEdge<'a> {
     /// Empty for every edge with nothing to respell, which is every edge that
     /// mentions no archive.
     pub deferred_new_input_names: &'a [(Symbol, Symbol)],
+    /// Prerequisite spellings a recipe the compiler had to read left for the
+    /// destination to fill in, because the directory search had answered about
+    /// them and the build had not yet chosen between the two names.
+    ///
+    /// Empty for every edge whose recipe the destination expands itself, and
+    /// for every edge none of whose prerequisites was searched for — which is
+    /// nearly all of them.
+    pub settled_names: &'a [SettledName],
     /// This edge publishes a real output only after its private action inputs
     /// have settled.  It runs no command itself.
     pub completion_join: bool,

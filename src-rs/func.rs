@@ -991,7 +991,10 @@ fn call_builtin(
         });
     }
     let _frame = ev.enter(FrameType::FunCall, Bytes::from_static(fi.name), loc);
-    (fi.func)(&expanded, ev, out)
+    ev.function_depth += 1;
+    let called = (fi.func)(&expanded, ev, out);
+    ev.function_depth -= 1;
+    called
 }
 
 fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {

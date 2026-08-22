@@ -952,6 +952,15 @@ pub struct Evaluator {
     // example, $(YYY) in $(XXX $(YYY)) is evaluated with depth==2.
     // This will be used to disallow $(shell) in other make constructs.
     pub eval_depth: i32,
+    /// How many function calls this evaluation is inside.
+    ///
+    /// What a function does to its arguments is its own business, and a
+    /// reference standing for a name it has still to be given is a word whose
+    /// content no function can read: `$(filter %.o,$^)` would match nothing and
+    /// `$(basename $^)` would cut nothing off. So a value that goes straight
+    /// into the text being built may carry one and a value a function is about
+    /// to read may not — see `AutoCommandVar::settled_references`.
+    pub function_depth: usize,
     // Commands which should run at ninja-time (i.e., info, warning, and
     // error).
     pub delayed_output_commands: Vec<Bytes>,
@@ -1267,6 +1276,7 @@ impl Evaluator {
             output_evaluation: OutputEvaluation::RecipeCommand,
             deferred_new_inputs_filter_out: Vec::new(),
             eval_depth: 0,
+            function_depth: 0,
             delayed_output_commands: Vec::new(),
 
             is_posix: false,

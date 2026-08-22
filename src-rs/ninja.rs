@@ -40,7 +40,8 @@ use crate::strutil::{Pattern, basename, concat_dir, dirname, strip_ext, strip_ex
 use crate::{
     build_sink::{
         BuildSink, DeferredRecipeId, FileEvaluation, NewInputsTiming, OutputEvaluation,
-        RecipeExpansion, RuleId, ShellEvaluation, SinkCommand, SinkEdge, SinkPool, SinkRule,
+        RecipeExpansion, RuleId, SettledName, ShellEvaluation, SinkCommand, SinkEdge, SinkPool,
+        SinkRule,
     },
     command::{
         Command, CommandEvaluator, expansion_can_reach_make, is_blank_recipe_line,
@@ -1906,6 +1907,19 @@ impl<'a> NinjaGenerator<'a> {
             Vec::new()
         };
 
+        // The spellings a recipe read at construction could not settle. Read
+        // through the phony aliases like every other name that crosses, so the
+        // reference names the same node the edge's own input list does.
+        let settled_names = node
+            .settled_names
+            .iter()
+            .map(|settled| SettledName {
+                variable: settled.variable,
+                input: self.phony_aliases.resolve(settled.input),
+                view: settled.view,
+            })
+            .collect::<Vec<_>>();
+
         sink.declare_edge(
             &self.ce.ev.session,
             &SinkEdge {
@@ -1934,6 +1948,7 @@ impl<'a> NinjaGenerator<'a> {
                 deferred_always_new_inputs: &deferred_always_new_inputs,
                 deferred_excluded_new_inputs: &deferred_excluded_new_inputs,
                 deferred_new_input_names: &deferred_new_input_names,
+                settled_names: &settled_names,
                 completion_join: node.grouped_double_join,
                 intermediate: node.is_intermediate,
                 disposable: node.is_disposable,
@@ -2644,6 +2659,7 @@ mod tests {
                     deferred_freshness_always_dirty: false,
                     deferred_always_new_inputs: &[],
                     deferred_excluded_new_inputs: &[],
+                    settled_names: &[],
                     deferred_new_input_names: &[],
                     completion_join: false,
                     intermediate: false,
