@@ -384,7 +384,23 @@ impl Flags {
                     should_propagate = false;
                 }
                 b"-c" => flags.is_syntax_check_only = true,
-                b"-i" => flags.is_dry_run = true,
+                // GNU Make's own letters. `-i` is `--ignore-errors` and `-n`
+                // is `--dry-run`; this table read `-i` as the dry run and had
+                // no `-n` at all, so `-i` ran nothing and reported success
+                // where Make ignores a status, and `-n` reached the unknown
+                // arm. Every field behind these was already written by the
+                // embedding frontend and already read by the evaluator — only
+                // the spelling on this side was wrong.
+                b"-i" => flags.ignore_errors = true,
+                b"-n" => flags.is_dry_run = true,
+                b"-k" => flags.keep_going = true,
+                // `-S` is Make's way of taking `-k` back off, which is what a
+                // `MAKEFLAGS` inherited from a parent that was given both
+                // relies on.
+                b"-S" => flags.keep_going = false,
+                b"-e" => flags.environment_overrides = true,
+                b"-r" => flags.no_builtin_rules = true,
+                b"-R" => flags.no_builtin_variables = true,
                 b"-s" => flags.is_silent_mode = true,
                 b"-d" => flags.enable_debug = true,
                 b"--kati_stats" => flags.enable_stat_logs = true,
@@ -582,6 +598,77 @@ mod tests {
                 OsString::from("one.mk"),
             ]
         );
+    }
+
+    /// The letters, read the way GNU Make spells them.
+    fn switches(words: &[&str]) -> Flags {
+        let mut symtab = Symtab::new();
+        let mut argv = vec!["rkati".to_owned()];
+        argv.extend(words.iter().map(|word| (*word).to_owned()));
+        Flags::from_args(argv.into_iter().map(Into::into).collect(), &mut symtab)
+    }
+
+    /// `-i` is `--ignore-errors` and nothing else.
+    ///
+    /// This table read it as the dry run, which is a different switch and very
+    /// nearly the opposite one: GNU Make 4.4.1 given `-i` over a recipe of
+    /// `@touch m1; false` then `@touch m2` makes both markers and exits 0
+    /// having run them, while a dry run makes neither and exits 0 having run
+    /// nothing. Both spellings answer "it worked", so the difference is only
+    /// ever visible in what is on the disk afterwards.
+    #[test]
+    fn a_dash_i_ignores_errors_rather_than_running_nothing() {
+        let flags = switches(&["-i"]);
+        assert!(flags.ignore_errors);
+        assert!(!flags.is_dry_run);
+    }
+
+    /// `-n` is the dry run, and this table had no `-n` at all — it reached the
+    /// unknown-flag arm and took the process with it.
+    #[test]
+    fn a_dash_n_is_the_dry_run() {
+        let flags = switches(&["-n"]);
+        assert!(flags.is_dry_run);
+        assert!(!flags.ignore_errors);
+    }
+
+    /// `-k` carries on past a failure, and `-S` is how Make takes it back off
+    /// — which is what a `MAKEFLAGS` inherited from a parent given both needs.
+    #[test]
+    fn keep_going_is_read_and_can_be_taken_back_off() {
+        assert!(!switches(&[]).keep_going);
+        assert!(switches(&["-k"]).keep_going);
+        assert!(!switches(&["-k", "-S"]).keep_going);
+        assert!(switches(&["-S", "-k"]).keep_going);
+    }
+
+    /// The three letters that change what a Makefile evaluates to rather than
+    /// how its recipes run. Each names a field the evaluator already read and
+    /// that only an embedding frontend could set.
+    #[test]
+    fn the_letters_that_change_the_evaluation_are_read() {
+        assert!(switches(&["-e"]).environment_overrides);
+        assert!(switches(&["-r"]).no_builtin_rules);
+        assert!(switches(&["-R"]).no_builtin_variables);
+        let none = switches(&[]);
+        assert!(!none.environment_overrides);
+        assert!(!none.no_builtin_rules);
+        assert!(!none.no_builtin_variables);
+    }
+
+    /// A switch a sub-make has to be given again is passed on, and the letters
+    /// above are all of that kind: GNU Make writes every one of them into
+    /// `MAKEFLAGS` for the child.
+    #[test]
+    fn the_switches_reach_a_sub_make() {
+        let flags = switches(&["-i", "-n", "-k", "-e", "-r", "-R"]);
+        let carried: Vec<_> = flags
+            .subkati_args
+            .iter()
+            .skip(1)
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(carried, ["-i", "-n", "-k", "-e", "-r", "-R"]);
     }
 
     #[test]
