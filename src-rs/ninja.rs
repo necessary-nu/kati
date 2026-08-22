@@ -354,10 +354,25 @@ impl DeferredRecipes {
         ev: &mut Evaluator,
         id: DeferredRecipeId,
         trigger: &[u8],
+        settled_names: &[(&[u8], &[u8])],
     ) -> Result<Option<ExpandedRecipe>> {
         let Some(recipe) = self.recipes.get(id) else {
             return Ok(None);
         };
+        // How the build spells the prerequisites the directory search answered
+        // about, for this launch. A target found elsewhere keeps both names
+        // until something settles whether it had to be remade, and the
+        // destination that settled it is the only thing that can say — see
+        // `SinkEdge::searched_at`. Installed for the length of the expansion
+        // and taken out again, because the next launch settles its own.
+        ev.settled_names = settled_names
+            .iter()
+            .map(|(written, settled)| {
+                let written = ev.session.intern(Bytes::copy_from_slice(written));
+                let settled = ev.session.intern(Bytes::copy_from_slice(settled));
+                (written, settled)
+            })
+            .collect();
         // The name this run is on behalf of. One recipe can make several
         // targets, and GNU Make binds `$@` to the one whose own state reached
         // the rule — which is a question about the build rather than about the
@@ -397,6 +412,7 @@ impl DeferredRecipes {
         ce.ev.file_evaluation = FileEvaluation::Refused;
         ce.ev.output_evaluation = OutputEvaluation::RecipeCommand;
         ce.ev.deferred_new_inputs_filter_out.clear();
+        ce.ev.settled_names.clear();
         expanded.map(Some)
     }
 
@@ -712,6 +728,11 @@ impl<'a> NinjaGenerator<'a> {
         // the files that exist when the command is about to run rather than
         // against the ones that existed before the build started.
         let deferred_recipe = self.defers_recipe(&node.lock());
+        // Said of THIS recipe, and a deferred one says nothing: `eval` is what
+        // clears the flag, so a node that skips it would otherwise be handed
+        // whatever the node before it found and be declared to name `$?` when
+        // its recipe does not mention it.
+        *self.ce.found_new_inputs.lock() = false;
         let commands = if deferred_recipe {
             Vec::new()
         } else {
@@ -1919,6 +1940,7 @@ impl<'a> NinjaGenerator<'a> {
                 withdrawable_outputs: &withdrawable_outputs,
                 delete_on_error: node.delete_on_error,
                 peer_outputs: &peer_outputs,
+                searched_at: node.searched_at,
                 pool: pool.as_deref(),
                 tags: tags.as_deref(),
                 loc: node.loc.as_ref(),
@@ -2629,6 +2651,7 @@ mod tests {
                     withdrawable_outputs: &[],
                     delete_on_error: false,
                     peer_outputs: &[],
+                    searched_at: None,
                     pool: None,
                     tags: None,
                     loc: None,

@@ -452,6 +452,32 @@ pub struct SinkEdge<'a> {
     /// [`Self::intermediate`] and [`Self::disposable`], and a sink that runs the
     /// build is the one that answers for it.
     pub peer_outputs: &'a [Symbol],
+    /// Where the directory search found this edge's output, when the output is
+    /// not where the Makefile named it.
+    ///
+    /// Both names, because which of them survives is the build's to decide and
+    /// not the compiler's. GNU Make searches for a target it cannot find here,
+    /// hangs the answer off the file object as `hname` beside the written
+    /// `name`, and lets `update_file_1` choose once the prerequisites have
+    /// settled: a target it does not have to remake takes the found name and
+    /// every dependent reads that path, and one it does have to remake throws
+    /// the found name away and is made here under its own. The choice cannot be
+    /// folded in here — a target current when the Makefile was read is made
+    /// stale by a prerequisite's own recipe — so the compiler says both and the
+    /// destination settles it.
+    ///
+    /// What that asks of a destination is two things. The output's freshness is
+    /// read from this path while the output itself is absent, which is GNU
+    /// Make's `f_mtime` taking the found file's date for the target. And an
+    /// edge that reads this output spells it this way for as long as the output
+    /// has not been remade.
+    ///
+    /// Nothing in a manifest says either, so the writer ignores it as it
+    /// ignores [`Self::intermediate`] and [`Self::peer_outputs`], and a sink
+    /// that runs the build is the one that answers for it. `None` for every
+    /// edge whose output is where it was written, which is nearly all of them,
+    /// and for one `GPATH` settled — there the name was already replaced.
+    pub searched_at: Option<Symbol>,
     /// The pool that limits how many edges like this run at once, unescaped.
     pub pool: Option<&'a [u8]>,
     /// Opaque per-edge metadata from `.KATI_TAGS`, for consumers of the graph

@@ -249,6 +249,12 @@ impl AutoCommandVar {
         let current_dep_node = self.current_dep_node.lock();
         let current_dep_node = current_dep_node.as_ref().unwrap().lock();
         let names = &ev.session.symtab;
+        // How the build spells a prerequisite the directory search answered
+        // about. Every automatic variable that names prerequisites reads
+        // through this, because GNU Make's `$<` and its neighbours are read off
+        // the file objects whose names `update_file_1` has already settled.
+        let settled = &ev.settled_names;
+        let spelt = |name: Symbol| settled.get(&name).copied().unwrap_or(name).as_bytes(names);
 
         match &self.typ {
             AutoCommand::At => {
@@ -269,7 +275,7 @@ impl AutoCommandVar {
             }
             AutoCommand::Less => {
                 if let Some(ai) = current_dep_node.actual_inputs.first() {
-                    out.put_slice(&crate::archive::member_or_whole(&ai.as_bytes(names)))
+                    out.put_slice(&crate::archive::member_or_whole(&spelt(*ai)))
                 }
             }
             AutoCommand::Hat => {
@@ -277,14 +283,14 @@ impl AutoCommandVar {
                 let mut ww = WordWriter::new(out);
                 for ai in current_dep_node.actual_inputs.iter() {
                     if seen.insert(*ai) {
-                        ww.write(&crate::archive::member_or_whole(&ai.as_bytes(names)))
+                        ww.write(&crate::archive::member_or_whole(&spelt(*ai)))
                     }
                 }
             }
             AutoCommand::Plus => {
                 let mut ww = WordWriter::new(out);
                 for ai in current_dep_node.actual_inputs.iter() {
-                    ww.write(&crate::archive::member_or_whole(&ai.as_bytes(names)))
+                    ww.write(&crate::archive::member_or_whole(&spelt(*ai)))
                 }
             }
             AutoCommand::Bar => {
@@ -292,7 +298,7 @@ impl AutoCommandVar {
                 let mut ww = WordWriter::new(out);
                 for oi in current_dep_node.actual_order_only_inputs.iter() {
                     if seen.insert(*oi) {
-                        ww.write(&oi.as_bytes(names))
+                        ww.write(&spelt(*oi))
                     }
                 }
             }
@@ -357,7 +363,7 @@ impl AutoCommandVar {
                         &current_dep_node.recipe_output.as_bytes(names),
                     )?);
                     for ai in current_dep_node.actual_inputs.iter() {
-                        let ai_str = ai.as_bytes(names);
+                        let ai_str = spelt(*ai);
                         if seen.insert(*ai)
                             && ExecStatus::Timestamp(prerequisite_timestamp(&ai_str)?) > target_age
                         {

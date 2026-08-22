@@ -517,6 +517,21 @@ pub struct DepNode {
     /// recipe-time `$(eval tgt: V = x)` has to reach every scope that link
     /// leads to, which is a walk down these and not down the prerequisites.
     pub planning_parent: Option<Symbol>,
+    /// Where the directory search found this target, when it is not here.
+    ///
+    /// GNU Make's `hname` beside its `name` (`file.c` `rehash_file`): the
+    /// search answered, the answer is not `GPATH`'s, and so which of the two
+    /// names survives is not settled until the prerequisites have been brought
+    /// up to date. `update_file_1` takes the found name for a target it does
+    /// not have to remake and throws it away for one it does, and that is the
+    /// build's decision rather than the read's — a target current when the
+    /// Makefile was read can be made stale by a prerequisite's own recipe.
+    ///
+    /// So the compiler carries both names and says which is which, and the
+    /// destination settles it: the target's own freshness is read from this
+    /// path while nothing is here, and whatever reads the target spells it
+    /// this way for as long as it is not remade.
+    pub searched_at: Option<Symbol>,
     /// Each name this target bound in its own right, and whether that binding
     /// survives into what a target inheriting from this one reads.
     ///
@@ -570,6 +585,7 @@ impl DepNode {
             output_pattern: None,
             stem: None,
             planning_parent: None,
+            searched_at: None,
             own_rule_vars: Vec::new(),
             loc: None,
         }))
@@ -1502,6 +1518,15 @@ struct DepBuilder<'a> {
     /// making the found path. Kati keys rules by name, so the found path needs
     /// a way back to the name that carries its rule.
     gpath_origin: HashMap<Symbol, Symbol>,
+    /// Where the search found a name that was left where it was written.
+    ///
+    /// The other half of `gpath_origin`, for the answers `GPATH` did not
+    /// settle: the name keeps its own spelling and carries the found path
+    /// beside it, because which of the two survives is the build's decision.
+    /// Recorded as the search runs and read again when the node for that name
+    /// is planned, which is the first moment anything asks whether the name
+    /// can be remade here at all.
+    searched_at: HashMap<Symbol, Symbol>,
     implicit_outputs_var_name: Symbol,
     ninja_pool_var_name: Symbol,
     validations_var_name: Symbol,
@@ -1594,6 +1619,7 @@ impl<'a> DepBuilder<'a> {
             gpath_var_name,
             gpaths: Vec::new(),
             gpath_origin: HashMap::new(),
+            searched_at: HashMap::new(),
             implicit_outputs_var_name,
             ninja_pool_var_name,
             validations_var_name,
@@ -3068,12 +3094,58 @@ impl<'a> DepBuilder<'a> {
             .collect()
     }
 
-    /// One name, replaced by where the directory search found it.
+    /// One name, answered by the directory search.
+    ///
+    /// Two answers, and only one of them is a replacement. `GPATH` says the
+    /// found path is where the name belongs whatever happens to it, so the
+    /// name is replaced here and now. Without `GPATH` the found path is where
+    /// the name is only for as long as nothing has to remake it, which is not
+    /// a question the read can answer: the name is kept and the found path is
+    /// recorded beside it for the build to choose between.
     fn at_found_name(&mut self, name: Symbol) -> Symbol {
         match self.at_vpath(name) {
-            Some((found, kept_by_gpath)) => self.take_found_name(name, found, kept_by_gpath),
+            Some((found, true)) => self.take_found_name(name, found, true),
+            Some((found, false)) => {
+                let found = self.ev.session.intern(found);
+                self.searched_at.insert(name, found);
+                name
+            }
             None => self.at_library(name),
         }
+    }
+
+    /// A prerequisite and its node, once planning the node has said whether the
+    /// name can be remade here.
+    ///
+    /// The half of the directory search that has no build behind it. A name the
+    /// search answered about and that nothing here can make is where the search
+    /// found it and stays there: GNU Make's `update_file_1` finds nothing to
+    /// run, takes `file->name = file->hname`, and everything that reads the name
+    /// reads the found path from then on. Nothing about that outcome is the
+    /// build's to decide, so the compiler decides it and the graph names the
+    /// file where it really is.
+    ///
+    /// A name that CAN be remade here keeps its own spelling, because which
+    /// name survives then depends on whether it turns out to need remaking —
+    /// see [`DepNode::searched_at`].
+    fn at_settled_name(
+        &mut self,
+        input: Symbol,
+        needed_by: Symbol,
+    ) -> Result<(Symbol, Arc<Mutex<DepNode>>)> {
+        let planned = self.build_plan(input, Some(needed_by))?;
+        let remakable = {
+            let node = planned.lock();
+            node.has_rule || node.is_phony
+        };
+        if remakable {
+            return Ok((input, planned));
+        }
+        let Some(found) = self.searched_at.get(&input).copied() else {
+            return Ok((input, planned));
+        };
+        let planned = self.build_plan(found, Some(needed_by))?;
+        Ok((found, planned))
     }
 
     /// One `-lNAME` prerequisite, replaced by the library it refers to.
@@ -3189,7 +3261,16 @@ impl<'a> DepBuilder<'a> {
     fn at_gpath(&mut self, name: Symbol) -> Symbol {
         match self.at_vpath(name) {
             Some((found, true)) => self.take_found_name(name, found, true),
-            _ => name,
+            Some((found, false)) => {
+                // A goal reaches the search without a prerequisite list to be
+                // rewritten in, and it is still a name the search answered
+                // about: `make out.o` with `build/out.o` current remakes
+                // nothing and with it stale remakes `out.o` here.
+                let found = self.ev.session.intern(found);
+                self.searched_at.insert(name, found);
+                name
+            }
+            None => name,
         }
     }
 
@@ -3208,12 +3289,13 @@ impl<'a> DepBuilder<'a> {
     /// Where one name was found, if it had to be looked for, and whether
     /// `GPATH` is what kept the answer.
     ///
-    /// A name with a rule of its own is normally left alone: it is going to be
-    /// built here, so where an older copy of it might be lying is not a
-    /// question worth asking. `GPATH` is the answer to that question anyway —
-    /// it says the directory the search looked in is where the name belongs, so
-    /// GNU Make renames the file to the found path before it asks anything else
-    /// about it and remakes it there.
+    /// A name is asked about whether or not it has a rule of its own, because
+    /// GNU Make asks: `f_mtime` searches for any target it cannot find here
+    /// and rehashes the file object onto the answer, and only then does
+    /// `update_file_1` decide which of the two names the target keeps.
+    /// `GPATH` is what takes that decision out of the build — it says the
+    /// directory the search looked in is where the name belongs, so the file
+    /// is renamed before anything else is asked about it and remade there.
     fn at_vpath(&self, input: Symbol) -> Option<(Bytes, bool)> {
         if self.phony.contains(&input) {
             return None;
@@ -3223,13 +3305,8 @@ impl<'a> DepBuilder<'a> {
             return None;
         }
         let found = self.vpath_of(input)?;
-        if self.gpath_holds(&found, &name) {
-            return Some((found, true));
-        }
-        if self.rules.contains_key(&input) {
-            return None;
-        }
-        Some((found, false))
+        let kept_by_gpath = self.gpath_holds(&found, &name);
+        Some((found, kept_by_gpath))
     }
 
     /// Where a prerequisite actually is, when it is not where it was named.
@@ -5064,6 +5141,11 @@ impl<'a> DepBuilder<'a> {
         // Set here and only here: the memoised return above is what makes the
         // first caller the parent, which is the whole of GNU Make's rule.
         n.lock().planning_parent = needed_by;
+        // What the search said about this name, recorded when whoever wanted it
+        // resolved its prerequisites. Read here because this is where the name
+        // acquires a rule, and the two together are what the destination needs
+        // to settle which name survives.
+        n.lock().searched_at = self.searched_at.get(&output).copied();
         self.done.insert(output, n.clone());
 
         let Some(mut picked_rule_info) = self.pick_rule(output, &n)? else {
@@ -5419,8 +5501,16 @@ impl<'a> DepBuilder<'a> {
         }
 
         let actual_inputs = n.lock().actual_inputs.clone();
-        for input in actual_inputs.into_iter().chain(grouped_peer_inputs) {
-            let c = self.build_plan(input, Some(output))?;
+        let visible_prerequisites = actual_inputs.len();
+        for (position, input) in actual_inputs
+            .into_iter()
+            .chain(grouped_peer_inputs)
+            .enumerate()
+        {
+            let (input, c) = self.at_settled_name(input, output)?;
+            if position < visible_prerequisites {
+                n.lock().actual_inputs[position] = input;
+            }
             n.lock().deps.push((input, c.clone()));
 
             let mut is_phony = c.lock().is_phony;
@@ -5449,11 +5539,16 @@ impl<'a> DepBuilder<'a> {
         }
 
         let actual_order_only_inputs = n.lock().actual_order_only_inputs.clone();
-        for input in actual_order_only_inputs
+        let visible_order_only = actual_order_only_inputs.len();
+        for (position, input) in actual_order_only_inputs
             .into_iter()
             .chain(grouped_peer_order_only)
+            .enumerate()
         {
-            let c = self.build_plan(input, Some(output))?;
+            let (input, c) = self.at_settled_name(input, output)?;
+            if position < visible_order_only {
+                n.lock().actual_order_only_inputs[position] = input;
+            }
             n.lock().order_onlys.push((input, c));
         }
 

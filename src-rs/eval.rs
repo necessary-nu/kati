@@ -923,6 +923,18 @@ pub struct Evaluator {
     assignment_sep: String,
 
     pub avoid_io: bool,
+    /// How a prerequisite the directory search answered about is spelt right
+    /// now, for the launch this recipe is being expanded for.
+    ///
+    /// A target the search found elsewhere keeps two names until the build
+    /// settles which one it has: the found path while nothing remade it, its
+    /// own the moment something did (`remake.c` `update_file_1`). Automatic
+    /// variables are what the difference is visible through, so the destination
+    /// that settled it says so here and `$<`, `$^`, `$+`, `$|` and `$?` read
+    /// the answer. Empty for every expansion nothing was searched for, which is
+    /// nearly all of them, and for one no destination answered — where the name
+    /// as written is the only name there is.
+    pub(crate) settled_names: HashMap<Symbol, Symbol>,
     /// Where the selected destination resolves `$?`.
     pub(crate) new_inputs_timing: NewInputsTiming,
     /// Who the selected destination lets answer a `$(shell)` in a recipe.
@@ -1248,6 +1260,7 @@ impl Evaluator {
             assignment_sep: "\n".to_string(),
 
             avoid_io: false,
+            settled_names: HashMap::new(),
             new_inputs_timing: NewInputsTiming::RecipeShell,
             shell_evaluation: ShellEvaluation::RecipeShell,
             file_evaluation: FileEvaluation::Refused,
