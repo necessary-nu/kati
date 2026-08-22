@@ -445,20 +445,36 @@ impl<'a> Parser<'a> {
     /// (read.c) does, so that every line read after it folds its continuations
     /// the POSIX way.
     ///
-    /// The names here are as the Makefile wrote them. GNU Make asks the same
-    /// question of the EXPANDED names, so a `.POSIX` a variable spells is one
-    /// this misses — the evaluator sets the same flag when it reaches such a
-    /// rule, which is in time for whatever is read after that and too late for
-    /// what was read before it. That, and a `.POSIX:` an included file
-    /// declares, is what make-a-posix-target-is-read-where-it-is-written owns.
+    /// Only a name this parse can read for itself counts, and there are two
+    /// ways it cannot.
+    ///
+    /// A target list holding a `$` is text rather than names: GNU Make asks the
+    /// question of the EXPANDED list, so `$(P):` with `P = .POSIX` names the
+    /// target and `$(info .POSIX:)` names nothing at all — and reading either as
+    /// written gets one of them wrong. Reading the written text would take the
+    /// second for a declaration no makefile made, which is the worse of the two
+    /// mistakes: it turns a run's continuations POSIX in a makefile that never
+    /// asked.
+    ///
+    /// A line inside a conditional is one GNU Make may never read. The branch is
+    /// chosen by the evaluation, and this parse buffers both, so a `.POSIX`
+    /// written in the branch that loses would otherwise be read anyway.
+    ///
+    /// What is missed either way falls to the evaluator, which sets the same
+    /// flag when it reaches such a rule — in time for whatever is read after
+    /// that, and too late for what was read before it. That gap is what
+    /// make-a-posix-target-is-read-where-it-is-written owns.
     fn note_posix_target(&mut self, line: &[u8]) {
-        if self.session.posix_pedantic {
+        if self.session.posix_pedantic || !self.if_stack.is_empty() {
             return;
         }
         let targets = match line.iter().position(|byte| *byte == b':') {
             Some(colon) => &line[..colon],
             None => line,
         };
+        if targets.contains(&b'$') {
+            return;
+        }
         if word_scanner(targets).any(|word| word == b".POSIX") {
             self.session.posix_pedantic = true;
         }
