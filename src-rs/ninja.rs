@@ -807,8 +807,19 @@ impl<'a> NinjaGenerator<'a> {
     ///
     /// Nothing here is about Ninja. The result is the command, and whoever
     /// writes it into a file escapes it for that file.
-    fn translate_command(inp: Bytes) -> Bytes {
+    ///
+    /// `one_shell` says how the recipe's lines will be joined, because that
+    /// decides what a trailing `;` is. Lines joined with ` ; ` carry a
+    /// separator already and a line's own is redundant; lines joined with
+    /// newlines are one script, where every `;` is a token of it.
+    fn translate_command(inp: Bytes, one_shell: bool) -> Bytes {
         let mut cmd_buf = BytesMut::new();
+        // How far back the trim below may reach. A `;` or a blank the shell
+        // would read as text rather than as syntax — quoted, or escaped by the
+        // backslash in front of it — is part of the command, and `find -exec
+        // ... \;` is the shape that makes it matter: taking that `;` off
+        // strands its backslash at the end of the line.
+        let mut protected = 0usize;
         let mut prev_backslash = false;
         // Set space as an initial value so the leading comment will be
         // stripped out.
@@ -816,6 +827,8 @@ impl<'a> NinjaGenerator<'a> {
         let mut quote = None;
         let mut inp = inp;
         while let Some(&c) = inp.first() {
+            let quoted = quote.is_some();
+            let escaped = prev_backslash;
             match c {
                 b'#' => {
                     if quote.is_none() && prev_char.is_ascii_whitespace() {
@@ -858,6 +871,10 @@ impl<'a> NinjaGenerator<'a> {
                 _ => cmd_buf.put_u8(c),
             }
 
+            if (quoted || escaped) && (c == b';' || c.is_ascii_whitespace()) {
+                protected = cmd_buf.len();
+            }
+
             if c == b'\\' {
                 prev_backslash = !prev_backslash;
             } else {
@@ -871,17 +888,37 @@ impl<'a> NinjaGenerator<'a> {
         if prev_backslash {
             cmd_buf.truncate(cmd_buf.len() - 1);
         }
+        protected = protected.min(cmd_buf.len());
 
-        while let Some(&c) = cmd_buf.last() {
-            // A continuation's newline is not trailing whitespace, and the
-            // backslash in front of it is what makes it one: taking the pair
-            // apart would leave the shell a line ending in an escape with
-            // nothing to escape.
-            if c == b'\n' || (!c.is_ascii_whitespace() && c != b';') {
-                break;
+        // A continuation's newline is not trailing whitespace, and the
+        // backslash in front of it is what makes it one: taking the pair apart
+        // would leave the shell a line ending in an escape with nothing to
+        // escape.
+        let blanks_before = |end: usize| {
+            let mut end = end;
+            while end > protected
+                && cmd_buf[end - 1] != b'\n'
+                && cmd_buf[end - 1].is_ascii_whitespace()
+            {
+                end -= 1;
             }
-            cmd_buf.truncate(cmd_buf.len() - 1);
+            end
+        };
+
+        let mut end = blanks_before(cmd_buf.len());
+        // A `;` a line ends on is a separator only where the join supplies one
+        // too, and only one of it: `;;` is a `case` item's terminator, a token
+        // of the script rather than punctuation between lines. GNU Make trims
+        // neither, and under `.ONESHELL` — where the join is a newline and
+        // supplies nothing — neither does this.
+        let mut bare_semicolons = end;
+        while bare_semicolons > protected && cmd_buf[bare_semicolons - 1] == b';' {
+            bare_semicolons -= 1;
         }
+        if !one_shell && end - bare_semicolons == 1 {
+            end = blanks_before(end - 1);
+        }
+        cmd_buf.truncate(end);
 
         cmd_buf.freeze()
     }
@@ -1152,7 +1189,7 @@ impl<'a> NinjaGenerator<'a> {
             || Self::is_work_worth_announcing(&work)
             || commands[index + 1..].iter().any(|c| {
                 let line = c.cmd.slice_ref(c.cmd.trim_ascii_start());
-                Self::is_work_worth_announcing(&Self::translate_command(line))
+                Self::is_work_worth_announcing(&Self::translate_command(line, flags.one_shell))
             });
         announces.then_some((text, work))
     }
@@ -1362,7 +1399,7 @@ impl<'a> NinjaGenerator<'a> {
         let mut kept_any = false;
         for (index, c) in commands.iter().enumerate() {
             let inp = c.cmd.slice_ref(c.cmd.trim_ascii_start());
-            let mut translated = Self::translate_command(inp);
+            let mut translated = Self::translate_command(inp, flags.one_shell);
             let hoisted = match description.as_deref() {
                 Some(None) if !c.echo => {
                     Self::hoisted_narration(flags, commands, index, &translated)
@@ -1750,7 +1787,10 @@ impl<'a> NinjaGenerator<'a> {
                     })
                     .map(|(invocation, location)| {
                         (
-                            Self::translate_command(invocation.command.clone()),
+                            Self::translate_command(
+                                invocation.command.clone(),
+                                self.ce.ev.session.flags.one_shell,
+                            ),
                             invocation.make.clone(),
                             location,
                         )
@@ -3050,15 +3090,60 @@ mod tests {
     #[test]
     fn test_translate_command() {
         assert_eq!(
-            NinjaGenerator::translate_command(Bytes::from_static(b"echo Hello")),
+            NinjaGenerator::translate_command(Bytes::from_static(b"echo Hello"), false),
             Bytes::from_static(b"echo Hello")
         );
         // Make's own escape is long gone by here, so a `$` is the shell's and
         // translation leaves it alone.
         assert_eq!(
-            NinjaGenerator::translate_command(Bytes::from_static(b"echo $PATH")),
+            NinjaGenerator::translate_command(Bytes::from_static(b"echo $PATH"), false),
             Bytes::from_static(b"echo $PATH")
         );
+    }
+
+    /// Which trailing bytes a recipe line may lose, and to what.
+    ///
+    /// GNU Make trims none of them: `chop_commands` splits the recipe and
+    /// hands each line to the shell as written. Everything here is therefore a
+    /// tidying of the separator the ` ; ` join would otherwise double, and it
+    /// may only reach bytes that separator would be redundant with.
+    #[test]
+    fn a_line_keeps_the_trailing_bytes_that_are_script() {
+        let trim = |line: &'static [u8], one_shell: bool| {
+            String::from_utf8(
+                NinjaGenerator::translate_command(Bytes::from_static(line), one_shell).to_vec(),
+            )
+            .unwrap()
+        };
+
+        // The redundant separator, which is what the trim is for.
+        assert_eq!(trim(b"touch m1 ;  ", false), "touch m1");
+        assert_eq!(trim(b"touch m1   ", false), "touch m1");
+        // Under `.ONESHELL` the join is a newline and supplies no separator,
+        // so the line's own stays.
+        assert_eq!(trim(b"touch m1 ;  ", true), "touch m1 ;");
+
+        // `;;` terminates a `case` item. Two arms need both, and a trim that
+        // took either would leave the shell an unterminated item.
+        assert_eq!(trim(b"x) touch m1 ;;", true), "x) touch m1 ;;");
+        assert_eq!(trim(b"x) touch m1 ;;", false), "x) touch m1 ;;");
+
+        // The backslash is what makes this `;` an argument. Dropping it would
+        // strand the backslash at the end of the line, where it escapes the
+        // separator that follows and swallows the next command.
+        assert_eq!(
+            trim(b"find . -name x -exec cp {} m1 \\;", false),
+            "find . -name x -exec cp {} m1 \\;"
+        );
+        assert_eq!(
+            trim(b"find . -name x -exec cp {} m1 \\; ", false),
+            "find . -name x -exec cp {} m1 \\;"
+        );
+        // Quoted is the same answer by the same reasoning.
+        assert_eq!(trim(b"echo 'a ;'", false), "echo 'a ;'");
+        assert_eq!(trim(b"echo \"a ;\" ;", false), "echo \"a ;\"");
+        // An escaped blank is a blank the command is carrying.
+        assert_eq!(trim(b"printf '%s|' a\\ ", false), "printf '%s|' a\\ ");
     }
 
     /// The launches a recipe becomes, as `(text, ignore_error, is direct)`.
@@ -3939,6 +4024,32 @@ mod tests {
         );
     }
 
+    /// A `case` arm's `;;` is the script's own punctuation, and a second arm
+    /// is what needs it: POSIX lets the last item drop its terminator, so a
+    /// one-arm `case` survives a trim that takes them and a two-arm one does
+    /// not — `y)` follows an unterminated item and the shell refuses the whole
+    /// script, making nothing at all.
+    ///
+    /// GNU Make 4.4.1 over these five lines under `.ONESHELL:`: m1 and m3, and
+    /// make succeeds. m2 is the arm not taken.
+    #[test]
+    fn a_case_arm_keeps_the_terminator_it_ends_on() {
+        assert_eq!(
+            one_shell_edge(
+                "case",
+                &[
+                    b"case x in",
+                    b"x) touch m1 ;;",
+                    b"y) touch m2 ;;",
+                    b"esac",
+                    b"touch m3",
+                ],
+                false
+            ),
+            ("m1 m3".to_owned(), true)
+        );
+    }
+
     /// One recipe line as GNU Make read it: the text, whether a `-` prefix was
     /// on it, and whether its failure is forgiven — by that prefix, or by
     /// `.IGNORE:`, which forgives the status without taking `-e` off the line.
@@ -4035,6 +4146,30 @@ mod tests {
                 false,
             ),
             ("m1".to_owned(), false)
+        );
+    }
+
+    /// `find -exec ... \;` ends on a `;` that is an argument, and the
+    /// backslash in front of it says so. Taking the `;` off leaves the
+    /// backslash last, where it escapes the ` ; ` join's own separator: the
+    /// line runs on into the next one, `find` never sees its terminator, and
+    /// it exits complaining that `-exec` is missing an argument.
+    ///
+    /// GNU Make 4.4.1, `@find . -name M.mk -exec cp {} m1 \;` then
+    /// `@touch m2`: both markers, and make succeeds.
+    #[test]
+    fn an_argument_semicolon_survives_the_join() {
+        assert_eq!(
+            ran_as_an_edge(
+                "findexec",
+                &[
+                    (b"touch M.mk", false, false),
+                    (b"find . -name M.mk -exec cp {} m1 \\;", false, false),
+                    (b"touch m2", false, false),
+                ],
+                false,
+            ),
+            ("M.mk m1 m2".to_owned(), true)
         );
     }
 
