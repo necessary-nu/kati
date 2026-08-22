@@ -101,6 +101,24 @@ fn find_command_line_flag_with_arg(cmd: &[u8], name: &[u8]) -> Option<Vec<u8>> {
     Some(val[..idx].to_vec())
 }
 
+/// One recipe every line of which is forgiven, written so a shell reports it
+/// as having succeeded.
+///
+/// Nothing in a manifest says an edge is allowed to fail, so the writer is the
+/// one that answers for it: the script goes in a subshell, which contains an
+/// `exit`, and the status is discarded outside it. The discard needs the shell
+/// to reach it, so a shell `.POSIX:` started with `-e` has the setting taken
+/// off first — otherwise the subshell's own failure ends the shell one command
+/// short of being forgiven.
+fn muted_script(script: &[u8], shell_flags: &[u8]) -> Vec<u8> {
+    let relax: &[u8] = if NinjaGenerator::arms_errexit(shell_flags) {
+        b"set +e ; ("
+    } else {
+        b"("
+    };
+    [relax, b" ", script, b" ) ; true"].concat()
+}
+
 fn get_depfile_from_command_impl(cmd: &mut BytesMut) -> Result<Option<Vec<u8>>> {
     if (find_command_line_flag(cmd, b" -MD").is_none()
         && find_command_line_flag(cmd, b" -MMD").is_none())
@@ -502,8 +520,8 @@ impl DeferredRecipes {
 /// One per surviving command line, except under `.ONESHELL`, where GNU Make
 /// really does hand the whole recipe to one shell and the assembled script is
 /// the thing to run. A step's shell flags are its own line's, so nothing has
-/// to be taken back off inside the command the way an assembled script does
-/// it — the reason `gen_shell_script` writes a `set +e`.
+/// to be stated inside the command the way an assembled script has to state
+/// it — the reason `gen_shell_script` writes a `set +e` or a `set -e`.
 fn recipe_steps(
     flags: &Flags,
     translated: &TranslatedRecipe,
@@ -1169,9 +1187,10 @@ impl<'a> NinjaGenerator<'a> {
     /// GNU Make invokes every recipe line separately, so each line's flags are
     /// its own. A manifest has one invocation per recipe, so the line that
     /// cannot bend governs: a line with no `-` prefix needs whatever `.POSIX:`
-    /// gave it, and the prefixed lines take the `-e` off again themselves —
-    /// which is the `set +e` in [`Self::gen_shell_script`]. When every line is
-    /// prefixed there is nothing to accommodate and the relaxed flags govern.
+    /// gave it, and every line states its own setting inside its own subshell
+    /// anyway — which is the `set +e` and `set -e` in
+    /// [`Self::gen_shell_script`]. When every line is prefixed there is
+    /// nothing to accommodate and the relaxed flags govern.
     ///
     /// One lifted invocation with the `MAKE` reference written back where the
     /// path it expanded to now stands.
@@ -1335,7 +1354,7 @@ impl<'a> NinjaGenerator<'a> {
         mut description: Option<&mut Option<Bytes>>,
     ) -> TranslatedRecipe {
         // A nonzero status is certainly an ignored failure only when every line
-        // ignores errors: otherwise it may be the `&&` chain stopping at a line
+        // ignores errors: otherwise it may be the script stopping at a line
         // whose failure counts. Read over every command rather than the ones
         // that survive the loop, so dropping one can only make this stricter.
         let wholly_ignored = !commands.is_empty() && commands.iter().all(|c| c.ignore_error);
@@ -1377,14 +1396,43 @@ impl<'a> NinjaGenerator<'a> {
         }
     }
 
+    /// Whether a shell started with these flags stops at its first failure.
+    ///
+    /// GNU Make writes `-ec` for a recipe line `.POSIX:` made strict and `-c`
+    /// for every other, and its own reader of the value — `job.c`'s test for
+    /// whether the shell can be skipped altogether — recognises exactly those
+    /// two spellings. A `.SHELLFLAGS` the Makefile set itself is passed
+    /// through untouched by both, so this reads the one thing an assembled
+    /// script has to know about it: whether the option letters it carries
+    /// include `e`. Written as an option cluster, because that is the form the
+    /// value takes; `-o errexit` is two words and is not read as arming it,
+    /// which leaves such a line exactly where it was before this asked.
+    fn arms_errexit(shell_flag: &[u8]) -> bool {
+        shell_flag
+            .split(u8::is_ascii_whitespace)
+            .any(|word| word.starts_with(b"-") && !word.starts_with(b"--") && word.contains(&b'e'))
+    }
+
     /// Assemble the translated recipe into one shell script.
     ///
     /// A destination that can only run one command per edge — a Ninja manifest
     /// is one, since a binding holds one command line — needs the whole recipe
-    /// in a single script, and the subshells, the `&&` chain and the muting
+    /// in a single script, and the subshells, the separators and the muting
     /// below are what stands in for the several shells GNU Make would have
     /// started. A destination that can start one shell per line does not use
     /// this at all and reads [`TranslatedRecipe::lines`] instead.
+    ///
+    /// The lines are separated and the script stops at the first failure with
+    /// `set -e`. Conjoining them with `&&` reads as the same thing and is not:
+    /// POSIX ignores `set -e` while executing any command of an AND-OR list
+    /// other than the last, and the suppression reaches into a subshell
+    /// standing in one — measured alike on dash, bash and nsh, where
+    /// `( set -e ; false ; echo LEAK ) && ( : )` prints and exits 0. A recipe
+    /// line that armed `-e` for itself would therefore lose it for as long as
+    /// it was not the recipe's last line, which is every compile Kbuild emits:
+    /// its `cmd` macro opens each line with `set -e ;`. Each line's own
+    /// setting goes inside its own subshell, where nothing suppresses it, and
+    /// the script's setting stands outside them.
     ///
     /// Returns whether the script's own status can be read as an ignored
     /// error, which is [`SinkRule::ignore_errors`].
@@ -1395,13 +1443,34 @@ impl<'a> NinjaGenerator<'a> {
         cmd_buf: &mut BytesMut,
     ) -> bool {
         let wholly_ignored = recipe.wholly_ignored;
-        // Ignored lines are chained rather than conjoined, so the next line runs
-        // whatever the last one left and the last line's status is the script's.
-        let separator: &[u8] = match (flags.one_shell, wholly_ignored) {
-            (true, _) => b"\n",
-            (false, true) => b" ; ",
-            (false, false) => b" && ",
+        // Only a script that joins lines can lose a failure between them, and
+        // only one whose failures count wants to stop at all: a recipe every
+        // line of which is forgiven runs to the end and reports what its last
+        // line left. A single line is its own script already and is left as
+        // the one command it is.
+        let stops_at_a_failure = !flags.one_shell && !wholly_ignored && recipe.kept().count() > 1;
+        // The other direction, and `.POSIX:` with `.IGNORE:` is where it shows:
+        // every line is forgiven, so the recipe runs to its end, and the shell
+        // the script is handed to was started with `-e` all the same, because
+        // `.IGNORE:` forgives a status without taking `-e` off the line — GNU
+        // Make reads only the `-` prefix for that. The header takes it off the
+        // script and each line puts its own back inside its own subshell.
+        let runs_to_the_end =
+            !flags.one_shell && wholly_ignored && Self::arms_errexit(script_flags);
+        // Under `.ONESHELL` the recipe really is one script and GNU Make's own
+        // newlines separate it. Elsewhere a manifest binding ends at a newline
+        // and cannot hold one, so the separator is the one a line can carry.
+        let separator: &[u8] = if flags.one_shell { b"\n" } else { b" ; " };
+        // The errexit the script is under between its lines: what the shell was
+        // started with, and then whatever the header below says instead.
+        let script_errexit =
+            stops_at_a_failure || (Self::arms_errexit(script_flags) && !runs_to_the_end);
+        let header: &[u8] = match (stops_at_a_failure, runs_to_the_end) {
+            (true, _) => b"set -e ; ",
+            (_, true) => b"set +e ; ",
+            _ => b"",
         };
+        let mut written = false;
         let mut command_count = recipe.lines.len();
         for line in &recipe.lines {
             let Some(c) = line else {
@@ -1416,46 +1485,62 @@ impl<'a> NinjaGenerator<'a> {
                 !flags.one_shell && (command_count > 1 || c.ignore_error) && !c.force_no_subshell;
 
             // An ignored line the script cannot speak for has to lose its
-            // status here, because a later line needs the one channel out. The
-            // subshell goes inside the group, so `exit` reaches the `true`
-            // instead of leaving before it, and the group keeps the `&&` chain
-            // able to stop at a line whose failure counts.
+            // status here, because a later line needs the one channel out.
             let mute = c.ignore_error && !flags.one_shell && !wholly_ignored;
-            // The script runs under flags this line did not ask for, which
-            // under `.POSIX:` means it asked for a shell without `-e`. Taking
-            // `-e` off again inside the line's own subshell gives the line the
-            // shell GNU Make would have given it and leaves the rest of the
-            // script strict. Only a `-` prefix can ask for this, and a
-            // prefixed line always has a subshell to put it in: the prefix
-            // makes `ignore_error` true, which `force_no_subshell` never is.
-            let relax = !flags.one_shell && c.shell_flag != script_flags;
+            // Where the script is strict, the only way to discard a line's
+            // status is to take the setting off around it: every construct
+            // that swallows a status — `||`, an `if` condition, `!` — is one
+            // POSIX suppresses the line's own `-e` inside, which is the defect
+            // this whole assembly exists to avoid. Where it is not strict, the
+            // group is the discard: the subshell sits inside it so an `exit`
+            // reaches the `true` instead of leaving before it.
+            let outer_errexit = script_errexit && !mute;
+
+            // GNU Make gives each line a shell of its own and these lines share
+            // one, so a line whose own setting differs from the script's states
+            // it inside its subshell, where it dies with the line. A line that
+            // asked for no subshell has nowhere to put it: those are written by
+            // the front end and are one command each, which `-e` decides
+            // nothing about.
+            let restore: &[u8] = match (needs_subshell, Self::arms_errexit(&c.shell_flag)) {
+                (true, true) if !outer_errexit => b"set -e ; ",
+                (true, false) if outer_errexit => b"set +e ; ",
+                _ => b"",
+            };
 
             let mut fragment = BytesMut::new();
             if mute {
-                fragment.put_slice(b"{ ");
+                fragment.put_slice(if script_errexit { b"set +e ; " } else { b"{ " });
             }
             if needs_subshell {
                 fragment.put_u8(b'(');
             }
-            if relax {
-                fragment.put_slice(b"set +e ; ");
-            }
+            fragment.put_slice(restore);
             fragment.put_slice(&c.text);
             if needs_subshell {
                 fragment.put_slice(b" )");
             }
             if mute {
-                fragment.put_slice(b" ; true ; }");
+                // `set -e` is the discard as well as the restoration: it is the
+                // fragment's last command and it succeeds.
+                fragment.put_slice(if script_errexit {
+                    b" ; set -e"
+                } else {
+                    b" ; true ; }"
+                });
             }
 
-            if !cmd_buf.is_empty() {
+            if !written {
+                cmd_buf.put_slice(header);
+            } else {
                 cmd_buf.put_slice(separator);
             }
+            written = true;
             cmd_buf.put_slice(&fragment);
         }
         // A script with nothing left in it has no status to read, and a whole
         // recipe can be absorbed: a lone `mkdir -p` of the output's directory.
-        wholly_ignored && !cmd_buf.is_empty()
+        wholly_ignored && written
     }
 
     /// One run of a recursive recipe's own lines, assembled into the script a
@@ -2407,12 +2492,9 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
             writeln!(self.out, "\n deps = gcc")?;
         }
 
-        // Nothing in a manifest says an edge is allowed to fail, so the writer
-        // is the one that answers for it: the script goes in a subshell, which
-        // contains an `exit`, and the status is discarded outside it.
         let muted = rule
             .ignore_errors
-            .then(|| [b"( ".as_slice(), &spelled, b" ) ; true"].concat());
+            .then(|| muted_script(&spelled, rule.shell_flags));
         let command = match (&muted, &rule.command) {
             (Some(muted), SinkCommand::ResponseFile(_)) => SinkCommand::ResponseFile(muted),
             (Some(muted), SinkCommand::Inline(_)) => SinkCommand::Inline(muted),
@@ -2900,8 +2982,8 @@ mod tests {
 
     /// GNU Make runs each command line of a recipe as its own process, so a
     /// recipe becomes as many launches as it has lines — and none of them
-    /// wears the subshell, the `&&` or the muting that assembling one script
-    /// out of them needs.
+    /// wears the subshell, the errexit or the muting that assembling one
+    /// script out of them needs.
     #[test]
     fn a_recipe_becomes_one_launch_per_command_line() {
         assert_eq!(
@@ -3089,7 +3171,10 @@ mod tests {
         // progress counter and leave the rest on stdout.
         assert_eq!(
             narrated_recipe(&[b"echo 'usage:'", b"echo '  make all'"], &Flags::default()),
-            (None, "(echo 'usage:' ) && (echo '  make all' )".into())
+            (
+                None,
+                "set -e ; (set +e ; echo 'usage:' ) ; (set +e ; echo '  make all' )".into()
+            )
         );
         assert_eq!(
             narrated_recipe(&[b"echo one; echo two"], &Flags::default()),
@@ -3144,7 +3229,7 @@ mod tests {
         assert_eq!(description, None);
         assert_eq!(
             String::from_utf8_lossy(&script),
-            "(echo '  CC      misc.o' ) && (cc misc.c )"
+            "set -e ; (set +e ; echo '  CC      misc.o' ) ; (set +e ; cc misc.c )"
         );
     }
 
@@ -3152,7 +3237,8 @@ mod tests {
     /// the whole of what the build shows and the echo has to stay inside it.
     #[test]
     fn a_run_that_shows_no_description_keeps_the_echo() {
-        let fused = "(echo '  CC      misc.o' ) && (cc -c -o misc.o misc.c )";
+        let fused =
+            "set -e ; (set +e ; echo '  CC      misc.o' ) ; (set +e ; cc -c -o misc.o misc.c )";
         for flags in [
             Flags {
                 is_silent_mode: true,
@@ -3347,24 +3433,28 @@ mod tests {
 
     /// `exit` leaves a subshell before anything after it inside runs, so the
     /// status is dropped outside the subshell or it is not dropped at all.
+    /// Where the script stops at a failure the drop is the setting coming off
+    /// around the line and going back on after it — the `set -e` that ends the
+    /// muted line is the discard, because it is a command that succeeds.
     #[test]
     fn an_ignored_line_lets_the_rest_of_the_recipe_run_even_past_exit() {
         let (script, ignore_errors) = recipe_script(&[(b"exit 1", true), (b"echo ok", false)]);
         assert_eq!(
             script,
-            Bytes::from_static(b"{ (exit 1 ) ; true ; } && (echo ok )")
+            Bytes::from_static(b"set -e ; set +e ; (exit 1 ) ; set -e ; (set +e ; echo ok )")
         );
         assert!(!ignore_errors, "only one of the two lines ignores errors");
     }
 
-    /// The group is what keeps the muting local: a bare `; true` would swallow
-    /// the chain's own break as well as the line it was written for.
+    /// The muting is local: the setting goes back on directly after the line
+    /// it was taken off for, so a line whose failure counts still ends the
+    /// script wherever it stands among lines whose failures do not.
     #[test]
     fn a_line_whose_failure_counts_still_stops_a_recipe_that_ignores_another() {
         let (script, ignore_errors) = recipe_script(&[(b"false", false), (b"exit 3", true)]);
         assert_eq!(
             script,
-            Bytes::from_static(b"(false ) && { (exit 3 ) ; true ; }")
+            Bytes::from_static(b"set -e ; (set +e ; false ) ; set +e ; (exit 3 ) ; set -e")
         );
         assert!(!ignore_errors);
     }
@@ -3380,8 +3470,10 @@ mod tests {
 
     /// GNU Make gives the prefixed line a shell without `-e` and the plain one
     /// beside it a shell with it. One invocation cannot have both, so the
-    /// strict flags govern and the prefixed line takes `-e` back off inside
-    /// its own subshell, where it reaches nothing else.
+    /// strict flags govern and the prefixed line runs with the setting off:
+    /// the muting takes it off around that line anyway, so nothing further is
+    /// written inside the line's own subshell, and the plain line beside it
+    /// asks for exactly what the script is already under.
     #[test]
     fn posix_relaxes_only_the_prefixed_line() {
         let ((script, _), flags) = script_of(
@@ -3391,7 +3483,9 @@ mod tests {
         assert_eq!(flags, Bytes::from_static(b"-ec"));
         assert_eq!(
             script,
-            Bytes::from_static(b"{ (set +e ; false ; echo body > out ) ; true ; } && (echo done )")
+            Bytes::from_static(
+                b"set -e ; set +e ; (false ; echo body > out ) ; set -e ; (echo done )"
+            )
         );
     }
 
@@ -3406,13 +3500,225 @@ mod tests {
         assert!(ignore_errors);
     }
 
-    /// Without `.POSIX:` every line already wanted the same shell, so the
-    /// accommodation never appears and the script reads as it always did.
+    /// Without `.POSIX:` every line asked for a shell without `-e`, and the
+    /// script it is assembled into has `-e` so that it stops where GNU Make
+    /// stops. Each line therefore takes the setting back off inside its own
+    /// subshell — the permissive default is what the line asked for, and a
+    /// line that arms `-e` for itself does so from there, where nothing
+    /// suppresses it.
     #[test]
-    fn a_plain_recipe_never_relaxes_a_line() {
+    fn a_plain_recipe_gives_each_line_the_shell_it_asked_for() {
         let ((script, _), flags) = script_of(&[(b"false", true), (b"echo done", false)], false);
         assert_eq!(flags, Bytes::from_static(b"-c"));
-        assert!(!script.windows(3).any(|w| w == b"set"), "{script:?}");
+        assert_eq!(
+            script,
+            Bytes::from_static(b"set -e ; set +e ; (false ) ; set -e ; (set +e ; echo done )")
+        );
+    }
+
+    /// One recipe line as GNU Make read it: the text, whether a `-` prefix was
+    /// on it, and whether its failure is forgiven — by that prefix, or by
+    /// `.IGNORE:`, which forgives the status without taking `-e` off the line.
+    type WrittenLine = (&'static [u8], bool, bool);
+
+    /// What the assembled script actually does, run the way a Ninja edge runs
+    /// it: one shell, started with the script's own flags, handed the script
+    /// as one argument, in a directory of its own.
+    ///
+    /// Answers in the two terms a build is judged in — the files the recipe
+    /// left behind, and whether the edge failed. The oracle for every
+    /// expectation below is GNU Make 4.4.1 running the same recipe, recorded
+    /// beside each case. The assertions are about effects and never about
+    /// narration, because a manifest is read by whatever runs it and not by a
+    /// reader of GNU's text.
+    fn ran_as_an_edge(label: &str, lines: &[WrittenLine], posix: bool) -> (String, bool) {
+        let mut names = Symtab::new();
+        let output = names.intern(&b"out"[..]);
+        let commands: Vec<Command> = lines
+            .iter()
+            .map(|(cmd, dash_prefixed, ignore_error)| Command {
+                output,
+                cmd: Bytes::from_static(cmd),
+                echo: true,
+                ignore_error: *ignore_error,
+                dash_prefixed: *dash_prefixed,
+                shell_flag: Bytes::from_static(match (posix, dash_prefixed) {
+                    (true, false) => b"-ec",
+                    _ => b"-c",
+                }),
+                force_no_subshell: false,
+                recursive_line: false,
+                recursive_make: Vec::new(),
+                nesting: None,
+                loc: None,
+            })
+            .collect();
+        let flags = Flags::default();
+        let script_flags = NinjaGenerator::script_shell_flags(&flags, &commands);
+        let translated =
+            NinjaGenerator::translate_recipe(&flags, &Bytes::from_static(b"out"), &commands, None);
+        let mut script = BytesMut::new();
+        let ignore_errors =
+            NinjaGenerator::gen_shell_script(&flags, &translated, &script_flags, &mut script);
+        let script = if ignore_errors {
+            muted_script(&script, &script_flags)
+        } else {
+            script.to_vec()
+        };
+
+        let directory = std::env::temp_dir().join(format!(
+            "kati-edge-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .arg(std::ffi::OsStr::from_bytes(&script_flags))
+            .arg(std::ffi::OsStr::from_bytes(&script))
+            .current_dir(&directory)
+            .status()
+            .unwrap();
+        let mut made: Vec<String> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        made.sort();
+        std::fs::remove_dir_all(&directory).unwrap();
+        (made.join(" "), status.success())
+    }
+
+    /// The defect this assembly exists for, in the shape it was found in.
+    ///
+    /// Kbuild's `cmd` macro opens every recipe line with `set -e ;`, and
+    /// `rule_cc_o_c` is six such lines, so a kernel compile is never the last
+    /// line of its own recipe. Joined with `&&` the line kept running past the
+    /// compiler that failed — POSIX ignores `-e` for a command of an AND-OR
+    /// list other than the last, into the subshell and all — and the edge
+    /// reported the status of the `rm -f` that ended the line.
+    ///
+    /// GNU Make 4.4.1, `@set -e; touch m1; false; touch m2` then two more
+    /// lines: `m1` alone, and `*** [Makefile:2: out] Error 1`.
+    #[test]
+    fn a_kbuild_line_keeps_the_errexit_it_armed_for_itself() {
+        assert_eq!(
+            ran_as_an_edge(
+                "kbuild",
+                &[
+                    (b"set -e; touch m1; false; touch m2", false, false),
+                    (b"set -e; touch m3", false, false),
+                    (b"set -e; touch m4", false, false),
+                ],
+                false,
+            ),
+            ("m1".to_owned(), false)
+        );
+    }
+
+    /// A line that armed nothing keeps GNU's permissive default: it runs to
+    /// its end and the last command on it decides, which is what makes the
+    /// recipe carry on here.
+    ///
+    /// GNU Make 4.4.1, `@touch m1; false; touch m2` then `@touch m3`: all
+    /// three, and make succeeds.
+    #[test]
+    fn a_line_that_armed_nothing_runs_to_its_end() {
+        assert_eq!(
+            ran_as_an_edge(
+                "permissive",
+                &[
+                    (b"touch m1; false; touch m2", false, false),
+                    (b"touch m3", false, false),
+                ],
+                false,
+            ),
+            ("m1 m2 m3".to_owned(), true)
+        );
+    }
+
+    /// A `-` prefix forgives the line's status and does not touch what the
+    /// line asked its own shell for, so an armed line still stops inside
+    /// itself while the recipe carries on past it.
+    ///
+    /// GNU Make 4.4.1, `-@set -e; touch m1; false; touch m2` then `@touch m3`:
+    /// `m1` and `m3`, `Error 1 (ignored)`, and make succeeds.
+    #[test]
+    fn a_forgiven_line_keeps_its_own_errexit() {
+        assert_eq!(
+            ran_as_an_edge(
+                "forgiven",
+                &[
+                    (b"set -e; touch m1; false; touch m2", true, true),
+                    (b"touch m3", false, false),
+                ],
+                false,
+            ),
+            ("m1 m3".to_owned(), true)
+        );
+    }
+
+    /// `.IGNORE:` forgives the status without taking `-e` off the line, so
+    /// under `.POSIX:` such a line stops at its first failing command and the
+    /// recipe still runs on. The whole recipe is forgiven, so the script must
+    /// not stop between its lines either, and the edge must succeed.
+    ///
+    /// GNU Make 4.4.1 with `.POSIX:` and `.IGNORE:`, `@touch m1; false;
+    /// touch m2` then `@touch m3`: `m1` and `m3`, `Error 1 (ignored)`, and
+    /// make succeeds.
+    #[test]
+    fn ignore_under_posix_keeps_the_line_strict_and_the_recipe_running() {
+        assert_eq!(
+            ran_as_an_edge(
+                "posix-ignore",
+                &[
+                    (b"touch m1; false; touch m2", false, true),
+                    (b"touch m3", false, true),
+                ],
+                true,
+            ),
+            ("m1 m3".to_owned(), true)
+        );
+    }
+
+    /// `.POSIX:` alone gives every unprefixed line `-e`, which the joined
+    /// script has to hold for the line without letting the line's failure be
+    /// the only thing that stops it.
+    ///
+    /// GNU Make 4.4.1 with `.POSIX:`, `@touch m1; false; touch m2` then
+    /// `@touch m3`: `m1` alone, and `*** [Makefile:3: out] Error 1`.
+    #[test]
+    fn posix_stops_a_line_at_its_first_failing_command() {
+        assert_eq!(
+            ran_as_an_edge(
+                "posix",
+                &[
+                    (b"touch m1; false; touch m2", false, false),
+                    (b"touch m3", false, false),
+                ],
+                true,
+            ),
+            ("m1".to_owned(), false)
+        );
+    }
+
+    /// A recipe every line of which is forgiven runs to its end whatever any
+    /// line left, and each line still keeps the setting it armed for itself.
+    ///
+    /// GNU Make 4.4.1, `-@set -e; touch m1; false; touch m2` then
+    /// `-@touch m3`: `m1` and `m3`, and make succeeds.
+    #[test]
+    fn a_wholly_forgiven_recipe_runs_every_line() {
+        assert_eq!(
+            ran_as_an_edge(
+                "wholly-forgiven",
+                &[
+                    (b"set -e; touch m1; false; touch m2", true, true),
+                    (b"touch m3", true, true),
+                ],
+                false,
+            ),
+            ("m1 m3".to_owned(), true)
+        );
     }
 
     /// A manifest cannot say an edge is allowed to fail, so the writer says it
