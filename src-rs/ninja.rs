@@ -828,11 +828,14 @@ impl<'a> NinjaGenerator<'a> {
                     cmd_buf.put_u8(c);
                 }
                 b'\n' => {
-                    if prev_backslash {
-                        cmd_buf.truncate(cmd_buf.len() - 1);
-                    } else {
-                        cmd_buf.put_u8(b' ');
-                    }
+                    // A newline that got this far is a continuation's: the
+                    // splitter ends a command line at any other. GNU Make hands
+                    // the shell both bytes — `construct_command_argv_internal`
+                    // (job.c) tests for `\\\n` above its newline case and
+                    // writes the pair out — and leaves the shell to decide what
+                    // they mean, which is nothing outside quotes and two
+                    // characters of text inside them.
+                    cmd_buf.put_u8(c);
                 }
                 _ => cmd_buf.put_u8(c),
             }
@@ -851,9 +854,12 @@ impl<'a> NinjaGenerator<'a> {
             cmd_buf.truncate(cmd_buf.len() - 1);
         }
 
-        while !cmd_buf.is_empty() {
-            let c = *cmd_buf.last().unwrap();
-            if !c.is_ascii_whitespace() && c != b';' {
+        while let Some(&c) = cmd_buf.last() {
+            // A continuation's newline is not trailing whitespace, and the
+            // backslash in front of it is what makes it one: taking the pair
+            // apart would leave the shell a line ending in an escape with
+            // nothing to escape.
+            if c == b'\n' || (!c.is_ascii_whitespace() && c != b';') {
                 break;
             }
             cmd_buf.truncate(cmd_buf.len() - 1);
@@ -2193,6 +2199,44 @@ impl Drop for NinjaGenerator<'_> {
 
 /// Escape a name for a `build.ninja`, where `$`, `:` and space would otherwise
 /// be syntax.
+/// The script written onto one line, for somewhere that has only one.
+///
+/// Two places do. A `build.ninja` binding holds one line — a raw newline ends
+/// the value and no escape puts one back — so the newline of a recipe
+/// continuation, which GNU Make hands to the shell along with the backslash in
+/// front of it and leaves the shell to read, is the one byte the manifest
+/// cannot carry at all. A description is the other: it is one line of
+/// narration whatever destination prints it.
+///
+/// Dropping the pair is what the shell would have done with it anywhere but
+/// inside quotes. Inside quotes it is a recipe neither place can express, and
+/// the manifest is then genuinely a manifest that builds something else — which
+/// is why the sink that keeps the recipe in memory is handed the launches
+/// themselves and never reads this.
+pub fn single_line(script: &[u8]) -> Bytes {
+    if !script.contains(&b'\n') {
+        return Bytes::copy_from_slice(script);
+    }
+    let mut out = BytesMut::with_capacity(script.len());
+    let mut rest = script;
+    while let Some(at) = rest.iter().position(|byte| *byte == b'\n') {
+        let (line, tail) = rest.split_at(at);
+        // Only an odd run of backslashes continues a line; an even one is
+        // escaped backslashes and the newline after it ended the line, which
+        // is `.ONESHELL`'s separator and not a continuation at all.
+        let run = line.iter().rev().take_while(|byte| **byte == b'\\').count();
+        if run % 2 == 1 {
+            out.put_slice(&line[..line.len() - 1]);
+        } else {
+            out.put_slice(line);
+            out.put_u8(b'\n');
+        }
+        rest = &tail[1..];
+    }
+    out.put_slice(rest);
+    out.freeze()
+}
+
 fn escape_ninja(s: &[u8]) -> Bytes {
     let extras = s.iter().filter(|c| b"$: ".contains(c)).count();
     if extras == 0 {
@@ -2341,13 +2385,19 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
         self.write_location(names, rule.loc)?;
         writeln!(self.out, "rule rule{}", rule.id)?;
 
-        let description = rule.description.or(match rule.command {
-            SinkCommand::Inline(script) => Some(script),
-            SinkCommand::ResponseFile(_) => None,
-        });
+        let spelled = match rule.command {
+            SinkCommand::Inline(script) | SinkCommand::ResponseFile(script) => single_line(script),
+        };
+        let description = rule
+            .description
+            .map(Bytes::copy_from_slice)
+            .or(match rule.command {
+                SinkCommand::Inline(_) => Some(spelled.clone()),
+                SinkCommand::ResponseFile(_) => None,
+            });
         if let Some(description) = description {
             self.out.write_all(b" description = ")?;
-            self.out.write_all(&escape_ninja_value(description))?;
+            self.out.write_all(&escape_ninja_value(&description))?;
             self.out.write_all(b"\n")?;
         }
 
@@ -2360,16 +2410,14 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
         // Nothing in a manifest says an edge is allowed to fail, so the writer
         // is the one that answers for it: the script goes in a subshell, which
         // contains an `exit`, and the status is discarded outside it.
-        let muted = rule.ignore_errors.then(|| {
-            let script = match rule.command {
-                SinkCommand::ResponseFile(script) | SinkCommand::Inline(script) => script,
-            };
-            [b"( ".as_slice(), script, b" ) ; true"].concat()
-        });
+        let muted = rule
+            .ignore_errors
+            .then(|| [b"( ".as_slice(), &spelled, b" ) ; true"].concat());
         let command = match (&muted, &rule.command) {
             (Some(muted), SinkCommand::ResponseFile(_)) => SinkCommand::ResponseFile(muted),
             (Some(muted), SinkCommand::Inline(_)) => SinkCommand::Inline(muted),
-            (None, command) => *command,
+            (None, SinkCommand::ResponseFile(_)) => SinkCommand::ResponseFile(&spelled),
+            (None, SinkCommand::Inline(_)) => SinkCommand::Inline(&spelled),
         };
 
         // Every one of these runs in place of the shell the build starts for
