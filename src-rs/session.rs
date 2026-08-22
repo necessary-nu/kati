@@ -388,10 +388,14 @@ impl Session {
     }
 
     /// A session whose flags come from `args`, a whole `argv`.
-    pub fn from_args(args: Vec<OsString>) -> Self {
+    ///
+    /// `Err` for a command line this front end will not take. Handed back
+    /// rather than raised, because a session is built inside other processes
+    /// than the standalone binary and none of them can be exited from here.
+    pub fn from_args(args: Vec<OsString>) -> Result<Self, crate::flags::Refusal> {
         let mut symtab = Symtab::new();
-        let flags = Flags::from_args(args, &mut symtab);
-        Self::from_parts(flags, symtab)
+        let flags = Flags::from_args(args, &mut symtab)?;
+        Ok(Self::from_parts(flags, symtab))
     }
 
     pub fn with_flags(flags: Flags) -> Self {

@@ -326,6 +326,137 @@ pub struct Flags {
     pub keep_going: bool,
 }
 
+/// Why a command line was refused, in this front end's own words.
+///
+/// [`Flags::from_args`] is a library entry point — Ronin's equivalence gate
+/// builds a session straight from an argv — so it can neither print nor exit.
+/// It hands the complaint back and whoever owns the process renders it. The
+/// standalone binary writes it to stderr and exits 2, which is the status GNU
+/// Make leaves for a command line it would not take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal(String);
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// How much of the word a short option takes with it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShortArgument {
+    /// None at all, so the letter beside it in a cluster is another option.
+    None,
+    /// Whatever follows it in the same word, or the next word when nothing
+    /// does — GNU Make's `filename`, `strlist` and `positive_int` switches.
+    Word,
+    /// Only what is attached: GNU Make's `string` switch with a `noarg_value`,
+    /// which getopt spells `O::`. A following word is a goal, not an argument.
+    Attached,
+    /// Attached, or the following word when it opens with a digit or a `.` —
+    /// the extra peek `main.c` does for a `floating` switch, which is why
+    /// `-l 2` consumes the `2` and `-l foo` leaves `foo` to be a goal.
+    AttachedOrNumber,
+}
+
+/// What a GNU Make short option costs this front end, by letter.
+///
+/// `None` for a letter neither tool knows. The three answers otherwise are the
+/// three things a compiler front end can do with a runner's switch: read it
+/// into a field, drop it, or refuse it.
+fn short_option(letter: u8) -> Option<(ShortArgument, ShortOption)> {
+    use ShortArgument::{Attached, AttachedOrNumber, None, Word};
+    use ShortOption::{Dropped, Read, Refused};
+    Some(match letter {
+        // Read into a field this front end already has, and already uses.
+        b'c' | b'd' | b'e' | b'i' | b'k' | b'n' | b'R' | b'r' | b'S' | b's' => (None, Read),
+        b'C' | b'f' | b'j' => (Word, Read),
+
+        // Dropped. `-b` and `-m` GNU Make ignores itself; the rest name
+        // something no compiled graph can carry — whether the database is
+        // printed, whether symlink times are checked, where a directory
+        // announcement goes, how a runner interleaves its output and how
+        // heavily it loads the machine. `MAKE_OPTION_SURFACE` in
+        // src/make/cli.rs classifies the same seven as no-ops, and is the
+        // reference this follows.
+        b'L' | b'b' | b'm' | b'p' | b'w' => (None, Dropped),
+        b'O' => (Attached, Dropped),
+        b'l' => (AttachedOrNumber, Dropped),
+
+        // Refused, because accepting one silently would answer a question this
+        // front end never asked. `-B`, `-t` and `-q` each say what to do
+        // INSTEAD of building — remake everything, touch instead of make,
+        // report instead of make — and a front end that compiles a graph and
+        // reports success would be lying about all three. `-v` and `-h` build
+        // nothing at all. `-E` evaluates a statement before the makefiles and
+        // there is no field behind it.
+        b'B' | b'h' | b'q' | b't' | b'v' => (None, Refused),
+        b'E' => (Word, Refused),
+        // `-I` and `-o` have fields — `include_dirs` and `old_files` — and are
+        // still refused, because both take an argument whose canonicalisation
+        // belongs to the front end rather than to the field: `-I -` resets the
+        // search path where it stands rather than adding a directory named
+        // `-`, and an old file is stored as the switch canonicalised it.
+        // Reading the argument in raw would put the wrong bytes in a real
+        // field, which is worse than not reading it. `-W` is the third of that
+        // shape and has no field at all.
+        b'I' | b'W' | b'o' => (Word, Refused),
+        _ => return Option::None,
+    })
+}
+
+/// What reading a short option costs, beside how much of the word it takes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShortOption {
+    Read,
+    Dropped,
+    Refused,
+}
+
+/// The words `arg` stands for once GNU Make's getopt has split it.
+///
+/// `-rR` is two options and GNU Make reads it as two; this table read it as
+/// one word it had never heard of. Splitting happens only where it cannot
+/// change an existing reading: the word must open with a single `-` followed
+/// by a letter that takes no argument, which leaves `-j8`, `-Csub` and every
+/// `--long` spelling exactly where they were. The first letter that does take
+/// an argument ends the split and keeps the rest of the word attached to
+/// itself, which is what getopt does with `-Cdir`.
+///
+/// A letter neither tool knows is emitted on its own rather than complained
+/// about here, so the complaint below names the letter the way GNU Make's does
+/// rather than the cluster it was written in.
+fn split_short_cluster(arg: &OsStr) -> Option<Vec<OsString>> {
+    let bytes = arg.as_bytes();
+    let letters = bytes.strip_prefix(b"-")?;
+    if letters.len() < 2 || letters[0] == b'-' {
+        return None;
+    }
+    if short_option(letters[0]).is_none_or(|(shape, _)| shape != ShortArgument::None) {
+        return None;
+    }
+    // `-` is the one byte getopt keeps for itself, so a word carrying one
+    // among its letters is not a cluster at all — GNU Make answers `-rR-q`
+    // with `invalid option -- '-'`. Left whole, it is complained about below
+    // as the word it was written as.
+    if letters.contains(&b'-') {
+        return None;
+    }
+    let mut words = Vec::with_capacity(letters.len());
+    for (index, &letter) in letters.iter().enumerate() {
+        let takes_a_word =
+            short_option(letter).is_some_and(|(shape, _)| shape != ShortArgument::None);
+        if takes_a_word {
+            let mut word = vec![b'-', letter];
+            word.extend_from_slice(&letters[index + 1..]);
+            words.push(OsString::from_vec(word));
+            return Some(words);
+        }
+        words.push(OsString::from_vec(vec![b'-', letter]));
+    }
+    Some(words)
+}
+
 fn parse_command_line_option_with_arg(
     option: &str,
     arg: &OsStr,
@@ -352,7 +483,7 @@ impl Flags {
     ///
     /// `symtab` is here only because command-line targets are interned; the
     /// flags keep no reference to it.
-    pub fn from_args(args: Vec<OsString>, symtab: &mut Symtab) -> Flags {
+    pub fn from_args(args: Vec<OsString>, symtab: &mut Symtab) -> Result<Flags, Refusal> {
         let mut iter = args.into_iter();
         let mut flags = Flags::default();
         let program = iter.next().unwrap();
@@ -376,9 +507,54 @@ impl Flags {
             }
         }
 
-        while let Some(arg) = iter.next() {
+        // What a cluster split off the word in hand, waiting to be read as
+        // words of their own. Never holds anything while an option is reaching
+        // for its argument: the split attaches the rest of the word to the
+        // first letter that takes one, so no letter after that is separate.
+        let mut split: std::collections::VecDeque<OsString> = std::collections::VecDeque::new();
+        let complain = |program: &str, text: String| Err(Refusal(format!("{program}: {text}")));
+        while let Some(arg) = split.pop_front().or_else(|| iter.next()) {
+            if split.is_empty()
+                && let Some(words) = split_short_cluster(&arg)
+                && words.len() > 1
+            {
+                split.extend(words);
+                continue;
+            }
             let mut should_propagate = true;
+            if let Some(letter) = arg
+                .as_bytes()
+                .strip_prefix(b"-")
+                .filter(|rest| rest.len() == 1)
+                .map(|rest| rest[0])
+            {
+                match short_option(letter) {
+                    Some((_, ShortOption::Refused)) => {
+                        return complain(
+                            &flags.program_name,
+                            format!("unsupported option -- '{}'", char::from(letter)),
+                        );
+                    }
+                    Some((shape, ShortOption::Dropped)) => {
+                        if shape == ShortArgument::AttachedOrNumber
+                            && iter
+                                .as_slice()
+                                .first()
+                                .and_then(|next| next.as_bytes().first())
+                                .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'.')
+                        {
+                            iter.next();
+                        }
+                        flags.subkati_args.push(arg);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             match arg.as_bytes() {
+                // A dropped switch written with its argument attached. Nothing
+                // reads either half; the word is passed on as it was written.
+                [b'-', b'O' | b'l', ..] => {}
                 b"-f" => {
                     flags.makefiles.extend(iter.next());
                     should_propagate = false;
@@ -482,14 +658,23 @@ impl Flags {
                         parse_command_line_option_with_arg("-j", &arg, &mut iter)
                     {
                         let Some(num_jobs) = arg.to_string_lossy().parse::<usize>().ok() else {
-                            panic!("Invalid -j flag: {}", arg.to_string_lossy());
+                            return complain(
+                                &flags.program_name,
+                                format!("Invalid -j flag: {}", arg.to_string_lossy()),
+                            );
                         };
                         flags.num_jobs = num_jobs;
                     } else if let Some(arg) =
                         parse_command_line_option_with_arg("--remote_num_jobs", &arg, &mut iter)
                     {
                         let Some(num_jobs) = arg.to_string_lossy().parse::<usize>().ok() else {
-                            panic!("Invalid --remote_num_jobs flag: {}", arg.to_string_lossy());
+                            return complain(
+                                &flags.program_name,
+                                format!(
+                                    "Invalid --remote_num_jobs flag: {}",
+                                    arg.to_string_lossy()
+                                ),
+                            );
                         };
                         flags.remote_num_jobs = num_jobs;
                     } else if let Some(arg) =
@@ -534,7 +719,10 @@ impl Flags {
                     {
                         flags.memory_profile_path = Some(arg)
                     } else if arg.as_bytes().starts_with(b"-") {
-                        panic!("Unknown flag: {}", arg.to_string_lossy());
+                        return complain(
+                            &flags.program_name,
+                            format!("Unknown flag: {}", arg.to_string_lossy()),
+                        );
                     } else if arg.as_bytes().contains(&b'=') {
                         flags.cl_vars.push(Bytes::from(arg.as_bytes().to_vec()));
                     } else {
@@ -552,12 +740,15 @@ impl Flags {
         if !flags.traced_variables_pattern.is_empty()
             && flags.dump_variable_assignment_trace.is_none()
         {
-            panic!(
-                "--variable_assignment_trace_filter is valid only together with --dump_variable_assignment_trace"
+            return complain(
+                &flags.program_name,
+                "--variable_assignment_trace_filter is valid only together with \
+                 --dump_variable_assignment_trace"
+                    .to_owned(),
             );
         }
 
-        flags
+        Ok(flags)
     }
 }
 
@@ -574,7 +765,8 @@ mod tests {
                 .map(|s| s.into())
                 .collect(),
             &mut symtab,
-        );
+        )
+        .unwrap();
         assert_eq!(flags.makefiles, vec![OsString::from("main.mk")]);
     }
 
@@ -589,7 +781,8 @@ mod tests {
                 .map(|s| s.into())
                 .collect(),
             &mut symtab,
-        );
+        )
+        .unwrap();
         assert_eq!(
             flags.makefiles,
             vec![
@@ -605,7 +798,18 @@ mod tests {
         let mut symtab = Symtab::new();
         let mut argv = vec!["rkati".to_owned()];
         argv.extend(words.iter().map(|word| (*word).to_owned()));
+        Flags::from_args(argv.into_iter().map(Into::into).collect(), &mut symtab).unwrap()
+    }
+
+    /// The complaint a command line this front end will not take produces,
+    /// which is a value rather than a crash or an exit.
+    fn refusal(words: &[&str]) -> String {
+        let mut symtab = Symtab::new();
+        let mut argv = vec!["rkati".to_owned()];
+        argv.extend(words.iter().map(|word| (*word).to_owned()));
         Flags::from_args(argv.into_iter().map(Into::into).collect(), &mut symtab)
+            .err()
+            .map_or_else(|| "accepted".to_owned(), |refusal| refusal.to_string())
     }
 
     /// `-i` is `--ignore-errors` and nothing else.
@@ -669,6 +873,122 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert_eq!(carried, ["-i", "-n", "-k", "-e", "-r", "-R"]);
+    }
+
+    /// The letters GNU Make has that this front end accepts and drops.
+    ///
+    /// Each reached `panic!("Unknown flag: ...")` before, which is a crash on
+    /// a command line GNU Make 4.4.1 takes without comment — `-b` and `-m` it
+    /// ignores itself, and the other five it honours in a runner this front
+    /// end is not. Accepting them leaves every field where it was, so the
+    /// assertion is that nothing moved and the argv was taken at all.
+    #[test]
+    fn the_letters_a_compiler_can_drop_are_taken() {
+        for letter in ["-b", "-m", "-L", "-p", "-w", "-O", "-l"] {
+            assert_eq!(refusal(&[letter]), "accepted", "for {letter}");
+        }
+        let dropped = switches(&["-b", "-m", "-L", "-p", "-w", "-O", "-l"]);
+        let none = switches(&[]);
+        assert_eq!(dropped.is_dry_run, none.is_dry_run);
+        assert_eq!(dropped.is_silent_mode, none.is_silent_mode);
+        assert_eq!(dropped.keep_going, none.keep_going);
+        assert_eq!(dropped.no_builtin_rules, none.no_builtin_rules);
+        assert_eq!(dropped.num_jobs, none.num_jobs);
+        assert!(dropped.targets.is_empty());
+    }
+
+    /// How much of the command line a dropped switch takes with it, which is
+    /// the only thing about it still observable: swallow a word too many and a
+    /// goal disappears, one too few and an argument becomes a goal.
+    ///
+    /// GNU Make's shapes, and its own peculiarity. `-O` is `string` with a
+    /// `noarg_value`, so getopt spells it `O::` and only an ATTACHED argument
+    /// counts — measured on 4.4.1, `-O line zz` reports `No rule to make
+    /// target 'line'`. `-l` is `floating`, and `main.c` additionally takes the
+    /// following word when it opens with a digit or a `.`, so `-l 2 zz` builds
+    /// `zz` alone and `-l foo` reports `No rule to make target 'foo'`.
+    #[test]
+    fn a_dropped_switch_takes_the_words_gnu_takes() {
+        let goals = |words: &[&str]| {
+            let mut symtab = Symtab::new();
+            let mut argv = vec!["rkati".to_owned()];
+            argv.extend(words.iter().map(|word| (*word).to_owned()));
+            let flags =
+                Flags::from_args(argv.into_iter().map(Into::into).collect(), &mut symtab).unwrap();
+            flags
+                .targets
+                .iter()
+                .map(|goal| String::from_utf8_lossy(&symtab.name(*goal)).into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(goals(&["-l", "2", "zz"]), ["zz"]);
+        assert_eq!(goals(&["-l", "2.5", "zz"]), ["zz"]);
+        assert_eq!(goals(&["-l", "foo"]), ["foo"]);
+        assert_eq!(goals(&["-O", "line", "zz"]), ["line", "zz"]);
+        assert_eq!(goals(&["-Oline", "zz"]), ["zz"]);
+    }
+
+    /// A switch this front end will not honour is refused rather than
+    /// accepted, and refused rather than crashed on.
+    ///
+    /// Silence would be the worst answer of the three: `rkati -q` that
+    /// compiled the graph and reported success would be answering a question
+    /// nobody asked it, and `-B` and `-t` each say what to do INSTEAD of
+    /// building. The complaint is this binary's own — it is not GNU Make and
+    /// does not speak for one — and the status is 2, which is what GNU Make
+    /// leaves for a command line it would not take.
+    #[test]
+    fn a_switch_this_front_end_cannot_honour_is_refused_and_not_crashed_on() {
+        for letter in ["B", "t", "q", "v", "h", "E", "I", "o", "W"] {
+            assert_eq!(
+                refusal(&[&format!("-{letter}")]),
+                format!("rkati: unsupported option -- '{letter}'")
+            );
+        }
+        // The letter nothing knows keeps the words it always had.
+        assert_eq!(refusal(&["-Z"]), "rkati: Unknown flag: -Z");
+        // And so do the three malformed-argument complaints beside it, which
+        // were the other panics on this path.
+        assert_eq!(refusal(&["-j", "many"]), "rkati: Invalid -j flag: many");
+        assert_eq!(
+            refusal(&["--remote_num_jobs", "many"]),
+            "rkati: Invalid --remote_num_jobs flag: many"
+        );
+        assert!(
+            refusal(&["--variable_assignment_trace_filter", "V"])
+                .starts_with("rkati: --variable_assignment_trace_filter is valid only together")
+        );
+    }
+
+    /// `-rR` is two switches, because GNU Make's getopt reads a cluster.
+    ///
+    /// It read as one word nothing knew, so the standalone binary crashed on a
+    /// spelling the corpus under tests/make/ writes seven times. The split
+    /// reaches only words that opened with a letter taking no argument, so
+    /// `-j8` and `-Csub` are read exactly as before; the first letter that
+    /// does take one keeps the rest of the word, which is what getopt does.
+    #[test]
+    fn a_cluster_of_short_switches_is_read_as_the_switches_it_is() {
+        let clustered = switches(&["-rR"]);
+        assert!(clustered.no_builtin_rules);
+        assert!(clustered.no_builtin_variables);
+        let three = switches(&["-rRs"]);
+        assert!(three.no_builtin_rules && three.no_builtin_variables && three.is_silent_mode);
+        // A letter that takes an argument ends the split and keeps the rest.
+        assert_eq!(switches(&["-rj8"]).num_jobs, 8);
+        assert!(switches(&["-rj8"]).no_builtin_rules);
+        // Untouched: these never opened with a no-argument letter.
+        assert_eq!(switches(&["-j8"]).num_jobs, 8);
+        assert_eq!(
+            switches(&["-Csub"]).working_dir,
+            Some(OsString::from("sub"))
+        );
+        // A cluster is refused by the letter that earns it, not by the word.
+        assert_eq!(refusal(&["-rZ"]), "rkati: Unknown flag: -Z");
+        assert_eq!(refusal(&["-rRq"]), "rkati: unsupported option -- 'q'");
+        // `-` is the byte getopt keeps, so this is not a cluster at all. GNU
+        // Make 4.4.1 answers `invalid option -- '-'` and exits 2.
+        assert_eq!(refusal(&["-rR-q"]), "rkati: Unknown flag: -rR-q");
     }
 
     #[test]

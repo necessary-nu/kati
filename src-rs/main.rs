@@ -238,7 +238,16 @@ fn main() {
 
     // Everything that used to be a process global now hangs off this value.
     // [spec:ronin:req:make.no-ambient-state]
-    let mut session = Session::from_args(std::env::args_os().collect());
+    let mut session = match Session::from_args(std::env::args_os().collect()) {
+        Ok(session) => session,
+        // A command line this front end will not take is a diagnostic and a
+        // status, not a crash: 2 is what GNU Make leaves for one, and this
+        // binary is the front end a conformance gate drives.
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            std::process::exit(ABANDONED);
+        }
+    };
 
     #[cfg(feature = "gperf")]
     {
