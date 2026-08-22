@@ -2063,10 +2063,12 @@ impl<'a> DepBuilder<'a> {
     ///
     /// `.INTERMEDIATE` and `.SECONDARY` win outright: a name either of them
     /// says is intermediate however else it was reached, which is what makes
-    /// them worth writing beside a `.NOTINTERMEDIATE` pattern.
+    /// them worth writing beside a `.NOTINTERMEDIATE` pattern. Either way the
+    /// bit only lasts until the file is found already lying there; see
+    /// [`Self::found_before_the_build`].
     fn treat_as_intermediate(&self, output: Symbol) -> bool {
         if self.moved_flag(&self.declared_intermediate, output) {
-            return true;
+            return !self.found_before_the_build(output);
         }
         if self.no_intermediates || self.merged_flag(&self.not_intermediate, output) {
             return false;
@@ -2079,7 +2081,38 @@ impl<'a> DepBuilder<'a> {
         {
             return false;
         }
-        self.all_secondary || self.intermediates.contains(&output)
+        // A name the implicit search invented is one the search only reached
+        // because nothing was at it, so the second question is already answered
+        // for it — and GNU Make asks it of no such name anyway, because
+        // `pattern_search` stamps `tried_implicit` in the same breath as the bit
+        // (`implicit.c`) and the turn-off wants that stamp clear. A bare
+        // `.SECONDARY:` reaches every other name there is, which is why the set
+        // is read first: it answers without going to the filesystem.
+        self.intermediates.contains(&output)
+            || (self.all_secondary && !self.found_before_the_build(output))
+    }
+
+    /// Whether the file this name stands for was there before anything ran.
+    ///
+    /// `f_mtime` (`remake.c`) ends by turning the intermediate bit OFF for a
+    /// file it has just found a date for and has never built, with the reason
+    /// written beside it: the file existed before make started, so make did not
+    /// create it and must not delete it. `.INTERMEDIATE:` and `.SECONDARY:` are
+    /// the only ways to reach that code with the bit already set, and the date
+    /// it acts on is whichever of the two the search produced — the name as
+    /// written, or the directory search's answer for it.
+    ///
+    /// Two names never reach it. A `.PHONY` one carries `NONEXISTENT_MTIME`
+    /// from the read and is never asked (`file.c`), and one `GPATH` renamed
+    /// leaves `f_mtime` through the `return` above this code — which is why a
+    /// name the search kept is swept up after all.
+    fn found_before_the_build(&self, output: Symbol) -> bool {
+        if self.phony.contains(&output) || self.gpath_origin.contains_key(&output) {
+            return false;
+        }
+        let name = output.as_bytes(&self.ev.session);
+        std::fs::exists(OsStr::from_bytes(&name)).is_ok_and(|found| found)
+            || self.vpath_of(output).is_some()
     }
 
     /// The suffix rules that could make `name`, each with the stem it leaves.
