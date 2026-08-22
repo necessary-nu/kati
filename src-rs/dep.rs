@@ -1512,6 +1512,14 @@ struct DepBuilder<'a> {
     first_rule: Option<Symbol>,
     done: HashMap<Symbol, Arc<Mutex<DepNode>>>,
     phony: HashSet<Symbol>,
+    /// The names `-o` asserted a date for, interned once.
+    ///
+    /// Read only by [`Self::found_before_the_build`]: the switch's whole effect
+    /// on the read is that such a name's date is never stated, and the
+    /// intermediate turn-off is the one conclusion the read draws from stating
+    /// one. Everything else `-o` decides is a scan's business, and the scan is
+    /// answered where the build runs.
+    assumed_old: HashSet<Symbol>,
     restat: HashSet<Symbol>,
     /// The targets `.IGNORE` named. Empty when it named none, which is the
     /// form that means every target and sets the flag instead.
@@ -1607,6 +1615,14 @@ impl<'a> DepBuilder<'a> {
         let wait_sym = ev.session.intern(".WAIT");
         let bootstrap_filename = ev.session.intern("*bootstrap*");
         let extra_prereqs_var_name = ev.session.intern(".EXTRA_PREREQS");
+        let assumed_old = ev
+            .session
+            .flags
+            .old_files
+            .clone()
+            .into_iter()
+            .map(|name| ev.session.intern(name.to_vec()))
+            .collect::<HashSet<_>>();
         let mut ret = Self {
             ev,
             rules: HashMap::new(),
@@ -1651,6 +1667,7 @@ impl<'a> DepBuilder<'a> {
             first_rule: None,
             done: HashMap::new(),
             phony: HashSet::new(),
+            assumed_old,
             restat: HashSet::new(),
             ignore_errors: HashSet::new(),
             delete_on_error: false,
@@ -2102,12 +2119,20 @@ impl<'a> DepBuilder<'a> {
     /// it acts on is whichever of the two the search produced — the name as
     /// written, or the directory search's answer for it.
     ///
-    /// Two names never reach it. A `.PHONY` one carries `NONEXISTENT_MTIME`
-    /// from the read and is never asked (`file.c`), and one `GPATH` renamed
-    /// leaves `f_mtime` through the `return` above this code — which is why a
-    /// name the search kept is swept up after all.
+    /// Three names never reach it. A `.PHONY` one carries `NONEXISTENT_MTIME`
+    /// from the read and is never asked (`file.c`), one `GPATH` renamed leaves
+    /// `f_mtime` through the `return` above this code — which is why a name the
+    /// search kept is swept up after all — and one `-o` named never enters
+    /// `f_mtime` at all, because `file_mtime` (`filedef.h`) calls it only for a
+    /// name whose date is unknown and `-o` has already asserted one
+    /// (`main.c`). So an `-o` name that is lying there is swept up where the
+    /// same file without the switch is kept, which is measured against 4.4.1
+    /// and is the switch's sharpest edge.
     fn found_before_the_build(&self, output: Symbol) -> bool {
-        if self.phony.contains(&output) || self.gpath_origin.contains_key(&output) {
+        if self.phony.contains(&output)
+            || self.gpath_origin.contains_key(&output)
+            || self.assumed_old.contains(&output)
+        {
             return false;
         }
         let name = output.as_bytes(&self.ev.session);
@@ -2772,6 +2797,16 @@ impl<'a> DepBuilder<'a> {
                 continue;
             };
             if !required {
+                continue;
+            }
+            // A name `-o` asserted a date for is never refused over. GNU Make
+            // stamps it `updated`, `us_success` and `cs_finished` (main.c), and
+            // `update_file_1` returns on `file->updated` before it can reach
+            // `complain()` — so a required `include` of a file that is not
+            // there and has no rule stops the run without the switch and reads
+            // on with it, with the open's own warning printed either way.
+            // Measured against 4.4.1.
+            if self.assumed_old.contains(&makefile) {
                 continue;
             }
             let name = include.filename.as_bytes(&self.ev.session);

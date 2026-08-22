@@ -248,6 +248,17 @@ pub struct Flags {
     /// Standalone kati leaves this absent and retains its historical behavior.
     pub makeflags_assignment: Option<MakeflagsAssignment>,
     pub writable: Vec<OsString>,
+    /// The names `-o` / `--old-file` / `--assume-old` asserted a date for, as
+    /// the switch canonicalised them.
+    ///
+    /// GNU Make's `old_files`, and the read is the one place the list is
+    /// legible to. `main` stamps `last_mtime = OLD_MTIME` on each of them
+    /// (main.c:2312), and `file_mtime` (filedef.h) calls `f_mtime` only for a
+    /// name whose date is still unknown — so the date of a name on this list is
+    /// asserted and never stated, and the code at the end of `f_mtime` never
+    /// runs for it. Turning the intermediate bit off is that code, which is why
+    /// the list has to reach a read that decides the bit ahead of the build.
+    pub old_files: Vec<Bytes>,
     pub traced_variables_pattern: Vec<crate::strutil::Pattern>,
 
     pub cpu_profile_path: Option<OsString>,
