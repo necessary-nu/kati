@@ -34,6 +34,7 @@ use crate::{
     strutil::{
         find_end_of_line, find_outside_paren, find_outside_reference,
         strip_recipe_prefix_continuations, trim_left_space, trim_right_space, trim_space,
+        word_scanner,
     },
     symtab::Symbol,
     var::VarExport,
@@ -433,10 +434,34 @@ impl<'a> Parser<'a> {
         }
 
         self.after_rule = true;
+        self.note_posix_target(&line);
         self.out_stmts
             .lock()
             .push(RuleStmt::new(self.loc.clone(), line, self.cmd_prefix));
         Ok(())
+    }
+
+    /// Read `.POSIX` off a rule's targets, the way GNU Make's `check_specials`
+    /// (read.c) does, so that every line read after it folds its continuations
+    /// the POSIX way.
+    ///
+    /// The names here are as the Makefile wrote them. GNU Make asks the same
+    /// question of the EXPANDED names, so a `.POSIX` a variable spells is one
+    /// this misses — the evaluator sets the same flag when it reaches such a
+    /// rule, which is in time for whatever is read after that and too late for
+    /// what was read before it. That, and a `.POSIX:` an included file
+    /// declares, is what make-a-posix-target-is-read-where-it-is-written owns.
+    fn note_posix_target(&mut self, line: &[u8]) {
+        if self.session.posix_pedantic {
+            return;
+        }
+        let targets = match line.iter().position(|byte| *byte == b':') {
+            Some(colon) => &line[..colon],
+            None => line,
+        };
+        if word_scanner(targets).any(|word| word == b".POSIX") {
+            self.session.posix_pedantic = true;
+        }
     }
 
     fn parse_assign(&mut self, line: Bytes, separator_pos: usize) -> Result<()> {

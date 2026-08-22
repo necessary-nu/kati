@@ -2352,6 +2352,10 @@ impl Evaluator {
             // must not.
             if o == &Symbol::POSIX && !self.is_posix {
                 self.is_posix = true;
+                // What a line read from here on folds against. The parser sets
+                // it too, where the name was written down; this is the same
+                // answer for a name only the expansion could give.
+                self.session.posix_pedantic = true;
                 crate::builtins::install_posix_variables(&mut self.session);
             }
         }

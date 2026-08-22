@@ -254,6 +254,16 @@ pub struct Session {
     pub(crate) recipe_command_line: GlobalVars,
     /// Named timing and count collection sites.
     pub stats: StatsRegistry,
+    /// GNU Make's `posix_pedantic`, as the READ sees it.
+    ///
+    /// `check_specials` (read.c) sets it the moment a rule names `.POSIX` as a
+    /// target, and `collapse_continuations` (misc.c) asks it about every
+    /// logical line read afterwards — which is why it belongs to the session
+    /// rather than to the evaluator, whose own `is_posix` answers the same
+    /// question about the build. The two agree except where reading a whole
+    /// file before evaluating any of it makes them differ; see
+    /// make-posix-continuation-blanks.
+    pub posix_pedantic: bool,
 
     /// `$(wildcard)` and `include` results, keyed by pattern.
     ///
@@ -397,6 +407,7 @@ impl Session {
             globals: GlobalVars::with_builtins(),
             recipe_command_line: GlobalVars::new(),
             stats: StatsRegistry::new(),
+            posix_pedantic: false,
             glob_cache: GlobCache::default(),
             makefiles: MakefileCache::new(),
             find_emulator: OnceLock::new(),

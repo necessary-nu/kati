@@ -348,18 +348,25 @@ fn continuation_fold(text: &[u8]) -> Option<(usize, usize)> {
 }
 
 /// Advance past everything a fold absorbs into its single space: the blanks on
-/// the far side of the newline, and any further continuation those blanks lead
-/// to.
+/// the far side of the newline, and — outside `.POSIX:` — any further
+/// continuation those blanks lead to.
 ///
-/// GNU Make writes one space per folded newline but first discards the blanks
-/// it has already written, so a run of continuations separated by nothing but
-/// blanks comes out as one space however long it is. A continuation whose run
-/// leaves a backslash behind ends the absorbing, because that backslash is
-/// value text that has to be written before the next space.
-fn skip_folded(loc: &mut Loc, s: &[u8], mut at: usize) -> usize {
+/// The blanks always go: `collapse_continuations` (misc.c) skips them before it
+/// asks anything else. What follows is where the two readings part. Ordinarily
+/// GNU Make then discards the blanks it has already WRITTEN, so a run of
+/// continuations separated by nothing but blanks comes out as one space however
+/// long it is; under `.POSIX:` it discards nothing and each folded newline is a
+/// space of its own, so the run is left for the caller to read one fold at a
+/// time. A continuation whose run leaves a backslash behind ends the absorbing
+/// either way, because that backslash is value text that has to be written
+/// before the next space.
+fn skip_folded(loc: &mut Loc, s: &[u8], mut at: usize, posix: bool) -> usize {
     loop {
         while matches!(s.get(at), Some(b' ' | b'\t')) {
             at += 1;
+        }
+        if posix {
+            return at;
         }
         let Some((0, consumed)) = continuation_fold(&s[at..]) else {
             return at;
@@ -685,6 +692,10 @@ pub fn parse_expr_impl_ext(
     end_paren: bool,
 ) -> Result<(usize, Arc<Value>)> {
     let list_loc = loc.clone();
+    // What `collapse_continuations` asks about every line it folds. Read once:
+    // the answer belongs to the moment the line is read, and nothing this parse
+    // does can change it.
+    let posix = session.posix_pedantic;
 
     let s = s.slice_ref(trim_suffix(&s, b"\r"));
 
@@ -783,7 +794,7 @@ pub fn parse_expr_impl_ext(
                     list.push(Arc::new(Value::Literal(None, s.slice(i + 2..i + 1 + kept))));
                     list.push(Arc::new(Value::Literal(None, Bytes::from_static(b" "))));
                 }
-                i = skip_folded(loc, &s, i + 1 + consumed);
+                i = skip_folded(loc, &s, i + 1 + consumed, posix);
                 b = i;
                 continue;
             }
@@ -834,7 +845,12 @@ pub fn parse_expr_impl_ext(
                 let literal_end = i + kept;
                 if literal_end > b {
                     let text = &s[b..literal_end];
-                    let text = if kept == 0 {
+                    // The blanks already written go back to the last byte that
+                    // is not one, and a backslash is not one. Under `.POSIX:`
+                    // they do not go at all: each folded newline is a space
+                    // added to what was there rather than a space standing in
+                    // for it.
+                    let text = if kept == 0 && !posix {
                         trim_right_space(text)
                     } else {
                         text
@@ -842,7 +858,7 @@ pub fn parse_expr_impl_ext(
                     list.push(Arc::new(Value::Literal(None, s.slice_ref(text))));
                 }
                 list.push(Arc::new(Value::Literal(None, Bytes::from_static(b" "))));
-                i = skip_folded(loc, &s, i + consumed);
+                i = skip_folded(loc, &s, i + consumed, posix);
                 b = i;
                 continue;
             }
