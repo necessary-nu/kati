@@ -1398,7 +1398,14 @@ impl<'a> NinjaGenerator<'a> {
         let mut lines = Vec::with_capacity(commands.len());
         let mut kept_any = false;
         for (index, c) in commands.iter().enumerate() {
-            let inp = c.cmd.slice_ref(c.cmd.trim_ascii_start());
+            // A line whose indentation is the script's own keeps it: under
+            // `.ONESHELL` the join is a newline, so what stands in front of a
+            // line is what the shell reads in front of it.
+            let inp = if c.keeps_indent {
+                c.cmd.clone()
+            } else {
+                c.cmd.slice_ref(c.cmd.trim_ascii_start())
+            };
             let mut translated = Self::translate_command(inp, flags.one_shell);
             let hoisted = match description.as_deref() {
                 Some(None) if !c.echo => {
@@ -3160,6 +3167,7 @@ mod tests {
                 dash_prefixed: *dash_prefixed,
                 shell_flag: Bytes::from_static(b"-c"),
                 force_no_subshell: false,
+                keeps_indent: false,
                 recursive_line: false,
                 recursive_make: Vec::new(),
                 nesting: None,
@@ -3279,6 +3287,7 @@ mod tests {
                     _ => b"-c",
                 }),
                 force_no_subshell: false,
+                keeps_indent: false,
                 recursive_line: false,
                 recursive_make: Vec::new(),
                 nesting: None,
@@ -3321,6 +3330,7 @@ mod tests {
                 dash_prefixed: false,
                 shell_flag: Bytes::from_static(b"-c"),
                 force_no_subshell: false,
+                keeps_indent: false,
                 recursive_line: false,
                 recursive_make: Vec::new(),
                 nesting: None,
@@ -3425,6 +3435,7 @@ mod tests {
             dash_prefixed: false,
             shell_flag: Bytes::from_static(b"-c"),
             force_no_subshell: false,
+            keeps_indent: false,
             recursive_line: false,
             recursive_make: Vec::new(),
             nesting: None,
@@ -3774,6 +3785,7 @@ mod tests {
                     _ => b"-c",
                 }),
                 force_no_subshell: false,
+                keeps_indent: false,
                 recursive_line: false,
                 recursive_make: Vec::new(),
                 nesting: None,
@@ -3925,6 +3937,7 @@ mod tests {
                 dash_prefixed: false,
                 shell_flag: Bytes::from_static(if posix { b"-ec" } else { b"-c" }),
                 force_no_subshell: false,
+                keeps_indent: false,
                 recursive_line: false,
                 recursive_make: Vec::new(),
                 nesting: None,
@@ -4081,6 +4094,7 @@ mod tests {
                     _ => b"-c",
                 }),
                 force_no_subshell: false,
+                keeps_indent: false,
                 recursive_line: false,
                 recursive_make: Vec::new(),
                 nesting: None,

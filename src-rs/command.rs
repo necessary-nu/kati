@@ -640,6 +640,15 @@ pub struct Command {
     /// line beside it still gets one.
     pub shell_flag: Bytes,
     pub force_no_subshell: bool,
+    /// Whether the blanks in front of this line are the script's own text
+    /// rather than the recipe syntax Make eats.
+    ///
+    /// True only below the first line of a `.ONESHELL` recipe whose `SHELL` is
+    /// not one of the seven names GNU Make knows — see [`PrefixStripping`].
+    /// Such a recipe is one script for a reader that may be counting columns:
+    /// `SHELL := /usr/bin/python3` with an `if` in the recipe is the case that
+    /// makes it plain, and 4.4.1 hands the indentation over untouched.
+    pub keeps_indent: bool,
     /// GNU Make's recursive-line classification, read from the recipe before
     /// it is expanded: the `+` prefix, or a `$(MAKE)`/`${MAKE}` reference.
     ///
@@ -1315,6 +1324,30 @@ fn substitution_end(command: &[u8], start: usize) -> Option<usize> {
     None
 }
 
+/// The shells GNU Make knows to be Bourne-compatible, in its own order.
+///
+/// `is_bourne_compatible_shell` (job.c:433) is the whole of the test: it walks
+/// back to the last directory separator and compares what follows against
+/// these seven names exactly. Nothing about the file is looked at — a shell
+/// named `flash` is not one of these and `./sub/sh` is, whatever either one
+/// turns out to be.
+const BOURNE_COMPATIBLE_SHELLS: [&[u8]; 7] =
+    [b"sh", b"bash", b"dash", b"ksh", b"rksh", b"zsh", b"ash"];
+
+/// Whether GNU Make would take a `SHELL` of this spelling for a Bourne shell.
+///
+/// The value is `$(SHELL)` as the Makefile left it, arguments and all, because
+/// that is what GNU Make hands the test. `SHELL = ./bsh/sh -x` therefore has
+/// the basename `sh -x` and is not one of these — measured against 4.4.1,
+/// which leaves the prefixes in place for it and strips them for `./bsh/sh`.
+fn is_bourne_compatible_shell(shell: &[u8]) -> bool {
+    let basename = match shell.iter().rposition(|&byte| byte == b'/') {
+        Some(separator) => &shell[separator + 1..],
+        None => shell,
+    };
+    BOURNE_COMPATIBLE_SHELLS.contains(&basename)
+}
+
 fn parse_command_prefixes(
     cmds: Bytes,
     echo: &mut bool,
@@ -1408,13 +1441,33 @@ struct ExpandedRecipeLines {
     /// forgiveness, and those plus the unexpanded `$(MAKE)` scan for the
     /// recursion.
     written: LinePrefixes,
+    stripping: PrefixStripping,
+}
+
+/// Which of a recipe's lines Make takes the leading blanks and `[@+-]` off.
+///
+/// GNU Make removes them in two places and only one of them asks about the
+/// shell. `start_job_command` (job.c:1198) skips them off the front of what it
+/// is about to run and stops at the first newline, so the recipe's first line
+/// loses them whatever the shell is. `construct_command_argv_internal`
+/// (job.c:3293) removes them from *every* logical line of a `.ONESHELL`
+/// recipe, and only when [`is_bourne_compatible_shell`] says so — its comment
+/// gives the reason: a `SHELL` Make does not recognise may be reading those
+/// characters as its own script.
+#[derive(Clone, Copy)]
+struct PrefixStripping {
+    /// Whether a line below the recipe's first loses them too.
+    interior: bool,
+    /// Whether the recipe's first line has been read already.
+    past_first: bool,
 }
 
 impl ExpandedRecipeLines {
-    fn new(expansion: Bytes, written: LinePrefixes) -> Self {
+    fn new(expansion: Bytes, written: LinePrefixes, stripping: PrefixStripping) -> Self {
         Self {
             rest: expansion,
             written,
+            stripping,
         }
     }
 }
@@ -1427,8 +1480,14 @@ impl Iterator for ExpandedRecipeLines {
             return None;
         }
         let eol = find_end_of_line(&self.rest);
-        let line = eol.line.slice_ref(trim_left_space(&eol.line));
         self.rest = eol.rest;
+        if self.stripping.past_first && !self.stripping.interior {
+            // Script text, handed over as the expansion left it — indentation
+            // included, because a shell Make does not know may be one that
+            // reads it.
+            return Some((eol.line, self.written));
+        }
+        let line = eol.line.slice_ref(trim_left_space(&eol.line));
         let mut prefixes = self.written;
         let command = parse_command_prefixes(
             line,
@@ -1439,6 +1498,7 @@ impl Iterator for ExpandedRecipeLines {
         // A line that was nothing but a `+` still carries it, so the write-back
         // happens before the caller decides there is no command here.
         self.written.recursive_line = prefixes.recursive_line;
+        self.stripping.past_first |= !command.is_empty();
         Some((command, prefixes))
     }
 }
@@ -1598,6 +1658,13 @@ impl<'a> CommandEvaluator<'a> {
             node_cmds = node.cmds.clone();
         }
         let node_ignores_errors = n.lock().is_ignore_error;
+        // Whether a `[@+-]` below the recipe's first line is a prefix Make eats
+        // or a character the script wrote. Only `.ONESHELL` can make it the
+        // latter, so only `.ONESHELL` asks what the shell is called — and it
+        // asks with the rule's own scope in hand, which is where GNU Make's
+        // `lookup_variable_for_file` reads `SHELL` from too.
+        let strips_interior_prefixes =
+            !self.ev.session.flags.one_shell || is_bourne_compatible_shell(&self.ev.get_shell()?);
         // GNU Make's `$(MAKE)` search runs over the whole line it chopped, and
         // under `.ONESHELL` that line is the whole recipe.
         let mut references_make_anywhere = false;
@@ -1624,9 +1691,19 @@ impl<'a> CommandEvaluator<'a> {
             };
             references_make_anywhere |= written.recursive_line;
             scan_written_prefixes(&v, &mut written);
-            let lines = ExpandedRecipeLines::new(cmds_buf, written);
+            let lines = ExpandedRecipeLines::new(
+                cmds_buf,
+                written,
+                PrefixStripping {
+                    interior: strips_interior_prefixes,
+                    // The recipe's first line is the first one that carried a
+                    // command, whichever written line it came from.
+                    past_first: !result.is_empty(),
+                },
+            );
             for (cmd, prefixes) in lines {
                 if !cmd.is_empty() {
+                    let keeps_indent = !strips_interior_prefixes && !result.is_empty();
                     let recursive_make = lifted_invocations(&cmd, &make_values);
                     // Only a classified line is held to this. A `MAKE`-valued
                     // variable that GNU Make never classified is composed when
@@ -1645,6 +1722,7 @@ impl<'a> CommandEvaluator<'a> {
                         dash_prefixed: prefixes.dash_prefixed,
                         shell_flag,
                         force_no_subshell: false,
+                        keeps_indent,
                         recursive_line: prefixes.recursive_line,
                         recursive_make,
                         nesting,
@@ -1673,6 +1751,7 @@ impl<'a> CommandEvaluator<'a> {
                     dash_prefixed: false,
                     shell_flag: shell_flag.clone(),
                     force_no_subshell: true,
+                    keeps_indent: false,
                     recursive_line: false,
                     recursive_make: Vec::new(),
                     nesting: None,
@@ -1697,8 +1776,9 @@ impl<'a> CommandEvaluator<'a> {
 mod tests {
     use super::{
         AutoCommand, AutoCommandVar, AutoCommandVariant, Command, CommandEvaluator,
-        ExpandedRecipeLines, LinePrefixes, invokes_make, lifted_invocations, nesting_reason,
-        references_make, scan_written_prefixes, spawns_make, unwrapped_command,
+        ExpandedRecipeLines, LinePrefixes, PrefixStripping, invokes_make,
+        is_bourne_compatible_shell, lifted_invocations, nesting_reason, references_make,
+        scan_written_prefixes, spawns_make, unwrapped_command,
     };
     use crate::expr::{ParseExprOpt, parse_expr};
     use crate::loc::Loc;
@@ -1724,10 +1804,21 @@ mod tests {
                 b"-ec"
             }),
             force_no_subshell: false,
+            keeps_indent: false,
             recursive_line: prefixes.recursive_line,
             recursive_make: Vec::new(),
             nesting: None,
             loc: None,
+        }
+    }
+
+    /// The reading every recipe gets but one: each line's leading blanks and
+    /// `[@+-]` are Make's, because the recipe is not `.ONESHELL` or its shell
+    /// is one of the seven.
+    fn every_line() -> PrefixStripping {
+        PrefixStripping {
+            interior: true,
+            past_first: false,
         }
     }
 
@@ -2016,6 +2107,7 @@ mod tests {
                 dash_prefixed: false,
                 recursive_line: false,
             },
+            every_line(),
         )
         .map(|(cmd, prefixes)| {
             (
@@ -2026,6 +2118,105 @@ mod tests {
             )
         })
         .collect()
+    }
+
+    /// Read one written line's expansion for a `.ONESHELL` recipe whose shell
+    /// GNU Make does not know: the first line is Make's to read, and every
+    /// line below it is the script's own text.
+    ///
+    /// Lines with no command left are dropped, as `eval` drops them.
+    fn expanded_for_an_unknown_shell(text: &'static [u8]) -> Vec<String> {
+        ExpandedRecipeLines::new(
+            Bytes::from_static(text),
+            LinePrefixes {
+                echo: true,
+                dash_prefixed: false,
+                recursive_line: false,
+            },
+            PrefixStripping {
+                interior: false,
+                past_first: false,
+            },
+        )
+        .filter(|(cmd, _)| !cmd.is_empty())
+        .map(|(cmd, _)| String::from_utf8_lossy(&cmd).into_owned())
+        .collect()
+    }
+
+    /// GNU Make's own list, and the only thing it asks about a shell before
+    /// deciding whether a `.ONESHELL` script's interior `[@+-]` are its to
+    /// remove. Measured against 4.4.1 with a `/bin/sh` copied under each name:
+    /// the strip follows the name and nothing about the file.
+    #[test]
+    fn a_shell_is_bourne_compatible_by_its_basename_and_nothing_else() {
+        for known in [
+            &b"sh"[..],
+            b"bash",
+            b"dash",
+            b"ksh",
+            b"rksh",
+            b"zsh",
+            b"ash",
+        ] {
+            assert!(is_bourne_compatible_shell(known), "{known:?}");
+            let path = [&b"/usr/local/bin/"[..], known].concat();
+            assert!(is_bourne_compatible_shell(&path), "{path:?}");
+        }
+        // Named for one of the seven without being it.
+        assert!(!is_bourne_compatible_shell(b"flash"));
+        assert!(!is_bourne_compatible_shell(b"shell"));
+        assert!(!is_bourne_compatible_shell(b"ashx"));
+        assert!(!is_bourne_compatible_shell(b"sh.exe"));
+        assert!(!is_bourne_compatible_shell(b"/usr/bin/python3"));
+        assert!(!is_bourne_compatible_shell(b""));
+        // The value is `$(SHELL)` whole, arguments included, so a shell given
+        // one has a basename no name on the list can equal. Measured: 4.4.1
+        // strips for `./bsh/sh` and leaves the prefixes in place for
+        // `./bsh/sh -x`.
+        assert!(!is_bourne_compatible_shell(b"./bsh/sh -x"));
+        assert!(is_bourne_compatible_shell(b"./bsh/sh"));
+        assert!(is_bourne_compatible_shell(b"./bsh/./sh"));
+    }
+
+    /// What a shell GNU Make cannot name is handed. `start_job_command`
+    /// (job.c) takes the blanks and prefixes off the front of the script it is
+    /// about to run and stops at the first newline, whatever the shell is;
+    /// `construct_command_argv_internal` (job.c:3293) takes them off every
+    /// line below that one only for a Bourne-compatible shell, because
+    /// otherwise they could be the script's own.
+    ///
+    /// Measured against 4.4.1 with a `SHELL` that writes its argument to a
+    /// file: `-@ touch m1` / `  @touch m2` / `    touch m3` arrives as
+    /// `touch m1\n  @touch m2\n    touch m3`.
+    #[test]
+    fn an_unknown_shell_reads_a_one_shell_script_below_its_first_line() {
+        assert_eq!(
+            expanded_for_an_unknown_shell(b"  -@ touch m1\n  @touch m2\n    touch m3"),
+            vec![
+                "touch m1".to_owned(),
+                "  @touch m2".to_owned(),
+                "    touch m3".to_owned(),
+            ]
+        );
+        // The same recipe for a shell on the list loses all three, which is the
+        // reading every other recipe gets.
+        assert_eq!(
+            expanded(b"  -@ touch m1\n  @touch m2\n    touch m3")
+                .into_iter()
+                .map(|(text, ..)| text)
+                .collect::<Vec<_>>(),
+            vec![
+                "touch m1".to_owned(),
+                "touch m2".to_owned(),
+                "touch m3".to_owned(),
+            ]
+        );
+        // The recipe's first line is the first that carried a command: a line
+        // of nothing but prefixes is not one, so the next line is still read.
+        assert_eq!(
+            expanded_for_an_unknown_shell(b"@\n  @touch m2\n  touch m3"),
+            vec!["touch m2".to_owned(), "  touch m3".to_owned()]
+        );
     }
 
     /// GNU Make 4.4.1 with `define multi / @echo hi / echo there / endef` and
@@ -2179,6 +2370,7 @@ mod tests {
                 dash_prefixed: true,
                 recursive_line: true,
             },
+            every_line(),
         )
         .map(|(_, prefixes)| prefixes)
         .collect::<Vec<_>>();
