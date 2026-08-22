@@ -99,6 +99,7 @@ pub fn was_interrupted(error: &anyhow::Error) -> bool {
 /// about, and this is the one that says a read already stopped starts nothing
 /// further — the same promise a build makes when it launches no further recipe
 /// line into the gap between two of them.
+// [spec:ronin:req:make.read-interrupt]
 pub(crate) fn stopped(interrupts: Option<&dyn Interruptible>) -> bool {
     interrupts.is_some_and(Interruptible::interrupted)
 }
@@ -125,6 +126,7 @@ pub(crate) enum Reading {
 /// Without an [`Interruptible`] this is [`std::io::Read::read_to_end`] and
 /// nothing else, so a session that was given no watch reads exactly as it read
 /// before.
+// [spec:ronin:req:make.read-interrupt]
 pub(crate) fn read_to_end_or_abandon<R>(
     reader: &mut R,
     output: &mut Vec<u8>,
@@ -168,6 +170,7 @@ where
 ///
 /// `None` back is the abandonment: the caller drops the handle, which neither
 /// waits nor kills.
+// [spec:ronin:req:make.read-interrupt]
 pub(crate) fn wait_or_abandon(
     handle: &mut std::process::Child,
     interrupts: Option<&dyn Interruptible>,
@@ -301,6 +304,7 @@ mod tests {
     /// The defect this module exists for: the writer never closes, so a plain
     /// `read_to_end` would not return at all.
     #[test]
+    // [spec:ronin:req:make.read-interrupt/test]
     fn an_interrupt_ends_a_read_the_writer_never_closes() {
         let (mut reader, _writer) = os_pipe::pipe().unwrap();
         let watch = Watch {
@@ -343,6 +347,7 @@ mod tests {
     /// The child outlives the wait, which is the whole point: a wait that could
     /// not be stopped would sit here for the child's ten seconds.
     #[test]
+    // [spec:ronin:req:make.read-interrupt/test]
     fn an_interrupt_ends_a_wait_for_a_child_that_is_still_running() {
         let mut child = std::process::Command::new("/bin/sh")
             .args(["-c", "sleep 10"])

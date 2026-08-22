@@ -100,6 +100,7 @@ pub struct ShellToReadWith<'a> {
 /// child is ABANDONED where it stands — not signalled, not reaped — which is
 /// what GNU Make 4.4.1 leaves behind when its `fatal_error_signal` re-raises
 /// past a `$(shell)` it knows nothing about. See [`crate::interrupt`].
+// [spec:ronin:req:make.read-interrupt]
 pub fn run_command(
     shell: ShellToReadWith<'_>,
     cmd: &Bytes,
