@@ -64,6 +64,7 @@ pub mod fileutil;
 pub mod find;
 pub mod flags;
 pub mod func;
+pub mod interrupt;
 pub mod io;
 pub mod loc;
 pub mod logging;

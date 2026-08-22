@@ -189,6 +189,7 @@ impl<'a> Executor<'a> {
                     RedirectStderr::Stdout,
                     &crate::diagnostic_prefix(&self.ce.ev.session),
                     &self.ce.ev.session.diagnostics,
+                    self.ce.ev.session.interrupts.as_deref(),
                 )?;
                 // The command was waited for, so whatever it did to the
                 // filesystem is what the next recipe's expansion has to see.

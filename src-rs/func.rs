@@ -695,6 +695,7 @@ fn shell_func_impl(
         RedirectStderr::None,
         &crate::diagnostic_prefix(session),
         crate::session::Context::diagnostics(session),
+        session.interrupts.as_deref(),
     )?;
     let output = Bytes::from(match trailing {
         Trailing::Drop => format_for_command_substitution(output),

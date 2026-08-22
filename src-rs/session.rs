@@ -299,6 +299,19 @@ pub struct Session {
     /// what the fork's own binary does; a front end that collects them replaces
     /// it before the read.
     pub diagnostics: std::sync::Arc<crate::diagnostics::Diagnostics>,
+    /// What the host has observed about the user stopping this read.
+    ///
+    /// Shared with every other session of the same compilation for the reason
+    /// the diagnostics descriptor is: one Ctrl-C stops the whole invocation,
+    /// not the one unit that happened to be waiting for a `$(shell)`.
+    ///
+    /// `None` — which is what `rkati` and every unit test leave — is a read
+    /// that cannot be told it was interrupted, and it runs the code that ran
+    /// before there was anything to tell it. Session-owned rather than
+    /// process-global even though the signal that sets it is not, because a
+    /// mutable process global is the thing this file exists to have removed.
+    // [spec:ronin:req:make.no-ambient-state]
+    pub interrupts: Option<std::sync::Arc<dyn crate::interrupt::Interruptible>>,
     /// Where this session records what it decided about each recursive
     /// invocation it classified.
     ///
@@ -395,6 +408,7 @@ impl Session {
             shell_status: None,
             vpaths: Vec::new(),
             diagnostics: std::sync::Arc::new(crate::diagnostics::Diagnostics::to_stderr()),
+            interrupts: None,
             census: std::sync::Arc::new(crate::census::Census::ignored()),
             unit_prefix: Vec::new(),
             suffixes: Vec::new(),

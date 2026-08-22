@@ -438,6 +438,7 @@ impl StampChecker {
             crate::fileutil::RedirectStderr::DevNull,
             "",
             &session.diagnostics,
+            session.interrupts.as_deref(),
         )?;
         let output = format_for_command_substitution(output);
         if sr.result != output {

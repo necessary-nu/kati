@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt as _;
 use std::{
@@ -95,6 +94,12 @@ pub struct ShellToReadWith<'a> {
 /// environment because that is what Make computes — a variable the makefile
 /// never touched reaches the child as the bytes this process was started with,
 /// unexpanded.
+///
+/// `interrupts` is what the host has observed about the user stopping the read.
+/// Given one, the wait for this command ends when an interrupt arrives, and the
+/// child is ABANDONED where it stands — not signalled, not reaped — which is
+/// what GNU Make 4.4.1 leaves behind when its `fatal_error_signal` re-raises
+/// past a `$(shell)` it knows nothing about. See [`crate::interrupt`].
 pub fn run_command(
     shell: ShellToReadWith<'_>,
     cmd: &Bytes,
@@ -102,6 +107,7 @@ pub fn run_command(
     redirect_stderr: RedirectStderr,
     diagnostic_prefix: &str,
     diagnostics: &crate::diagnostics::Diagnostics,
+    interrupts: Option<&dyn crate::interrupt::Interruptible>,
 ) -> Result<(ExitStatus, Vec<u8>)> {
     let ShellToReadWith {
         program: shell,
@@ -159,6 +165,14 @@ pub fn run_command(
         };
     }
 
+    // Nothing further is launched once the read has been stopped. The wait
+    // below is what the interrupt was measured against, and this is the promise
+    // beside it: an interrupt that arrived between two commands means the
+    // second one does not run at all.
+    if crate::interrupt::stopped(interrupts) {
+        return Err(crate::interrupt::Interrupted.into());
+    }
+
     let (mut reader, writer) = os_pipe::pipe()?;
     match redirect_stderr {
         RedirectStderr::None => {
@@ -193,9 +207,21 @@ pub fn run_command(
     drop(cmd);
 
     let mut output = Vec::new();
-    reader.read_to_end(&mut output)?;
+    let reading = crate::interrupt::read_to_end_or_abandon(&mut reader, &mut output, interrupts)?;
+    if matches!(reading, crate::interrupt::Reading::Interrupted) {
+        // Dropping a `Child` neither waits nor kills, so this leaves the
+        // command exactly where GNU Make leaves it: running, unsignalled, and
+        // about to be the init process's to bury when this one exits.
+        drop(handle);
+        return Err(crate::interrupt::Interrupted.into());
+    }
 
-    let res = handle.wait()?;
+    let Some(res) = crate::interrupt::wait_or_abandon(&mut handle, interrupts)? else {
+        // A command that closed its output early is waited for here rather than
+        // above, and is abandoned in the same way and for the same reason.
+        drop(handle);
+        return Err(crate::interrupt::Interrupted.into());
+    };
 
     Ok((res, output))
 }
