@@ -316,8 +316,14 @@ impl AutoCommandVar {
                     // target that missed the pattern: substitution leaves a
                     // name it could not match alone, so `$*` is the whole
                     // target rather than the empty string a non-match reads as.
+                    //
+                    // Substituted into the name the rule was WRITTEN for, which
+                    // is the one whose stem `record_files` read when it worked
+                    // the prerequisites out. A `GPATH` rename moves the target
+                    // and leaves the stem where it was: `out.o: %.o: %.c` made
+                    // at `build/out.o` still has `$*` of `out`.
                     out.put_slice(&pat.append_subst(
-                        &current_dep_node.recipe_output.as_bytes(names),
+                        &current_dep_node.declared_output.as_bytes(names),
                         &Bytes::from_static(b"%"),
                     ));
                 } else {

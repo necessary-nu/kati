@@ -417,6 +417,16 @@ pub struct DepNode {
     pub output: Symbol,
     /// The logical Make target used by automatic variables and diagnostics.
     pub recipe_output: Symbol,
+    /// The name the rule this node runs was written for.
+    ///
+    /// The same as [`Self::recipe_output`] for every target but one `GPATH`
+    /// renamed. GNU Make moves ONE file object to the path the search found
+    /// (`file.c` `rename_file`), chain and all, so everything the read already
+    /// worked out for the name as written travels with it: a static pattern
+    /// rule's prerequisites were substituted for that name's stem when
+    /// `record_files` read the rule, and `$*` is that stem. Only `$@` is the
+    /// name the file moved to.
+    pub declared_output: Symbol,
     /// Runtime freshness metadata for one exact grouped double-colon record.
     pub grouped_double_action: Option<GroupedDoubleAction>,
     /// A public member joining every independent action that declares it.
@@ -561,6 +571,7 @@ impl DepNode {
         Arc::new(Mutex::new(Self {
             output,
             recipe_output: output,
+            declared_output: output,
             grouped_double_action: None,
             grouped_double_join: false,
             cmds: Vec::new(),
@@ -1216,10 +1227,13 @@ impl RuleMerger {
         Ok(())
     }
 
+    /// `declared` and not the node's output: a static pattern rule's
+    /// prerequisites are worked out against the name the rule was written for,
+    /// which is what `GPATH`'s rename carries along rather than re-derives.
     fn fill_dep_node_from_rule(
         &self,
         session: &mut Session,
-        output: Symbol,
+        declared: Symbol,
         r: &Rule,
         n: &mut DepNode,
     ) {
@@ -1228,11 +1242,11 @@ impl RuleMerger {
         }
 
         n.actual_inputs
-            .extend(apply_output_pattern(session, r, output, &r.inputs));
+            .extend(apply_output_pattern(session, r, declared, &r.inputs));
         n.actual_order_only_inputs.extend(apply_output_pattern(
             session,
             r,
-            output,
+            declared,
             &r.order_only_inputs,
         ));
 
@@ -1266,6 +1280,7 @@ impl RuleMerger {
         &self,
         session: &mut Session,
         output: Symbol,
+        declared: Symbol,
         pattern_rule: &Option<Arc<Rule>>,
         grouped_outputs: &[Symbol],
         n: &Arc<Mutex<DepNode>>,
@@ -1273,7 +1288,7 @@ impl RuleMerger {
         let mut n = n.lock();
         if let Some(primary_rule) = &self.primary_rule {
             assert!(pattern_rule.is_none());
-            self.fill_dep_node_from_rule(session, output, primary_rule, &mut n);
+            self.fill_dep_node_from_rule(session, declared, primary_rule, &mut n);
             if primary_rule.is_grouped && !primary_rule.is_double_colon {
                 for grouped_output in grouped_outputs {
                     if *grouped_output != output && !n.implicit_outputs.contains(grouped_output) {
@@ -1286,7 +1301,7 @@ impl RuleMerger {
             self.fill_dep_node_loc(primary_rule, &mut n);
             n.cmds = primary_rule.cmds.clone();
         } else if let Some(pattern_rule) = pattern_rule {
-            self.fill_dep_node_from_rule(session, output, pattern_rule, &mut n);
+            self.fill_dep_node_from_rule(session, declared, pattern_rule, &mut n);
             self.fill_dep_node_loc(pattern_rule, &mut n);
             n.cmds = pattern_rule.cmds.clone();
         }
@@ -1297,7 +1312,7 @@ impl RuleMerger {
             {
                 continue;
             }
-            self.fill_dep_node_from_rule(session, output, r, &mut n);
+            self.fill_dep_node_from_rule(session, declared, r, &mut n);
             if self.is_double_colon {
                 self.fill_grouped_outputs(output, r, &mut n);
             }
@@ -1314,7 +1329,7 @@ impl RuleMerger {
             all_outputs.insert(*sym);
             let merger = merger.lock();
             for r in &merger.rules {
-                self.fill_dep_node_from_rule(session, output, r, &mut n);
+                self.fill_dep_node_from_rule(session, declared, r, &mut n);
             }
         }
 
@@ -2798,19 +2813,20 @@ impl<'a> DepBuilder<'a> {
     /// The prerequisites already recorded for a target, which is what `$<` and
     /// its neighbours are worth while the rest are being worked out.
     fn recorded_prerequisites(&mut self, output: Symbol) -> (Vec<Symbol>, Vec<Symbol>) {
-        let Some(merger) = self.rules.get(&output).cloned() else {
+        let Some(merger) = self.lookup_rule_merger(output) else {
             return (Vec::new(), Vec::new());
         };
+        let declared = self.written_as(output);
         let rules = merger.lock().rules.clone();
         let mut inputs = Vec::new();
         let mut order_only = Vec::new();
         for r in &rules {
             let session = &mut self.ev.session;
-            inputs.extend(apply_output_pattern(session, r, output, &r.inputs));
+            inputs.extend(apply_output_pattern(session, r, declared, &r.inputs));
             order_only.extend(apply_output_pattern(
                 session,
                 r,
-                output,
+                declared,
                 &r.order_only_inputs,
             ));
         }
@@ -4116,7 +4132,10 @@ impl<'a> DepBuilder<'a> {
         rule: Arc<Rule>,
         trigger: Symbol,
     ) -> Result<(Arc<Mutex<DepNode>>, bool)> {
-        let id = Self::double_action_id(&rule, trigger);
+        // The record was filed under the name the makefile wrote, and a
+        // `GPATH` rename moves the target rather than the record.
+        let declared = self.written_as(trigger);
+        let id = Self::double_action_id(&rule, declared);
         if let Some(action) = self.double_actions.get(&id) {
             return Ok((action.clone(), false));
         }
@@ -4134,6 +4153,7 @@ impl<'a> DepBuilder<'a> {
         {
             let mut node = action.lock();
             node.recipe_output = trigger;
+            node.declared_output = declared;
             if has_recipe {
                 let members = if rule.is_grouped {
                     rule.outputs.clone()
@@ -4148,11 +4168,11 @@ impl<'a> DepBuilder<'a> {
             }
             node.cmds = rule.cmds.clone();
             node.actual_inputs =
-                apply_output_pattern(&mut self.ev.session, &rule, trigger, &rule.inputs);
+                apply_output_pattern(&mut self.ev.session, &rule, declared, &rule.inputs);
             node.actual_order_only_inputs = apply_output_pattern(
                 &mut self.ev.session,
                 &rule,
-                trigger,
+                declared,
                 &rule.order_only_inputs,
             );
             node.output_pattern = rule.output_patterns.first().copied();
@@ -4172,10 +4192,10 @@ impl<'a> DepBuilder<'a> {
         if let Some(text) = rule
             .deferred_prerequisites
             .as_ref()
-            .filter(|_| prerequisites_reach(&self.ev.session, &rule, trigger))
+            .filter(|_| prerequisites_reach(&self.ev.session, &rule, declared))
         {
-            let trigger_text = trigger.as_bytes(&self.ev.session);
-            let stem = self.stem_of(&rule, &trigger_text);
+            let declared_text = declared.as_bytes(&self.ev.session);
+            let stem = self.stem_of(&rule, &declared_text);
             let recorded = {
                 let node = action.lock();
                 (
@@ -4291,14 +4311,15 @@ impl<'a> DepBuilder<'a> {
         rules: Vec<Arc<Rule>>,
         validations: Vec<Symbol>,
     ) -> Result<Arc<Mutex<DepNode>>> {
+        let declared = self.written_as(output);
         let shared = self
             .double_memberships
-            .get(&output)
+            .get(&declared)
             .is_some_and(|memberships| memberships.len() > 1);
         let mut actions = Vec::with_capacity(rules.len());
         let mut created_action = false;
         for rule in rules {
-            let id = Self::double_action_id(&rule, output);
+            let id = Self::double_action_id(&rule, declared);
             let (action, newly_created) = self.build_double_action(rule, output)?;
             created_action |= newly_created;
             actions.push((id, action));
@@ -5357,6 +5378,14 @@ impl<'a> DepBuilder<'a> {
             grouped_outputs = outputs;
             grouped_peer_rules = peer_rules;
         }
+        // What the read wrote this target's rule for. `GPATH` renamed the one
+        // file object rather than looking the rule up again, so the record it
+        // already carries — a static pattern rule's substituted prerequisites,
+        // and the stem they were substituted from — answers about the name as
+        // written. Every other name is declared under itself.
+        let declared = self.written_as(output);
+        n.lock().declared_output = declared;
+        let declared_str = declared.as_bytes(&self.ev.session);
         let output_str = output.as_bytes(&self.ev.session);
 
         // A static pattern rule reaches this the same way an explicit one does,
@@ -5371,12 +5400,12 @@ impl<'a> DepBuilder<'a> {
                     .iter()
                     .filter(|rule| {
                         rule.deferred_prerequisites.is_some()
-                            && prerequisites_reach(&self.ev.session, rule, output)
+                            && prerequisites_reach(&self.ev.session, rule, declared)
                     })
                     .map(|rule| {
                         (
                             rule.deferred_prerequisites.clone().unwrap(),
-                            self.stem_of(rule, &output_str),
+                            self.stem_of(rule, &declared_str),
                             merger.is_double_colon
                                 && !rule.cmds.is_empty()
                                 && rule.inputs.is_empty()
@@ -5403,6 +5432,7 @@ impl<'a> DepBuilder<'a> {
             .fill_dep_node(
                 &mut self.ev.session,
                 output,
+                declared,
                 &picked_rule_info.pattern_rule,
                 &grouped_outputs,
                 &n,
