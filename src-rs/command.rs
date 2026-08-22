@@ -1539,6 +1539,54 @@ impl<'a> CommandEvaluator<'a> {
         Ok(())
     }
 
+    /// Give every line of a `.ONESHELL` recipe the one set of prefixes GNU
+    /// Make read for the whole of it.
+    ///
+    /// Under `.ONESHELL` the recipe is not chopped: `chop_commands` leaves it
+    /// as a single line, so the scan that fills `lines_flags` runs over its
+    /// first line's leading characters and what it finds stands for all of it.
+    /// `start_job_command` then scans the *expanded* text the same way and
+    /// stops at the first newline — its skip-over is blanks and prefixes, and
+    /// a newline is neither — so an expansion that produced the first line
+    /// carries prefixes too, and lines below it never do.
+    ///
+    /// A prefix character further down is script text rather than a flag.
+    /// Whether the shell ever sees it is decided elsewhere and by the shell's
+    /// name: `construct_command_argv_internal` strips the leading blanks and
+    /// `[@+-]` off every line for a Bourne-compatible one — the basenames
+    /// `sh`, `bash`, `dash`, `ksh`, `rksh`, `zsh`, `ash` — and leaves the whole
+    /// text alone for any other, because there the characters could be the
+    /// script's own. Measured on 4.4.1: `@echo two` on the second line prints
+    /// `two` under `/bin/sh` and under `SHELL = /bin/dash`, and reports
+    /// `@echo: not found` under a `SHELL` named anything else. Either way the
+    /// recipe stays loud, because the flags came from the line above.
+    ///
+    /// `+` is the one GNU Make widens for itself: the `$(MAKE)` search
+    /// `chop_commands` runs after the prefix scan reads the whole line it
+    /// chopped, which here is the whole recipe. So `$(MAKE)` on any line marks
+    /// the recipe recursive while a `+` on any line but the first does not —
+    /// measured under `-n`, where a recursive recipe runs and an ordinary one
+    /// is only printed.
+    fn read_one_shell_prefixes_off_the_first_line(result: &mut [Command], references_make: bool) {
+        let Some(first) = result.first() else {
+            return;
+        };
+        let echo = first.echo;
+        let dash_prefixed = first.dash_prefixed;
+        let ignore_error = first.ignore_error;
+        let shell_flag = first.shell_flag.clone();
+        // The first line's own `+` is already in its `recursive_line`, beside
+        // the reference this recipe was read for.
+        let recursive_line = first.recursive_line || references_make;
+        for command in result.iter_mut() {
+            command.echo = echo;
+            command.dash_prefixed = dash_prefixed;
+            command.ignore_error = ignore_error;
+            command.shell_flag = shell_flag.clone();
+            command.recursive_line = recursive_line;
+        }
+    }
+
     // [spec:ronin:req:make.recursive-invocation+2]
     pub fn eval(&mut self, n: &Arc<Mutex<DepNode>>) -> Result<Vec<Command>> {
         let mut result: Vec<Command> = Vec::new();
@@ -1550,6 +1598,9 @@ impl<'a> CommandEvaluator<'a> {
             node_cmds = node.cmds.clone();
         }
         let node_ignores_errors = n.lock().is_ignore_error;
+        // GNU Make's `$(MAKE)` search runs over the whole line it chopped, and
+        // under `.ONESHELL` that line is the whole recipe.
+        let mut references_make_anywhere = false;
         self.ev.is_evaluating_command = true;
         self.ev.session.ground_journal.suspend(true);
         *self.current_dep_node.lock() = Some(n.clone());
@@ -1571,6 +1622,7 @@ impl<'a> CommandEvaluator<'a> {
                 // has to be taken before anything is expanded away.
                 recursive_line: references_make(&v, &self.ev.session),
             };
+            references_make_anywhere |= written.recursive_line;
             scan_written_prefixes(&v, &mut written);
             let lines = ExpandedRecipeLines::new(cmds_buf, written);
             for (cmd, prefixes) in lines {
@@ -1600,6 +1652,10 @@ impl<'a> CommandEvaluator<'a> {
                     })
                 }
             }
+        }
+
+        if self.ev.session.flags.one_shell {
+            Self::read_one_shell_prefixes_off_the_first_line(&mut result, references_make_anywhere);
         }
 
         if !self.ev.delayed_output_commands.is_empty() {
@@ -1640,9 +1696,9 @@ impl<'a> CommandEvaluator<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoCommand, AutoCommandVar, AutoCommandVariant, ExpandedRecipeLines, LinePrefixes,
-        invokes_make, lifted_invocations, nesting_reason, references_make, scan_written_prefixes,
-        spawns_make, unwrapped_command,
+        AutoCommand, AutoCommandVar, AutoCommandVariant, Command, CommandEvaluator,
+        ExpandedRecipeLines, LinePrefixes, invokes_make, lifted_invocations, nesting_reason,
+        references_make, scan_written_prefixes, spawns_make, unwrapped_command,
     };
     use crate::expr::{ParseExprOpt, parse_expr};
     use crate::loc::Loc;
@@ -1650,6 +1706,104 @@ mod tests {
     use bytes::Bytes;
     use parking_lot::Mutex;
     use std::sync::Arc;
+
+    /// One line of a `.ONESHELL` recipe as the per-line reading left it, as
+    /// `(text, prefixes)` — what a `@`, `-` or `+` in front of that line said
+    /// about that line alone.
+    fn one_shell_line(text: &'static str, prefixes: LinePrefixes) -> Command {
+        let mut session = Session::new();
+        Command {
+            output: session.intern("out"),
+            cmd: Bytes::from_static(text.as_bytes()),
+            echo: prefixes.echo,
+            ignore_error: prefixes.dash_prefixed,
+            dash_prefixed: prefixes.dash_prefixed,
+            shell_flag: Bytes::from_static(if prefixes.dash_prefixed {
+                b"-c"
+            } else {
+                b"-ec"
+            }),
+            force_no_subshell: false,
+            recursive_line: prefixes.recursive_line,
+            recursive_make: Vec::new(),
+            nesting: None,
+            loc: None,
+        }
+    }
+
+    fn plain() -> LinePrefixes {
+        LinePrefixes {
+            echo: true,
+            dash_prefixed: false,
+            recursive_line: false,
+        }
+    }
+
+    /// What a `.ONESHELL` recipe's lines say about the recipe, measured
+    /// against GNU Make 4.4.1 on each shape.
+    ///
+    /// `-` on the first line: `-@touch m1` above `false` makes m1 and exits 0.
+    /// `-` below it: `@touch m1`, `-touch m2`, `false` makes both and exits 2.
+    /// `@` on the first line silences the whole recipe; `@echo two` on the
+    /// second line prints `two` and leaves every line echoed. `+` on the first
+    /// line runs the whole script under `-n`; `+touch n2` on the second runs
+    /// nothing. `$(MAKE)` on any line runs the whole script under `-n`,
+    /// because the search `chop_commands` runs reads the whole chopped line
+    /// and under `.ONESHELL` that is the whole recipe.
+    #[test]
+    fn a_one_shell_recipe_reads_its_prefixes_off_the_first_line() {
+        let read = |lines: &[LinePrefixes], references_make: bool| {
+            let mut commands: Vec<Command> = lines
+                .iter()
+                .map(|prefixes| one_shell_line("touch m", *prefixes))
+                .collect();
+            CommandEvaluator::read_one_shell_prefixes_off_the_first_line(
+                &mut commands,
+                references_make,
+            );
+            commands
+                .iter()
+                .map(|c| LinePrefixes {
+                    echo: c.echo,
+                    dash_prefixed: c.dash_prefixed,
+                    recursive_line: c.recursive_line,
+                })
+                .collect::<Vec<_>>()
+        };
+        let dashed = LinePrefixes {
+            dash_prefixed: true,
+            ..plain()
+        };
+        let silent = LinePrefixes {
+            echo: false,
+            ..plain()
+        };
+        let plussed = LinePrefixes {
+            recursive_line: true,
+            ..plain()
+        };
+
+        // The first line's prefix reaches the whole recipe.
+        assert_eq!(read(&[dashed, plain(), plain()], false), [dashed; 3]);
+        assert_eq!(read(&[silent, plain(), plain()], false), [silent; 3]);
+        assert_eq!(read(&[plussed, plain()], false), [plussed; 2]);
+        // A prefix below it reaches nothing: it is script text, and whether
+        // the shell ever sees it is the shell's name's business.
+        assert_eq!(read(&[plain(), dashed, plain()], false), [plain(); 3]);
+        assert_eq!(read(&[plain(), silent, plain()], false), [plain(); 3]);
+        assert_eq!(read(&[plain(), plussed], false), [plain(); 2]);
+        // `$(MAKE)` is the one GNU Make widens to the whole recipe.
+        assert_eq!(read(&[plain(), plain()], true), [plussed; 2]);
+        // The forgiveness carries the shell's flags with it, because a `-`
+        // under `.POSIX:` is what asks for a shell without `-e`.
+        let mut recipe = vec![
+            one_shell_line("touch m1", dashed),
+            one_shell_line("false", plain()),
+        ];
+        CommandEvaluator::read_one_shell_prefixes_off_the_first_line(&mut recipe, false);
+        assert!(recipe.iter().all(|c| c.ignore_error));
+        assert!(recipe.iter().all(|c| c.shell_flag == "-c"));
+    }
 
     /// An automatic variable named `c`, in the form the `variant` selects.
     fn automatic(typ: AutoCommand, variant: AutoCommandVariant) -> AutoCommandVar {
