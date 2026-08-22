@@ -2363,6 +2363,63 @@ pub fn script_file_flags(shell_flags: &[u8]) -> Bytes {
     out.freeze()
 }
 
+/// The script as one line of narration, or nothing when it cannot be one.
+///
+/// A description is one line wherever it is printed, and [`single_line`] takes
+/// a recipe continuation's newline back out for exactly that. What it cannot
+/// take out is a newline GNU Make put there on purpose — `.ONESHELL`'s own
+/// separator — so a script still holding one after it is a script no
+/// destination can narrate with its own text.
+///
+/// Nothing, rather than the reconstruction the command carries: that is the
+/// plumbing a manifest needs to say the recipe at all, and narrating it would
+/// tell the reader less than saying nothing does. The Makefile's own words,
+/// where it wrote any, are preferred ahead of this.
+///
+/// The writer's alone, like [`RESPONSE_FILE`]. A sink that keeps the script in
+/// memory has somewhere to put every byte of it and narrates with
+/// [`single_line`] instead, which is why the comparison between them treats a
+/// respelled rule's description as destination-specific.
+fn narrated_script(script: &[u8]) -> Option<Bytes> {
+    let line = single_line(script);
+    (!line.contains(&b'\n')).then_some(line)
+}
+
+/// The one-line command that writes `script` back out with its newlines.
+///
+/// A `build.ninja` binding ends at a newline and no escape puts one back —
+/// measured on stock ninja 1.14.0.git, where `$` before a newline is a
+/// continuation that yields nothing at all, in a `command` and in an
+/// `rspfile_content` alike. So a script GNU Make hands to one shell, whose own
+/// newlines are its separators, is the one recipe a manifest cannot write down
+/// as itself.
+///
+/// It can write down how to rebuild it. Each line becomes a single-quoted
+/// operand of a `printf '%s\n'`, which puts the newlines back where they were
+/// and interprets nothing else: the format holds the only escape, and the
+/// operands are bytes. `'` is the one byte single quotes cannot hold, and it
+/// is spelled the way a shell spells it.
+///
+/// The caller decides where the output goes. `"$(...)"` makes it the shell's
+/// `-c` argument, which is where GNU Make puts it; `eval "$(...)"` runs it in
+/// a shell that was handed a file instead.
+pub fn script_printer(script: &[u8]) -> Bytes {
+    let mut out = BytesMut::with_capacity(script.len() + 16);
+    out.put_slice(b"printf '%s\\n'");
+    for line in script.split(|byte| *byte == b'\n') {
+        out.put_slice(b" '");
+        let mut rest = line;
+        while let Some(at) = rest.iter().position(|byte| *byte == b'\'') {
+            out.put_slice(&rest[..at]);
+            out.put_slice(b"'\\''");
+            rest = &rest[at + 1..];
+        }
+        out.put_slice(rest);
+        out.put_u8(b'\'');
+    }
+    out.freeze()
+}
+
 fn escape_ninja(s: &[u8]) -> Bytes {
     let extras = s.iter().filter(|c| b"$: ".contains(c)).count();
     if extras == 0 {
@@ -2518,7 +2575,7 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
             .description
             .map(Bytes::copy_from_slice)
             .or(match rule.command {
-                SinkCommand::Inline(_) => Some(spelled.clone()),
+                SinkCommand::Inline(script) => narrated_script(script),
                 SinkCommand::ResponseFile(_) => None,
             });
         if let Some(description) = description {
@@ -2560,7 +2617,19 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
             SinkCommand::ResponseFile(script) => {
                 writeln!(self.out, " rspfile = {RESPONSE_FILE}")?;
                 write!(self.out, " rspfile_content = ")?;
-                self.out.write_all(&escape_ninja_value(script))?;
+                // The file is written from a binding, so it holds one line
+                // too. A script that needs its newlines therefore reaches it
+                // as the command that writes them back, and `eval` runs the
+                // result in the shell already started for it rather than in
+                // one of its own.
+                if script.contains(&b'\n') {
+                    let mut content = BytesMut::from(&b"eval \"$("[..]);
+                    content.put_slice(&script_printer(script));
+                    content.put_slice(b")\"");
+                    self.out.write_all(&escape_ninja_value(&content))?;
+                } else {
+                    self.out.write_all(&escape_ninja_value(script))?;
+                }
                 write!(self.out, "\n command = ")?;
                 self.out.write_all(b"exec ")?;
                 self.out
@@ -2587,10 +2656,21 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
                 self.out.write_all(b" ")?;
                 self.out.write_all(&escape_ninja(rule.shell_flags))?;
                 self.out.write_all(b" \"")?;
-                self.out
-                    .write_all(&escape_ninja_value(&escape_shell(&Bytes::copy_from_slice(
-                        script,
-                    ))))?;
+                // A script holding a newline cannot be quoted into the
+                // binding at all, so the binding carries the command that
+                // writes it and the shell substitutes the result in. What
+                // reaches the recipe's own shell is still one argument after
+                // `-c`, which is exactly where GNU Make puts it.
+                if script.contains(&b'\n') {
+                    let mut substitution = BytesMut::from(&b"$("[..]);
+                    substitution.put_slice(&script_printer(script));
+                    substitution.put_u8(b')');
+                    self.out.write_all(&escape_ninja_value(&substitution))?;
+                } else {
+                    self.out.write_all(&escape_ninja_value(&escape_shell(
+                        &Bytes::copy_from_slice(script),
+                    )))?;
+                }
                 writeln!(self.out, "\"")?;
             }
         }
@@ -3685,6 +3765,177 @@ mod tests {
         assert_eq!(
             ran_from_a_response_file("plain", &[(b": ; false ; touch m1", false, false)], false),
             ("m1".to_owned(), true)
+        );
+    }
+
+    /// The printer's whole claim, put to a real shell: the script comes back
+    /// byte for byte, with the newline `printf` adds after the last line.
+    ///
+    /// A command substitution strips trailing newlines, which is why the
+    /// caller's `"$(...)"` gets the script and not the script plus one.
+    fn rebuilt(script: &'static [u8]) -> Vec<u8> {
+        let printer = script_printer(script);
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(std::ffi::OsStr::from_bytes(&printer))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "the printer itself has to run");
+        out.stdout
+    }
+
+    #[test]
+    fn a_printed_script_comes_back_byte_for_byte() {
+        for script in [
+            &b"touch m1; false\ntouch m2"[..],
+            // Every byte single quotes cannot hold, and every byte a manifest
+            // or a shell would otherwise read as its own.
+            &b"echo 'it'\\''s'\ncase x in\nx) echo $HOME ;;\nesac"[..],
+            &b"printf '%s' \"a\\\\b\"\necho \"$$x\""[..],
+            // A line whose meaning ends where the line does. kati strips a
+            // recipe's own leading comment before this, so it is the printer
+            // rather than the corpus that has to be able to carry one.
+            &b"# a comment\ntouch m1"[..],
+            // One line, and a line that is empty.
+            &b"touch m1"[..],
+            &b"touch m1\n\ntouch m2"[..],
+        ] {
+            assert_eq!(rebuilt(script), [script, b"\n"].concat());
+        }
+    }
+
+    /// The reconstruction is not merely equal to the script: it is one line,
+    /// which is the property a `build.ninja` binding needs.
+    #[test]
+    fn a_printed_script_is_one_line() {
+        assert!(!script_printer(b"a\nb\nc").contains(&b'\n'));
+        assert_eq!(
+            String::from_utf8(script_printer(b"touch m1\ntouch m2").to_vec()).unwrap(),
+            r"printf '%s\n' 'touch m1' 'touch m2'"
+        );
+        assert_eq!(
+            String::from_utf8(script_printer(b"echo 'hi'").to_vec()).unwrap(),
+            r"printf '%s\n' 'echo '\''hi'\'''"
+        );
+    }
+
+    /// The `.ONESHELL` recipe as the manifest spells it, run the way ninja
+    /// runs an edge: ninja starts a shell for the command line, and the
+    /// command line substitutes the printer's output into the recipe's own
+    /// shell.
+    ///
+    /// Answers in the two terms a build is judged in — the files left behind,
+    /// and whether the edge failed — against GNU Make 4.4.1 recorded on each
+    /// case below.
+    fn one_shell_edge(label: &str, recipe: &[&'static [u8]], posix: bool) -> (String, bool) {
+        let mut names = Symtab::new();
+        let output = names.intern(&b"out"[..]);
+        let commands: Vec<Command> = recipe
+            .iter()
+            .map(|cmd| Command {
+                output,
+                cmd: Bytes::from_static(cmd),
+                echo: true,
+                ignore_error: false,
+                dash_prefixed: false,
+                shell_flag: Bytes::from_static(if posix { b"-ec" } else { b"-c" }),
+                force_no_subshell: false,
+                recursive_line: false,
+                recursive_make: Vec::new(),
+                nesting: None,
+                loc: None,
+            })
+            .collect();
+        let flags = Flags {
+            one_shell: true,
+            ..Flags::default()
+        };
+        let script_flags = NinjaGenerator::script_shell_flags(&flags, &commands);
+        let translated =
+            NinjaGenerator::translate_recipe(&flags, &Bytes::from_static(b"out"), &commands, None);
+        let mut script = BytesMut::new();
+        NinjaGenerator::gen_shell_script(&flags, &translated, &script_flags, &mut script);
+        assert!(
+            script.contains(&b'\n'),
+            "the case is only a case while the script holds a newline"
+        );
+
+        // What the manifest binding says, after ninja has unescaped it: the
+        // shell, its flags, and one argument the shell builds by substitution.
+        let mut line = BytesMut::from(&b"exec /bin/sh "[..]);
+        line.put_slice(&script_flags);
+        line.put_slice(b" \"$(");
+        line.put_slice(&script_printer(&script));
+        line.put_slice(b")\"");
+
+        let directory = std::env::temp_dir().join(format!(
+            "kati-oneshell-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(std::ffi::OsStr::from_bytes(&line))
+            .current_dir(&directory)
+            .status()
+            .unwrap();
+        let mut made: Vec<String> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        made.sort();
+        std::fs::remove_dir_all(&directory).unwrap();
+        (made.join(" "), status.success())
+    }
+
+    /// GNU Make 4.4.1, `.ONESHELL:` over `@touch m1; false` then `@touch m2`:
+    /// both markers, and make succeeds. One shell for the whole recipe and no
+    /// `-e` anywhere, so a failing line stops nothing.
+    #[test]
+    fn a_one_shell_recipe_runs_to_its_end() {
+        assert_eq!(
+            one_shell_edge("plain", &[b"touch m1; false", b"touch m2"], false),
+            ("m1 m2".to_owned(), true)
+        );
+    }
+
+    /// GNU Make 4.4.1, the same recipe under `.POSIX:`: m1 alone, and
+    /// `*** Error 1`. `.ONESHELL` takes the flags from the first line, so the
+    /// one shell is started with `-ec` and stops where the line fails.
+    #[test]
+    fn a_posix_one_shell_recipe_stops_at_a_failure() {
+        assert_eq!(
+            one_shell_edge("posix", &[b"touch m1; false", b"touch m2"], true),
+            ("m1".to_owned(), false)
+        );
+    }
+
+    /// A `cd` on one line reaching the next is what `.ONESHELL` is for, and a
+    /// construct spanning lines is what a separator would break: joined with
+    /// `;` this is `if true ; then ;   touch ../m1 ; fi`, which is a syntax
+    /// error and makes nothing. Measured on dash, bash and nsh alike.
+    ///
+    /// GNU Make 4.4.1 over these six lines: m1 and m2 both made under `sub`'s
+    /// parent, `sub` left behind, and make succeeds.
+    #[test]
+    fn a_directory_and_a_construct_cross_the_lines() {
+        assert_eq!(
+            one_shell_edge(
+                "cd",
+                &[
+                    b"mkdir -p sub",
+                    b"cd sub",
+                    b"if true",
+                    b"then",
+                    b"  touch ../m1",
+                    b"fi",
+                    b"touch ../m2",
+                ],
+                false
+            ),
+            ("m1 m2 sub".to_owned(), true)
         );
     }
 
