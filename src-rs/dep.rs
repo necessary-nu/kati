@@ -1520,6 +1520,13 @@ struct DepBuilder<'a> {
     /// one. Everything else `-o` decides is a scan's business, and the scan is
     /// answered where the build runs.
     assumed_old: HashSet<Symbol>,
+    /// The names `-W` asserted a date for, interned once.
+    ///
+    /// Read only by [`Self::refuse_an_asserted_double_colon`]. Every other
+    /// thing the switch decides is a scan's business; this one is the read's,
+    /// because the `::` record the refusal is about is gone by the time the
+    /// graph exists.
+    assumed_new: HashSet<Symbol>,
     restat: HashSet<Symbol>,
     /// The targets `.IGNORE` named. Empty when it named none, which is the
     /// form that means every target and sets the flag instead.
@@ -1623,6 +1630,14 @@ impl<'a> DepBuilder<'a> {
             .into_iter()
             .map(|name| ev.session.intern(name.to_vec()))
             .collect::<HashSet<_>>();
+        let assumed_new = ev
+            .session
+            .flags
+            .new_files
+            .clone()
+            .into_iter()
+            .map(|name| ev.session.intern(name.to_vec()))
+            .collect::<HashSet<_>>();
         let mut ret = Self {
             ev,
             rules: HashMap::new(),
@@ -1668,6 +1683,7 @@ impl<'a> DepBuilder<'a> {
             done: HashMap::new(),
             phony: HashSet::new(),
             assumed_old,
+            assumed_new,
             restat: HashSet::new(),
             ignore_errors: HashSet::new(),
             delete_on_error: false,
@@ -2522,6 +2538,15 @@ impl<'a> DepBuilder<'a> {
             Err(error) if refusals.is_empty() => return Err(error),
             Err(_) => Vec::new(),
         };
+        // The other refusal a switch's name can raise, and it is the goals'
+        // rather than the makefiles': GNU Make refuses over a `-W` name a
+        // double-colon record declares, where the update reaches it. Asked
+        // after the goals are planned, because being reached is the whole of
+        // the condition, and only where no makefile has already been refused
+        // over — GNU Make dies in the makefile update, one pass earlier.
+        if refusals.is_empty() {
+            self.refuse_an_asserted_double_colon()?;
+        }
         // `--shuffle` reorders the goals and every prerequisite list reachable
         // from them, and it happens here because the drop below reads those
         // lists: GNU Make shuffles immediately before `update_goal_chain
@@ -2540,6 +2565,56 @@ impl<'a> DepBuilder<'a> {
             regenerations: regeneration_nodes,
             refusals,
         })
+    }
+
+    /// Refuse over a `-W` name a double-colon record declares, as GNU Make
+    /// refuses over it.
+    ///
+    /// `main` stamps each `-W` name by entering it (main.c:2325) and
+    /// `enter_file` (file.c) returns the entry it found only when that entry is
+    /// not a double-colon target: `if (! HASH_VACANT (f) && !f->double_colon)
+    /// return f;`. So a `::` name gets a fresh `struct file` appended to the
+    /// chain, carrying the date and no `cmds`, and `remake_file` (remake.c)
+    /// meets a file with no commands that is neither phony nor a target and
+    /// calls `complain()` over it. `-o` reaches the same entry and escapes,
+    /// because it also writes `updated` and `us_success` and `update_file_1`
+    /// returns before it can look for a recipe.
+    ///
+    /// Measured against 4.4.1 over `out:: a` / `out:: b` beneath `app: out`:
+    /// `-W out` refuses with `No rule to make target 'out'` and exit 2, with
+    /// the chain up to date and with it stale, with `app` newer than `out` and
+    /// with it older, and for a lone `::` record as much as for a chain of
+    /// them. `-W other` where nothing reaches `other` exits 0 and says nothing,
+    /// which is why this asks what the plan reached rather than what the
+    /// Makefile declared.
+    ///
+    /// One thing GNU Make does that this does not: the chain's own entries are
+    /// updated before the walk arrives at the fresh one, so a `::` rule with
+    /// work to do runs and THEN the run is refused. A graph is planned before
+    /// any of it runs, so the refusal comes first. Recorded rather than
+    /// chased — the recipe that runs is one the refusal then throws away.
+    fn refuse_an_asserted_double_colon(&mut self) -> Result<()> {
+        if self.assumed_new.is_empty() {
+            return Ok(());
+        }
+        let reached = self
+            .assumed_new
+            .iter()
+            .copied()
+            .filter(|name| self.done.contains_key(name))
+            .collect::<Vec<_>>();
+        for name in reached {
+            let declared = self.written_as(name);
+            if !self.double_memberships.contains_key(&declared) {
+                continue;
+            }
+            let written =
+                String::from_utf8_lossy(&declared.as_bytes(&self.ev.session)).into_owned();
+            // `complain()` at remake.c:414, which is GNU Make's own wording for
+            // a name nothing knows how to make.
+            error_loc!(self.ev, None, "*** No rule to make target '{written}'.");
+        }
+        Ok(())
     }
 
     /// Plan the goals this invocation was aimed at, choosing the default when

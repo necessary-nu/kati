@@ -259,6 +259,18 @@ pub struct Flags {
     /// runs for it. Turning the intermediate bit off is that code, which is why
     /// the list has to reach a read that decides the bit ahead of the build.
     pub old_files: Vec<Bytes>,
+    /// The names `-W` / `--what-if` / `--new-file` / `--assume-new` asserted a
+    /// date for, as the switch canonicalised them.
+    ///
+    /// GNU Make's `new_files`, and the read is legible to one thing about it:
+    /// `main` stamps each name by ENTERING it (main.c:2325), and `enter_file`
+    /// (file.c) hands back the entry it found only when that entry is not a
+    /// double-colon target — so for a `::` name the stamp lands on a fresh
+    /// `struct file` with a date and no `cmds`, and the update refuses over it
+    /// where it reaches it. The scan cannot see that: a `::` record compiles
+    /// to actions and a join, and the name the Makefile wrote is not what
+    /// either of them is called. The read is where the record still is.
+    pub new_files: Vec<Bytes>,
     pub traced_variables_pattern: Vec<crate::strutil::Pattern>,
 
     pub cpu_profile_path: Option<OsString>,
@@ -398,8 +410,8 @@ fn short_option(letter: u8) -> Option<(ShortArgument, ShortOption)> {
         // search path where it stands rather than adding a directory named
         // `-`, and an old file is stored as the switch canonicalised it.
         // Reading the argument in raw would put the wrong bytes in a real
-        // field, which is worse than not reading it. `-W` is the third of that
-        // shape and has no field at all.
+        // field, which is worse than not reading it. `-W` is the third of the
+        // same shape and `new_files` is the field behind it.
         b'I' | b'W' | b'o' => (Word, Refused),
         _ => return Option::None,
     })
