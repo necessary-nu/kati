@@ -218,7 +218,15 @@ pub enum SinkCommand<'a> {
     /// `<shell> <shell_flags> "<script>"`.
     Inline(&'a [u8]),
     /// The script does not fit in an argument list, so it has to reach the
-    /// shell as a file instead: `<shell> <script file>`, with no flags.
+    /// shell as a file instead: `<shell> <shell_flags less the `c`> <script
+    /// file>`.
+    ///
+    /// The flags still apply — the script is the same script and the shell is
+    /// the same shell — but the letter saying the next word is the command
+    /// would take the file name for it, so
+    /// [`script_file_flags`](crate::ninja::script_file_flags) takes that one
+    /// off and copies the rest. Dropping the value here is how a `.POSIX:`
+    /// recipe silently lost its `-e` on crossing the length threshold.
     ///
     /// Which file is not said here. A sink that runs the script itself may not
     /// need one at all, and the manifest writer names it in the only terms a
@@ -266,7 +274,11 @@ pub struct SinkRule<'a> {
     /// The shell to run the script under, unescaped.
     pub shell: &'a [u8],
     /// The flags that make the shell take a script as an argument, unescaped.
-    /// Unused by [`SinkCommand::ResponseFile`].
+    ///
+    /// [`SinkCommand::ResponseFile`] reads them too, through
+    /// [`script_file_flags`](crate::ninja::script_file_flags): the script
+    /// arrives another way, and everything else these say about the shell
+    /// still holds.
     pub shell_flags: &'a [u8],
     /// The assembled shell script, as the shell should receive it. A `$` here
     /// is a `$` the shell will act on, never an escape belonging to some

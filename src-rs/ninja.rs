@@ -2322,6 +2322,47 @@ pub fn single_line(script: &[u8]) -> Bytes {
     out.freeze()
 }
 
+/// The same shell flags, for a shell handed the script as a FILE.
+///
+/// `.SHELLFLAGS` is written for the argument form and ends in the `c` that
+/// says "the next word IS the command". A script too long to be an argument
+/// reaches the shell as a file name instead, and there that letter would take
+/// the name as the command and never read the file — which is why the
+/// response-file spelling was written with no flags at all.
+///
+/// Dropping the value is not what the launch means, though. Every other letter
+/// still applies to a script whatever it arrived in: `-e` is what a `.POSIX:`
+/// recipe's strictness *is*, and `-x`, `-u` or a `-o` word is what a Makefile
+/// that set its own flags asked for. So the one letter comes off and the rest
+/// is copied, which makes the two spellings say the same thing about the shell
+/// and differ only in how the script got there.
+///
+/// Read as an option cluster, because that is the form the value takes —
+/// `-ec`, `-lc`, `-c` — and left alone from `--` onwards and on any word that
+/// is an option's argument rather than an option. A cluster that was nothing
+/// but `-c` disappears rather than becoming a bare `-`.
+pub fn script_file_flags(shell_flags: &[u8]) -> Bytes {
+    let mut out = BytesMut::with_capacity(shell_flags.len());
+    for word in shell_flags
+        .split(u8::is_ascii_whitespace)
+        .filter(|word| !word.is_empty())
+    {
+        let kept: Vec<u8> = if word.starts_with(b"-") && !word.starts_with(b"--") {
+            word.iter().copied().filter(|byte| *byte != b'c').collect()
+        } else {
+            word.to_vec()
+        };
+        if kept == b"-" {
+            continue;
+        }
+        if !out.is_empty() {
+            out.put_u8(b' ');
+        }
+        out.put_slice(&kept);
+    }
+    out.freeze()
+}
+
 fn escape_ninja(s: &[u8]) -> Bytes {
     let extras = s.iter().filter(|c| b"$: ".contains(c)).count();
     if extras == 0 {
@@ -2512,7 +2553,10 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
         // so from there on there is nothing left to replace.
         match command {
             // The script is the file, so the only layer between these bytes
-            // and the shell is ninja's own.
+            // and the shell is ninja's own. The flags still go on it: only the
+            // letter that would have taken the file name for the command comes
+            // off, so a `.POSIX:` recipe keeps its `-e` on the far side of the
+            // threshold that decided how the script travelled.
             SinkCommand::ResponseFile(script) => {
                 writeln!(self.out, " rspfile = {RESPONSE_FILE}")?;
                 write!(self.out, " rspfile_content = ")?;
@@ -2522,6 +2566,11 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
                 self.out
                     .write_all(&escape_ninja(&environment_prefix(rule.recipe_environment)))?;
                 self.out.write_all(&escape_ninja(rule.shell))?;
+                let flags = script_file_flags(rule.shell_flags);
+                if !flags.is_empty() {
+                    self.out.write_all(b" ")?;
+                    self.out.write_all(&escape_ninja(&flags))?;
+                }
                 writeln!(self.out, " {RESPONSE_FILE}")?;
             }
             // Two layers, and they have to be applied in this order. The
@@ -3513,6 +3562,129 @@ mod tests {
         assert_eq!(
             script,
             Bytes::from_static(b"set -e ; set +e ; (false ) ; set -e ; (set +e ; echo done )")
+        );
+    }
+
+    /// The `c` says the next word is the command, and a response file makes
+    /// the next word a file name. Only that letter comes off.
+    #[test]
+    fn script_file_flags_take_off_the_command_letter() {
+        let flags = |value: &[u8]| String::from_utf8(script_file_flags(value).to_vec()).unwrap();
+        // What a Makefile that said nothing gets, and what `.POSIX:` gets.
+        assert_eq!(flags(b"-c"), "");
+        assert_eq!(flags(b"-ec"), "-e");
+        // Written as separate words, and written with more than errexit in the
+        // cluster.
+        assert_eq!(flags(b"-e -c"), "-e");
+        assert_eq!(flags(b"-xec"), "-xe");
+        // An option's argument is a word of its own and is not a cluster.
+        assert_eq!(flags(b"-o pipefail -ec"), "-o pipefail -e");
+        // A long option keeps every letter it has, `c` included.
+        assert_eq!(flags(b"--posix -c"), "--posix");
+        // Nothing in, nothing out: a recipe that runs no shell at all.
+        assert_eq!(flags(b""), "");
+    }
+
+    /// What the assembled script does when it reaches the shell as a FILE,
+    /// which is the other half of [`ran_as_an_edge`] and the destination a
+    /// script over the length threshold gets.
+    ///
+    /// The script is written to a file and the shell is started the way the
+    /// manifest and Ronin's own launch start it: the shell, the flags
+    /// [`script_file_flags`] leaves, and the file. Answers in the same two
+    /// terms — what the recipe left behind, and whether the edge failed.
+    fn ran_from_a_response_file(label: &str, lines: &[WrittenLine], posix: bool) -> (String, bool) {
+        let mut names = Symtab::new();
+        let output = names.intern(&b"out"[..]);
+        let commands: Vec<Command> = lines
+            .iter()
+            .map(|(cmd, dash_prefixed, ignore_error)| Command {
+                output,
+                cmd: Bytes::from_static(cmd),
+                echo: true,
+                ignore_error: *ignore_error,
+                dash_prefixed: *dash_prefixed,
+                shell_flag: Bytes::from_static(match (posix, dash_prefixed) {
+                    (true, false) => b"-ec",
+                    _ => b"-c",
+                }),
+                force_no_subshell: false,
+                recursive_line: false,
+                recursive_make: Vec::new(),
+                nesting: None,
+                loc: None,
+            })
+            .collect();
+        let flags = Flags::default();
+        let script_flags = NinjaGenerator::script_shell_flags(&flags, &commands);
+        let translated =
+            NinjaGenerator::translate_recipe(&flags, &Bytes::from_static(b"out"), &commands, None);
+        let mut script = BytesMut::new();
+        let ignore_errors =
+            NinjaGenerator::gen_shell_script(&flags, &translated, &script_flags, &mut script);
+        let script = if ignore_errors {
+            muted_script(&script, &script_flags)
+        } else {
+            script.to_vec()
+        };
+
+        let directory = std::env::temp_dir().join(format!(
+            "kati-rsp-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("out.rsp");
+        std::fs::write(&file, &script).unwrap();
+        let mut shell = std::process::Command::new("/bin/sh");
+        for word in script_file_flags(&script_flags).split(u8::is_ascii_whitespace) {
+            if !word.is_empty() {
+                shell.arg(std::ffi::OsStr::from_bytes(word));
+            }
+        }
+        let status = shell
+            .arg("out.rsp")
+            .current_dir(&directory)
+            .status()
+            .unwrap();
+        let mut made: Vec<String> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "out.rsp")
+            .collect();
+        made.sort();
+        std::fs::remove_dir_all(&directory).unwrap();
+        (made.join(" "), status.success())
+    }
+
+    /// A `.POSIX:` recipe of one line stops at that line's first failure, and
+    /// the only thing saying so is the shell's `-e`: one line assembles no
+    /// header of its own, because a script that is a single command has
+    /// nothing to stop between. So the flags have to survive the trip through
+    /// the file, and they used not to.
+    ///
+    /// GNU Make 4.4.1, `.POSIX:` over `@: ; false ; touch m1`: nothing made,
+    /// and `*** Error 1`.
+    #[test]
+    fn a_posix_line_read_from_a_file_still_stops_at_its_failure() {
+        assert_eq!(
+            ran_from_a_response_file("posix", &[(b": ; false ; touch m1", false, false)], true),
+            (String::new(), false)
+        );
+    }
+
+    /// The control, and the reason the flags cannot simply be copied: a recipe
+    /// read without `.POSIX:` is given `-c` and nothing else, so the file-borne
+    /// launch takes no flags at all and the line runs to its end.
+    ///
+    /// GNU Make 4.4.1, same recipe with no `.POSIX:`: m1 made, and make
+    /// succeeds.
+    #[test]
+    fn a_plain_line_read_from_a_file_runs_to_its_end() {
+        assert_eq!(
+            ran_from_a_response_file("plain", &[(b": ; false ; touch m1", false, false)], false),
+            ("m1".to_owned(), true)
         );
     }
 
