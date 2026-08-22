@@ -1911,7 +1911,7 @@ impl<'a> DepBuilder<'a> {
     /// Whether `.PRECIOUS` protects this name, given the implicit rule pattern
     /// that made it if one did.
     fn is_precious(&self, output: Symbol, output_pattern: Option<Symbol>) -> bool {
-        self.precious.contains(&output)
+        self.merged_flag(&self.precious, output)
             || output_pattern.is_some_and(|pattern| self.precious_patterns.contains(&pattern))
     }
 
@@ -2065,10 +2065,10 @@ impl<'a> DepBuilder<'a> {
     /// says is intermediate however else it was reached, which is what makes
     /// them worth writing beside a `.NOTINTERMEDIATE` pattern.
     fn treat_as_intermediate(&self, output: Symbol) -> bool {
-        if self.declared_intermediate.contains(&output) {
+        if self.moved_flag(&self.declared_intermediate, output) {
             return true;
         }
-        if self.no_intermediates || self.not_intermediate.contains(&output) {
+        if self.no_intermediates || self.merged_flag(&self.not_intermediate, output) {
             return false;
         }
         let name = output.as_bytes(&self.ev.session);
@@ -4048,6 +4048,42 @@ impl<'a> DepBuilder<'a> {
         self.gpath_origin.get(&o).copied().unwrap_or(o)
     }
 
+    /// Whether the Makefile names this path itself, so that GNU Make already
+    /// has a file object standing at it when a `GPATH` rename arrives.
+    ///
+    /// `record_files` enters every target, `record_target_var` every name
+    /// given a binding of its own, and `expand_deps` every prerequisite —
+    /// including the prerequisites of the special targets, which is how
+    /// `.PRECIOUS: build/out.o` puts an object in the way of the rename.
+    fn names_an_object(&self, name: Symbol) -> bool {
+        self.rules.contains_key(&name)
+            || self.mentioned.contains(&name)
+            || self.rule_vars.contains_key(&name)
+    }
+
+    /// Whether a flag the Makefile declared for one of the two names a `GPATH`
+    /// rename brought together is in force at the name that survived.
+    ///
+    /// `rehash_file` (`file.c`) ends two ways. With the found path's hash slot
+    /// vacant the searched name's object is reinserted under it and everything
+    /// the object carries arrives with it; with an object already standing
+    /// there that one is retained and only the fields the closing run of
+    /// `MERGE(field)` names are taken from the searched name's. `precious`,
+    /// `secondary`, `notintermediate` and `phony` are in that run, so they are
+    /// in force whichever of the two names declared them.
+    fn merged_flag(&self, set: &HashSet<Symbol>, name: Symbol) -> bool {
+        set.contains(&name) || set.contains(&self.written_as(name))
+    }
+
+    /// The same question for a flag `rehash_file` does not merge — the
+    /// `command_flags` `.IGNORE` and `.SILENT` set, and `intermediate`, whose
+    /// omission from the run carries its own comment. Such a flag reaches the
+    /// found path only by riding the whole object there, so it survives the
+    /// rename exactly when the Makefile named that path nowhere at all.
+    fn moved_flag(&self, set: &HashSet<Symbol>, name: Symbol) -> bool {
+        set.contains(&name) || (!self.names_an_object(name) && set.contains(&self.written_as(name)))
+    }
+
     /// Every pattern scope that applies to `output`, weakest first, in GNU
     /// Make's order. The target's own scope goes on top of these; see
     /// `scopes_for`.
@@ -4176,7 +4212,7 @@ impl<'a> DepBuilder<'a> {
             graph_output,
             false,
             false,
-            self.ignore_errors.contains(&trigger),
+            self.moved_flag(&self.ignore_errors, trigger),
             false,
             false,
         );
@@ -5352,10 +5388,19 @@ impl<'a> DepBuilder<'a> {
         let n = DepNode::new(
             output,
             self.phony.contains(&output),
-            self.restat.contains(&output),
-            self.ignore_errors.contains(&output),
+            self.moved_flag(&self.restat, output),
+            self.moved_flag(&self.ignore_errors, output),
             is_intermediate,
-            is_intermediate && !self.all_secondary && !self.secondary.contains(&output),
+            // `remove_intermediates` (file.c) asks for `intermediate` and
+            // against `secondary` and `notintermediate` separately, so a name
+            // both a `.INTERMEDIATE` and a `.NOTINTERMEDIATE` reached is
+            // intermediate and is still not swept up. Only a rename can put a
+            // name in that position: the two written for one name are a
+            // read-time error.
+            is_intermediate
+                && !self.all_secondary
+                && !self.merged_flag(&self.secondary, output)
+                && !self.merged_flag(&self.not_intermediate, output),
         );
         // Set here and only here: the memoised return above is what makes the
         // first caller the parent, which is the whole of GNU Make's rule.
