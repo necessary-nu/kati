@@ -126,6 +126,42 @@ const SHELL_BUILTINS: &[&[u8]] = &[
     b"while",
 ];
 
+/// `$(SHELL)` as it goes into an assembled command line.
+///
+/// Where a launch has to go to a shell, GNU Make builds `$(SHELL)
+/// $(.SHELLFLAGS) LINE` as text and copies the shell in one character at a
+/// time, putting a backslash in front of every [`SHELL_CHARACTERS`] byte
+/// (job.c). Its comment says why, and it is not about safety: without the
+/// escaping `construct_command_argv_internal` "will recursively call itself ad
+/// nauseam, or until stack overflow", because the assembled line keeps landing
+/// back on the slow path that assembled it.
+///
+/// The effect is what a Makefile can see. A `SHELL` holding `$(touch pwned)`
+/// escapes to `\$\(touch pwned\)`, which is two words — the blank inside it
+/// is NOT escaped, because a blank is not one of these characters and "SHELL
+/// may be a multi-word command" is documented behaviour — and the first of them
+/// is exec'd as a path. Nothing substitutes, and no file is written. Copied in
+/// as it stands the same value is a command substitution that RUNS.
+///
+/// Note which characters are absent: the backslash and the two quotes, which
+/// the LINE beside it does get escaped for. That is a different and wider loop
+/// in the same function, and the difference is deliberate on GNU Make's part —
+/// see [`crate::strutil::escape_shell`], which is this side's counterpart for
+/// the line.
+pub fn escaped_shell_name(shell: &[u8]) -> Bytes {
+    if !shell.iter().any(|byte| SHELL_CHARACTERS.contains(byte)) {
+        return Bytes::copy_from_slice(shell);
+    }
+    let mut escaped = BytesMut::with_capacity(shell.len() * 2);
+    for &byte in shell {
+        if SHELL_CHARACTERS.contains(&byte) {
+            escaped.put_u8(b'\\');
+        }
+        escaped.put_u8(byte);
+    }
+    escaped.freeze()
+}
+
 /// What the shell would have been asked to do, when it need not be asked.
 ///
 /// `None` is GNU Make's `goto slow`: hand the whole line to `$(SHELL)`.
@@ -667,5 +703,25 @@ mod tests {
                 Bytes::from_static(b"true")
             ])
         );
+    }
+
+    /// Every character GNU Make escapes into the assembled line gets a
+    /// backslash, and nothing else does — the blank in particular, which is why
+    /// a multi-word `SHELL` is still more than one word once the line is taken
+    /// apart again. Measured against 4.4.1: `SHELL := ./shell space.sh` answers
+    /// `./shell: No such file or directory`, naming the first word alone.
+    #[test]
+    fn a_shell_name_is_escaped_for_the_line_and_not_for_the_word() {
+        let escaped =
+            |name: &'static [u8]| String::from_utf8(escaped_shell_name(name).to_vec()).unwrap();
+        assert_eq!(escaped(b"/bin/sh"), "/bin/sh");
+        assert_eq!(escaped(b"/usr/bin/env sh"), "/usr/bin/env sh");
+        assert_eq!(escaped(b"./sh$(touch pwned)"), "./sh\\$\\(touch pwned\\)");
+        assert_eq!(escaped(b"./sh`>pwned`"), "./sh\\`\\>pwned\\`");
+        assert_eq!(escaped(b"./sh;a|b&c"), "./sh\\;a\\|b\\&c");
+        // Not escaped, because GNU Make does not escape them here: the two
+        // quotes and the backslash belong to the wider loop the LINE gets.
+        assert_eq!(escaped(b"./sh'x'"), "./sh'x'");
+        assert_eq!(escaped(b"./sh\\x"), "./sh\\x");
     }
 }

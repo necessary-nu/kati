@@ -220,9 +220,14 @@ pub fn run_command(
         // GNU Make's `goto slow` for a command line nothing here can take
         // apart: the text is assembled and one shell reads all of it, which is
         // also what splits `$(.SHELLFLAGS)` into words for this launch.
+        //
+        // The shell is escaped into the line and the flags are not, which is
+        // GNU Make's own asymmetry: it copies `$(.SHELLFLAGS)` in as it stands
+        // and walks `$(SHELL)` character by character. See
+        // [`crate::simple_command::escaped_shell_name`].
         let cmd_escaped = crate::strutil::escape_shell(cmd);
         cmd_with_shell = BytesMut::new();
-        cmd_with_shell.put_slice(shell);
+        cmd_with_shell.put_slice(&crate::simple_command::escaped_shell_name(shell));
         cmd_with_shell.put_u8(b' ');
         cmd_with_shell.put_slice(shellflag);
         cmd_with_shell.put_slice(b" \"");
