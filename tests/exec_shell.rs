@@ -200,3 +200,126 @@ fn a_shell_no_recipe_needs_is_unasked() {
         "a recursive shell no recipe needed was asked for: {unasked}"
     );
 }
+
+/// `.ONESHELL` says a recipe's lines are ONE script handed to one shell, and
+/// the executor has to say it too.
+///
+/// Every reader of the flag used to be on the compiling side: the separator
+/// that joins the lines, whether the script arms `errexit`, whether a line
+/// needs a subshell, and what the shell is called. The executor beside it ran
+/// a shell per line, so a variable set on one line was gone by the next, a
+/// `cd` did not persist, and the first line's status became the recipe's.
+///
+/// Each case below is GNU Make 4.4.1's answer, measured on the same makefile.
+/// A variable is the plainest of the three: the second line reads what the
+/// first set, which one shell can do and two cannot.
+#[test]
+fn one_shell_keeps_a_variable_set() {
+    let said = ran(
+        "one-shell-variable",
+        ".ONESHELL:\nall:\n\tx=1\n\t@echo \"held $$x\"\n",
+    );
+    // Read off a whole line rather than by substring: the recipe echo prints
+    // the script before it runs, so every word of the makefile is in this
+    // output already and only what the shell answered is new.
+    assert!(
+        said.lines().any(|line| line == "held 1"),
+        "the variable did not survive the line that set it: {said}"
+    );
+}
+
+/// The same about the working directory, which is the case a makefile is most
+/// likely to be relying on: `cd` and then work, with no `&&` between them.
+#[test]
+fn one_shell_keeps_a_directory_change() {
+    let said = ran(
+        "one-shell-directory",
+        ".ONESHELL:\nall:\n\tmkdir -p sub\n\tcd sub\n\t@pwd\n",
+    );
+    assert!(
+        said.lines().any(|line| line.ends_with("/sub")),
+        "the directory change did not survive the line that made it: {said}"
+    );
+}
+
+/// One script has one status, and it is the last line's. A failing line in the
+/// middle of a script the shell was not told to stop for is not the recipe's
+/// answer — where a shell per line makes it the first failure's.
+#[test]
+fn one_shell_reports_its_last_status() {
+    let said = ran(
+        "one-shell-status",
+        ".ONESHELL:\nall:\n\tfalse\n\t@echo went-on\n",
+    );
+    assert!(
+        said.lines().any(|line| line == "went-on"),
+        "the recipe stopped at a line the script would have run past: {said}"
+    );
+    assert!(
+        !said.contains("Error 1"),
+        "a line's status was read as the recipe's: {said}"
+    );
+}
+
+/// The count itself, read off the shell rather than off what it did: three
+/// lines, one launch. This is the cell the other three are consequences of.
+#[test]
+fn one_shell_starts_one_shell() {
+    let said = ran(
+        "one-shell-count",
+        "SHELL := ./own\n.ONESHELL:\nall:\n\t@echo one\n\techo two\n\techo three\n",
+    );
+    // `launches` reads one line each, and this launch's argument holds two
+    // newlines — which is the whole claim, so the count is what is asserted
+    // and the first line names the script it starts with.
+    assert_eq!(
+        launches(&said),
+        vec!["own] -c echo one"],
+        "the recipe was not one launch: {said}"
+    );
+    assert!(
+        said.contains("OWN[own] -c echo one\necho two\necho three\n"),
+        "the one launch was not handed the whole recipe: {said}"
+    );
+}
+
+/// A `-` below the first line is script text and not a flag: `chop_commands`
+/// never chopped the recipe, so the scan that fills `lines_flags` saw only its
+/// first line. The recipe therefore runs to its end and reports zero, because
+/// the failing line is neither forgiven nor fatal — it is just a command in the
+/// middle of a script.
+#[test]
+fn a_dash_below_the_first_line() {
+    let said = ran(
+        "one-shell-dash-below",
+        ".ONESHELL:\nall:\n\ttrue\n\t-false\n\t@echo went-on\n",
+    );
+    assert!(
+        said.lines().any(|line| line == "went-on"),
+        "the recipe stopped at an interior line: {said}"
+    );
+    assert!(
+        !said.contains("Error"),
+        "an interior line's status ended the recipe: {said}"
+    );
+}
+
+/// `.POSIX:` is the other direction and the control for the case above: the
+/// one shell is started with `-e`, so the script really does stop at the
+/// failing line, and the recipe reports it. One script, and the shell's own
+/// setting decides — not a status the executor read between two launches.
+#[test]
+fn a_posix_one_shell_recipe_stops() {
+    let said = ran(
+        "one-shell-posix",
+        ".POSIX:\n.ONESHELL:\nall:\n\tfalse\n\t@echo went-on\n",
+    );
+    assert!(
+        !said.lines().any(|line| line == "went-on"),
+        "the strict script ran past the line that failed: {said}"
+    );
+    assert!(
+        said.contains("Error 1"),
+        "the strict script's failure was not the recipe's: {said}"
+    );
+}

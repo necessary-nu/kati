@@ -165,7 +165,7 @@ impl<'a> Executor<'a> {
             return Ok(output_ts);
         }
 
-        let commands = self.ce.eval(n)?;
+        let commands = self.ce.launches(n)?;
         for command in commands {
             self.num_commands += 1;
             if command.echo {
@@ -192,6 +192,10 @@ impl<'a> Executor<'a> {
                         program: &shell,
                         flag: &command.shell_flag,
                         stand_in: self.ce.ev.session.flags.default_shell_program.as_deref(),
+                        // `.ONESHELL` made this one script out of the recipe's
+                        // lines, so the newlines in it separate commands and
+                        // there is no single command line to exec directly.
+                        one_script: self.ce.ev.session.flags.one_shell,
                     },
                     &command.cmd,
                     // This executor applied the exported set to its own

@@ -689,6 +689,12 @@ fn shell_func_impl(
             program: shell,
             flag: shellflag,
             stand_in: session.flags.default_shell_program.as_deref(),
+            // A `$(shell)` is one command line whatever `.ONESHELL` says about
+            // recipes. GNU Make reaches the same answer by passing no line
+            // flags at all: `construct_command_argv` is called from
+            // `func_shell_base` with none, and `one_shell` is only consulted
+            // for a recipe.
+            one_script: false,
         },
         cmd,
         environment,

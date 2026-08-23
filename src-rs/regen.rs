@@ -429,6 +429,9 @@ impl StampChecker {
                 program: sr.shell.as_bytes(),
                 flag: sr.shellflag.as_bytes(),
                 stand_in: session.flags.default_shell_program.as_deref(),
+                // The recorded call is a `$(shell)`, and replaying it asks the
+                // same question the same way.
+                one_script: false,
             },
             &cmd,
             // Replaying a recorded `$(shell)` to see whether it still answers

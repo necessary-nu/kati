@@ -84,6 +84,18 @@ pub struct ShellToReadWith<'a> {
     pub program: &'a [u8],
     pub flag: &'a [u8],
     pub stand_in: Option<&'a Path>,
+    /// Whether the text handed over is one SCRIPT, whose newlines separate the
+    /// commands in it, rather than one command line.
+    ///
+    /// A `.ONESHELL` recipe is the only thing that is, and it has to be said
+    /// here because the direct-exec fast path below reads the text as one
+    /// command's words — to which a newline is a blank like any other, so a
+    /// script would be exec'd as a single argument list holding every line's
+    /// words. GNU Make asks at the same point and for the same reason:
+    /// `construct_command_argv_internal` (job.c:3034) has `else if (one_shell
+    /// && *p == '\n') goto slow`, "in .ONESHELL mode \n is a separator like ;
+    /// or &&".
+    pub one_script: bool,
 }
 
 /// Run one command and read back what it wrote.
@@ -114,12 +126,13 @@ pub fn run_command(
         program: shell,
         flag: shellflag,
         stand_in: default_shell_program,
+        one_script,
     } = shell;
     // A line with no shell syntax in it is exec'd directly, exactly as GNU
     // Make's `construct_command_argv_internal` does — so a program that is not
     // there is reported against its own name and by whoever went looking,
     // rather than in the words of a shell that was never needed.
-    let direct = crate::simple_command::direct_argv(cmd, shell, shellflag, false);
+    let direct = crate::simple_command::direct_argv(cmd, shell, shellflag, one_script);
     let mut cmd_with_shell;
     let owned;
     let args: &[&OsStr] = if let Some(words) = &direct {

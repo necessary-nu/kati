@@ -1566,7 +1566,11 @@ impl<'a> NinjaGenerator<'a> {
         // Under `.ONESHELL` the recipe really is one script and GNU Make's own
         // newlines separate it. Elsewhere a manifest binding ends at a newline
         // and cannot hold one, so the separator is the one a line can carry.
-        let separator: &[u8] = if flags.one_shell { b"\n" } else { b" ; " };
+        let separator: &[u8] = if flags.one_shell {
+            crate::command::ONE_SHELL_SEPARATOR
+        } else {
+            b" ; "
+        };
         // The errexit the script is under between its lines: what the shell was
         // started with, and then whatever the header below says instead.
         let script_errexit =

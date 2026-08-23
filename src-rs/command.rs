@@ -663,6 +663,41 @@ pub struct LiftedInvocation {
     pub make: Bytes,
 }
 
+/// What separates the lines of a recipe `.ONESHELL` made one script of.
+///
+/// GNU Make's own newlines, and nothing else: `chop_commands` never chopped
+/// the recipe, so what the shell is handed is the text the makefile wrote.
+/// Both consumers spell it with this — the one that compiles the recipe into a
+/// build file and the one that runs it — because a separator that differed
+/// between them would be two different scripts from one makefile.
+pub const ONE_SHELL_SEPARATOR: &[u8] = b"\n";
+
+/// The one script a `.ONESHELL` recipe is, out of the lines it was read as.
+///
+/// Beside [`CommandEvaluator::read_one_shell_prefixes_off_the_first_line`]
+/// because the two are one reading of one flag: the prefixes are the first
+/// line's BECAUSE there is only one line, and this assembles that line. Every
+/// per-line flag the runner reads has already been made one answer there, so
+/// the script takes the first line's and the rest carry nothing left to
+/// disagree about.
+fn one_shell_script(lines: Vec<Command>) -> Vec<Command> {
+    let mut lines = lines.into_iter();
+    let Some(mut script) = lines.next() else {
+        return Vec::new();
+    };
+    let mut text = BytesMut::from(script.cmd.as_ref());
+    for line in lines {
+        text.put_slice(ONE_SHELL_SEPARATOR);
+        text.put_slice(&line.cmd);
+        // The invocations stay in the order the shell would reach them; the
+        // script runs every line's, because it is every line.
+        script.recursive_make.extend(line.recursive_make);
+        script.nesting = script.nesting.take().or(line.nesting);
+    }
+    script.cmd = text.freeze();
+    vec![script]
+}
+
 #[derive(Clone)]
 pub struct Command {
     pub output: Symbol,
@@ -1695,6 +1730,28 @@ impl<'a> CommandEvaluator<'a> {
             command.shell_flag = shell_flag.clone();
             command.recursive_line = recursive_line;
         }
+    }
+
+    /// The processes this recipe is, for a consumer that RUNS it rather than
+    /// compiling it into a build file.
+    ///
+    /// One per line, which is what GNU Make gives a recipe — except under
+    /// `.ONESHELL`, where the recipe is one script handed to one shell. So a
+    /// variable set on one line is still set on the next, a `cd` stays made,
+    /// and the status the recipe is judged on is the last line's rather than
+    /// the first failure's.
+    ///
+    /// Held apart from [`Self::eval`] rather than folded into it because the
+    /// lines are what a compiler wants: each has to be translated for the
+    /// binding it lands in, classified for `$(MAKE)`, and read for whether it
+    /// is work worth announcing. Only a consumer that starts processes needs
+    /// them assembled, and it needs them assembled the same way.
+    pub fn launches(&mut self, n: &Arc<Mutex<DepNode>>) -> Result<Vec<Command>> {
+        let commands = self.eval(n)?;
+        if !self.ev.session.flags.one_shell {
+            return Ok(commands);
+        }
+        Ok(one_shell_script(commands))
     }
 
     // [spec:ronin:req:make.recursive-invocation+2]
