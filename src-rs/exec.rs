@@ -195,7 +195,18 @@ impl<'a> Executor<'a> {
                         // `.ONESHELL` made this one script out of the recipe's
                         // lines, so the newlines in it separate commands and
                         // there is no single command line to exec directly.
-                        one_script: self.ce.ev.session.flags.one_shell,
+                        // The flags travelling with it are what GNU Make's own
+                        // recursion would default to while it re-reads
+                        // `.SHELLFLAGS` for this launch: the recipe's prefixes
+                        // are the first line's, and so is the `-` this asks
+                        // about.
+                        one_script: self
+                            .ce
+                            .ev
+                            .session
+                            .flags
+                            .one_shell
+                            .then(|| self.ce.ev.default_shell_flag(command.dash_prefixed)),
                     },
                     &command.cmd,
                     // This executor applied the exported set to its own

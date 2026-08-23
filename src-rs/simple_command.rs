@@ -45,7 +45,7 @@ limitations under the License.
 //! another POSIX shell — takes the slow path, because GNU Make compares it
 //! against `default_shell` and nothing else.
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 
 /// The shell GNU Make was compiled with, which is the only one the fast path
 /// is willing to stand in for.
@@ -159,14 +159,84 @@ pub fn direct_argv(
 /// $(.SHELLFLAGS) LINE` as text and re-tokenizes the whole of it — see
 /// [`command_line_flag_argv`].
 ///
-/// ONE MEASURED DIVERGENCE, left here rather than fixed: flags the tokenizer
-/// hands back to a shell. GNU Make's guard is not reached for those, because
-/// the inner call has already gone slow and answered with the argument list
-/// that starts a shell, so `.SHELLFLAGS := "-e" -c` under `.ONESHELL` reaches
-/// the launch as the three words `/bin/sh`, `-c` and `"-e" -c` ahead of the
-/// script — measured on 4.4.1. This hands over no words at all for them.
-pub fn shell_flag_argv(shell_flags: &[u8]) -> Vec<Bytes> {
-    tokenize(shell_flags, false).unwrap_or_default()
+/// WHERE THE TOKENIZER REFUSES, the flags do not go to a command line: they
+/// come back as THREE WORDS. `one_shell` is a global, so the recursion this
+/// branch makes lands in this very branch again, one level down, with the
+/// flags text as its recipe — and there the shell is the default `/bin/sh`,
+/// which is Bourne-compatible, so the text loses the blanks and `[@+-]` at the
+/// front of each of its lines and the launch built out of it is `[/bin/sh,
+/// <the flags GNU defaults to>, <that text>]`. The `if (argv)` guard sees
+/// those three and copies them in ahead of the script. Measured on 4.4.1:
+/// `.SHELLFLAGS := "-e" -c` reaches an `argv`-printing `SHELL` as `/bin/sh`,
+/// `-c`, `"-e" -c`; `-e $X -c` reaches it as `/bin/sh`, `-c`, `e $X -c`, the
+/// leading `-` gone; `-e\n-c` as `/bin/sh`, `-c`, `e\nc`, both of them gone.
+///
+/// `default_flags` is what that recursion defaults its own `shellflags` to,
+/// having been handed none — [`crate::eval::Evaluator::default_shell_flag`].
+///
+/// 4.4.1 REACHES THIS ANSWER THROUGH A HEAP OVERFLOW, which is why the band it
+/// can be asked about has a floor. The one-shell branch sizes its buffer for
+/// the flags it expects to split — `shell_len + sflags_len + line_len + 3`,
+/// which is exact for words that came out of the flags text — and the three
+/// words above are `/bin/sh` and `-c` longer than that. Valgrind names the
+/// `stpcpy` at job.c:3452 writing past the block for every input on this path;
+/// short ones die of it (`.SHELLFLAGS := set` and `:= exec` both segfault
+/// 4.4.1), longer ones survive with the argv the source says they should have.
+/// This implements what the source says, which is the only thing there is to
+/// implement: the overflow is 4.4.1's bug and not a behaviour to reproduce.
+pub fn shell_flag_argv(shell_flags: &[u8], default_flags: &[u8]) -> Vec<Bytes> {
+    // GNU Make's own first test, and the whole of what its `if (argv)` guard
+    // is ever false for: `while (ISBLANK (*line)) ++line; if (*line == '\0')
+    // return 0;`. A newline is not a blank, so a flags value of one is a
+    // script of one empty line rather than nothing to run.
+    if shell_flags.iter().all(|byte| matches!(byte, b' ' | b'\t')) {
+        return Vec::new();
+    }
+    match tokenize(shell_flags, true) {
+        Some(words) => words,
+        None => vec![
+            Bytes::from_static(DEFAULT_SHELL),
+            Bytes::copy_from_slice(default_flags),
+            one_shell_prefixes_stripped(shell_flags),
+        ],
+    }
+}
+
+/// A one-shell script with the blanks and `[@+-]` taken off the front of each
+/// of its lines.
+///
+/// What GNU Make's one-shell branch does to the text it is about to hand a
+/// Bourne-compatible shell (job.c), and its comment says why only that shell:
+/// a `SHELL` Make does not recognise may be reading those characters as its
+/// own script. A line ends at a newline the text did not escape, which is why
+/// this counts backslashes rather than splitting on `\n`.
+fn one_shell_prefixes_stripped(text: &[u8]) -> Bytes {
+    let mut stripped = BytesMut::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let start = rest
+            .iter()
+            .position(|byte| !matches!(byte, b' ' | b'\t' | b'-' | b'@' | b'+'))
+            .unwrap_or(rest.len());
+        rest = &rest[start..];
+        let mut escaped = false;
+        let mut index = 0;
+        while index < rest.len() {
+            let byte = rest[index];
+            stripped.put_u8(byte);
+            index += 1;
+            if byte == b'\\' {
+                escaped = !escaped;
+            } else {
+                if byte == b'\n' && !escaped {
+                    break;
+                }
+                escaped = false;
+            }
+        }
+        rest = &rest[index..];
+    }
+    stripped.freeze()
 }
 
 /// `.SHELLFLAGS` as the words every other launch passes ahead of the command.
@@ -329,8 +399,17 @@ mod tests {
     }
 
     fn flag_words(flags: &str) -> Vec<String> {
-        shell_flag_argv(flags.as_bytes())
-            .into_iter()
+        words_of(shell_flag_argv(flags.as_bytes(), b"-c"))
+    }
+
+    /// The same, for a recipe read under `.POSIX:` whose first line carries no
+    /// `-`, which is the whole of what changes the flags GNU Make defaults to.
+    fn posix_flag_words(flags: &str) -> Vec<String> {
+        words_of(shell_flag_argv(flags.as_bytes(), b"-ec"))
+    }
+
+    fn words_of(argv: Vec<Bytes>) -> Vec<String> {
+        argv.into_iter()
             .map(|word| String::from_utf8(word.to_vec()).unwrap())
             .collect()
     }
@@ -350,21 +429,96 @@ mod tests {
                 "-E".to_owned(),
             ]
         );
-        // No flags at all contribute nothing: GNU Make's `if (argv)` guard.
+        // No flags at all contribute nothing: GNU Make's `if (argv)` guard,
+        // which is false for blanks and for nothing else.
         assert!(flag_words("").is_empty());
-        // Flags the tokenizer hands back to a shell contribute nothing HERE
-        // and three words in 4.4.1, which is the divergence the doc comment
-        // records — the inner call has already gone slow and answered with the
-        // argument list that starts a shell, so the guard is never reached.
-        assert!(flag_words("-c $(unterminated").is_empty());
-        // The gates that are part of the tokenizer itself still apply,
-        // because GNU Make calls the whole of the function: a lone word that
-        // is a shell builtin hands the flags back to a shell and so
-        // contributes nothing. Not measured against the oracle — 4.4.1 sizes
-        // `new_argv` from `sflags_len` before it knows the parse failed and
-        // dies of heap corruption on this shape, so there is nothing there to
-        // agree with.
-        assert!(flag_words("set").is_empty());
+        assert!(flag_words("  \t ").is_empty());
+    }
+
+    /// What a `.SHELLFLAGS` the tokenizer refuses reaches the launch as.
+    ///
+    /// Three words, because GNU Make's `one_shell` is a global and the
+    /// recursion that parses the flags therefore lands in the one-shell branch
+    /// itself: `/bin/sh`, the flags that branch defaults to, and the flags text
+    /// with the prefixes stripped off the front of each of its lines.
+    #[test]
+    fn one_shell_flags_a_shell_would_split_are_three_words() {
+        // Measured on 4.4.1 with an argv-printing `SHELL`. A double quote is a
+        // shell character, and nothing about this text is a prefix, so it comes
+        // back whole.
+        assert_eq!(
+            flag_words("\"-e\" -c"),
+            vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "\"-e\" -c".to_owned()
+            ]
+        );
+        // The prefix stripping, which is the part that is not a round trip.
+        // `-e $X -c` reaches 4.4.1's launch with its leading `-` gone.
+        assert_eq!(
+            flag_words("-e $X -c"),
+            vec!["/bin/sh".to_owned(), "-c".to_owned(), "e $X -c".to_owned()]
+        );
+        // A run of them, blanks between, all gone; and only at the front.
+        assert_eq!(
+            flag_words(" +- e \"x\" -c"),
+            vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "e \"x\" -c".to_owned()
+            ]
+        );
+        assert_eq!(
+            flag_words("@e \"x\" -c"),
+            vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "e \"x\" -c".to_owned()
+            ]
+        );
+        // A newline is what sends this text slow in the first place — under
+        // `.ONESHELL` it separates commands — and it is also what starts
+        // another line for the stripping to reach.
+        assert_eq!(
+            flag_words("-e\n-c"),
+            vec!["/bin/sh".to_owned(), "-c".to_owned(), "e\nc".to_owned()]
+        );
+        // An escaped newline does not end a line, so what follows it is script
+        // rather than the front of anything.
+        assert_eq!(
+            flag_words("-e\\\n-c\n-x"),
+            vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "e\\\n-c\nx".to_owned()
+            ]
+        );
+        // Under `.POSIX:` the recursion defaults its own flags to `-ec`, so
+        // the second word is not always `-c`. Measured: `.IGNORE:` does not
+        // change it, because only the line's own `-` clears COMMANDS_NOERROR.
+        assert_eq!(
+            posix_flag_words("\"-e\" -c"),
+            vec![
+                "/bin/sh".to_owned(),
+                "-ec".to_owned(),
+                "\"-e\" -c".to_owned()
+            ]
+        );
+        // The gates that are part of the tokenizer itself send the flags the
+        // same way, because GNU Make calls the whole of the function: a lone
+        // word that is a shell builtin is the shell's to run. Measured on
+        // `export`, `unset`, `readonly` and `ulimit -c`; `set` and `exec` are
+        // in the band where the oracle's own heap overflow kills it before it
+        // can answer.
+        assert_eq!(
+            flag_words("export"),
+            vec!["/bin/sh".to_owned(), "-c".to_owned(), "export".to_owned()]
+        );
+        assert_eq!(
+            flag_words("set"),
+            vec!["/bin/sh".to_owned(), "-c".to_owned(), "set".to_owned()]
+        );
     }
 
     fn command_line_flags(flags: &str) -> Option<Vec<String>> {

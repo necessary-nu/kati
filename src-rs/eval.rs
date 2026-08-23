@@ -3425,13 +3425,26 @@ impl Evaluator {
         };
         let is_default = var.read().origin() == VarOrigin::Default;
         if self.is_posix && is_default {
-            return Ok(Bytes::from_static(if dash_prefixed {
-                b"-c"
-            } else {
-                b"-ec"
-            }));
+            return Ok(Bytes::from_static(self.default_shell_flag(dash_prefixed)));
         }
         self.eval_bound_var(Symbol::SHELLFLAGS, var)
+    }
+
+    /// The flags GNU Make gives a launch it was handed none for.
+    ///
+    /// `job.c` opens `construct_command_argv_internal` with `if (shellflags ==
+    /// 0) shellflags = posix_pedantic && NONE_SET (flags, COMMANDS_NOERROR) ?
+    /// "-ec" : "-c"`, so this is the value behind an unassigned `.SHELLFLAGS`
+    /// and the value the one-shell branch's own recursion parses its flags
+    /// under — see [`crate::simple_command::shell_flag_argv`], which is where
+    /// it becomes visible even though `.SHELLFLAGS` was assigned.
+    #[must_use]
+    pub fn default_shell_flag(&self, dash_prefixed: bool) -> &'static [u8] {
+        if self.is_posix && !dash_prefixed {
+            b"-ec"
+        } else {
+            b"-c"
+        }
     }
 
     fn get_allow_rules(&mut self) -> Result<RulesAllowed> {

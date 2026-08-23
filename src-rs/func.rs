@@ -694,7 +694,7 @@ fn shell_func_impl(
             // flags at all: `construct_command_argv` is called from
             // `func_shell_base` with none, and `one_shell` is only consulted
             // for a recipe.
-            one_script: false,
+            one_script: None,
         },
         cmd,
         environment,

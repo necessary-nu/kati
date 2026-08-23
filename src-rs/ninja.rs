@@ -287,6 +287,14 @@ pub struct RecipeStep {
     /// argument. Per step, because GNU Make chooses them per line.
     pub shell: Bytes,
     pub shell_flags: Bytes,
+    /// The flags GNU Make's own recursion defaults to while it re-reads
+    /// [`Self::shell_flags`] for this step, having been handed none.
+    ///
+    /// Only a `.ONESHELL` step ever passes them on, and only where that
+    /// re-reading has to hand the flags back to a shell — see
+    /// [`crate::simple_command::shell_flag_argv`], which is the whole of what
+    /// this is for.
+    pub default_shell_flags: Bytes,
     /// A nonzero status from this step is an error Make was told to ignore:
     /// it is not the recipe's answer and the steps after it still run.
     pub ignore_error: bool,
@@ -514,11 +522,19 @@ impl DeferredRecipes {
         // read HERE rather than when the rule was declared because a deferred
         // recipe is one nothing may read early — `SHELL`'s own value included.
         let shell = ce.recipe_shell.clone();
+        // What GNU Make would have defaulted this launch's flags to. It stays
+        // relevant after `.SHELLFLAGS` was assigned, because the one-shell
+        // branch re-reads that value through a recursion it hands no flags of
+        // its own; the prefixes it reads are the first written line's.
+        let default_flags = ce
+            .ev
+            .default_shell_flag(commands.first().is_some_and(|c| c.dash_prefixed));
         let steps = recipe_steps(
             &ce.ev.session.flags,
             &translated,
             &shell,
             &shell_flags,
+            default_flags,
             &script,
         );
         Ok(ExpandedRecipe {
@@ -546,6 +562,7 @@ fn recipe_steps(
     translated: &TranslatedRecipe,
     shell: &Bytes,
     script_flags: &Bytes,
+    default_flags: &[u8],
     script: &Bytes,
 ) -> Vec<RecipeStep> {
     let step =
@@ -566,6 +583,7 @@ fn recipe_steps(
             text,
             shell: shell.clone(),
             shell_flags,
+            default_shell_flags: Bytes::copy_from_slice(default_flags),
             ignore_error,
             recursive_line,
             // `.ONESHELL` is the whole of the condition, and it is a property
@@ -1984,6 +2002,9 @@ impl<'a> NinjaGenerator<'a> {
                     &translated,
                     &nn.shell,
                     &script_flags,
+                    self.ce
+                        .ev
+                        .default_shell_flag(nn.commands.first().is_some_and(|c| c.dash_prefixed)),
                     &script,
                 )
             };
@@ -3315,7 +3336,7 @@ mod tests {
         NinjaGenerator::gen_shell_script(&flags, &translated, &script_flags, &mut script);
         let script = script.freeze();
         let shell = Bytes::from_static(b"/bin/sh");
-        recipe_steps(&flags, &translated, &shell, &script_flags, &script)
+        recipe_steps(&flags, &translated, &shell, &script_flags, b"-c", &script)
             .into_iter()
             .map(|step| {
                 (

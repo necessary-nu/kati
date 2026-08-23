@@ -95,7 +95,13 @@ pub struct ShellToReadWith<'a> {
     /// `construct_command_argv_internal` (job.c:3034) has `else if (one_shell
     /// && *p == '\n') goto slow`, "in .ONESHELL mode \n is a separator like ;
     /// or &&".
-    pub one_script: bool,
+    ///
+    /// The bytes it carries are the flags GNU Make's own recursion defaults to
+    /// while it parses `.SHELLFLAGS` for such a launch — read only where that
+    /// parse has to hand the flags back to a shell, which is the one case a
+    /// one-script launch passes words that did not come out of the flags text.
+    /// See [`crate::simple_command::shell_flag_argv`].
+    pub one_script: Option<&'a [u8]>,
 }
 
 /// The argument list a launch execs, or `None` where a shell has to read the
@@ -126,13 +132,15 @@ fn argv_to_exec(
     shell: &[u8],
     shellflag: &[u8],
     cmd: &Bytes,
-    one_script: bool,
+    one_script: Option<&[u8]>,
 ) -> Option<Vec<Bytes>> {
-    if let Some(direct) = crate::simple_command::direct_argv(cmd, shell, shellflag, one_script) {
+    if let Some(direct) =
+        crate::simple_command::direct_argv(cmd, shell, shellflag, one_script.is_some())
+    {
         return Some(direct);
     }
-    let flags = if one_script {
-        crate::simple_command::shell_flag_argv(shellflag)
+    let flags = if let Some(default_flags) = one_script {
+        crate::simple_command::shell_flag_argv(shellflag, default_flags)
     } else {
         // A shell that is a command line rather than a program cannot be
         // exec'd, and neither can flags with shell syntax in them.
