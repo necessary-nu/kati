@@ -143,6 +143,29 @@ pub fn direct_argv(
     if shell_flags != b"-c" && shell_flags != b"-ec" {
         return None;
     }
+    tokenize(line, one_shell)
+}
+
+/// `.SHELLFLAGS` as the words a `.ONESHELL` launch passes.
+///
+/// GNU Make's one-shell branch parses them with `construct_command_argv_internal`
+/// itself — "Parse shellflags using construct_command_argv_internal to handle
+/// quotes" (job.c) — so `-E 'use warnings FATAL => "all";'` is two words and
+/// not five, and the quotes come off. It passes no shell and no flags of its
+/// own, so none of the fast path's gates apply; and it guards the result with
+/// `if (argv)`, so flags the tokenizer hands back to a shell contribute
+/// nothing at all rather than being split some other way.
+///
+/// Only the one-shell branch does this. Every other recipe builds `$(SHELL)
+/// $(.SHELLFLAGS) LINE` as text and re-tokenizes the whole of it, where the
+/// flags are quoted like anything else on a command line.
+pub fn shell_flag_argv(shell_flags: &[u8]) -> Vec<Bytes> {
+    tokenize(shell_flags, false).unwrap_or_default()
+}
+
+/// The shell's own word splitting, with no question asked about what the words
+/// turn out to be. GNU Make's `construct_command_argv_internal` past its gates.
+fn tokenize(line: &[u8], one_shell: bool) -> Option<Vec<Bytes>> {
     let line = Bytes::copy_from_slice(line);
     let mut argv: Vec<Bytes> = Vec::new();
     let mut word = Vec::new();
@@ -268,6 +291,42 @@ mod tests {
                 .map(|word| String::from_utf8(word.to_vec()).unwrap())
                 .collect()
         })
+    }
+
+    fn flag_words(flags: &str) -> Vec<String> {
+        shell_flag_argv(flags.as_bytes())
+            .into_iter()
+            .map(|word| String::from_utf8(word.to_vec()).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn one_shell_flags_are_read_with_the_shells_own_quoting() {
+        assert_eq!(flag_words("-e"), vec!["-e".to_owned()]);
+        assert_eq!(flag_words("-e -c"), vec!["-e".to_owned(), "-c".to_owned()]);
+        // The upstream case: a quoted flag with blanks, a `;`, a `>` and a
+        // pair of double quotes in it is ONE word, and the quotes come off.
+        assert_eq!(
+            flag_words("-w -E 'use warnings FATAL => \"all\";' -E"),
+            vec![
+                "-w".to_owned(),
+                "-E".to_owned(),
+                "use warnings FATAL => \"all\";".to_owned(),
+                "-E".to_owned(),
+            ]
+        );
+        // No flags at all, and flags the tokenizer hands back to a shell,
+        // contribute nothing: GNU Make's `if (argv)` guard.
+        assert!(flag_words("").is_empty());
+        assert!(flag_words("-c $(unterminated").is_empty());
+        // The gates that are part of the tokenizer itself still apply,
+        // because GNU Make calls the whole of the function: a lone word that
+        // is a shell builtin hands the flags back to a shell and so
+        // contributes nothing. Not measured against the oracle — 4.4.1 sizes
+        // `new_argv` from `sflags_len` before it knows the parse failed and
+        // dies of heap corruption on this shape, so there is nothing there to
+        // agree with.
+        assert!(flag_words("set").is_empty());
     }
 
     #[test]

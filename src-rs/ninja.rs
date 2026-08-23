@@ -307,6 +307,18 @@ pub struct RecipeStep {
     /// itself — and would report a missing program against its own name, in
     /// Make's voice rather than a shell's.
     pub direct: Option<Vec<Bytes>>,
+    /// Whether [`Self::shell`] is a path to exec rather than a command line to
+    /// read.
+    ///
+    /// A real asymmetry in GNU Make rather than an oversight. The slow path of
+    /// `construct_command_argv_internal` (job.c) says "SHELL may be a
+    /// multi-word command" and builds `$(SHELL) $(.SHELLFLAGS) LINE` as text,
+    /// then recurses to tokenise it — which is what makes `SHELL = /bin/sh -x`
+    /// work for an ordinary recipe. The `if (one_shell)` branch above it does
+    /// not: it writes `new_argv[0] = xstrdup (shell)` and execs that, so a
+    /// value with a space in it is a path with a space in it and the exec
+    /// fails. True for a `.ONESHELL` step and false for every other.
+    pub shell_is_a_path: bool,
 }
 
 /// One expanded recipe: what a [`SinkRule`] would have carried, had the text
@@ -556,6 +568,11 @@ fn recipe_steps(
             shell_flags,
             ignore_error,
             recursive_line,
+            // `.ONESHELL` is the whole of the condition, and it is a property
+            // of the branch GNU Make takes rather than of this value: the
+            // `one_shell` branch execs the shell as it stands, and every other
+            // recipe's shell goes back through the tokeniser.
+            shell_is_a_path: flags.one_shell,
         };
     if flags.one_shell {
         if script.is_empty() {
