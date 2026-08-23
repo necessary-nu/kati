@@ -4525,16 +4525,36 @@ impl<'a> DepBuilder<'a> {
         // Each `::` record stands on its own, and what `.EXTRA_PREREQS` adds is
         // required of every one of them — out of the automatic variables here
         // as everywhere else, so it joins the graph rather than the inputs.
+        //
+        // Every prerequisite goes through [`Self::at_settled_name`], which is
+        // where a name nothing can remake becomes the path the directory
+        // search found it at. An action is a rule like any other and GNU Make
+        // searches for the prerequisites of each `::` entry the same way it
+        // searches for an ordinary rule's; reaching that here rather than only
+        // in [`Self::build_plan`] is also what puts the found path into
+        // `actual_inputs`, and so into `$<` and `$^`.
         let (extra_compared, extra_order_only) = self.extra_prerequisites(trigger, true)?;
         let actual_inputs = action.lock().actual_inputs.clone();
-        for input in actual_inputs.into_iter().chain(extra_compared) {
-            let dependency = self.build_plan(input, Some(trigger))?;
+        let visible_prerequisites = actual_inputs.len();
+        for (position, input) in actual_inputs.into_iter().chain(extra_compared).enumerate() {
+            let (input, dependency) = self.at_settled_name(input, trigger)?;
+            if position < visible_prerequisites {
+                action.lock().actual_inputs[position] = input;
+            }
             self.record_searched_input(&action, input);
             action.lock().deps.push((input, dependency));
         }
         let actual_order_only_inputs = action.lock().actual_order_only_inputs.clone();
-        for input in actual_order_only_inputs.into_iter().chain(extra_order_only) {
-            let dependency = self.build_plan(input, Some(trigger))?;
+        let visible_order_only = actual_order_only_inputs.len();
+        for (position, input) in actual_order_only_inputs
+            .into_iter()
+            .chain(extra_order_only)
+            .enumerate()
+        {
+            let (input, dependency) = self.at_settled_name(input, trigger)?;
+            if position < visible_order_only {
+                action.lock().actual_order_only_inputs[position] = input;
+            }
             self.record_searched_input(&action, input);
             action.lock().order_onlys.push((input, dependency));
         }
