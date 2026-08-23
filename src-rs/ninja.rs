@@ -871,9 +871,12 @@ impl<'a> NinjaGenerator<'a> {
     /// writes it into a file escapes it for that file.
     ///
     /// `one_shell` says how the recipe's lines will be joined, because that
-    /// decides what a trailing `;` is. Lines joined with ` ; ` carry a
-    /// separator already and a line's own is redundant; lines joined with
-    /// newlines are one script, where every `;` is a token of it.
+    /// decides what the end of a line is. Lines joined with ` ; ` are separate
+    /// commands and the join supplies the punctuation between them, so a
+    /// line's own trailing separator is redundant and the blanks in front of
+    /// it are the join's business rather than the command's. Lines joined with
+    /// newlines are one script, where every byte a line ends on is script text
+    /// a here-document can read back — so nothing at all comes off the end.
     fn translate_command(inp: Bytes, one_shell: bool) -> Bytes {
         let mut cmd_buf = BytesMut::new();
         // How far back the trim below may reach. A `;` or a blank the shell
@@ -967,18 +970,28 @@ impl<'a> NinjaGenerator<'a> {
             end
         };
 
-        let mut end = blanks_before(cmd_buf.len());
-        // A `;` a line ends on is a separator only where the join supplies one
-        // too, and only one of it: `;;` is a `case` item's terminator, a token
-        // of the script rather than punctuation between lines. GNU Make trims
-        // neither, and under `.ONESHELL` — where the join is a newline and
-        // supplies nothing — neither does this.
-        let mut bare_semicolons = end;
-        while bare_semicolons > protected && cmd_buf[bare_semicolons - 1] == b';' {
-            bare_semicolons -= 1;
-        }
-        if !one_shell && end - bare_semicolons == 1 {
-            end = blanks_before(end - 1);
+        // GNU Make takes nothing off the end of a recipe line: the one-shell
+        // branch of `construct_command_argv_internal` (job.c) strips only the
+        // blanks and `[@+-]` that stand at the START of an interior line, and
+        // the ordinary branch hands the line to a shell as it was written.
+        // What comes off below comes off because the ` ; ` join made it
+        // redundant, so under `.ONESHELL` — where the join is a newline and
+        // supplies nothing — none of it comes off, and a line's trailing
+        // blanks reach the script. A here-document reading the script's own
+        // text writes them into a file.
+        let mut end = cmd_buf.len();
+        if !one_shell {
+            end = blanks_before(end);
+            // A `;` a line ends on is a separator only where the join supplies
+            // one too, and only one of it: `;;` is a `case` item's terminator,
+            // a token of the script rather than punctuation between lines.
+            let mut bare_semicolons = end;
+            while bare_semicolons > protected && cmd_buf[bare_semicolons - 1] == b';' {
+                bare_semicolons -= 1;
+            }
+            if end - bare_semicolons == 1 {
+                end = blanks_before(end - 1);
+            }
         }
         cmd_buf.truncate(end);
 
@@ -3232,8 +3245,15 @@ mod tests {
         assert_eq!(trim(b"touch m1 ;  ", false), "touch m1");
         assert_eq!(trim(b"touch m1   ", false), "touch m1");
         // Under `.ONESHELL` the join is a newline and supplies no separator,
-        // so the line's own stays.
-        assert_eq!(trim(b"touch m1 ;  ", true), "touch m1 ;");
+        // so the line's own stays — and so do the blanks it ends on, which
+        // are script text there rather than the space in front of a ` ; `.
+        assert_eq!(trim(b"touch m1 ;  ", true), "touch m1 ;  ");
+        assert_eq!(trim(b"touch m1   ", true), "touch m1   ");
+        assert_eq!(trim(b"touch m1\t", true), "touch m1\t");
+        // A line whose whole text is blanks is a blank line of that script,
+        // and a here-document reading it writes the blanks into a file.
+        assert_eq!(trim(b" ", true), " ");
+        assert_eq!(trim(b" ", false), "");
 
         // `;;` terminates a `case` item. Two arms need both, and a trim that
         // took either would leave the shell an unterminated item.
