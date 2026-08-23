@@ -2155,6 +2155,10 @@ impl<'a> NinjaGenerator<'a> {
                     .grouped_double_action
                     .as_ref()
                     .is_some_and(|action| !action.has_recipe),
+                deferred_freshness_heads_the_record: node
+                    .grouped_double_action
+                    .as_ref()
+                    .is_some_and(|action| action.heads_the_record),
                 deferred_always_new_inputs: &deferred_always_new_inputs,
                 deferred_excluded_new_inputs: &deferred_excluded_new_inputs,
                 deferred_new_input_names: &deferred_new_input_names,
@@ -3048,6 +3052,7 @@ mod tests {
                     deferred_freshness_outputs: &[],
                     deferred_freshness_always_dirty: false,
                     deferred_freshness_ignores_dates: false,
+                    deferred_freshness_heads_the_record: false,
                     deferred_always_new_inputs: &[],
                     deferred_excluded_new_inputs: &[],
                     settled_names: &[],

@@ -428,6 +428,15 @@ pub struct SinkEdge<'a> {
     /// `--always-make` withholds the overruling, and the ordinary comparison
     /// stands again — which is the same clause read the other way round.
     pub deferred_freshness_ignores_dates: bool,
+    /// This edge is the FIRST entry of a `::` record, which is the one a
+    /// dependent of that record reads the name off.
+    ///
+    /// The rename `update_file_1` makes reaches forward through the record and
+    /// no further, and what a dependent holds is the entry the record was filed
+    /// under. So the record's name has two answers: the one the entries pass
+    /// along to each other as they run, and this entry's, which is everybody
+    /// else's.
+    pub deferred_freshness_heads_the_record: bool,
     /// Normal inputs that are phony and therefore always belong to the late
     /// new-input set used by the recipe.
     pub deferred_always_new_inputs: &'a [Symbol],

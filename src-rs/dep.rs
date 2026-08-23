@@ -336,6 +336,17 @@ pub struct GroupedDoubleAction {
     /// ahead of the overruling clause and counts an order-only prerequisite as
     /// a prerequisite. Such an entry is never current, so it never renames.
     pub without_prerequisites: bool,
+    /// Whether this is the entry the record was filed under, which is the
+    /// FIRST one the makefile wrote.
+    ///
+    /// The rename reaches forward and no further — `update_file_1` ends an
+    /// entry it found current with `while (file) { file->name = file->hname;
+    /// file = file->prev; }`, and `enter_file` links each new entry off the
+    /// last, so `prev` walks towards the end of the record. What a DEPENDENT
+    /// holds is the `struct file` the hash table answers with, and that is the
+    /// head, so a dependent reads this entry's verdict and no other's however
+    /// many entries after it renamed themselves.
+    pub heads_the_record: bool,
 }
 
 /// The cycle guard cannot catch `%.a: %.b.a` against `%.b.a: %.a`, where every
@@ -4494,6 +4505,9 @@ impl<'a> DepBuilder<'a> {
                 phony_inputs: Vec::new(),
                 has_recipe,
                 without_prerequisites: false,
+                // Decided in `build_grouped_double_member`, where the record's
+                // entries are in one place and in the order they were written.
+                heads_the_record: false,
             });
             node.cmds = rule.cmds.clone();
             node.actual_inputs =
@@ -4680,8 +4694,20 @@ impl<'a> DepBuilder<'a> {
             created_action |= newly_created;
             actions.push((id, action));
         }
-        if shared && created_action {
+        if shared {
             actions.sort_by_key(|(id, _)| self.double_action_creation_indices[id]);
+            // Which entry the record was filed under, said here because this is
+            // where the record's entries are in the order the makefile wrote
+            // them. Said on every build of the member and not only on the one
+            // that created the actions: the head is a property of the record,
+            // and a member reached a second time finds the same actions again.
+            if let Some((_, head)) = actions.first()
+                && let Some(grouped) = head.lock().grouped_double_action.as_mut()
+            {
+                grouped.heads_the_record = true;
+            }
+        }
+        if shared && created_action {
             for pair in actions.windows(2) {
                 let previous = &pair[0].1;
                 let action = &pair[1].1;
