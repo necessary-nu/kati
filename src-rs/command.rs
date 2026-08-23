@@ -269,42 +269,76 @@ impl AutoCommandVar {
         if ev.new_inputs_timing != NewInputsTiming::SchedulerBoundary || ev.function_depth > 0 {
             return references;
         }
+        let view = self.settled_view();
+        // `$@` is the one automatic variable that names the TARGET, and for a
+        // `::` action the target's name is settled by the walk rather than by
+        // the read: an entry running after a current one writes the found path.
+        // So it leaves a reference too, and is minted first so a recipe that
+        // names both the target and a searched prerequisite numbers them in the
+        // order it reads them.
+        if matches!(self.typ, AutoCommand::At) {
+            let target = {
+                let node = node.lock();
+                node.settled_target.map(|_| node.recipe_output)
+            };
+            // An archive target's `$@` is the archive rather than the whole
+            // name, which is a halving of the settled spelling this side cannot
+            // do. Nothing renames an archive down a search path here, so the
+            // case is left where it was.
+            if let Some(target) = target
+                && crate::archive::split_archive_name(&target.as_bytes(&ev.session)).is_none()
+            {
+                let reference = Self::settled_reference(ev, node, target, view);
+                references.insert(target, reference);
+            }
+        }
         let searched = node.lock().searched_inputs.clone();
         if searched.is_empty() {
             return references;
         }
-        let view = self.settled_view();
         for word in words {
             if !searched.iter().any(|(input, _)| input == word) || references.contains_key(word) {
                 continue;
             }
-            let held = node
-                .lock()
-                .settled_names
-                .iter()
-                .find(|settled| settled.input == *word && settled.view == view)
-                .map(|settled| settled.variable);
-            let variable = match held {
-                Some(variable) => variable,
-                None => {
-                    let index = node.lock().settled_names.len();
-                    let mut name = BytesMut::from(SETTLED_NAME_PREFIX);
-                    name.put_slice(index.to_string().as_bytes());
-                    let variable = ev.session.intern(name.freeze());
-                    node.lock().settled_names.push(SettledName {
-                        variable,
-                        input: *word,
-                        view,
-                    });
-                    variable
-                }
-            };
-            let mut reference = BytesMut::from(&b"${"[..]);
-            reference.put_slice(&variable.as_bytes(&ev.session));
-            reference.put_slice(b"}");
-            references.insert(*word, reference.freeze());
+            references.insert(*word, Self::settled_reference(ev, node, *word, view));
         }
         references
+    }
+
+    /// The reference that stands for one name the build has still to settle,
+    /// minted once per name and form and reused wherever the recipe reads it
+    /// again.
+    fn settled_reference(
+        ev: &mut Evaluator,
+        node: &Arc<Mutex<DepNode>>,
+        name: Symbol,
+        view: SettledNameView,
+    ) -> Bytes {
+        let held = node
+            .lock()
+            .settled_names
+            .iter()
+            .find(|settled| settled.input == name && settled.view == view)
+            .map(|settled| settled.variable);
+        let variable = match held {
+            Some(variable) => variable,
+            None => {
+                let index = node.lock().settled_names.len();
+                let mut spelling = BytesMut::from(SETTLED_NAME_PREFIX);
+                spelling.put_slice(index.to_string().as_bytes());
+                let variable = ev.session.intern(spelling.freeze());
+                node.lock().settled_names.push(SettledName {
+                    variable,
+                    input: name,
+                    view,
+                });
+                variable
+            }
+        };
+        let mut reference = BytesMut::from(&b"${"[..]);
+        reference.put_slice(&variable.as_bytes(&ev.session));
+        reference.put_slice(b"}");
+        reference.freeze()
     }
 
     pub fn eval(&self, ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
@@ -397,7 +431,14 @@ impl AutoCommandVar {
                 let name = current_dep_node.recipe_output.as_bytes(names);
                 match crate::archive::split_archive_name(&name) {
                     Some((archive, _)) => out.put_slice(&name.slice(..archive.len())),
-                    None => out.put_slice(&name),
+                    // A reference where the build settles the spelling, and the
+                    // name itself where it does not. The reference already
+                    // stands for the form this variable asks for, so nothing
+                    // halves it afterwards -- `eval` is told by `Bound::Late`.
+                    None => match held(current_dep_node.recipe_output) {
+                        Some(reference) => out.put_slice(&reference),
+                        None => out.put_slice(&name),
+                    },
                 }
             }
             AutoCommand::Percent => {

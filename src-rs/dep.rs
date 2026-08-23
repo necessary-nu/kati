@@ -564,6 +564,27 @@ pub struct DepNode {
     /// path while nothing is here, and whatever reads the target spells it
     /// this way for as long as it is not remade.
     pub searched_at: Option<Symbol>,
+    /// Where the search found the TARGET this action's recipe writes, for a
+    /// `::` action that may have to write it there.
+    ///
+    /// [`Self::searched_at`] is the node's own, and a `::` action's own output
+    /// is a private name the compiler invented, which no search ever answered
+    /// about. The target the recipe writes is the chain's, shared with every
+    /// other entry — and GNU Make settles the chain's name as it walks it:
+    /// `update_file_1` (remake.c) ends an entry it does not have to remake with
+    /// `while (file) { file->name = file->hname; file = file->prev; }`, which
+    /// renames that entry AND every entry after it. So an entry running after a
+    /// current one writes the found path, and an entry running before one
+    /// writes the name as written, and which of the two this recipe is cannot
+    /// be known until the build walks the chain.
+    ///
+    /// So the recipe cannot spell `$@` at all, and leaves a reference for the
+    /// build to fill in — the same machinery `$<` and `$?` already use for a
+    /// prerequisite whose name is unsettled. See [`Self::settled_names`].
+    ///
+    /// `None` for every node but a `::` action, and for a `::` action whose
+    /// target the search never answered about, which is nearly all of them.
+    pub settled_target: Option<Symbol>,
     /// The prerequisites of this node the directory search answered about, each
     /// paired with where it found them.
     ///
@@ -631,6 +652,7 @@ impl DepNode {
             stem: None,
             planning_parent: None,
             searched_at: None,
+            settled_target: None,
             searched_inputs: Vec::new(),
             settled_names: Vec::new(),
             own_rule_vars: Vec::new(),
@@ -4435,6 +4457,10 @@ impl<'a> DepBuilder<'a> {
             let mut node = action.lock();
             node.recipe_output = trigger;
             node.declared_output = declared;
+            // Only here, and only for the actions-plus-join shape: a lone `::`
+            // record takes the ordinary single-node path, where the target's
+            // name is settled before the one recipe there is runs.
+            node.settled_target = self.searched_at.get(&trigger).copied();
             if has_recipe {
                 let members = if rule.is_grouped {
                     rule.outputs.clone()
