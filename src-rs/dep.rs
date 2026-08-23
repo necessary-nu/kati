@@ -2604,17 +2604,52 @@ impl<'a> DepBuilder<'a> {
             .filter(|name| self.done.contains_key(name))
             .collect::<Vec<_>>();
         for name in reached {
-            let declared = self.written_as(name);
-            if !self.double_memberships.contains_key(&declared) {
+            // The name as the command line wrote it, because that is the file
+            // database `enter_file` reads: `main` stamps the switches after the
+            // read and before the update, so nothing has been renamed yet and a
+            // name spelt as the path a search will find is not a double-colon
+            // target at all. Measured — under `GPATH` the found spelling builds
+            // and the written one refuses.
+            if !self.double_memberships.contains_key(&name) {
                 continue;
             }
-            let written =
-                String::from_utf8_lossy(&declared.as_bytes(&self.ev.session)).into_owned();
+            // The fresh entry has no recipe, so `update_file_1` offers it the
+            // implicit rule search like any other file with none. A rule found
+            // there is a rule the entry has, and its prerequisites are deps, so
+            // neither the complaint nor the `double_colon && deps == 0` clause
+            // that would have forced it is reached. Measured: `out:: a` beside
+            // an `out.c` is not refused, and the same tree under `-r` is.
+            if self.an_implicit_rule_could_make(name)? {
+                continue;
+            }
+            let written = String::from_utf8_lossy(&name.as_bytes(&self.ev.session)).into_owned();
             // `complain()` at remake.c:414, which is GNU Make's own wording for
             // a name nothing knows how to make.
             error_loc!(self.ev, None, "*** No rule to make target '{written}'.");
         }
         Ok(())
+    }
+
+    /// Whether the implicit rule search would find something to make `name`
+    /// with, asked of a name that has rules of its own.
+    ///
+    /// `try_implicit_rule` is offered every file with no `cmds`, and the entry
+    /// a switch appends to a `::` chain is one — so the question has to be put
+    /// for a name whose own record `pick_rule` would answer with long before it
+    /// reached the search. The scratch node is that entry: it carries no rules,
+    /// it is thrown away, and what the search remembered on the way through is
+    /// put back, so a probe that answers yes leaves the plan as it found it.
+    ///
+    /// Asked once the goals are planned, so anything the search reaches was
+    /// reachable already and nothing it plans is joined to a root.
+    fn an_implicit_rule_could_make(&mut self, name: Symbol) -> Result<bool> {
+        let intermediates = self.intermediates.clone();
+        let tried_implicit = self.tried_implicit.clone();
+        let scratch = DepNode::new(name, false, false, false, false, false);
+        let picked = self.implicit_rule_for(name, &scratch, &None, &[], &None);
+        self.intermediates = intermediates;
+        self.tried_implicit = tried_implicit;
+        Ok(picked?.is_some())
     }
 
     /// Plan the goals this invocation was aimed at, choosing the default when
@@ -5130,6 +5165,81 @@ impl<'a> DepBuilder<'a> {
             .any(|p| p.as_bytes(&self.ev.session).as_ref() == b"%")
     }
 
+    /// GNU Make's `try_implicit_rule` (implicit.c), over one name.
+    ///
+    /// Each pass runs out over every candidate before the next one begins;
+    /// `SearchPass` says why. Held apart from [`Self::pick_rule`] because the
+    /// search is asked one other question besides "what makes this target":
+    /// whether the name could be made at all, which is what a `-W` name a
+    /// double-colon record declares turns on.
+    fn implicit_rule_for(
+        &mut self,
+        output: Symbol,
+        n: &Arc<Mutex<DepNode>>,
+        rule_merger: &Option<Arc<Mutex<RuleMerger>>>,
+        patterns: &[Arc<Vars>],
+        vars: &Option<Arc<Vars>>,
+    ) -> Result<Option<PickedRuleInfo>> {
+        let whole_name = output.as_bytes(&self.ev.session);
+        let outer_compat = std::mem::replace(&mut self.found_compat_rule, false);
+        let mut picked = None;
+        for pass in SearchPass::all() {
+            // The passes that take a name on trust are a retry of the whole
+            // search, and GNU Make retries only a search that passed over a
+            // rule for such a name.
+            if pass.compat && !self.found_compat_rule {
+                break;
+            }
+            picked = self.pick_pattern_rule(
+                ImplicitSearch {
+                    output,
+                    name: &whole_name,
+                    pass,
+                },
+                n,
+                rule_merger,
+                patterns,
+                vars,
+            )?;
+            if picked.is_some() {
+                break;
+            }
+        }
+        // The archive-member search, GNU Make's second call to
+        // `pattern_search` from `try_implicit_rule`. It runs only after the
+        // first has failed, because — as the comment there puts it — the
+        // ordinary search uses more of the target's name and is therefore
+        // the more specific of the two. What changes is only the name being
+        // matched: `lib.a(foo.o)` is searched for as `(foo.o)`, with the
+        // archive held aside entirely, which is how the built-in `(%): %`
+        // rule matches and how its stem comes out as the member name.
+        if picked.is_none()
+            && let Some(archive_name) = crate::archive::archive_search_name(&whole_name)
+        {
+            for pass in SearchPass::all() {
+                if pass.compat && !self.found_compat_rule {
+                    break;
+                }
+                picked = self.pick_pattern_rule(
+                    ImplicitSearch {
+                        output,
+                        name: &archive_name,
+                        pass,
+                    },
+                    n,
+                    rule_merger,
+                    patterns,
+                    vars,
+                )?;
+                if picked.is_some() {
+                    break;
+                }
+            }
+        }
+        self.found_compat_rule = outer_compat;
+        Ok(picked)
+    }
+
     fn pick_rule(
         &mut self,
         output: Symbol,
@@ -5155,8 +5265,7 @@ impl<'a> DepBuilder<'a> {
         }
 
         // Steps 5 then 6, over the same rules, and then both again taking a
-        // written-down prerequisite on trust. Each pass runs out over every
-        // candidate before the next one begins; `SearchPass` says why.
+        // written-down prerequisite on trust.
         //
         // Not for a phony name. GNU Make's `remake.c` asks for an implicit rule
         // only where `!file->phony`, and it matters as soon as there are
@@ -5167,63 +5276,7 @@ impl<'a> DepBuilder<'a> {
         // Nor for a name a terminal rule has already been given, which is the
         // other half of the same condition: `!file->tried_implicit`.
         if !self.phony.contains(&output) && !self.tried_implicit.contains(&output) {
-            let whole_name = output.as_bytes(&self.ev.session);
-            let outer_compat = std::mem::replace(&mut self.found_compat_rule, false);
-            let mut picked = None;
-            for pass in SearchPass::all() {
-                // The passes that take a name on trust are a retry of the whole
-                // search, and GNU Make retries only a search that passed over a
-                // rule for such a name.
-                if pass.compat && !self.found_compat_rule {
-                    break;
-                }
-                picked = self.pick_pattern_rule(
-                    ImplicitSearch {
-                        output,
-                        name: &whole_name,
-                        pass,
-                    },
-                    n,
-                    &rule_merger,
-                    &patterns,
-                    &vars,
-                )?;
-                if picked.is_some() {
-                    break;
-                }
-            }
-            // The archive-member search, GNU Make's second call to
-            // `pattern_search` from `try_implicit_rule`. It runs only after the
-            // first has failed, because — as the comment there puts it — the
-            // ordinary search uses more of the target's name and is therefore
-            // the more specific of the two. What changes is only the name being
-            // matched: `lib.a(foo.o)` is searched for as `(foo.o)`, with the
-            // archive held aside entirely, which is how the built-in `(%): %`
-            // rule matches and how its stem comes out as the member name.
-            if picked.is_none()
-                && let Some(archive_name) = crate::archive::archive_search_name(&whole_name)
-            {
-                for pass in SearchPass::all() {
-                    if pass.compat && !self.found_compat_rule {
-                        break;
-                    }
-                    picked = self.pick_pattern_rule(
-                        ImplicitSearch {
-                            output,
-                            name: &archive_name,
-                            pass,
-                        },
-                        n,
-                        &rule_merger,
-                        &patterns,
-                        &vars,
-                    )?;
-                    if picked.is_some() {
-                        break;
-                    }
-                }
-            }
-            self.found_compat_rule = outer_compat;
+            let picked = self.implicit_rule_for(output, n, &rule_merger, &patterns, &vars)?;
             if picked.is_some() {
                 return Ok(picked);
             }
