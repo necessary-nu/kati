@@ -725,7 +725,7 @@ fn should_store_command_result(session: &Session, cmd: &[u8]) -> bool {
     true
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum CommandOp {
     Shell,
     Find,
@@ -758,6 +758,40 @@ impl CommandOp {
             _ => None,
         }
     }
+
+    /// The op as the regeneration stamp records it, carrying [`Self`] and the
+    /// one-script bit in one int.
+    ///
+    /// The stamp is a fixed sequence of length-prefixed fields with no version
+    /// word to branch on and no room for a new one — the format is this tool's
+    /// own now that the C++ writer is retired, but its field ORDER is still
+    /// what both readers ([`crate::regen`] and [`crate::regen_dump`]) walk in
+    /// lockstep. So the one thing a replay needs and cannot otherwise have —
+    /// whether the recorded `$(shell)` was read by the one-shell branch —
+    /// rides in a high bit of the op int rather than as a field of its own. A
+    /// stamp written before this bit existed holds an op in `0..=5` with the
+    /// bit clear, which reads back as `one_script = false`: exactly the launch
+    /// such a stamp was replayed with before, so an old stamp is read safely.
+    pub fn as_stamp_int(self, one_script: bool) -> i32 {
+        self.as_int()
+            | if one_script {
+                Self::STAMP_ONE_SCRIPT
+            } else {
+                0
+            }
+    }
+
+    /// The op and the one-script bit back out of what [`Self::as_stamp_int`]
+    /// packed. `None` only where the op itself is unknown, which is a corrupt
+    /// stamp either way.
+    pub fn from_stamp_int(i: i32) -> Option<(CommandOp, bool)> {
+        let one_script = i & Self::STAMP_ONE_SCRIPT != 0;
+        Self::from_int(i & !Self::STAMP_ONE_SCRIPT).map(|op| (op, one_script))
+    }
+
+    /// The bit [`Self::as_stamp_int`] sets, above the op values it shares the
+    /// int with.
+    const STAMP_ONE_SCRIPT: i32 = 0x100;
 }
 
 pub struct CommandResult {
@@ -768,6 +802,11 @@ pub struct CommandResult {
     pub find: Option<FindCommand>,
     pub result: Bytes,
     pub loc: Loc,
+    /// Whether the launch that produced [`Self::result`] was read by GNU Make's
+    /// one-shell branch — `.ONESHELL:` was in force. A replay that does not
+    /// know this reads a script as a command line and can answer differently
+    /// for a `$(shell)` that did not change, regenerating when it need not.
+    pub one_script: bool,
 }
 
 /// What a command's run of trailing newlines becomes.
@@ -890,6 +929,10 @@ fn shell_func_with(
             find: fc,
             result: output.clone(),
             loc,
+            // The launch that just ran read its flags the way this run's
+            // `.ONESHELL:` state says, and a replay has no other way to learn
+            // it — see [`CommandResult::one_script`].
+            one_script: one_script.is_some(),
         })
     }
     ev.session
@@ -1390,6 +1433,9 @@ fn file_read_func(
                     find: None,
                     result: Bytes::new(),
                     loc,
+                    // A `$(file)` is not a shell launch; the one-shell branch
+                    // never touches it.
+                    one_script: false,
                 })
             }
             // A file that was not there is an answer too, and the read after
@@ -1442,6 +1488,7 @@ fn file_read_func(
             find: None,
             result: buf.clone(),
             loc,
+            one_script: false,
         })
     }
     out.put_slice(&buf);
@@ -1508,6 +1555,7 @@ fn file_write_func(
             find: None,
             result: text,
             loc,
+            one_script: false,
         })
     }
 
@@ -2106,6 +2154,44 @@ mod tests {
     use crate::build_sink::{FileEvaluation, ShellEvaluation};
     use crate::expr::{ParseExprOpt, parse_expr};
     use crate::symtab::Symbol;
+
+    /// The stamp op int carries the one-script bit and gives it back, for every
+    /// op and both bit values.
+    #[test]
+    fn the_stamp_op_int_round_trips_the_one_script_bit() {
+        for op in [
+            CommandOp::Shell,
+            CommandOp::Find,
+            CommandOp::Read,
+            CommandOp::ReadMissing,
+            CommandOp::Write,
+            CommandOp::Append,
+        ] {
+            for one_script in [false, true] {
+                let packed = op.as_stamp_int(one_script);
+                assert_eq!(CommandOp::from_stamp_int(packed), Some((op, one_script)));
+            }
+        }
+    }
+
+    /// A stamp written before the one-script bit existed holds a bare op in
+    /// `0..=5`, and it must read back as that op with `one_script = false` —
+    /// the launch it was replayed with before — so an old stamp is read safely.
+    #[test]
+    fn a_bare_op_int_reads_as_not_one_script() {
+        for (bare, op) in [
+            (0, CommandOp::Shell),
+            (1, CommandOp::Find),
+            (2, CommandOp::Read),
+            (3, CommandOp::ReadMissing),
+            (4, CommandOp::Write),
+            (5, CommandOp::Append),
+        ] {
+            assert_eq!(CommandOp::from_stamp_int(bare), Some((op, false)));
+            // And a bare op is exactly what a not-one-script launch still writes.
+            assert_eq!(op.as_stamp_int(false), bare);
+        }
+    }
 
     /// Evaluate a Make expression with a fresh evaluator, returning both the
     /// result and whatever the expression managed to write before failing.

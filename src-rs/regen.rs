@@ -58,6 +58,10 @@ struct ShellResult {
     shellflag: OsString,
     cmd: OsString,
     result: Vec<u8>,
+    /// Whether the recorded launch was read by GNU Make's one-shell branch, so
+    /// the replay reads it the same way rather than as a command line — see
+    /// [`crate::func::CommandOp::from_stamp_int`].
+    one_script: bool,
     missing_dirs: Vec<OsString>,
     files: Vec<OsString>,
     read_dirs: Vec<OsString>,
@@ -239,7 +243,7 @@ impl StampChecker {
 
         let num_crs = load!(load_usize(fp));
         for _ in 0..num_crs {
-            let op = load!(load_int(fp).and_then(CommandOp::from_int));
+            let (op, one_script) = load!(load_int(fp).and_then(CommandOp::from_stamp_int));
             let shell = load!(load_string(fp));
             let shellflag = load!(load_string(fp));
             let cmd = load!(load_string(fp));
@@ -250,6 +254,7 @@ impl StampChecker {
                 shellflag,
                 cmd,
                 result: result.into_vec(),
+                one_script,
                 missing_dirs: Vec::new(),
                 files: Vec::new(),
                 read_dirs: Vec::new(),
@@ -429,16 +434,23 @@ impl StampChecker {
                 program: sr.shell.as_bytes(),
                 flag: sr.shellflag.as_bytes(),
                 stand_in: session.flags.default_shell_program.as_deref(),
-                // The recorded call is a `$(shell)`, and replaying it asks
-                // the same question the same way — except for the one thing
-                // the stamp does not carry. A `$(shell)` expanded below a
-                // `.ONESHELL:` was read as a script, and this replay runs
-                // before any makefile has been read, so nothing here knows
-                // that. The cost is a replay that can answer differently and
-                // regenerate when it need not; the stamp's field order is
-                // ckati's, so recording the bit is a format change and a node
-                // of its own.
-                one_script: None,
+                // Replay the recorded `$(shell)` the way it was recorded. A
+                // call expanded below a `.ONESHELL:` was read by the one-shell
+                // branch — newline a separator, `[@+-]` off the front of each
+                // line — and reading it here as a command line instead can
+                // answer differently for a call that did not change,
+                // regenerating when it need not. This replay runs before any
+                // makefile, so `flags.one_shell` is false whatever the makefile
+                // said; the bit rides in the stamp's op int instead.
+                //
+                // The bytes a one-script launch carries are the flags GNU
+                // Make's own recursion defaults to, read only where the
+                // recorded `.SHELLFLAGS` itself holds shell syntax and has to
+                // go back to a shell (`shell_flag_argv`); `-c` is that default
+                // for every `$(shell)` whose flags are ordinary, which is all
+                // of them bar a case that would have changed the recorded
+                // `shellflag` too.
+                one_script: sr.one_script.then_some(b"-c".as_slice()),
             },
             &cmd,
             // Replaying a recorded `$(shell)` to see whether it still answers

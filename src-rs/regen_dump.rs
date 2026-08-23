@@ -127,7 +127,9 @@ fn inner(
 
     let num_cmds = load_usize(fp)?;
     for _ in 0..num_cmds {
-        let op = CommandOp::from_int(load_int(fp)?)?;
+        // The op int carries the one-script bit above the op values — see
+        // [`crate::func::CommandOp::from_stamp_int`].
+        let (op, one_script) = CommandOp::from_stamp_int(load_int(fp)?)?;
         let shell = load_string(fp)?;
         let shellflag = load_string(fp)?;
         let cmd = load_string(fp)?;
@@ -174,6 +176,7 @@ fn inner(
                     println!("cmd type: SHELL");
                     println!("  shell: {}", shell.display());
                     println!("  shell flagss: {}", shellflag.display());
+                    println!("  one script: {one_script}");
                 }
                 CommandOp::Read => println!("cmd type: READ"),
                 CommandOp::ReadMissing => println!("cmd type: READ_MISSING"),

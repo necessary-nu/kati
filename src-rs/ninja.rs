@@ -2411,7 +2411,10 @@ impl<'a> NinjaGenerator<'a> {
             let crs = &self.ce.ev.session.command_results;
             dump_usize(&mut out, crs.len())?;
             for cr in crs.iter() {
-                dump_int(&mut out, cr.op.as_int())?;
+                // The op int carries the one-script bit too, so a replay reads
+                // a `$(shell)` the way the one-shell branch recorded it — see
+                // [`crate::func::CommandOp::as_stamp_int`].
+                dump_int(&mut out, cr.op.as_stamp_int(cr.one_script))?;
                 dump_string(&mut out, &cr.shell)?;
                 dump_string(&mut out, &cr.shellflag)?;
                 dump_string(&mut out, &cr.cmd)?;
