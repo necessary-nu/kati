@@ -419,6 +419,15 @@ pub struct SinkEdge<'a> {
     /// One of the deferred freshness outputs is phony, so reaching the action
     /// always requires it to run even if a file with that spelling exists.
     pub deferred_freshness_always_dirty: bool,
+    /// This edge's freshness is not decided by comparing dates: it is a `::`
+    /// entry that wrote no recipe, and GNU Make overrules the comparison for
+    /// one of those outright (`update_file_1`'s `file->cmds == 0` clause), so
+    /// only a prerequisite this run actually remade makes it out of date. Its
+    /// answer still settles the chain's name for the entries after it.
+    ///
+    /// `--always-make` withholds the overruling, and the ordinary comparison
+    /// stands again — which is the same clause read the other way round.
+    pub deferred_freshness_ignores_dates: bool,
     /// Normal inputs that are phony and therefore always belong to the late
     /// new-input set used by the recipe.
     pub deferred_always_new_inputs: &'a [Symbol],

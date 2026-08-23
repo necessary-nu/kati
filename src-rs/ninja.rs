@@ -2138,12 +2138,23 @@ impl<'a> NinjaGenerator<'a> {
                 // ever settle, and reading that here would make the two sink
                 // encodings disagree over a value neither path uses.
                 deferred_freshness_always_dirty: !node.grouped_double_join
-                    && node
-                        .grouped_double_action
-                        .as_ref()
-                        .map_or(node.is_phony || node.unconditional_double_colon, |action| {
+                    && node.grouped_double_action.as_ref().map_or(
+                        node.is_phony || node.unconditional_double_colon,
+                        |action| {
+                            // An entry with no recipe carries its own
+                            // never-current flag here rather than on the edge:
+                            // the edge's is `unconditional_double_colon`,
+                            // which is withheld from a recipe-less entry
+                            // because a Makefile declared by one is still
+                            // remakable.
                             action.has_phony_member
-                        }),
+                                || (!action.has_recipe && action.without_prerequisites)
+                        },
+                    ),
+                deferred_freshness_ignores_dates: node
+                    .grouped_double_action
+                    .as_ref()
+                    .is_some_and(|action| !action.has_recipe),
                 deferred_always_new_inputs: &deferred_always_new_inputs,
                 deferred_excluded_new_inputs: &deferred_excluded_new_inputs,
                 deferred_new_input_names: &deferred_new_input_names,
@@ -3036,6 +3047,7 @@ mod tests {
                     always_dirty: true,
                     deferred_freshness_outputs: &[],
                     deferred_freshness_always_dirty: false,
+                    deferred_freshness_ignores_dates: false,
                     deferred_always_new_inputs: &[],
                     deferred_excluded_new_inputs: &[],
                     settled_names: &[],

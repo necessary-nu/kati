@@ -319,6 +319,23 @@ pub struct GroupedDoubleAction {
     pub has_phony_member: bool,
     /// Normal prerequisites declared phony are always present in `$?`.
     pub phony_inputs: Vec<Symbol>,
+    /// Whether this entry of the chain wrote a recipe.
+    ///
+    /// An entry with none still answers for the chain's name — GNU Make's
+    /// `update_file_1` ends a target it does not have to remake by renaming
+    /// that entry and every entry after it, whether or not there was anything
+    /// to run — but it answers by a different rule: `remake.c` overrules the
+    /// timestamp comparison outright for a target with no recipe
+    /// (`!noexist && file->is_target && !deps_changed && file->cmds == 0`), so
+    /// a prerequisite that is merely NEWER decides nothing and only one that
+    /// was actually remade does.
+    pub has_recipe: bool,
+    /// Whether the entry declared no prerequisites of either kind.
+    ///
+    /// `update_file_1`'s `file->double_colon && file->deps == 0`, which is
+    /// ahead of the overruling clause and counts an order-only prerequisite as
+    /// a prerequisite. Such an entry is never current, so it never renames.
+    pub without_prerequisites: bool,
 }
 
 /// The cycle guard cannot catch `%.a: %.b.a` against `%.b.a: %.a`, where every
@@ -4461,18 +4478,23 @@ impl<'a> DepBuilder<'a> {
             // record takes the ordinary single-node path, where the target's
             // name is settled before the one recipe there is runs.
             node.settled_target = self.searched_at.get(&trigger).copied();
-            if has_recipe {
-                let members = if rule.is_grouped {
-                    rule.outputs.clone()
-                } else {
-                    vec![trigger]
-                };
-                node.grouped_double_action = Some(GroupedDoubleAction {
-                    has_phony_member: members.iter().any(|output| self.phony.contains(output)),
-                    members,
-                    phony_inputs: Vec::new(),
-                });
-            }
+            // Said for an entry with no recipe as much as for one with a
+            // recipe: having nothing to run is not the same as having nothing
+            // to say, and an entry found current renames the chain either way.
+            // What differs is the rule the entry is found current BY, which
+            // `has_recipe` carries to whoever decides it.
+            let members = if rule.is_grouped {
+                rule.outputs.clone()
+            } else {
+                vec![trigger]
+            };
+            node.grouped_double_action = Some(GroupedDoubleAction {
+                has_phony_member: members.iter().any(|output| self.phony.contains(output)),
+                members,
+                phony_inputs: Vec::new(),
+                has_recipe,
+                without_prerequisites: false,
+            });
             node.cmds = rule.cmds.clone();
             node.actual_inputs =
                 apply_output_pattern(&mut self.ev.session, &rule, declared, &rule.inputs);
@@ -4531,17 +4553,22 @@ impl<'a> DepBuilder<'a> {
                 .copied()
                 .filter(|input| self.phony.contains(input))
                 .collect::<Vec<_>>();
-            if let Some(metadata) = &mut node.grouped_double_action {
-                metadata.phony_inputs = phony_inputs;
-            }
             // `update_file_1`: a double-colon entry with no prerequisites at
             // all is always out of date. Read after second expansion, because
             // that is when GNU Make reaches the same test, and counting both
             // kinds because it asks whether the entry declared any dependency
             // rather than any it would compare timestamps against.
-            node.unconditional_double_colon = has_recipe
-                && node.actual_inputs.is_empty()
-                && node.actual_order_only_inputs.is_empty();
+            let without_prerequisites =
+                node.actual_inputs.is_empty() && node.actual_order_only_inputs.is_empty();
+            if let Some(metadata) = &mut node.grouped_double_action {
+                metadata.phony_inputs = phony_inputs;
+                metadata.without_prerequisites = without_prerequisites;
+            }
+            // Said of an entry with a recipe alone, because this is what
+            // `is_remakable` refuses a Makefile for — a rule that would be run
+            // on every pass and restart the read forever. An entry with
+            // nothing to run cannot do that however out of date it is.
+            node.unconditional_double_colon = has_recipe && without_prerequisites;
         }
         let vars = self.applicable_rule_vars(trigger);
         let mut bound = Vec::new();
