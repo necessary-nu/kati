@@ -429,8 +429,15 @@ impl StampChecker {
                 program: sr.shell.as_bytes(),
                 flag: sr.shellflag.as_bytes(),
                 stand_in: session.flags.default_shell_program.as_deref(),
-                // The recorded call is a `$(shell)`, and replaying it asks the
-                // same question the same way.
+                // The recorded call is a `$(shell)`, and replaying it asks
+                // the same question the same way — except for the one thing
+                // the stamp does not carry. A `$(shell)` expanded below a
+                // `.ONESHELL:` was read as a script, and this replay runs
+                // before any makefile has been read, so nothing here knows
+                // that. The cost is a replay that can answer differently and
+                // regenerate when it need not; the stamp's field order is
+                // ckati's, so recording the bit is a format change and a node
+                // of its own.
                 one_script: None,
             },
             &cmd,

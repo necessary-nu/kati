@@ -210,7 +210,14 @@ pub fn shell_flag_argv(shell_flags: &[u8], default_flags: &[u8]) -> Vec<Bytes> {
 /// a `SHELL` Make does not recognise may be reading those characters as its
 /// own script. A line ends at a newline the text did not escape, which is why
 /// this counts backslashes rather than splitting on `\n`.
-fn one_shell_prefixes_stripped(text: &[u8]) -> Bytes {
+///
+/// The caller answers the shell question. Two reach here: the refused-flags
+/// fallback above, where the shell of the recursion is the default `/bin/sh`
+/// and therefore always compatible, and [`crate::fileutil`]'s assembly of a
+/// one-script launch, which asks
+/// [`is_bourne_compatible_shell`](crate::command::is_bourne_compatible_shell)
+/// about the `SHELL` this launch actually names.
+pub(crate) fn one_shell_prefixes_stripped(text: &[u8]) -> Bytes {
     let mut stripped = BytesMut::with_capacity(text.len());
     let mut rest = text;
     while !rest.is_empty() {

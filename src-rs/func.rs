@@ -659,8 +659,7 @@ fn has_no_io_in_shell_script(cmd: &[u8]) -> bool {
 
 fn shell_func_impl(
     session: &Session,
-    shell: &[u8],
-    shellflag: &[u8],
+    shell: crate::fileutil::ShellToReadWith<'_>,
     cmd: &Bytes,
     environment: &[(Bytes, Option<Bytes>)],
     loc: &Loc,
@@ -685,17 +684,7 @@ fn shell_func_impl(
 
     collect_stats_with_slow_report!(session, "func shell time", OsStr::from_bytes(cmd));
     let (status, output) = run_command(
-        crate::fileutil::ShellToReadWith {
-            program: shell,
-            flag: shellflag,
-            stand_in: session.flags.default_shell_program.as_deref(),
-            // A `$(shell)` is one command line whatever `.ONESHELL` says about
-            // recipes. GNU Make reaches the same answer by passing no line
-            // flags at all: `construct_command_argv` is called from
-            // `func_shell_base` with none, and `one_shell` is only consulted
-            // for a recipe.
-            one_script: None,
-        },
+        shell,
         cmd,
         environment,
         RedirectStderr::None,
@@ -850,6 +839,19 @@ fn shell_func_with(
     // GNU Make passes no command flags here (`func_shell` hands
     // `construct_command_argv` a zero), so `.POSIX:` keeps its `-e`.
     let shellflag = ev.get_shell_flag(false)?;
+    // `one_shell` is a GLOBAL in GNU Make, not a parameter, and
+    // `func_shell_base` reaches `construct_command_argv` like every other
+    // launch — so under `.ONESHELL:` a `$(shell)` is read by the one-shell
+    // branch too, newline separator and all, and the question is only whether
+    // the line has been read YET. The bytes are what that branch's own
+    // recursion defaults its flags to while it re-reads `.SHELLFLAGS` for this
+    // launch; the zero line flags above are why `false` is the whole of what it
+    // asks.
+    let one_script = ev
+        .session
+        .flags
+        .one_shell
+        .then(|| ev.default_shell_flag(false));
     let current_scope = ev.current_scope.clone();
 
     // GNU Make's `func_shell` builds the child's environment with
@@ -863,8 +865,12 @@ fn shell_func_with(
     )?;
     let (exit_code, output, fc) = shell_func_impl(
         &ev.session,
-        &shell,
-        &shellflag,
+        crate::fileutil::ShellToReadWith {
+            program: &shell,
+            flag: &shellflag,
+            stand_in: ev.session.flags.default_shell_program.as_deref(),
+            one_script,
+        },
         &cmd,
         &environment,
         &loc,
@@ -926,6 +932,19 @@ fn shell_no_rerun_func(
     // GNU Make passes no command flags here (`func_shell` hands
     // `construct_command_argv` a zero), so `.POSIX:` keeps its `-e`.
     let shellflag = ev.get_shell_flag(false)?;
+    // `one_shell` is a GLOBAL in GNU Make, not a parameter, and
+    // `func_shell_base` reaches `construct_command_argv` like every other
+    // launch — so under `.ONESHELL:` a `$(shell)` is read by the one-shell
+    // branch too, newline separator and all, and the question is only whether
+    // the line has been read YET. The bytes are what that branch's own
+    // recursion defaults its flags to while it re-reads `.SHELLFLAGS` for this
+    // launch; the zero line flags above are why `false` is the whole of what it
+    // asks.
+    let one_script = ev
+        .session
+        .flags
+        .one_shell
+        .then(|| ev.default_shell_flag(false));
     let current_scope = ev.current_scope.clone();
 
     let environment = crate::export::exported_environment(
@@ -935,8 +954,12 @@ fn shell_no_rerun_func(
     )?;
     let (exit_code, output, _) = shell_func_impl(
         &ev.session,
-        &shell,
-        &shellflag,
+        crate::fileutil::ShellToReadWith {
+            program: &shell,
+            flag: &shellflag,
+            stand_in: ev.session.flags.default_shell_program.as_deref(),
+            one_script,
+        },
         &cmd,
         &environment,
         &loc,

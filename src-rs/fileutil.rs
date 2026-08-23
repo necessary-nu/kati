@@ -87,8 +87,11 @@ pub struct ShellToReadWith<'a> {
     /// Whether the text handed over is one SCRIPT, whose newlines separate the
     /// commands in it, rather than one command line.
     ///
-    /// A `.ONESHELL` recipe is the only thing that is, and it has to be said
-    /// here because the direct-exec fast path below reads the text as one
+    /// `.ONESHELL:` is the whole of what makes one, and it makes one of a
+    /// `$(shell)` expanded below it as readily as of a recipe: GNU Make's
+    /// `one_shell` is a GLOBAL rather than a parameter, and `func_shell_base`
+    /// reaches `construct_command_argv` like every other launch. It has to be
+    /// said here because the direct-exec fast path below reads the text as one
     /// command's words — to which a newline is a blank like any other, so a
     /// script would be exec'd as a single argument list holding every line's
     /// words. GNU Make asks at the same point and for the same reason:
@@ -114,11 +117,13 @@ pub struct ShellToReadWith<'a> {
 ///     all — so a program that is not there is reported against its own name
 ///     and by whoever went looking, rather than in the words of a shell that
 ///     was never needed;
-///   * a `.ONESHELL` recipe is the shell, its flags, and the whole script as
+///   * a one-script launch is the shell, its flags, and the whole script as
 ///     one argument. GNU Make's one-shell branch builds exactly that and never
 ///     falls back to a command line, so a `SHELL` of more than one word is a
 ///     program of more than one word that nothing can start — which is the
-///     answer 4.4.1 gives, `No such file or directory` against the whole of it;
+///     answer 4.4.1 gives, `No such file or directory` against the whole of it.
+///     The script also loses the blanks and `[@+-]` off the front of each of
+///     its lines, for a Bourne-compatible shell and no other;
 ///   * every other launch is the shell, its flags, and the line as one
 ///     argument, whenever the flags can be split here. GNU Make reaches that
 ///     by assembling `$(SHELL) $(.SHELLFLAGS) LINE` and re-tokenizing all of
@@ -139,20 +144,36 @@ fn argv_to_exec(
     {
         return Some(direct);
     }
-    let flags = if let Some(default_flags) = one_script {
-        crate::simple_command::shell_flag_argv(shellflag, default_flags)
+    let (flags, line) = if let Some(default_flags) = one_script {
+        (
+            crate::simple_command::shell_flag_argv(shellflag, default_flags),
+            // Only the shell's errand loses the prefixes. GNU Make's one-shell
+            // branch is on the far side of `goto slow`, so a script the
+            // tokenizer took apart itself is exec'd with its `[@+-]` intact —
+            // measured on 4.4.1, where `.ONESHELL:` and `V := $(shell @echo
+            // hi)` report `@echo: No such file or directory` and the same text
+            // with a `>` in it prints `hi`.
+            if crate::command::is_bourne_compatible_shell(shell) {
+                crate::simple_command::one_shell_prefixes_stripped(cmd)
+            } else {
+                cmd.clone()
+            },
+        )
     } else {
         // A shell that is a command line rather than a program cannot be
         // exec'd, and neither can flags with shell syntax in them.
         if !shell.starts_with(b"/") || memchr2(b' ', b'$', shell).is_some() {
             return None;
         }
-        crate::simple_command::command_line_flag_argv(shellflag)?
+        (
+            crate::simple_command::command_line_flag_argv(shellflag)?,
+            cmd.clone(),
+        )
     };
     let mut argv = Vec::with_capacity(flags.len() + 2);
     argv.push(Bytes::copy_from_slice(shell));
     argv.extend(flags);
-    argv.push(cmd.clone());
+    argv.push(line);
     Some(argv)
 }
 
@@ -560,5 +581,41 @@ mod tests {
 
         cache.clear();
         assert!(cache.is_empty());
+    }
+
+    /// A one-script launch loses the blanks and `[@+-]` off the front of each
+    /// of its lines, and only where GNU Make's own test says the shell would
+    /// not be reading them as script. `construct_command_argv_internal` does
+    /// this on the far side of `goto slow`, so a text the tokenizer took apart
+    /// itself keeps them — which is why the two `@echo` cases below differ only
+    /// in whether the line has a shell character in it.
+    #[test]
+    fn a_one_script_launch_keeps_the_prefixes_a_shell_may_be_reading() {
+        let script = Bytes::from_static(b"@echo hi > out\n  -echo bye\n");
+        let bourne = argv_to_exec(b"/bin/dash", b"-c", &script, Some(b"-c"))
+            .expect("a one-script launch always has an argv");
+        assert_eq!(
+            bourne,
+            vec![
+                Bytes::from_static(b"/bin/dash"),
+                Bytes::from_static(b"-c"),
+                Bytes::from_static(b"echo hi > out\necho bye\n"),
+            ]
+        );
+
+        let unknown = argv_to_exec(b"/opt/myshell", b"-c", &script, Some(b"-c"))
+            .expect("a one-script launch always has an argv");
+        assert_eq!(unknown[2], script, "the prefixes could be its own script");
+
+        // The fast path is not the one-shell branch, so nothing comes off a
+        // line it can take apart by itself.
+        let plain = Bytes::from_static(b"@echo hi");
+        assert_eq!(
+            argv_to_exec(b"/bin/sh", b"-c", &plain, Some(b"-c")),
+            Some(vec![
+                Bytes::from_static(b"@echo"),
+                Bytes::from_static(b"hi")
+            ])
+        );
     }
 }

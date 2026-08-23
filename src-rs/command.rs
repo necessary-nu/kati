@@ -1416,7 +1416,12 @@ const BOURNE_COMPATIBLE_SHELLS: [&[u8]; 7] =
 /// that is what GNU Make hands the test. `SHELL = ./bsh/sh -x` therefore has
 /// the basename `sh -x` and is not one of these — measured against 4.4.1,
 /// which leaves the prefixes in place for it and strips them for `./bsh/sh`.
-fn is_bourne_compatible_shell(shell: &[u8]) -> bool {
+///
+/// Asked twice, because GNU Make asks twice about the same script: here, where
+/// a recipe is being compiled and the answer decides whether the text keeps its
+/// interior prefixes, and again in [`crate::fileutil`], where a launch is being
+/// assembled and `construct_command_argv_internal` asks it for itself.
+pub(crate) fn is_bourne_compatible_shell(shell: &[u8]) -> bool {
     let basename = match shell.iter().rposition(|&byte| byte == b'/') {
         Some(separator) => &shell[separator + 1..],
         None => shell,

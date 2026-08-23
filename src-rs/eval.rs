@@ -2333,6 +2333,24 @@ impl Evaluator {
             self.second_expansion = true;
         }
 
+        // `.ONESHELL:` is latched WHERE IT STANDS, like `.POSIX:` below and
+        // `.SECONDEXPANSION` above it: `read.c:1925` sets the global the moment
+        // the target is recorded, and the global is what
+        // `construct_command_argv_internal` asks. So a `$(shell)` expanded
+        // above the line reads its command as one command line and one
+        // expanded below it reads it as a script. Recipes cannot tell the
+        // difference — they all run after the read — which is why the switch
+        // was collected with the other special targets until a `$(shell)`
+        // needed it. Measured on 4.4.1: `V := $(shell @echo hi > out ; cat
+        // out)` answers `hi` below the line and nothing above it.
+        if !is_pattern_rule
+            && targets
+                .iter()
+                .any(|t| t.as_bytes(&self.session).as_ref() == b".ONESHELL")
+        {
+            self.session.flags.one_shell = true;
+        }
+
         let mut rule = Rule::new(self.loc.clone().unwrap(), is_double_colon, is_grouped);
         rule.expand_again = self.second_expansion;
         if is_pattern_rule {
