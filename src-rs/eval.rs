@@ -3108,38 +3108,51 @@ impl Evaluator {
     }
 
     pub fn lookup_var_for_eval(&mut self, name: Symbol) -> Result<Option<Var>> {
-        if let Some(var) = self.lookup_var(name)? {
-            if self.expanding_vars.contains(&var_identity(&var)) {
-                // A variable waiting on itself is an error, except while a
-                // `$(shell)`'s environment is being built: there it is what an
-                // exported variable holding a `$(shell)` unavoidably does, and
-                // GNU Make answers it with the bytes the invocation carried
-                // rather than refusing the makefile.
-                if self.environment_recursion > 0 {
-                    // A binding of its own, so finishing it takes nothing out
-                    // that the expansion it is nested inside put in.
-                    return Ok(Some(self.inherited_binding(name)));
-                }
-                // GNU Make installs this variable as `expanding_var` and then
-                // finds the recursion, so the diagnostic already carries the
-                // variable's own location -- and the location standing before
-                // it where the variable has none of its own.
-                let loc = var
-                    .read()
-                    .expansion_loc()
-                    .cloned()
-                    .or_else(|| self.expanding_var_loc());
-                error_loc!(
-                    self,
-                    loc.as_ref(),
-                    "*** Recursive variable \"{}\" references itself (eventually).",
-                    name.display(self)
-                );
-            }
-            self.expanding_vars.insert(var_identity(&var));
-            return Ok(Some(var));
+        match self.lookup_var(name)? {
+            Some(var) => Ok(Some(self.begin_var_expansion(name, var)?)),
+            None => Ok(None),
         }
-        Ok(None)
+    }
+
+    /// Mark `var` as being expanded, refusing a variable that is already.
+    ///
+    /// The half of [`Self::lookup_var_for_eval`] that is not the lookup, so a
+    /// caller that had to look the binding up for itself -- to read its origin,
+    /// or because it asked for a name rather than followed a reference -- still
+    /// enters the expansion the same way a `$(NAME)` in the text does. GNU Make
+    /// has no second door either: everything that consults a variable goes
+    /// through `recursively_expand_for_file` (expand.c) and meets `v->expanding`
+    /// there, however far around the houses it came.
+    pub fn begin_var_expansion(&mut self, name: Symbol, var: Var) -> Result<Var> {
+        if self.expanding_vars.contains(&var_identity(&var)) {
+            // A variable waiting on itself is an error, except while a
+            // `$(shell)`'s environment is being built: there it is what an
+            // exported variable holding a `$(shell)` unavoidably does, and
+            // GNU Make answers it with the bytes the invocation carried
+            // rather than refusing the makefile.
+            if self.environment_recursion > 0 {
+                // A binding of its own, so finishing it takes nothing out
+                // that the expansion it is nested inside put in.
+                return Ok(self.inherited_binding(name));
+            }
+            // GNU Make installs this variable as `expanding_var` and then
+            // finds the recursion, so the diagnostic already carries the
+            // variable's own location -- and the location standing before
+            // it where the variable has none of its own.
+            let loc = var
+                .read()
+                .expansion_loc()
+                .cloned()
+                .or_else(|| self.expanding_var_loc());
+            error_loc!(
+                self,
+                loc.as_ref(),
+                "*** Recursive variable \"{}\" references itself (eventually).",
+                name.display(self)
+            );
+        }
+        self.expanding_vars.insert(var_identity(&var));
+        Ok(var)
     }
 
     /// Finish the expansion [`Self::lookup_var_for_eval`] began, which needs
@@ -3284,12 +3297,35 @@ impl Evaluator {
         }
     }
 
+    /// Expand the variable `name` is bound to, as a reference to it would.
+    ///
+    /// Make consults variables of its own outside any text it is expanding --
+    /// `SHELL` before it starts one, `.DEFAULT_GOAL` when nothing named a goal,
+    /// `GPATH` while it searches -- and GNU Make reaches every one of them the
+    /// way the makefile would, by expanding `$(NAME)`. So the recursion guard
+    /// is on this path too: a `SHELL` whose value has to start a shell to
+    /// expand asks for `SHELL` again through `$(shell)`, and without the mark
+    /// the second ask is a descent with no floor.
     pub fn eval_var(&mut self, name: Symbol) -> Result<Bytes> {
-        if let Some(var) = self.lookup_var(name)? {
-            var.read().eval_to_buf(self)
-        } else {
-            Ok(Bytes::new())
+        match self.lookup_var(name)? {
+            Some(var) => self.eval_bound_var(name, var),
+            None => Ok(Bytes::new()),
         }
+    }
+
+    /// [`Self::eval_var`] for a binding the caller already has in hand.
+    pub fn eval_bound_var(&mut self, name: Symbol, var: Var) -> Result<Bytes> {
+        let var = self.begin_var_expansion(name, var)?;
+        let v = var.read();
+        // Where a diagnostic raised inside the value points, which is the
+        // variable's own definition -- `recursively_expand_for_file` installs
+        // `expanding_var` before it expands, whoever asked.
+        self.enter_expanding_var(v.expansion_loc());
+        let value = v.eval_to_buf(self);
+        drop(v);
+        self.leave_expanding_var();
+        self.var_eval_complete(&var);
+        value
     }
 
     pub fn enter(&mut self, frame_type: FrameType, name: Bytes, loc: Loc) -> ScopedFrame {
@@ -3395,7 +3431,7 @@ impl Evaluator {
                 b"-ec"
             }));
         }
-        var.read().eval_to_buf(self)
+        self.eval_bound_var(Symbol::SHELLFLAGS, var)
     }
 
     fn get_allow_rules(&mut self) -> Result<RulesAllowed> {

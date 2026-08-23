@@ -62,13 +62,13 @@ impl PartialOrd for ExecStatus {
 struct Executor<'a> {
     ce: CommandEvaluator<'a>,
     done: HashMap<Symbol, ExecStatus>,
-    shell: Bytes,
+    /// See [`Executor::shell`]. `None` until a recipe needs one.
+    shell: Option<Bytes>,
     num_commands: u64,
 }
 
 impl<'a> Executor<'a> {
     fn new(ev: &'a mut Evaluator) -> Result<Self> {
-        let shell = ev.get_shell()?;
         Ok(Executor {
             ce: CommandEvaluator::new(
                 ev,
@@ -81,9 +81,25 @@ impl<'a> Executor<'a> {
                 OutputEvaluation::Expansion,
             )?,
             done: HashMap::new(),
-            shell,
+            shell: None,
             num_commands: 0,
         })
+    }
+
+    /// The shell a recipe is run with.
+    ///
+    /// Read when a recipe first needs one rather than before the walk starts.
+    /// GNU Make expands `$(SHELL)` in `construct_command_argv` (job.c), once
+    /// per recipe it is about to start, so a build with nothing to do never
+    /// asks — and a `SHELL` whose own value has to start a shell to expand is
+    /// a makefile GNU Make runs to completion when nothing needs one.
+    fn shell(&mut self) -> Result<Bytes> {
+        if let Some(shell) = &self.shell {
+            return Ok(shell.clone());
+        }
+        let shell = self.ce.ev.get_shell()?;
+        self.shell = Some(shell.clone());
+        Ok(shell)
     }
 
     fn exec_node(
@@ -176,9 +192,10 @@ impl<'a> Executor<'a> {
                 println!("{}", String::from_utf8_lossy(&command.cmd));
             }
             if !self.ce.ev.session.flags.is_dry_run {
+                let shell = self.shell()?;
                 let (status, output) = run_command(
                     crate::fileutil::ShellToReadWith {
-                        program: &self.shell,
+                        program: &shell,
                         flag: &command.shell_flag,
                         stand_in: self.ce.ev.session.flags.default_shell_program.as_deref(),
                     },

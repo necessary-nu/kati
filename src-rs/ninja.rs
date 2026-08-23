@@ -632,7 +632,8 @@ struct NinjaGenerator<'a> {
     ce: CommandEvaluator<'a>,
     done: HashSet<Symbol>,
     rule_id: RuleId,
-    shell: Bytes,
+    /// See [`NinjaGenerator::deferred_shell`]. `None` until something asks.
+    shell: Option<Bytes>,
     used_envs: HashMap<Symbol, OsString>,
     nodes: Vec<NinjaNode>,
     phony_aliases: PhonyAliases,
@@ -642,22 +643,47 @@ struct NinjaGenerator<'a> {
 
 impl<'a> NinjaGenerator<'a> {
     fn new(ce: CommandEvaluator<'a>, recipe_expansion: RecipeExpansion) -> Result<Self> {
-        // Unescaped: whether these need escaping is a question about the
-        // destination, so the answer belongs to whatever is on the far side of
-        // the sink.
-        let shell = ce.ev.get_shell()?;
         ce.ev.avoid_io = true;
         Ok(Self {
             ce,
             done: HashSet::new(),
             rule_id: 0,
-            shell,
+            shell: None,
             used_envs: HashMap::new(),
             nodes: Vec::new(),
             phony_aliases: PhonyAliases::default(),
             recipe_expansion,
             deferred_recipes: Vec::new(),
         })
+    }
+
+    /// The global `SHELL`, for a deferred recipe's provisional rule.
+    ///
+    /// Read when something asks rather than when the generator is built, and
+    /// the difference is a whole class of makefile. GNU Make expands
+    /// `$(SHELL)` in `construct_command_argv` (job.c), once per recipe it is
+    /// about to start — so a graph with no recipe in it never asks at all, and
+    /// a `SHELL` whose own value has to start a shell to expand is a makefile
+    /// GNU Make runs to completion when nothing needs a shell. Reading it up
+    /// front made that makefile a refusal here.
+    ///
+    /// Unescaped: whether the value needs escaping is a question about the
+    /// destination, so the answer belongs to whatever is on the far side of
+    /// the sink.
+    ///
+    /// The read is [`Evaluator::avoid_io`]'s side of the line, and only a
+    /// destination that defers a recipe reaches it — which is a destination
+    /// that runs the build, whose [`ShellEvaluation`] is `Expansion`. So the
+    /// `$(shell)` in a value read here is answered rather than written into
+    /// the recipe, exactly as it was when this was read before `avoid_io`
+    /// was set.
+    fn deferred_shell(&mut self) -> Result<Bytes> {
+        if let Some(shell) = &self.shell {
+            return Ok(shell.clone());
+        }
+        let shell = self.ce.ev.get_shell()?;
+        self.shell = Some(shell.clone());
+        Ok(shell)
     }
 
     /// Whether this node's recipe can be left for the destination to expand
@@ -788,7 +814,7 @@ impl<'a> NinjaGenerator<'a> {
         // provisional rule is declared with, and a deferred rule's bindings
         // never look at it.
         let shell = if deferred_recipe {
-            self.shell.clone()
+            self.deferred_shell()?
         } else {
             self.ce.recipe_shell.clone()
         };

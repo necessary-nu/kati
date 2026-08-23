@@ -1674,7 +1674,23 @@ impl<'a> CommandEvaluator<'a> {
         // to the prerequisites built for it exactly as every other
         // target-specific variable does. The scope was put in place above;
         // `.SHELLFLAGS` beside it has been read this way all along.
-        let shell = self.ev.get_shell()?;
+        //
+        // A target remade by doing nothing never reaches
+        // `construct_command_argv`, so it never asks what the shell is — and a
+        // `SHELL` that cannot be expanded without starting one is a makefile
+        // GNU Make runs to completion when nothing in it has a recipe to run.
+        // Nothing reads the answer in that case either: an empty recipe
+        // declares no rule.
+        //
+        // The boundary is the text as written rather than what it expands to,
+        // and GNU Make's is the same one: `chop_commands` (commands.c) drops a
+        // blank line before anything is expanded, while `all: ; $(EMPTY)` is a
+        // command line that survives to be expanded and therefore does ask.
+        let shell = if node_cmds.iter().all(|cmd| is_blank_recipe_line(cmd)) {
+            Bytes::new()
+        } else {
+            self.ev.get_shell()?
+        };
         // Whether a `[@+-]` below the recipe's first line is a prefix Make eats
         // or a character the script wrote. Only `.ONESHELL` can make it the
         // latter, so only `.ONESHELL` asks what the shell is called — and the
