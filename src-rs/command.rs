@@ -1512,6 +1512,30 @@ fn scan_written_prefixes(value: &Value, prefixes: &mut LinePrefixes) -> bool {
 /// lines written out make only the first.
 struct ExpandedRecipeLines {
     rest: Bytes,
+    /// Whether a line is still owed although the text has run out.
+    ///
+    /// Set where the text ended ON a newline, and set to begin with, so an
+    /// expansion that came out empty is still the one line it was written as.
+    /// Only [`Self::keeps_blank_lines`] ever sets it, so every other recipe
+    /// stops exactly where it always did — at the first empty remainder.
+    owed: bool,
+    /// Whether an expansion that left a line empty leaves a BLANK LINE rather
+    /// than nothing at all.
+    ///
+    /// `.ONESHELL` is the whole of the condition. GNU Make chops a recipe into
+    /// lines BEFORE expanding it and then walks past every expanded line that
+    /// came out empty — `construct_command_argv_internal` answers no argv for
+    /// one ("Make sure not to bother processing an empty line") and
+    /// `start_job_command` moves to the next. `chop_commands` (commands.c:335)
+    /// never chops a `.ONESHELL` recipe at all: it is one line, so the same
+    /// expansion leaves the newlines that were around it exactly where they
+    /// were and the script has a blank line in it.
+    ///
+    /// That is more than a blank line in an echo, because a script can be
+    /// reading its own text. Measured on 4.4.1: a here-document with a line
+    /// that expands to nothing inside it writes that blank line into the file,
+    /// and dropping the line writes a different file.
+    keeps_blank_lines: bool,
     /// What the written line already settled for every line of its expansion:
     /// `-s` and any prefix written before the expansion for the echo and the
     /// forgiveness, and those plus the unexpanded `$(MAKE)` scan for the
@@ -1539,9 +1563,16 @@ struct PrefixStripping {
 }
 
 impl ExpandedRecipeLines {
-    fn new(expansion: Bytes, written: LinePrefixes, stripping: PrefixStripping) -> Self {
+    fn new(
+        expansion: Bytes,
+        written: LinePrefixes,
+        stripping: PrefixStripping,
+        keeps_blank_lines: bool,
+    ) -> Self {
         Self {
             rest: expansion,
+            owed: keeps_blank_lines,
+            keeps_blank_lines,
             written,
             stripping,
         }
@@ -1552,10 +1583,14 @@ impl Iterator for ExpandedRecipeLines {
     type Item = (Bytes, LinePrefixes);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.rest.is_empty() {
+        if self.rest.is_empty() && !self.owed {
             return None;
         }
         let eol = find_end_of_line(&self.rest);
+        // A newline was consumed exactly where the two halves do not add back
+        // up to what was walked, and a text that ended on one still owes the
+        // line after it.
+        self.owed = self.keeps_blank_lines && eol.line.len() + eol.rest.len() != self.rest.len();
         self.rest = eol.rest;
         if self.stripping.past_first && !self.stripping.interior {
             // Script text, handed over as the expansion left it — indentation
@@ -1574,7 +1609,11 @@ impl Iterator for ExpandedRecipeLines {
         // A line that was nothing but a `+` still carries it, so the write-back
         // happens before the caller decides there is no command here.
         self.written.recursive_line = prefixes.recursive_line;
-        self.stripping.past_first |= !command.is_empty();
+        // Where a blank line is a line, reading one is being past the first:
+        // GNU Make's skip-over runs off the front of the whole expanded text
+        // and stops at the first newline, so an expansion that opened with one
+        // leaves the line above empty and everything below it interior.
+        self.stripping.past_first |= self.keeps_blank_lines || !command.is_empty();
         Some((command, prefixes))
     }
 }
@@ -1828,12 +1867,19 @@ impl<'a> CommandEvaluator<'a> {
                 PrefixStripping {
                     interior: strips_interior_prefixes,
                     // The recipe's first line is the first one that carried a
-                    // command, whichever written line it came from.
+                    // command, whichever written line it came from — and under
+                    // `.ONESHELL`, where a line that came out empty is still a
+                    // line, the first one the makefile wrote.
                     past_first: !result.is_empty(),
                 },
+                self.ev.session.flags.one_shell,
             );
             for (cmd, prefixes) in lines {
-                if !cmd.is_empty() {
+                // A line whose expansion came out empty is a line that
+                // vanished for every recipe GNU Make chopped, and a blank line
+                // of the one script for the recipe it did not — see
+                // [`ExpandedRecipeLines::keeps_blank_lines`].
+                if !cmd.is_empty() || self.ev.session.flags.one_shell {
                     let keeps_indent = !strips_interior_prefixes && !result.is_empty();
                     let recursive_make = lifted_invocations(&cmd, &make_values);
                     // Only a classified line is held to this. A `MAKE`-valued
@@ -1864,6 +1910,21 @@ impl<'a> CommandEvaluator<'a> {
         }
 
         if self.ev.session.flags.one_shell {
+            // A whole recipe that expanded to blanks starts no shell at all,
+            // and the target is remade by doing nothing. That is GNU Make's
+            // opening test in `construct_command_argv_internal` — skip the
+            // blanks, and answer no argv if the text ends there — asked of the
+            // one line a `.ONESHELL` recipe is. A NEWLINE IS NOT A BLANK, so
+            // two lines that both expanded to nothing are a script of one
+            // newline and 4.4.1 really does start a shell on it; only a single
+            // blank line is nothing to run.
+            if result.len() <= 1
+                && result
+                    .iter()
+                    .all(|c| c.cmd.iter().all(|b| matches!(b, b' ' | b'\t')))
+            {
+                result.clear();
+            }
             Self::read_one_shell_prefixes_off_the_first_line(&mut result, references_make_anywhere);
         }
 
@@ -2239,6 +2300,7 @@ mod tests {
                 recursive_line: false,
             },
             every_line(),
+            false,
         )
         .map(|(cmd, prefixes)| {
             (
@@ -2249,6 +2311,50 @@ mod tests {
             )
         })
         .collect()
+    }
+
+    /// The same reading for a `.ONESHELL` recipe, where the recipe was never
+    /// chopped and a line the expansion emptied is a blank line of the script.
+    fn expanded_for_one_shell(text: &'static [u8]) -> Vec<String> {
+        ExpandedRecipeLines::new(
+            Bytes::from_static(text),
+            LinePrefixes {
+                echo: true,
+                dash_prefixed: false,
+                recursive_line: false,
+            },
+            every_line(),
+            true,
+        )
+        .map(|(cmd, _)| String::from_utf8_lossy(&cmd).into_owned())
+        .collect()
+    }
+
+    /// A `.ONESHELL` recipe's lines are the text's, counted the way a shell
+    /// counts them: one more than the newlines in it, and never fewer than
+    /// one. GNU Make expands the whole recipe as a single line and hands the
+    /// result over whole, so the blanks between are still there.
+    #[test]
+    fn a_one_shell_expansion_keeps_the_lines_it_emptied() {
+        assert_eq!(expanded_for_one_shell(b""), vec![String::new()]);
+        assert_eq!(expanded_for_one_shell(b"one"), vec!["one".to_owned()]);
+        assert_eq!(
+            expanded_for_one_shell(b"\none"),
+            vec![String::new(), "one".to_owned()]
+        );
+        assert_eq!(
+            expanded_for_one_shell(b"one\n"),
+            vec!["one".to_owned(), String::new()]
+        );
+        assert_eq!(
+            expanded_for_one_shell(b"one\n\ntwo"),
+            vec!["one".to_owned(), String::new(), "two".to_owned()]
+        );
+        // The control, and the answer for every recipe GNU Make did chop: an
+        // expansion that came out empty is no line at all, because
+        // `start_job_command` gets no argv for it and walks on.
+        assert!(expanded(b"").is_empty());
+        assert_eq!(expanded(b"one\n").len(), 1);
     }
 
     /// Read one written line's expansion for a `.ONESHELL` recipe whose shell
@@ -2268,6 +2374,7 @@ mod tests {
                 interior: false,
                 past_first: false,
             },
+            false,
         )
         .filter(|(cmd, _)| !cmd.is_empty())
         .map(|(cmd, _)| String::from_utf8_lossy(&cmd).into_owned())
@@ -2502,6 +2609,7 @@ mod tests {
                 recursive_line: true,
             },
             every_line(),
+            false,
         )
         .map(|(_, prefixes)| prefixes)
         .collect::<Vec<_>>();

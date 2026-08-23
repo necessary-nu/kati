@@ -1475,19 +1475,28 @@ impl<'a> NinjaGenerator<'a> {
                 }
                 _ => None,
             };
+            // Whether the line is gone because this translation took it,
+            // rather than because there was nothing on it. Only an absorbed
+            // line leaves no trace: a line the expansion emptied is still a
+            // line of a `.ONESHELL` script, and the newline that ended it is
+            // still in the text a shell is handed.
+            let mut absorbed = false;
             if let Some((text, work)) = hoisted {
                 if let Some(slot) = description.as_deref_mut() {
                     *slot = Some(text);
                 }
                 translated = work;
+                absorbed = true;
             } else if Self::is_output_mkdir(name, &translated) && !c.echo && !kept_any {
                 translated.clear();
+                absorbed = true;
             }
-            if translated.is_empty() {
+            if translated.is_empty() && (absorbed || !flags.one_shell) {
                 lines.push(None);
                 continue;
             }
-            kept_any = true;
+            // A blank line is not the command an absorption waits behind.
+            kept_any |= !translated.is_empty();
             lines.push(Some(TranslatedLine {
                 text: translated,
                 ignore_error: c.ignore_error,
