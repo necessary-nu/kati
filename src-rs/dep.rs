@@ -2601,9 +2601,10 @@ impl<'a> DepBuilder<'a> {
             .assumed_new
             .iter()
             .copied()
-            .filter(|name| self.done.contains_key(name))
+            .map(|name| (name, self.found_as(name)))
+            .filter(|(_, found)| self.done.contains_key(found))
             .collect::<Vec<_>>();
-        for name in reached {
+        for (name, found) in reached {
             // The name as the command line wrote it, because that is the file
             // database `enter_file` reads: `main` stamps the switches after the
             // read and before the update, so nothing has been renamed yet and a
@@ -2619,10 +2620,14 @@ impl<'a> DepBuilder<'a> {
             // neither the complaint nor the `double_colon && deps == 0` clause
             // that would have forced it is reached. Measured: `out:: a` beside
             // an `out.c` is not refused, and the same tree under `-r` is.
-            if self.an_implicit_rule_could_make(name)? {
+            // Asked of the name the plan reached, which is where `GPATH` moved
+            // it: `rename_file` takes the whole chain, the appended entry with
+            // it, so the search GNU Make offers that entry runs over the path
+            // it has just been moved to.
+            if self.an_implicit_rule_could_make(found)? {
                 continue;
             }
-            let written = String::from_utf8_lossy(&name.as_bytes(&self.ev.session)).into_owned();
+            let written = String::from_utf8_lossy(&found.as_bytes(&self.ev.session)).into_owned();
             // `complain()` at remake.c:414, which is GNU Make's own wording for
             // a name nothing knows how to make.
             error_loc!(self.ev, None, "*** No rule to make target '{written}'.");
@@ -4215,6 +4220,21 @@ impl<'a> DepBuilder<'a> {
         }
         scopes.extend(own);
         scopes
+    }
+
+    /// Where `GPATH` moved the target the Makefile wrote as `name`, or the
+    /// name itself.
+    ///
+    /// [`Self::written_as`] read backwards, for the one caller that starts
+    /// from the name rather than from the node: a switch names a target as the
+    /// Makefile wrote it, and the plan holds it under the path the search
+    /// found. Walked rather than indexed because the map holds one entry per
+    /// renamed target and almost every build has none.
+    fn found_as(&self, name: Symbol) -> Symbol {
+        self.gpath_origin
+            .iter()
+            .find_map(|(found, written)| (*written == name).then_some(*found))
+            .unwrap_or(name)
     }
 
     /// The name a target's rule and its own variables were declared under.

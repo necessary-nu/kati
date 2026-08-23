@@ -2094,6 +2094,13 @@ impl<'a> NinjaGenerator<'a> {
                 delete_on_error: node.delete_on_error,
                 peer_outputs: &peer_outputs,
                 searched_at: node.searched_at,
+                // Only where this edge's own output is the target the rule was
+                // written for. A double-colon action's output is a private
+                // name the compiler invented and the rename is the target's,
+                // not the action's.
+                written_as: (node.declared_output != node.recipe_output
+                    && output == node.recipe_output)
+                    .then_some(node.declared_output),
                 pool: pool.as_deref(),
                 tags: tags.as_deref(),
                 loc: node.loc.as_ref(),
@@ -2974,6 +2981,7 @@ mod tests {
                     delete_on_error: false,
                     peer_outputs: &[],
                     searched_at: None,
+                    written_as: None,
                     pool: None,
                     tags: None,
                     loc: None,

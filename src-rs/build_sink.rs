@@ -531,6 +531,23 @@ pub struct SinkEdge<'a> {
     /// edge whose output is where it was written, which is nearly all of them,
     /// and for one `GPATH` settled — there the name was already replaced.
     pub searched_at: Option<Symbol>,
+    /// The name the Makefile wrote for an output `GPATH` moved, and `None` for
+    /// every output that is where it was written — which is nearly all of them.
+    ///
+    /// The other half of [`Self::searched_at`], with the survivors swapped.
+    /// `GPATH` says a directory the search looks in is also the directory a
+    /// target found there is remade in, so GNU Make's `f_mtime` calls
+    /// `rename_file` and the one file object moves to the found path while the
+    /// rule the Makefile wrote goes on making it. Here the node IS the found
+    /// path, and the name that carries its rule is otherwise nowhere: nothing
+    /// downstream could tell that `src/out.o` was ever called `out.o`.
+    ///
+    /// What that asks of a destination is one thing, and it is the invocation's
+    /// business rather than the build's: a name the command line gives —
+    /// `-o out.o`, `-W out.o` — is matched against the file database as the
+    /// makefiles left it, before any rename, so it has to reach this node.
+    /// Nothing in a manifest says it, so the writer ignores it.
+    pub written_as: Option<Symbol>,
     /// The pool that limits how many edges like this run at once, unescaped.
     pub pool: Option<&'a [u8]>,
     /// Opaque per-edge metadata from `.KATI_TAGS`, for consumers of the graph
