@@ -3445,7 +3445,42 @@ impl Evaluator {
         if self.is_posix && is_default {
             return Ok(Bytes::from_static(self.default_shell_flag(dash_prefixed)));
         }
-        self.eval_bound_var(Symbol::SHELLFLAGS, var)
+        let text = Bytes::copy_from_slice(&var.read().string(&self.session)?);
+        // Nothing to expand and nothing to parse. GNU Make's
+        // `variable_expand_string` walks for a `$` and hands the text back
+        // where it finds none, so this is the same answer without the parse --
+        // and this runs once per recipe line of every build.
+        if !text.contains(&b'$') {
+            return Ok(text);
+        }
+        // GNU Make expands the VALUE and not the reference:
+        // `construct_command_argv` (job.c) ends the `.SHELLFLAGS` lookup with
+        // `allocated_variable_expand_for_file (var->value, file)`. For a
+        // recursive value that is the one expansion a reference would have
+        // done; for a SIMPLE one it is a SECOND expansion, over text the
+        // assignment already expanded once, against the target's own scope at
+        // the moment of the launch. So `.SHELLFLAGS := -e $$X -c` resolves `X`
+        // where the launch happens -- a later global assignment, a
+        // target-specific binding, a function call -- and not where the
+        // variable was written.
+        //
+        // `SHELL` is NOT read this way and must not be given the same
+        // treatment: `allocated_variable_expand_for_file ("$(SHELL)", file)`
+        // expands the REFERENCE, so a simply-expanded `SHELL := ./sh$$X`
+        // reaches the exec as the literal path `./sh$X`. See
+        // [`Self::get_shell`], which stays a plain reference expansion.
+        //
+        // The recursion mark is this side's own. GNU Make sets none here and
+        // dies of it -- 4.4.1 segfaults on a `.SHELLFLAGS` whose value calls
+        // `$(shell)`, because answering the call needs the flags it is in the
+        // middle of expanding -- and a compiler that recurses without a floor
+        // is worse than one that says which variable did it.
+        let var = self.begin_var_expansion(Symbol::SHELLFLAGS, var)?;
+        let mut loc = self.loc.clone().unwrap_or_default();
+        let parsed = parse_expr(&mut self.session, &mut loc, text, ParseExprOpt::Normal)?;
+        let expanded = parsed.eval_to_buf(self);
+        self.var_eval_complete(&var);
+        expanded
     }
 
     /// The flags GNU Make gives a launch it was handed none for.
