@@ -1507,6 +1507,14 @@ pub struct CommandEvaluator<'a> {
     pub ev: &'a mut Evaluator,
     pub current_dep_node: Arc<Mutex<Option<Arc<Mutex<DepNode>>>>>,
     pub found_new_inputs: Arc<Mutex<bool>>,
+    /// The shell the last node read through [`Self::eval`] runs its recipe
+    /// under, read with that node's own scope in hand.
+    ///
+    /// Said here rather than returned because it is the answer to a question
+    /// about the node rather than about the lines: a recipe that expanded to
+    /// nothing still has a shell, and the caller needs the same one either
+    /// way. Empty before the first node is read.
+    pub recipe_shell: Bytes,
 }
 
 impl<'a> CommandEvaluator<'a> {
@@ -1526,6 +1534,7 @@ impl<'a> CommandEvaluator<'a> {
             ev,
             current_dep_node: Arc::new(Mutex::new(None)),
             found_new_inputs: found_new_inputs.clone(),
+            recipe_shell: Bytes::new(),
         };
         ret.register_autocommand('@', AutoCommand::At)?;
         ret.register_autocommand('<', AutoCommand::Less)?;
@@ -1658,13 +1667,21 @@ impl<'a> CommandEvaluator<'a> {
             node_cmds = node.cmds.clone();
         }
         let node_ignores_errors = n.lock().is_ignore_error;
+        // GNU Make expands `$(SHELL)` once per recipe with the target's own
+        // scope — `construct_command_argv` (job.c) calls
+        // `allocated_variable_expand_for_file ("$(SHELL)", file)` — so a
+        // `SHELL` one target set governs that target's launches, and descends
+        // to the prerequisites built for it exactly as every other
+        // target-specific variable does. The scope was put in place above;
+        // `.SHELLFLAGS` beside it has been read this way all along.
+        let shell = self.ev.get_shell()?;
         // Whether a `[@+-]` below the recipe's first line is a prefix Make eats
         // or a character the script wrote. Only `.ONESHELL` can make it the
-        // latter, so only `.ONESHELL` asks what the shell is called — and it
-        // asks with the rule's own scope in hand, which is where GNU Make's
-        // `lookup_variable_for_file` reads `SHELL` from too.
+        // latter, so only `.ONESHELL` asks what the shell is called — and the
+        // name it asks about is this node's own.
         let strips_interior_prefixes =
-            !self.ev.session.flags.one_shell || is_bourne_compatible_shell(&self.ev.get_shell()?);
+            !self.ev.session.flags.one_shell || is_bourne_compatible_shell(&shell);
+        self.recipe_shell = shell;
         // GNU Make's `$(MAKE)` search runs over the whole line it chopped, and
         // under `.ONESHELL` that line is the whole recipe.
         let mut references_make_anywhere = false;

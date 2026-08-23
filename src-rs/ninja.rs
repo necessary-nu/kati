@@ -202,6 +202,10 @@ struct NinjaNode {
     /// `commands` is empty because nothing has read it yet rather than because
     /// the node has none.
     deferred_recipe: bool,
+    /// The shell this node's recipe runs under, read with the node's own scope
+    /// in hand. A target that set no `SHELL` of its own reads the global one
+    /// here, so this is the whole of the answer rather than an override.
+    shell: Bytes,
 }
 
 /// One recipe left unexpanded, and everything the expansion will need that is
@@ -213,7 +217,6 @@ struct DeferredRecipe {
     /// Decided while the graph is constructed, because it is a fact about the
     /// graph rather than about the recipe.
     description_fallback: Option<Bytes>,
-    shell: Bytes,
 }
 
 /// The recipes a [`RecipeExpansion::Launch`] sink asked to expand for itself.
@@ -495,15 +498,19 @@ impl DeferredRecipes {
         }
         let script = script.freeze();
         let recipe_environment = node_environment(ce.ev, &recipe.node)?;
+        // Read by `eval` above, with this node's own scope in front of it, and
+        // read HERE rather than when the rule was declared because a deferred
+        // recipe is one nothing may read early — `SHELL`'s own value included.
+        let shell = ce.recipe_shell.clone();
         let steps = recipe_steps(
             &ce.ev.session.flags,
             &translated,
-            &recipe.shell,
+            &shell,
             &shell_flags,
             &script,
         );
         Ok(ExpandedRecipe {
-            shell: recipe.shell.clone(),
+            shell,
             shell_flags,
             script,
             steps,
@@ -757,6 +764,17 @@ impl<'a> NinjaGenerator<'a> {
         } else {
             self.ce.eval(node)?
         };
+        // A deferred recipe is not read here, so nothing has put this node's
+        // scope in front of `SHELL` — and reading it now would be the one
+        // thing deferral exists to avoid. Its shell is read when the recipe
+        // is, in `expand_with`; the value carried here is only what the
+        // provisional rule is declared with, and a deferred rule's bindings
+        // never look at it.
+        let shell = if deferred_recipe {
+            self.shell.clone()
+        } else {
+            self.ce.recipe_shell.clone()
+        };
         let deferred_new_inputs = self.ce.ev.new_inputs_timing
             == NewInputsTiming::SchedulerBoundary
             && *self.ce.found_new_inputs.lock();
@@ -777,6 +795,7 @@ impl<'a> NinjaGenerator<'a> {
             deferred_new_inputs,
             deferred_new_inputs_filter_out,
             deferred_recipe,
+            shell,
         });
 
         let deps = node.lock().deps.clone();
@@ -1686,13 +1705,12 @@ impl<'a> NinjaGenerator<'a> {
             self.deferred_recipes.push(DeferredRecipe {
                 node: nn.node.clone(),
                 description_fallback,
-                shell: self.shell.clone(),
             });
             sink.declare_rule(
                 &self.ce.ev.session,
                 &SinkRule {
                     id,
-                    shell: &self.shell,
+                    shell: &nn.shell,
                     // Absent rather than empty: the recipe these come from has
                     // not been read yet.
                     shell_flags: b"",
@@ -1895,7 +1913,7 @@ impl<'a> NinjaGenerator<'a> {
                 recipe_steps(
                     &self.ce.ev.session.flags,
                     &translated,
-                    &self.shell,
+                    &nn.shell,
                     &script_flags,
                     &script,
                 )
@@ -1904,7 +1922,7 @@ impl<'a> NinjaGenerator<'a> {
                 &self.ce.ev.session,
                 &SinkRule {
                     id,
-                    shell: &self.shell,
+                    shell: &nn.shell,
                     recipe_environment: &recipe_environment,
                     steps: &steps,
                     shell_flags: &script_flags,
