@@ -152,15 +152,50 @@ pub fn direct_argv(
 /// itself — "Parse shellflags using construct_command_argv_internal to handle
 /// quotes" (job.c) — so `-E 'use warnings FATAL => "all";'` is two words and
 /// not five, and the quotes come off. It passes no shell and no flags of its
-/// own, so none of the fast path's gates apply; and it guards the result with
-/// `if (argv)`, so flags the tokenizer hands back to a shell contribute
-/// nothing at all rather than being split some other way.
+/// own, so none of the fast path's gates apply, and it guards the result with
+/// `if (argv)`, which is only ever false for flags that are blank.
 ///
 /// Only the one-shell branch does this. Every other recipe builds `$(SHELL)
-/// $(.SHELLFLAGS) LINE` as text and re-tokenizes the whole of it, where the
-/// flags are quoted like anything else on a command line.
+/// $(.SHELLFLAGS) LINE` as text and re-tokenizes the whole of it — see
+/// [`command_line_flag_argv`].
+///
+/// ONE MEASURED DIVERGENCE, left here rather than fixed: flags the tokenizer
+/// hands back to a shell. GNU Make's guard is not reached for those, because
+/// the inner call has already gone slow and answered with the argument list
+/// that starts a shell, so `.SHELLFLAGS := "-e" -c` under `.ONESHELL` reaches
+/// the launch as the three words `/bin/sh`, `-c` and `"-e" -c` ahead of the
+/// script — measured on 4.4.1. This hands over no words at all for them.
 pub fn shell_flag_argv(shell_flags: &[u8]) -> Vec<Bytes> {
     tokenize(shell_flags, false).unwrap_or_default()
+}
+
+/// `.SHELLFLAGS` as the words every other launch passes ahead of the command.
+///
+/// GNU Make builds the text `$(SHELL) $(.SHELLFLAGS) LINE` — the shell and the
+/// line escaped, the flags copied in as they stand — and re-tokenizes all of
+/// it (job.c), so the flags are split and quoted exactly like words on a
+/// command line while the line comes back as the single argument it was
+/// escaped into. Tokenizing the flags alone reaches the same words: the
+/// tokenizer's leading-word rules are about the first word of a command line,
+/// and there the shell is already ahead of them.
+///
+/// `None` is that tokenizer's `goto slow`: the flags have shell syntax in them
+/// — or trip a leading-word rule that the shell ahead of them would have
+/// answered — so the caller hands the whole command line to a shell and lets
+/// that shell split them, which is what GNU Make's own slow path does with it.
+///
+/// Blank flags are `Some` of no words at all rather than one empty word: the
+/// text has a run of blanks where they were, and the tokenizer skips a run of
+/// blanks. `.SHELLFLAGS :=` therefore starts the shell with the script as its
+/// first argument — a file to read, which is what GNU Make 4.4.1 does with it.
+pub fn command_line_flag_argv(shell_flags: &[u8]) -> Option<Vec<Bytes>> {
+    if shell_flags
+        .iter()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'\n'))
+    {
+        return Some(Vec::new());
+    }
+    tokenize(shell_flags, false)
 }
 
 /// The shell's own word splitting, with no question asked about what the words
@@ -315,9 +350,12 @@ mod tests {
                 "-E".to_owned(),
             ]
         );
-        // No flags at all, and flags the tokenizer hands back to a shell,
-        // contribute nothing: GNU Make's `if (argv)` guard.
+        // No flags at all contribute nothing: GNU Make's `if (argv)` guard.
         assert!(flag_words("").is_empty());
+        // Flags the tokenizer hands back to a shell contribute nothing HERE
+        // and three words in 4.4.1, which is the divergence the doc comment
+        // records — the inner call has already gone slow and answered with the
+        // argument list that starts a shell, so the guard is never reached.
         assert!(flag_words("-c $(unterminated").is_empty());
         // The gates that are part of the tokenizer itself still apply,
         // because GNU Make calls the whole of the function: a lone word that
@@ -327,6 +365,44 @@ mod tests {
         // dies of heap corruption on this shape, so there is nothing there to
         // agree with.
         assert!(flag_words("set").is_empty());
+    }
+
+    fn command_line_flags(flags: &str) -> Option<Vec<String>> {
+        command_line_flag_argv(flags.as_bytes()).map(|words| {
+            words
+                .into_iter()
+                .map(|word| String::from_utf8(word.to_vec()).unwrap())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn every_other_launchs_flags_are_the_words_of_a_command_line() {
+        assert_eq!(command_line_flags("-c"), Some(vec!["-c".to_owned()]));
+        assert_eq!(
+            command_line_flags("-e -c"),
+            Some(vec!["-e".to_owned(), "-c".to_owned()])
+        );
+        // The quoting is a command line's, so a quoted flag with a blank in it
+        // is still one word: GNU Make copies the flags into the assembled line
+        // as they stand and lets the tokenizer read them there.
+        assert_eq!(
+            command_line_flags("-E 'a b' -c"),
+            Some(vec!["-E".to_owned(), "a b".to_owned(), "-c".to_owned()])
+        );
+        // Blank flags are no word rather than an empty one — the assembled
+        // line has a run of blanks where they were, and a run of blanks is not
+        // a word. This is what makes `.SHELLFLAGS :=` hand the script to the
+        // shell as a file operand, which is 4.4.1's answer for it.
+        assert_eq!(command_line_flags(""), Some(Vec::new()));
+        assert_eq!(command_line_flags("  \t "), Some(Vec::new()));
+        // `None` is the whole command line going to a shell, which is where
+        // the flags get split instead. Shell syntax in the flags is one way in
+        // and a leading-word rule is the other — the shell would have been
+        // ahead of them on the real line, so answering `None` and letting a
+        // shell split them reaches the words GNU Make reaches.
+        assert_eq!(command_line_flags("-c $(unterminated"), None);
+        assert_eq!(command_line_flags("set -c"), None);
     }
 
     #[test]

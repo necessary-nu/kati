@@ -37,6 +37,17 @@ use std::process::Command;
 const ANNOUNCING_SHELL: &str =
     "#!/bin/sh\necho \"OWN[$(basename \"$0\")] $*\" >&2\nexec /bin/sh \"$@\"\n";
 
+/// A shell that says every argument it was handed, one to a line, and runs
+/// nothing at all.
+///
+/// Which words a launch was split into cannot be read off [`ANNOUNCING_SHELL`]:
+/// it prints `$*`, and one argument holding a blank and two arguments come out
+/// as the same line. This one brackets each argument on its own line, so
+/// `.SHELLFLAGS := -e -c` arriving as one word and as two are different
+/// outputs.
+const COUNTING_SHELL: &str =
+    "#!/bin/sh\nfor word in \"$@\"; do\n  echo \"WORD[$word]\" >&2\ndone\n";
+
 /// A directory of this test's own, emptied first so a rerun starts where the
 /// first run did.
 fn scratch(name: &str) -> PathBuf {
@@ -48,9 +59,9 @@ fn scratch(name: &str) -> PathBuf {
     directory
 }
 
-fn announcing_shell_at(directory: &Path, name: &str) {
+fn shell_at(directory: &Path, name: &str, text: &str) {
     let path = directory.join(name);
-    fs::write(&path, ANNOUNCING_SHELL).unwrap();
+    fs::write(&path, text).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
     fs::set_permissions(&path, permissions).unwrap();
@@ -62,13 +73,20 @@ fn ran(name: &str, makefile: &str) -> String {
 }
 
 /// The same, with the files a rule needs to find already there.
+///
+/// `{here}` in the makefile is the run's own directory, spelled absolutely.
+/// Which branch a launch takes turns on whether the shell is a plain path, so
+/// a shell named `./own` and the same shell named `/tmp/.../own` are two
+/// different measurements and the tests need both spellings.
 fn ran_beside(name: &str, makefile: &str, present: &[&str]) -> String {
     let directory = scratch(name);
-    announcing_shell_at(&directory, "own");
-    announcing_shell_at(&directory, "own2");
+    shell_at(&directory, "own", ANNOUNCING_SHELL);
+    shell_at(&directory, "own2", ANNOUNCING_SHELL);
+    shell_at(&directory, "count", COUNTING_SHELL);
     for file in present {
         fs::write(directory.join(file), "").unwrap();
     }
+    let makefile = makefile.replace("{here}", &directory.display().to_string());
     fs::write(directory.join("Makefile"), makefile).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_rkati"))
         .current_dir(&directory)
@@ -85,6 +103,13 @@ fn ran_beside(name: &str, makefile: &str, present: &[&str]) -> String {
 fn launches(said: &str) -> Vec<&str> {
     said.lines()
         .filter_map(|line| line.strip_prefix("OWN["))
+        .collect()
+}
+
+/// Every argument [`COUNTING_SHELL`] was handed, in order and one to an entry.
+fn words(said: &str) -> Vec<&str> {
+    said.lines()
+        .filter_map(|line| line.strip_prefix("WORD[")?.strip_suffix(']'))
         .collect()
 }
 
@@ -321,5 +346,103 @@ fn a_posix_one_shell_recipe_stops() {
     assert!(
         said.contains("Error 1"),
         "the strict script's failure was not the recipe's: {said}"
+    );
+}
+
+/// `.SHELLFLAGS` holding more than one word is more than one argument.
+///
+/// GNU Make 4.4.1 hands `/bin/sh` the flags `-e` and `-c` for this makefile and
+/// the recipe runs; the executor handed over the single word `-e -c`, which
+/// `dash` answers with `Illegal option -` before running anything at all. It is
+/// not `.ONESHELL`'s — measured the same with and without one.
+#[test]
+fn multi_word_shell_flags_are_words() {
+    let said = ran(
+        "flag-words",
+        "SHELL := {here}/count\n.SHELLFLAGS := -e -c\nall:\n\t@echo one\n",
+    );
+    assert_eq!(
+        words(&said),
+        vec!["-e", "-c", "echo one"],
+        "the flags did not reach the launch as words: {said}"
+    );
+}
+
+/// The same for the launch a `.ONESHELL` recipe makes, which GNU Make splits
+/// with the shell's own tokenizer rather than on blanks: a quoted flag with a
+/// space in it is one word and the quotes come off.
+#[test]
+fn a_one_shell_launchs_flags_are_read_with_the_shells_own_quoting() {
+    let said = ran(
+        "flag-words-one-shell",
+        ".ONESHELL:\nSHELL := {here}/count\n.SHELLFLAGS := -e 'a b' -c\nall:\n\t@echo one\n",
+    );
+    assert_eq!(
+        words(&said),
+        vec!["-e", "a b", "-c", "echo one"],
+        "the one-shell launch's flags were not read with the shell's quoting: {said}"
+    );
+}
+
+/// An empty `.SHELLFLAGS` is no argument rather than an empty one.
+///
+/// GNU Make assembles the command line with a run of blanks where the flags
+/// would have been and then splits it, and a run of blanks is not a word — so
+/// the script arrives as the shell's first argument, which a Bourne shell reads
+/// as a FILE to run. The executor passed an empty word ahead of it, so the
+/// shell was asked to open `` rather than the script.
+#[test]
+fn blank_shell_flags_are_no_word_at_all() {
+    let said = ran(
+        "flag-words-blank",
+        "SHELL := {here}/count\n.SHELLFLAGS :=\nall:\n\t@echo one\n",
+    );
+    assert_eq!(
+        words(&said),
+        vec!["echo one"],
+        "an empty flags value became an argument: {said}"
+    );
+}
+
+/// `$(shell)` asks the same question, and it is the reason this reaches Ronin
+/// too: the compiled path splits a recipe's flags itself, but a `$(shell)` is
+/// run by this executor whoever the front end is.
+#[test]
+fn multi_word_shell_flags_reach_a_shell_function() {
+    let said = ran(
+        "flag-words-shell-function",
+        ".SHELLFLAGS := -e -c\nX := $(shell echo hi)\nall:\n\t@echo [$(X)]\n",
+    );
+    assert!(
+        said.lines().any(|line| line == "[hi]"),
+        "the flags did not reach the shell function's launch as words: {said}"
+    );
+}
+
+/// A `.ONESHELL` recipe's `SHELL` is a program and not a command line.
+///
+/// GNU Make's one-shell branch execs the shell exactly as spelled, with the
+/// flags and the script after it, and never assembles a command line for
+/// another shell to read — so a `SHELL` of more than one word names a program
+/// that is not there, and 4.4.1 says so against the whole of it and stops with
+/// `Error 127`. The executor handed the spelling to `/bin/sh`, which split it
+/// and ran it.
+#[test]
+fn a_one_shell_recipes_shell_is_a_program() {
+    let said = ran(
+        "one-shell-shell-is-a-program",
+        ".ONESHELL:\nSHELL := {here}/count -q\nall:\n\t@echo one\n\t@echo two\n",
+    );
+    assert!(
+        words(&said).is_empty(),
+        "the multi-word shell was started anyway: {said}"
+    );
+    assert!(
+        said.contains("count -q: No such file or directory"),
+        "the failure was not reported against the whole spelling: {said}"
+    );
+    assert!(
+        said.contains("Error 127"),
+        "the recipe did not stop with the status of a command that could not run: {said}"
     );
 }

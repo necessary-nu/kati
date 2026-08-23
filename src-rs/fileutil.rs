@@ -98,6 +98,56 @@ pub struct ShellToReadWith<'a> {
     pub one_script: bool,
 }
 
+/// The argument list a launch execs, or `None` where a shell has to read the
+/// whole thing as a command line.
+///
+/// GNU Make asks this in `construct_command_argv_internal` (job.c) and gets
+/// three different answers, and so does this:
+///
+///   * a line with no shell syntax in it is exec'd with no shell in between at
+///     all — so a program that is not there is reported against its own name
+///     and by whoever went looking, rather than in the words of a shell that
+///     was never needed;
+///   * a `.ONESHELL` recipe is the shell, its flags, and the whole script as
+///     one argument. GNU Make's one-shell branch builds exactly that and never
+///     falls back to a command line, so a `SHELL` of more than one word is a
+///     program of more than one word that nothing can start — which is the
+///     answer 4.4.1 gives, `No such file or directory` against the whole of it;
+///   * every other launch is the shell, its flags, and the line as one
+///     argument, whenever the flags can be split here. GNU Make reaches that
+///     by assembling `$(SHELL) $(.SHELLFLAGS) LINE` and re-tokenizing all of
+///     it; where the tokenizer refuses, the text really does go to a shell and
+///     `None` says so.
+///
+/// The two flag splittings are different functions because GNU Make has two:
+/// see [`crate::simple_command::shell_flag_argv`] and
+/// [`crate::simple_command::command_line_flag_argv`].
+fn argv_to_exec(
+    shell: &[u8],
+    shellflag: &[u8],
+    cmd: &Bytes,
+    one_script: bool,
+) -> Option<Vec<Bytes>> {
+    if let Some(direct) = crate::simple_command::direct_argv(cmd, shell, shellflag, one_script) {
+        return Some(direct);
+    }
+    let flags = if one_script {
+        crate::simple_command::shell_flag_argv(shellflag)
+    } else {
+        // A shell that is a command line rather than a program cannot be
+        // exec'd, and neither can flags with shell syntax in them.
+        if !shell.starts_with(b"/") || memchr2(b' ', b'$', shell).is_some() {
+            return None;
+        }
+        crate::simple_command::command_line_flag_argv(shellflag)?
+    };
+    let mut argv = Vec::with_capacity(flags.len() + 2);
+    argv.push(Bytes::copy_from_slice(shell));
+    argv.extend(flags);
+    argv.push(cmd.clone());
+    Some(argv)
+}
+
 /// Run one command and read back what it wrote.
 ///
 /// `environment` is what Make's export set says about the child: a name bound
@@ -128,20 +178,19 @@ pub fn run_command(
         stand_in: default_shell_program,
         one_script,
     } = shell;
-    // A line with no shell syntax in it is exec'd directly, exactly as GNU
-    // Make's `construct_command_argv_internal` does — so a program that is not
-    // there is reported against its own name and by whoever went looking,
-    // rather than in the words of a shell that was never needed.
-    let direct = crate::simple_command::direct_argv(cmd, shell, shellflag, one_script);
+    let words = argv_to_exec(shell, shellflag, cmd, one_script);
     let mut cmd_with_shell;
     let owned;
-    let args: &[&OsStr] = if let Some(words) = &direct {
+    let args: &[&OsStr] = if let Some(words) = &words {
         owned = words
             .iter()
             .map(|word| <OsStr as OsStrExt>::from_bytes(word))
             .collect::<Vec<_>>();
         &owned
-    } else if !shell.starts_with(b"/") || memchr2(b' ', b'$', shell).is_some() {
+    } else {
+        // GNU Make's `goto slow` for a command line nothing here can take
+        // apart: the text is assembled and one shell reads all of it, which is
+        // also what splits `$(.SHELLFLAGS)` into words for this launch.
         let cmd_escaped = crate::strutil::escape_shell(cmd);
         cmd_with_shell = BytesMut::new();
         cmd_with_shell.put_slice(shell);
@@ -154,13 +203,6 @@ pub fn run_command(
             <OsStr as OsStrExt>::from_bytes(b"/bin/sh"),
             <OsStr as OsStrExt>::from_bytes(b"-c"),
             <OsStr as OsStrExt>::from_bytes(&cmd_with_shell),
-        ]
-    } else {
-        // If the shell isn't complicated, we don't need to wrap in /bin/sh
-        &[
-            <OsStr as OsStrExt>::from_bytes(shell),
-            <OsStr as OsStrExt>::from_bytes(shellflag),
-            <OsStr as OsStrExt>::from_bytes(cmd),
         ]
     };
 
@@ -203,9 +245,9 @@ pub fn run_command(
 
     let mut handle = match cmd.spawn() {
         Ok(handle) => handle,
-        // Only the direct launch answers for this: with a shell in the way the
-        // shell is what failed to find the program, and it says so itself.
-        Err(error) if direct.is_some() => {
+        // Only a launch that execs answers for this: with a shell in the way
+        // the shell is what failed to find the program, and it says so itself.
+        Err(error) if words.is_some() => {
             let name = String::from_utf8_lossy(args[0].as_bytes()).into_owned();
             diagnostics.write_line(&format!(
                 "{diagnostic_prefix}{name}: {}",
