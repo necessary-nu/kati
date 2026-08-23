@@ -431,6 +431,22 @@ pub struct DepNode {
     pub grouped_double_action: Option<GroupedDoubleAction>,
     /// A public member joining every independent action that declares it.
     pub grouped_double_join: bool,
+    /// The name a `::` record filed this node's output under, for a node a
+    /// `::` record declares.
+    ///
+    /// Said for both shapes such a record compiles to, which is the point of
+    /// carrying it: a record of more than one rule becomes actions plus a join
+    /// and is recognisable from the graph, and a lone record keeps the
+    /// single-node shape an ordinary rule has and is not. GNU Make appends the
+    /// fresh entry `-W` and `-o` stamp to a chain of one as readily as to a
+    /// chain of three, so the two have to answer alike.
+    ///
+    /// The NAME rather than a flag, because what a switch's name means is
+    /// decided against the file database as the makefiles left it: a target a
+    /// `GPATH` rename moved is a `::` target under the name the Makefile wrote
+    /// and an ordinary fresh entry under the path the search found, and the
+    /// two spellings reach the same node here.
+    pub declared_by_double_colon: Option<Symbol>,
     pub cmds: Vec<Arc<Value>>,
     pub deps: Vec<NamedDepNode>,
     pub order_onlys: Vec<NamedDepNode>,
@@ -585,6 +601,7 @@ impl DepNode {
             declared_output: output,
             grouped_double_action: None,
             grouped_double_join: false,
+            declared_by_double_colon: None,
             cmds: Vec::new(),
             deps: Vec::new(),
             order_onlys: Vec::new(),
@@ -5664,6 +5681,15 @@ impl<'a> DepBuilder<'a> {
             picked_rule_info = new_picked_rule_info;
         }
         if let Some(merger) = &picked_rule_info.merger {
+            // Said of the node the Makefile named, for both shapes: the join
+            // below is this same node, and a lone `::` record falls through to
+            // the ordinary path carrying it. The name is the one the record was
+            // filed under, which a `GPATH` rename moves the target away from
+            // rather than moving the record.
+            n.lock().declared_by_double_colon = merger
+                .lock()
+                .is_double_colon
+                .then(|| self.written_as(output));
             let grouped_double = {
                 let merger = merger.lock();
                 // Every `::` record is a rule of its own: GNU Make walks the

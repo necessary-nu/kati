@@ -548,6 +548,27 @@ pub struct SinkEdge<'a> {
     /// makefiles left it, before any rename, so it has to reach this node.
     /// Nothing in a manifest says it, so the writer ignores it.
     pub written_as: Option<Symbol>,
+    /// The name a `::` record filed this edge's output under, and `None` for
+    /// every output no `::` record declares — which is nearly all of them.
+    ///
+    /// The shape of the compiled graph does not say it. A record of more than
+    /// one rule becomes an action per rule plus a completion join, which is
+    /// recognisable; a lone `::` record keeps the single-node shape an ordinary
+    /// rule has and is not. GNU Make treats the two identically, so the read is
+    /// the only place the answer exists and it has to be carried.
+    ///
+    /// What that asks of a destination is the invocation's business rather than
+    /// the build's, and it is one thing: `enter_file` (file.c) hands a switch
+    /// that stamps such a name a FRESH `struct file` appended to the chain,
+    /// because it returns the entry it found only when that entry is not a
+    /// double-colon target. So the date `-W` or `-o` writes lands on an object
+    /// nothing consults, and both switches are inert over the name. The NAME
+    /// rather than a flag, because a switch's name is matched against the file
+    /// database as the makefiles left it: the path a `GPATH` rename moved the
+    /// target to is not the name the record was filed under, and is an ordinary
+    /// entry the stamp does reach. Nothing in a manifest says it, so the writer
+    /// ignores it.
+    pub declared_by_double_colon: Option<Symbol>,
     /// The pool that limits how many edges like this run at once, unescaped.
     pub pool: Option<&'a [u8]>,
     /// Opaque per-edge metadata from `.KATI_TAGS`, for consumers of the graph

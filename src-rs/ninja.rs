@@ -2136,6 +2136,11 @@ impl<'a> NinjaGenerator<'a> {
                 written_as: (node.declared_output != node.recipe_output
                     && output == node.recipe_output)
                     .then_some(node.declared_output),
+                // Said of the edge that makes the name the Makefile wrote, and
+                // of no other. A `::` action's output is a private name the
+                // compiler invented; the record declares the target, and the
+                // join is the edge that carries it.
+                declared_by_double_colon: node.declared_by_double_colon,
                 pool: pool.as_deref(),
                 tags: tags.as_deref(),
                 loc: node.loc.as_ref(),
@@ -3017,6 +3022,7 @@ mod tests {
                     peer_outputs: &[],
                     searched_at: None,
                     written_as: None,
+                    declared_by_double_colon: None,
                     pool: None,
                     tags: None,
                     loc: None,
