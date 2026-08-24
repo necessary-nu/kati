@@ -4642,12 +4642,27 @@ impl<'a> DepBuilder<'a> {
             return Ok(Some(found.clone()));
         }
         let (recorded, recorded_order_only) = self.recorded_prerequisites(output);
+        // The candidate is being expanded for a target that already has a
+        // variable set, and GNU Make installs it before it expands: this is
+        // `initialize_file_variables` and `set_file_variables` in front of
+        // `variable_expand_for_file` (reference/gnumake/src/implicit.c), so a
+        // `$$(%_a)` in a pattern rule's prerequisites reads the target-specific
+        // and pattern-specific bindings its name carries. Read in the ambient
+        // scope they come back empty, and the prerequisite they named is not in
+        // the graph at all.
+        //
+        // The scope follows the target's name and not the candidate, so caching
+        // the answer under `(candidate_order, output)` is still sound.
+        let vars = self.applicable_rule_vars(output);
+        let previous_scope = self.push_expansion_scope(&vars);
         let expanded = self.expand_pattern_prerequisites_again(
             output,
             matched_at.clone(),
             (&recorded, &recorded_order_only),
             &text,
-        )?;
+        );
+        self.pop_expansion_scope(previous_scope);
+        let expanded = expanded?;
         self.expanded.insert(key, expanded.clone());
         Ok(Some(expanded))
     }
@@ -5723,8 +5738,17 @@ impl<'a> DepBuilder<'a> {
             n.lock().is_phony = true;
         }
 
-        let previous_scope = (!grouped_outputs.is_empty())
-            .then(|| self.push_expansion_scope(&picked_rule_info.vars));
+        // Every target's second expansion reads in the target's own scope, not
+        // only a grouped one's. GNU Make's `snap_deps` installs the file's
+        // variable set around the deferred expansion for each target in turn
+        // (reference/gnumake/src/file.c, `initialize_file_variables` then
+        // `set_file_variables` before `eval_prereqs`), so a `$$a` under
+        // `foo.x: a := bar` reads `bar` and a `$$(%_b)` under `%.x: x_b := baz`
+        // reads `baz`. Reading them in the ambient scope instead leaves both
+        // empty, and a prerequisite that expands to nothing is not in the graph
+        // at all — which is a build that does not happen rather than a value
+        // that comes out wrong.
+        let previous_scope = self.push_expansion_scope(&picked_rule_info.vars);
         let expanded = (|| -> Result<()> {
             for (text, stem, unconditional_candidate) in deferred {
                 // Each `::` rule stands on its own, so nothing another one
@@ -5753,9 +5777,7 @@ impl<'a> DepBuilder<'a> {
             }
             Ok(())
         })();
-        if let Some(previous_scope) = previous_scope {
-            self.pop_expansion_scope(previous_scope);
-        }
+        self.pop_expansion_scope(previous_scope);
         expanded?;
 
         // Ordinary `&:` includes every peer rule in the shared action's
