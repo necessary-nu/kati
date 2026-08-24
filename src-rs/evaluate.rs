@@ -120,14 +120,13 @@ pub struct Evaluated {
 /// [`crate::builtins::install_default_variables`].
 fn read_bootstrap_makefile(session: &mut Session) -> Result<Arc<Mutex<Vec<Stmt>>>> {
     let mut bootstrap = BytesMut::new();
-    bootstrap.put_slice(b"KATI?=ckati\n");
-    // Three names that used to be lines here are not any more, because no
+    // Four names that used to be lines here are not any more. Three because no
     // makefile line says what GNU Make's own call for each of them says:
     // `SHELL` (see [`stand_the_shell`]), `.FEATURES` and `MAKE` (see
-    // [`install_worked_out_variables`]). `KATI` stays, because it is kati's own
-    // name and a `?=` is exactly what it means: a default the makefile may
-    // prefer to set.
-    // TODO: Add more builtin vars.
+    // [`install_worked_out_variables`]). The fourth is `KATI?=ckati`, which was
+    // kati telling a makefile which tool was reading it — surface GNU Make does
+    // not have, removed on the operator's ruling of 2026-08-24. See
+    // docs/make-kati-extensions.md.
 
     // GNU Make's `set_default_suffixes`, which is the whole of the built-in
     // rule catalogue that has to be in scope while a Makefile is read: the

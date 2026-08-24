@@ -21,24 +21,10 @@ mk="$@"
 echo "PASS" >testfile
 
 cat <<EOF > Makefile
-ifdef KATI
-SUPPORTS_FILE := 1
-endif
-ifneq (,\$(filter 4.2%,\$(MAKE_VERSION)))
-SUPPORTS_FILE := 1
-endif
-
-ifdef SUPPORTS_FILE
-  \$(file >testwrite,PASS)
-  \$(info Read not found: \$(if \$(file <notfound),FAIL,PASS))
-  \$(info Read: \$(file < testfile))
-  \$(info Read back: \$(file <testwrite))
-else
-  # Make <4 does not support \$(file ...)
-  \$(info Read not found: PASS)
-  \$(info Read: PASS)
-  \$(info Read back: PASS)
-endif
+\$(file >testwrite,PASS)
+\$(info Read not found: \$(if \$(file <notfound),FAIL,PASS))
+\$(info Read: \$(file < testfile))
+\$(info Read back: \$(file <testwrite))
 
 .PHONY: all
 all:
