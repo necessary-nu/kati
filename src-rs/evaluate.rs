@@ -37,7 +37,7 @@ use parking_lot::Mutex;
 
 use crate::dep::{NamedDepNode, RegenerationRoot, make_dep};
 use crate::eval::{Evaluator, FrameType};
-use crate::expr::{ParseExprOpt, Value, parse_expr};
+use crate::expr::{Evaluable, ParseExprOpt, Value, parse_expr};
 use crate::file::Source;
 use crate::loc::Loc;
 use crate::session::Session;
@@ -720,6 +720,70 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
         ev.session.set_global_var(sym, var, false, None)?;
     }
     Ok(())
+}
+
+/// Expand an environment option stream — `MAKEFLAGS` or `GNUMAKEFLAGS` — as
+/// makefile text, the way GNU Make does before it splits the value into
+/// switches.
+///
+/// `decode_env_switches` (main.c) never reads the environment's bytes directly:
+/// it builds the text `$(NAME)`, hands it to `variable_expand`, and only then
+/// splits the RESULT into words. So `MAKEFLAGS='$(subst X,-,Xk)'` decodes to
+/// `-k`, a `$(FOO)` resolves against the environment, and a `$$` halves to one
+/// `$` exactly as it would anywhere else in a makefile.
+///
+/// What is in scope is the ENVIRONMENT and nothing else. This runs before
+/// `define_automatic_variables` and `define_default_variables`, so `$(CC)`,
+/// `$(MAKELEVEL)` and `$(CURDIR)` are all empty — the only names a value can
+/// reach are the ones the process was handed. A throwaway session with just
+/// the environment loaded is therefore the whole of the scope, and it is why
+/// this is a bootstrap evaluator standing before switch decode rather than a
+/// second option system: nothing it expands reaches a name of its own.
+///
+/// The environment enters as RECURSIVE, which is what makes a `$` in a value
+/// makefile syntax: `define_variable_in_set (name, len, value, o_env, 1)`, the
+/// trailing 1 being the recursive flag. `$(warning)` reports through the
+/// supplied diagnostics sink with no makefile location, and `$(error)` ends
+/// the expansion with a failure the caller turns into a refusal — both exactly
+/// where GNU Make raises them, before `-C` has moved anywhere. `$(shell)` runs
+/// a command against the environment's `SHELL`, as GNU Make's does here.
+pub fn expand_environment_option_stream(
+    environment: Option<&[(OsString, OsString)]>,
+    value: &[u8],
+    diagnostics: Arc<crate::diagnostics::Diagnostics>,
+) -> Result<Bytes> {
+    let mut session = Session::new();
+    session.diagnostics = diagnostics;
+    let environment: Vec<(OsString, OsString)> = environment
+        .map(<[_]>::to_vec)
+        .unwrap_or_else(|| std::env::vars_os().collect());
+    // GNU Make's scope at this point is the raw environment, every name of it
+    // recursive. The special second-defines that make `MAKELEVEL`, `MFLAGS` and
+    // an emptied `GNUMAKEFLAGS` what a recipe reads all happen LATER — here the
+    // names hold whatever the process was handed, so the loader is the plain
+    // one and not `read_invocation_state`'s, which has the switch table to fold.
+    for (k, v) in environment {
+        let v = Bytes::from(v.as_bytes().to_vec());
+        let sym = session.intern(k.as_bytes().to_vec());
+        let mut loc = Loc::default();
+        let parsed = parse_expr(&mut session, &mut loc, v.clone(), ParseExprOpt::Normal)?;
+        let var = Variable::new_recursive(parsed, VarOrigin::Environment, None, None, v);
+        var.write().export = if k.as_bytes() == b"SHELL" {
+            VarExport::NoExport
+        } else {
+            VarExport::Export
+        };
+        session.set_global_var(sym, var, false, None)?;
+    }
+    let mut loc = Loc::default();
+    let parsed = parse_expr(
+        &mut session,
+        &mut loc,
+        Bytes::from(value.to_vec()),
+        ParseExprOpt::Normal,
+    )?;
+    let mut ev = Evaluator::new(session);
+    parsed.eval_to_buf(&mut ev)
 }
 
 /// Read `GNUMAKEFLAGS` a second time, once the last makefile has been read.
