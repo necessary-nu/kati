@@ -41,7 +41,7 @@ use crate::{
     },
     symtab::{Interner, Symbol},
     timeutil::ScopedTimeReporter,
-    var::{ScopedVar, Var, Variable, Vars},
+    var::{ScopedVar, Var, VarExport, Variable, Vars},
     warn_loc,
 };
 
@@ -5495,6 +5495,7 @@ impl<'a> DepBuilder<'a> {
                     _ => {}
                 }
                 pending.insert(*name, (public_var.clone(), is_private));
+                new_var = self.carrying_outward_export(*name, new_var);
 
                 {
                     bound.push(RuleBinding {
@@ -5512,6 +5513,50 @@ impl<'a> DepBuilder<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The binding to install, with the export answer an outer scope already
+    /// gave this name if it has none of its own.
+    ///
+    /// A target-specific binding supplies the VALUE for the recipe that reads
+    /// it; whether that value reaches the recipe's ENVIRONMENT is a separate
+    /// answer, and GNU Make takes it from the innermost scope that actually
+    /// gave one. `target_environment` (variable.c) walks the file's whole set
+    /// list from most specific outward, keeps the first definition it meets for
+    /// the value, and then — `else if ((*evslot)->export == v_default)` — lets
+    /// each set further out fill the export attribute in if it is still
+    /// unanswered.
+    ///
+    /// So `mid: export hello=mid` over `base: hello=base` exports `base`'s own
+    /// value when `base` is built for `mid`, and `mid: unexport hello=mid`
+    /// keeps it out of the environment. The decision descends the prerequisite
+    /// chain along with the value, and getting only the value across has it
+    /// backwards in both directions.
+    ///
+    /// The outer scopes are already flattened into `cur_rule_vars` by the time
+    /// this runs, so what stands there is the nearest outward answer; the
+    /// GLOBAL set is asked separately and later, by `export::scoped_environment`,
+    /// which is the rest of the same walk.
+    ///
+    /// A copy rather than a write, because the binding is the one stored
+    /// against the rule and one rule's scope can be reached for more than one
+    /// target — a pattern-specific set most of all. What is inherited here
+    /// belongs to this target's reading of it.
+    fn carrying_outward_export(&self, name: Symbol, var: Var) -> Var {
+        if var.read().export != VarExport::Default {
+            return var;
+        }
+        let outward = self
+            .cur_rule_vars
+            .as_ref()
+            .and_then(|scope| scope.peek(name))
+            .map_or(VarExport::Default, |standing| standing.read().export);
+        if outward == VarExport::Default {
+            return var;
+        }
+        let mut carried = var.read().clone();
+        carried.export = outward;
+        Arc::new(parking_lot::RwLock::new(carried))
     }
 
     fn pick_pattern_rule(
