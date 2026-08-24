@@ -1417,6 +1417,12 @@ impl Evaluator {
         is_override: bool,
         ambient_value: bool,
     ) -> Result<(Var, bool)> {
+        // A `Folded` continuation in the value is settled here, where the
+        // definition stands and the read that folds it does in GNU Make. Every
+        // `.POSIX:` above this line in evaluation order has been seen, so this is
+        // the answer GNU Make's `collapse_continuations` had; nothing read below
+        // can change it, which is why it is fixed now rather than at expansion.
+        let rhs_v = rhs_v.resolve_folds(self.is_posix);
         let (origin, current_frame) = if self.is_bootstrap {
             (VarOrigin::Default, None)
         } else if self.is_commandline {
@@ -1456,7 +1462,8 @@ impl Evaluator {
                     &mut loc,
                     escaped.clone(),
                     ParseExprOpt::Normal,
-                )?;
+                )?
+                .resolve_folds(self.is_posix);
                 result = Variable::new_recursive(
                     value,
                     origin,
@@ -1481,7 +1488,8 @@ impl Evaluator {
                     &mut loc,
                     output.clone(),
                     ParseExprOpt::Normal,
-                )?;
+                )?
+                .resolve_folds(self.is_posix);
                 result =
                     Variable::new_recursive(value, origin, current_frame, self.loc.clone(), output);
             }

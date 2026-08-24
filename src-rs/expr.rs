@@ -125,6 +125,25 @@ pub enum Value {
         fi: &'static FuncInfo,
         args: Vec<Arc<Value>>,
     },
+    /// The bytes a run of line continuations collapses to, in both of the two
+    /// readings `.POSIX:` chooses between: `plain` is what a fold ordinarily
+    /// leaves — the blanks in front of the backslash discarded and the whole run
+    /// a single space — and `posix` is what it leaves under `.POSIX:`, where the
+    /// blanks stay and each folded newline is a space of its own.
+    ///
+    /// Held rather than settled at the read because a `.POSIX:` the evaluation
+    /// reaches — through an `include`, a taken conditional, an expansion-named
+    /// target — turns the flag on for a line kati had already read. The choice
+    /// is made where the value is read: [`Value::resolve_folds`] settles it into
+    /// the recursive value a definition stores, and [`Evaluable::eval`] answers
+    /// it for text expanded on the spot. Both consult the evaluator's `is_posix`,
+    /// which is the flag as the *evaluation* has reached it. A fold whose two
+    /// readings are identical is never held as one -- it is emitted as literal
+    /// text, so this stands only where `.POSIX:` would be observable.
+    Folded {
+        plain: Bytes,
+        posix: Bytes,
+    },
 }
 
 impl Evaluable for Value {
@@ -266,6 +285,15 @@ impl Evaluable for Value {
                 called?;
                 ev.eval_depth -= 1;
             }
+            // Text expanded on the spot answers to the flag the evaluation has
+            // reached, which is exactly what GNU Make's read did: the line is
+            // folded where it is read, and by then every `.POSIX:` above it has
+            // been seen. A value a definition stored has had this settled
+            // already by [`Value::resolve_folds`], so what reaches here is the
+            // immediate kind -- a rule word, a function argument, `$(info ...)`.
+            Value::Folded { plain, posix } => {
+                out.put_slice(if ev.is_posix() { posix } else { plain });
+            }
         }
         Ok(())
     }
@@ -292,6 +320,8 @@ impl Evaluable for Value {
             // question is trying not to provoke.
             Value::Unreadable(_, _) => true,
             Value::Literal(_, _) => false,
+            // Finished bytes either way; nothing in it is a call.
+            Value::Folded { .. } => false,
         }
     }
 }
@@ -306,6 +336,87 @@ impl Value {
             Value::VarRef(loc, _) => Some(loc.clone()),
             Value::VarSubst { loc, .. } => Some(loc.clone()),
             Value::Func { loc, .. } => Some(loc.clone()),
+            Value::Folded { .. } => None,
+        }
+    }
+
+    /// Settle every `Folded` in this value against the `.POSIX:` state the
+    /// evaluation has reached, replacing it with the reading that state selects.
+    ///
+    /// Called where a definition stores a recursive value, so the fold is read
+    /// once — at the definition, as GNU Make reads it — rather than re-read
+    /// against whatever `.POSIX:` is in force wherever the value is later
+    /// expanded. A value holding no `Folded` is returned as itself, allocating
+    /// nothing; only the nodes on the path to one are rebuilt.
+    pub fn resolve_folds(self: &Arc<Value>, posix: bool) -> Arc<Value> {
+        fn resolved_list(items: &[Arc<Value>], posix: bool) -> Option<Vec<Arc<Value>>> {
+            let mut changed = false;
+            let out: Vec<Arc<Value>> = items
+                .iter()
+                .map(|item| {
+                    let settled = item.resolve_folds(posix);
+                    changed |= !Arc::ptr_eq(&settled, item);
+                    settled
+                })
+                .collect();
+            changed.then_some(out)
+        }
+        match self.as_ref() {
+            Value::Folded {
+                plain,
+                posix: under_posix,
+            } => Arc::new(Value::Literal(
+                None,
+                if posix {
+                    under_posix.clone()
+                } else {
+                    plain.clone()
+                },
+            )),
+            Value::List(loc, items) => match resolved_list(items, posix) {
+                Some(items) => Arc::new(Value::List(loc.clone(), items)),
+                None => self.clone(),
+            },
+            Value::VarRef(loc, name) => {
+                let settled = name.resolve_folds(posix);
+                if Arc::ptr_eq(&settled, name) {
+                    self.clone()
+                } else {
+                    Arc::new(Value::VarRef(loc.clone(), settled))
+                }
+            }
+            Value::VarSubst {
+                loc,
+                name,
+                pat,
+                subst,
+            } => {
+                let name_s = name.resolve_folds(posix);
+                let pat_s = pat.resolve_folds(posix);
+                let subst_s = subst.resolve_folds(posix);
+                if Arc::ptr_eq(&name_s, name)
+                    && Arc::ptr_eq(&pat_s, pat)
+                    && Arc::ptr_eq(&subst_s, subst)
+                {
+                    self.clone()
+                } else {
+                    Arc::new(Value::VarSubst {
+                        loc: loc.clone(),
+                        name: name_s,
+                        pat: pat_s,
+                        subst: subst_s,
+                    })
+                }
+            }
+            Value::Func { loc, fi, args } => match resolved_list(args, posix) {
+                Some(args) => Arc::new(Value::Func {
+                    loc: loc.clone(),
+                    fi,
+                    args,
+                }),
+                None => self.clone(),
+            },
+            Value::Literal(..) | Value::SymRef(..) | Value::Unreadable(..) => self.clone(),
         }
     }
 }
@@ -374,6 +485,37 @@ fn skip_folded(loc: &mut Loc, s: &[u8], mut at: usize, posix: bool) -> usize {
         loc.line += 1;
         at += consumed;
     }
+}
+
+/// [`skip_folded`] with `posix` false, counting the folds it takes.
+///
+/// A `Folded` holds both readings of a run at once, so it must consume the run
+/// maximally — the way the plain reading does — and know how many further folds
+/// the first one absorbed, since under `.POSIX:` each of those is a space of its
+/// own. Returns where the run ends and that count (not including the fold that
+/// triggered it).
+fn absorb_fold_run(loc: &mut Loc, s: &[u8], mut at: usize) -> (usize, usize) {
+    let mut extra = 0;
+    loop {
+        while matches!(s.get(at), Some(b' ' | b'\t')) {
+            at += 1;
+        }
+        let Some((0, consumed)) = continuation_fold(&s[at..]) else {
+            return (at, extra);
+        };
+        loc.line += 1;
+        at += consumed;
+        extra += 1;
+    }
+}
+
+/// The `.POSIX:` reading of a fold: the blanks written before the backslash,
+/// kept rather than discarded, then one space for each folded newline.
+fn posix_fold_bytes(trailing: &[u8], spaces: usize) -> Bytes {
+    let mut bytes = Vec::with_capacity(trailing.len() + spaces);
+    bytes.extend_from_slice(trailing);
+    bytes.resize(trailing.len() + spaces, b' ');
+    Bytes::from(bytes)
 }
 
 /// Whether this byte ends a function name where GNU Make ends one.
@@ -794,7 +936,22 @@ pub fn parse_expr_impl_ext(
                     list.push(Arc::new(Value::Literal(None, s.slice(i + 2..i + 1 + kept))));
                     list.push(Arc::new(Value::Literal(None, Bytes::from_static(b" "))));
                 }
-                i = skip_folded(loc, &s, i + 1 + consumed, posix);
+                if posix {
+                    i = skip_folded(loc, &s, i + 1 + consumed, true);
+                } else {
+                    // The reference took the fold's space as its name. A further
+                    // run behind it is one space per fold under `.POSIX:` and
+                    // nothing without it — the plain reading swallows the run —
+                    // so hold that difference for the evaluation to settle.
+                    let (end, extra) = absorb_fold_run(loc, &s, i + 1 + consumed);
+                    if extra > 0 {
+                        list.push(Arc::new(Value::Folded {
+                            plain: Bytes::new(),
+                            posix: posix_fold_bytes(b"", extra),
+                        }));
+                    }
+                    i = end;
+                }
                 b = i;
                 continue;
             }
@@ -843,22 +1000,40 @@ pub fn parse_expr_impl_ext(
                 // Make discards what it has already written back to the last
                 // byte that is not a blank, and a backslash is not one.
                 let literal_end = i + kept;
-                if literal_end > b {
-                    let text = &s[b..literal_end];
-                    // The blanks already written go back to the last byte that
-                    // is not one, and a backslash is not one. Under `.POSIX:`
-                    // they do not go at all: each folded newline is a space
-                    // added to what was there rather than a space standing in
-                    // for it.
-                    let text = if kept == 0 && !posix {
-                        trim_right_space(text)
+                let text = &s[b..literal_end];
+                if posix {
+                    // `.POSIX:` was written above and the read has seen it: the
+                    // blanks in front of the backslash stay and each folded
+                    // newline is a space of its own, so the run is left for the
+                    // outer loop to read one fold at a time.
+                    if literal_end > b {
+                        list.push(Arc::new(Value::Literal(None, s.slice_ref(text))));
+                    }
+                    list.push(Arc::new(Value::Literal(None, Bytes::from_static(b" "))));
+                    i = skip_folded(loc, &s, i + consumed, true);
+                } else {
+                    // The read has seen no `.POSIX:`, but the evaluation may
+                    // still reach one before this value is read. Emit the text
+                    // the two readings share — the run's leading non-blank bytes
+                    // — and hold the rest as a `Folded` when they differ: `plain`
+                    // discards the blanks and the whole run is one space, `posix`
+                    // keeps the blanks and adds a space per fold.
+                    let (end, extra) = absorb_fold_run(loc, &s, i + consumed);
+                    let head = trim_right_space(text);
+                    if !head.is_empty() {
+                        list.push(Arc::new(Value::Literal(None, s.slice_ref(head))));
+                    }
+                    let trailing = &text[head.len()..];
+                    if trailing.is_empty() && extra == 0 {
+                        list.push(Arc::new(Value::Literal(None, Bytes::from_static(b" "))));
                     } else {
-                        text
-                    };
-                    list.push(Arc::new(Value::Literal(None, s.slice_ref(text))));
+                        list.push(Arc::new(Value::Folded {
+                            plain: Bytes::from_static(b" "),
+                            posix: posix_fold_bytes(trailing, 1 + extra),
+                        }));
+                    }
+                    i = end;
                 }
-                list.push(Arc::new(Value::Literal(None, Bytes::from_static(b" "))));
-                i = skip_folded(loc, &s, i + consumed, posix);
                 b = i;
                 continue;
             }
@@ -924,6 +1099,9 @@ mod tests {
             match value {
                 Value::Literal(_, text) => out.extend_from_slice(text),
                 Value::List(_, list) => list.iter().for_each(|v| walk(v, out)),
+                // These cases assert the reading a fold has without `.POSIX:`,
+                // which is what `Folded` holds as its `plain` half.
+                Value::Folded { plain, .. } => out.extend_from_slice(plain),
                 // A reference to an unset variable is empty, and every name
                 // these cases produce is one nothing ever assigns.
                 _ => {}

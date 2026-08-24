@@ -873,6 +873,8 @@ pub fn expansion_can_reach_make(
             args.iter()
                 .any(|arg| expansion_can_reach_make(arg, ev, rule_vars, seen))
         }
+        // Finished fold bytes hold no reference at all.
+        Value::Folded { .. } => false,
     }
 }
 
@@ -951,6 +953,8 @@ pub fn references_new_inputs(value: &Value, names: &impl Interner) -> bool {
             fi: _,
             args,
         } => args.iter().any(|arg| references_new_inputs(arg, names)),
+        // Finished fold bytes — blanks and spaces — reach no automatic variable.
+        Value::Folded { .. } => false,
     }
 }
 
@@ -976,6 +980,8 @@ fn references_make(value: &Value, names: &impl Interner) -> bool {
             fi: _,
             args,
         } => args.iter().any(|arg| references_make(arg, names)),
+        // Finished fold bytes name nothing, `MAKE` included.
+        Value::Folded { .. } => false,
     }
 }
 
