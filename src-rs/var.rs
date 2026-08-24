@@ -176,18 +176,30 @@ fn appended_values(prev: Arc<Value>, prev_text: &Bytes, added: Arc<Value>) -> Ve
 /// and a name the two readers bind differently is read differently. A base
 /// already reduced to text is spliced as a literal, which is a simple level GNU
 /// Make copies verbatim rather than expanding again.
+///
+/// `base_in_scope` says whether the base lives in the same variable set this
+/// binding is written into. GNU Make's `variable_append` stores only the
+/// appended text on a target-specific binding whose base lives in a PARENT set,
+/// setting `v->append` so the parent is walked and prepended at lookup; the base
+/// is stored on the binding only when an earlier assignment or append in the
+/// same set put it there. So the text beside the expression — what `$(value)`
+/// reads — carries the base only when `base_in_scope`. The expression carries it
+/// either way, because `$(V)` walks to the base whether it was stored or found.
 pub(crate) fn appended_recursive_value(
     base: Arc<Value>,
     base_text: &Bytes,
     tail: Arc<Value>,
     tail_text: &Bytes,
+    base_in_scope: bool,
 ) -> (Arc<Value>, Bytes) {
     let loc = base.loc();
     let values = appended_values(base.clone(), base_text, tail);
-    (
-        Arc::new(Value::List(loc, values)),
-        appended_text(base_text, tail_text),
-    )
+    let orig = if base_in_scope {
+        appended_text(base_text, tail_text)
+    } else {
+        tail_text.clone()
+    };
+    (Arc::new(Value::List(loc, values)), orig)
 }
 
 /// The same join over the text those values were written as.

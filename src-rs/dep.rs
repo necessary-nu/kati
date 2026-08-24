@@ -5562,11 +5562,24 @@ impl<'a> DepBuilder<'a> {
                             // What the target's own recipe reads: the tail on
                             // the base that stood in the target's scope.
                             let (base, base_text) = self.append_expression(&old_var)?;
+                            // Whether that base lives in this target's own set or
+                            // in a parent it inherited from. `$(value)` reads the
+                            // stored text, and GNU Make stores the base there
+                            // only when it was set in the same set — an earlier
+                            // assignment or append in this rule — not when the
+                            // walk found it in a parent. `outer` holds what the
+                            // name stood at before this run bound it: a base that
+                            // is still that value came from a parent.
+                            let base_in_scope = outer
+                                .get(name)
+                                .and_then(Option::as_ref)
+                                .is_none_or(|outer_var| !Arc::ptr_eq(&old_var, outer_var));
                             let (guard, guard_text) = crate::var::appended_recursive_value(
                                 base,
                                 &base_text,
                                 tail.clone(),
                                 &tail_text,
+                                base_in_scope,
                             );
                             new_var = Variable::new_recursive(
                                 guard,
@@ -5579,6 +5592,14 @@ impl<'a> DepBuilder<'a> {
                                 Some(pb) if Arc::ptr_eq(&pb, &old_var) => new_var.clone(),
                                 Some(pb) => {
                                     let po = pb.read().origin();
+                                    // The same test the guard made, against the
+                                    // base a reader across the parent link finds:
+                                    // stored on the binding only when this run's
+                                    // own earlier work put it there.
+                                    let public_base_in_scope = outer
+                                        .get(name)
+                                        .and_then(Option::as_ref)
+                                        .is_none_or(|outer_var| !Arc::ptr_eq(&pb, outer_var));
                                     let (base, base_text) = self.append_expression(&pb)?;
                                     let (public, public_text) =
                                         crate::var::appended_recursive_value(
@@ -5586,6 +5607,7 @@ impl<'a> DepBuilder<'a> {
                                             &base_text,
                                             tail.clone(),
                                             &tail_text,
+                                            public_base_in_scope,
                                         );
                                     Variable::new_recursive(
                                         public,
