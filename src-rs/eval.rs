@@ -948,6 +948,18 @@ pub struct Evaluator {
     /// `filter-out` patterns applied to the deferred `$?` marker while the
     /// current recipe is expanded.
     pub(crate) deferred_new_inputs_filter_out: Vec<Bytes>,
+    /// The scheduler's own list of new prerequisites, spelt where the recipe
+    /// runs, for a `$?` recipe expanded at launch.
+    ///
+    /// GNU Make's `$?` is the set its scheduler decided was out of date, which
+    /// a stat of the tree at launch cannot always reproduce — a prerequisite
+    /// that does not exist, one remade without its mtime moving, and an archive
+    /// member all count for GNU and not for a stat. So a recipe naming `$?` is
+    /// deferred to launch like any other and handed the destination's list
+    /// here rather than left to work it out from the disk. `None` when nothing
+    /// handed one over, which is every launch expansion that is not a `$?`
+    /// recipe's — the stat is the answer for a grouped action expanded here.
+    pub(crate) launch_new_inputs: Option<Bytes>,
     // This value tracks the nest level of make expressions. For
     // example, $(YYY) in $(XXX $(YYY)) is evaluated with depth==2.
     // This will be used to disallow $(shell) in other make constructs.
@@ -1275,6 +1287,7 @@ impl Evaluator {
             file_evaluation: FileEvaluation::Refused,
             output_evaluation: OutputEvaluation::RecipeCommand,
             deferred_new_inputs_filter_out: Vec::new(),
+            launch_new_inputs: None,
             eval_depth: 0,
             function_depth: 0,
             delayed_output_commands: Vec::new(),

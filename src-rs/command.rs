@@ -395,6 +395,10 @@ impl AutoCommandVar {
             }
         };
         let references = self.settled_references(ev, current_dep_node, &words);
+        // The destination's own `$?` for this launch, when it handed one over.
+        // Taken before the field borrows below so a `$?` read can reach it
+        // without a second mutable borrow of the evaluator.
+        let launch_new_inputs = ev.launch_new_inputs.clone();
         let current_dep_node = current_dep_node.lock();
         let names = &ev.session.symtab;
         // How the build spells a prerequisite the directory search answered
@@ -535,19 +539,34 @@ impl AutoCommandVar {
                 let mut seen: HashSet<Symbol> = HashSet::new();
 
                 if *timing == NewInputsTiming::Launch {
-                    // The recipe is being expanded at launch, so every
-                    // prerequisite has settled and the comparison GNU Make
-                    // makes here is the one the filesystem already answers.
-                    let mut ww = WordWriter::new(out);
-                    let target_age = ExecStatus::Timestamp(target_timestamp(
-                        &current_dep_node.recipe_output.as_bytes(names),
-                    )?);
-                    for ai in current_dep_node.actual_inputs.iter() {
-                        let ai_str = spelt(*ai);
-                        if seen.insert(*ai)
-                            && ExecStatus::Timestamp(prerequisite_timestamp(&ai_str)?) > target_age
-                        {
-                            ww.write(&crate::archive::member_or_whole(&ai_str));
+                    // The recipe is being expanded at launch. When the
+                    // destination handed over the list its scheduler settled,
+                    // that is `$?` — it counts a prerequisite that does not
+                    // exist, one remade without its mtime moving, and an
+                    // archive member, none of which a stat of the tree can see.
+                    // The words are already spelt where this command runs and
+                    // an archive member is already reduced to its member name,
+                    // so the `D`/`F` forms split this value where `eval` splits
+                    // any other.
+                    if let Some(new_inputs) = &launch_new_inputs {
+                        out.put_slice(new_inputs);
+                    } else {
+                        // Nothing was handed over — a grouped action expanded
+                        // here answers from the timestamps GNU Make compares,
+                        // which are the ones on disk now that every
+                        // prerequisite has settled.
+                        let mut ww = WordWriter::new(out);
+                        let target_age = ExecStatus::Timestamp(target_timestamp(
+                            &current_dep_node.recipe_output.as_bytes(names),
+                        )?);
+                        for ai in current_dep_node.actual_inputs.iter() {
+                            let ai_str = spelt(*ai);
+                            if seen.insert(*ai)
+                                && ExecStatus::Timestamp(prerequisite_timestamp(&ai_str)?)
+                                    > target_age
+                            {
+                                ww.write(&crate::archive::member_or_whole(&ai_str));
+                            }
                         }
                     }
                 } else if ev.avoid_io

@@ -397,10 +397,16 @@ impl DeferredRecipes {
         id: DeferredRecipeId,
         trigger: &[u8],
         settled_names: &[(&[u8], &[u8])],
+        new_inputs: Option<&[u8]>,
     ) -> Result<Option<ExpandedRecipe>> {
         let Some(recipe) = self.recipes.get(id) else {
             return Ok(None);
         };
+        // The scheduler's own `$?` for this launch. A recipe naming it is
+        // deferred to here like any other, and the value it reads is the one
+        // the destination settled after every prerequisite finished, not a
+        // stat of the tree.
+        ev.launch_new_inputs = new_inputs.map(Bytes::copy_from_slice);
         // How the build spells the prerequisites the directory search answered
         // about, for this launch. A target found elsewhere keeps both names
         // until something settles whether it had to be remade, and the
@@ -455,6 +461,7 @@ impl DeferredRecipes {
         ce.ev.output_evaluation = OutputEvaluation::RecipeCommand;
         ce.ev.deferred_new_inputs_filter_out.clear();
         ce.ev.settled_names.clear();
+        ce.ev.launch_new_inputs = None;
         expanded.map(Some)
     }
 
@@ -710,10 +717,17 @@ impl<'a> NinjaGenerator<'a> {
     /// Everything refused here is refused because the compiler itself has to
     /// read the recipe's text before the graph is complete: a recursive
     /// `$(MAKE)` line becomes a child graph, an automatic or declared depfile
-    /// rewrites the script and names a file on the rule, a grouped
-    /// double-colon action and a `$?` are values the scheduler binds against
-    /// an edge that has to declare them. The recipe as written is what decides
-    /// — the same classification GNU Make makes before it expands anything.
+    /// rewrites the script and names a file on the rule, and a grouped
+    /// double-colon action is a value the scheduler binds against an edge that
+    /// has to declare it. The recipe as written is what decides — the same
+    /// classification GNU Make makes before it expands anything.
+    ///
+    /// A recipe naming `$?` is NOT refused. Its edge declares deferred
+    /// freshness from the text — [`references_new_inputs`] answers that without
+    /// expanding — and the launch is handed the scheduler's own list, so the
+    /// recipe waits for launch like any other and GNU Make's rule holds: an
+    /// up-to-date target expands nothing, and the name whose own state reached
+    /// the rule is the one `$@` binds to.
     fn defers_recipe(&self, node: &DepNode) -> bool {
         if self.recipe_expansion != RecipeExpansion::Launch || node.cmds.is_empty() {
             return false;
@@ -735,7 +749,6 @@ impl<'a> NinjaGenerator<'a> {
         node.cmds.iter().all(|cmd| {
             let mut seen = HashSet::new();
             !expansion_can_reach_make(cmd, self.ce.ev, rule_vars.as_deref(), &mut seen)
-                && !references_new_inputs(cmd, &self.ce.ev.session)
         })
     }
 
@@ -815,10 +828,10 @@ impl<'a> NinjaGenerator<'a> {
         // the files that exist when the command is about to run rather than
         // against the ones that existed before the build started.
         let deferred_recipe = self.defers_recipe(&node.lock());
-        // Said of THIS recipe, and a deferred one says nothing: `eval` is what
-        // clears the flag, so a node that skips it would otherwise be handed
-        // whatever the node before it found and be declared to name `$?` when
-        // its recipe does not mention it.
+        // Said of THIS recipe by `eval`, which clears the flag before it reads,
+        // so a node that skips `eval` would otherwise be handed whatever the
+        // node before it found. A deferred recipe skips `eval`, so its own
+        // answer is read from the text below rather than from this flag.
         *self.ce.found_new_inputs.lock() = false;
         let commands = if deferred_recipe {
             Vec::new()
@@ -838,7 +851,19 @@ impl<'a> NinjaGenerator<'a> {
         };
         let deferred_new_inputs = self.ce.ev.new_inputs_timing
             == NewInputsTiming::SchedulerBoundary
-            && *self.ce.found_new_inputs.lock();
+            && if deferred_recipe {
+                // The recipe was not read, so `found_new_inputs` could not have
+                // been set. Whether it names `$?` is a fact about the text,
+                // which `references_new_inputs` reads without expanding, and it
+                // is what declares the edge's deferred freshness so the
+                // scheduler binds the list the launch is handed.
+                node.lock()
+                    .cmds
+                    .iter()
+                    .any(|cmd| references_new_inputs(cmd, &self.ce.ev.session))
+            } else {
+                *self.ce.found_new_inputs.lock()
+            };
         let deferred_new_inputs_filter_out =
             std::mem::take(&mut self.ce.ev.deferred_new_inputs_filter_out);
         let rule_id = if commands.is_empty() && !deferred_recipe {
