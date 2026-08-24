@@ -728,17 +728,20 @@ impl<'a> NinjaGenerator<'a> {
     /// Everything refused here is refused because the compiler itself has to
     /// read the recipe's text before the graph is complete: a recursive
     /// `$(MAKE)` line becomes a child graph, an automatic or declared depfile
-    /// rewrites the script and names a file on the rule, and a grouped
-    /// double-colon action is a value the scheduler binds against an edge that
-    /// has to declare it. The recipe as written is what decides — the same
-    /// classification GNU Make makes before it expands anything.
+    /// names a file on the rule the edge that reads it has to declare, and an
+    /// ordinary multi-target `::` action's `$@` is the name the chain walk
+    /// renames and the construction read settles. The recipe as written is what
+    /// decides — the same classification GNU Make makes before it expands
+    /// anything.
     ///
-    /// A recipe naming `$?` is NOT refused. Its edge declares deferred
-    /// freshness from the text — [`references_new_inputs`] answers that without
-    /// expanding — and the launch is handed the scheduler's own list, so the
-    /// recipe waits for launch like any other and GNU Make's rule holds: an
-    /// up-to-date target expands nothing, and the name whose own state reached
-    /// the rule is the one `$@` binds to.
+    /// A recipe naming `$?`, and a grouped `&::` action, are NOT refused. The
+    /// `$?` recipe declares deferred freshness from the text —
+    /// [`references_new_inputs`] answers that without expanding — and the launch
+    /// is handed the scheduler's own list. A grouped `&::` action is one recipe
+    /// for the whole group, whose `$@` is the member reached rather than a name
+    /// the chain walk renames, so it too waits for launch. Either way GNU Make's
+    /// rule holds: an up-to-date target expands nothing, and the name whose own
+    /// state reached the rule is the one `$@` binds to.
     fn defers_recipe(&self, node: &DepNode) -> bool {
         if self.recipe_expansion != RecipeExpansion::Launch || node.cmds.is_empty() {
             return false;
@@ -749,10 +752,26 @@ impl<'a> NinjaGenerator<'a> {
         if node.cmds.iter().all(|cmd| is_blank_recipe_line(cmd)) {
             return false;
         }
+        // A depfile is a dependency read at runtime: `--detect_depfiles` finds
+        // it by rewriting the assembled script, and `.KATI_DEPFILE` names it in
+        // a variable, but either way the edge it is read for has to declare it,
+        // and a deferred rule has no path to. So a recipe naming a depfile is
+        // read where it is built, and its `$(file ...)` is performed there — a
+        // divergence confined to a kati extension no GNU makefile reaches.
         if node.depfile_var.is_some()
             || self.ce.ev.session.flags.detect_depfiles
-            || node.grouped_double_action.is_some()
             || node.grouped_double_join
+        {
+            return false;
+        }
+        // An ordinary multi-target `::` action's `$@` is the name the chain walk
+        // renames and the construction read settles; the launch cannot redo that
+        // walk, so such a recipe is read where it is built. A grouped `&::`
+        // action is one recipe for the whole group with no such per-member name
+        // to settle, so it defers like any other and its `$(file ...)`,
+        // `$(shell)` and `$(wildcard)` wait for the launch that runs it.
+        if let Some(action) = &node.grouped_double_action
+            && !action.is_grouped
         {
             return false;
         }
@@ -1866,6 +1885,10 @@ impl<'a> NinjaGenerator<'a> {
                     residual_steps: &[],
                     residual_ignore_errors: false,
                     description: None,
+                    // A `.KATI_DEPFILE` recipe is not deferred (`defers_recipe`
+                    // refuses it): the depfile it names becomes a runtime
+                    // dependency the deferred rule has no path to declare, so it
+                    // is read where it is built. No deferred rule carries one.
                     depfile: None,
                     restat: node.is_restat,
                     ignore_errors: false,

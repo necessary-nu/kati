@@ -347,6 +347,13 @@ pub struct GroupedDoubleAction {
     /// head, so a dependent reads this entry's verdict and no other's however
     /// many entries after it renamed themselves.
     pub heads_the_record: bool,
+    /// Whether this action came from a grouped `&::` record rather than an
+    /// ordinary multi-target `::` one. A grouped record is one recipe for the
+    /// whole group with no per-member name to settle, so it can be left for the
+    /// launch to expand; an ordinary `::` action's `$@` is renamed by the chain
+    /// walk and settled during the construction read, which the launch cannot
+    /// redo, so that one is read where it is built.
+    pub is_grouped: bool,
 }
 
 /// The cycle guard cannot catch `%.a: %.b.a` against `%.b.a: %.a`, where every
@@ -4508,6 +4515,7 @@ impl<'a> DepBuilder<'a> {
                 // Decided in `build_grouped_double_member`, where the record's
                 // entries are in one place and in the order they were written.
                 heads_the_record: false,
+                is_grouped: rule.is_grouped,
             });
             node.cmds = rule.cmds.clone();
             node.actual_inputs =
