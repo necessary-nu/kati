@@ -250,6 +250,19 @@ pub struct SinkSubninja<'a> {
     /// line can hand the next is on the filesystem, and a Makefile the child
     /// includes is read from there.
     pub preceding: Option<SinkCommand<'a>>,
+    /// The processes [`Self::preceding`] really is, in written order, for a sink
+    /// that can run several.
+    ///
+    /// A segment of a composed recipe is an ordinary recipe: GNU Make runs its
+    /// lines one process each, so a `+`-marked line inside it runs under `-t`
+    /// and answers under `-q` the way it would in any recipe. The assembled
+    /// script stays [`Self::preceding`] — a progress line and a `-n` want the
+    /// whole of it — and a sink that can launch several runs these instead.
+    ///
+    /// Empty on the same terms [`SinkRule::steps`] is: a sink is free to refuse
+    /// the split for a line too long to be an argument, and take the assembled
+    /// script for that segment instead.
+    pub preceding_steps: &'a [crate::ninja::RecipeStep],
     /// Whether every line in [`Self::preceding`] ignores failure.
     pub preceding_ignore_errors: bool,
     /// The Makefile and line the recipe line was written on, rendered here for
@@ -343,6 +356,14 @@ pub struct SinkRule<'a> {
     /// invocation are on that invocation's
     /// [`SinkSubninja::preceding`] instead.
     pub residual_command: Option<SinkCommand<'a>>,
+    /// The processes [`Self::residual_command`] really is, in written order, for
+    /// a sink that can run several.
+    ///
+    /// The recipe's own trailing lines are an ordinary recipe like any segment,
+    /// and carry their launches for the same reason [`SinkSubninja::preceding_steps`]
+    /// does: a `+`-marked line among them runs under `-t` and answers under
+    /// `-q`. Empty on the same terms [`Self::steps`] is.
+    pub residual_steps: &'a [crate::ninja::RecipeStep],
     /// Whether every residual line ignores failure.
     pub residual_ignore_errors: bool,
     /// What to print while the command runs, if the Makefile said — literal

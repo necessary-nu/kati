@@ -557,6 +557,17 @@ impl DeferredRecipes {
     }
 }
 
+/// How one recipe's segments are rendered, gathered so a segment builder is not
+/// a long positional argument list. The first three are the recipe's and the
+/// same for every segment of it; the default flags are the segment's own first
+/// written line's.
+struct SegmentRender<'a> {
+    recipe_output: &'a Bytes,
+    shell: &'a Bytes,
+    script_flags: &'a Bytes,
+    default_flags: &'a [u8],
+}
+
 /// The launches one translated recipe becomes.
 ///
 /// One per surviving command line, except under `.ONESHELL`, where GNU Make
@@ -1729,20 +1740,24 @@ impl<'a> NinjaGenerator<'a> {
     /// A sink that runs these scripts instead needs the identical
     /// transformation, and every one of them must name the file the whole
     /// recipe named.
+    /// How one recipe's segments are turned into scripts and launches: the
+    /// values `translate_recipe`, `gen_shell_script` and `recipe_steps` read
+    /// that belong to the recipe rather than the segment, plus the default
+    /// flags, which are the segment's own first written line's.
     fn residual_segment(
         flags: &Flags,
-        recipe_output: &Bytes,
-        script_flags: &[u8],
+        render: &SegmentRender<'_>,
         commands: &[Command],
         detect_depfile: bool,
         depfile: &Option<Bytes>,
-    ) -> Result<(Bytes, bool)> {
+    ) -> Result<(Bytes, bool, Vec<RecipeStep>)> {
         let mut buf = BytesMut::new();
         // No description: this segment is part of a recipe whose whole text
         // was read for narration already, and a second reading here could
         // only take an echo out of the script with nowhere to put it.
-        let translated = Self::translate_recipe(flags, recipe_output, commands, None);
-        let ignore_errors = Self::gen_shell_script(flags, &translated, script_flags, &mut buf);
+        let translated = Self::translate_recipe(flags, render.recipe_output, commands, None);
+        let ignore_errors =
+            Self::gen_shell_script(flags, &translated, render.script_flags, &mut buf);
         if detect_depfile && !buf.is_empty() {
             let segment_depfile = get_depfile_from_command(&mut buf)?;
             if segment_depfile != *depfile {
@@ -1751,7 +1766,20 @@ impl<'a> NinjaGenerator<'a> {
                 ));
             }
         }
-        Ok((buf.freeze(), ignore_errors))
+        let script = buf.freeze();
+        // The segment's own launches, the same list `recipe_steps` makes for a
+        // whole recipe read here — the lines the assembled script above is the
+        // one-shell form of. A destination that can launch several runs these
+        // and never looks at the script; one that cannot does the reverse.
+        let steps = recipe_steps(
+            flags,
+            &translated,
+            render.shell,
+            render.script_flags,
+            render.default_flags,
+            &script,
+        );
+        Ok((script, ignore_errors, steps))
     }
 
     fn get_depfile(&mut self, node: &DepNode, cmd_buf: &mut BytesMut) -> Result<Option<Bytes>> {
@@ -1835,6 +1863,7 @@ impl<'a> NinjaGenerator<'a> {
                     deferred_recipe: Some(deferred),
                     subninjas: &[],
                     residual_command: None,
+                    residual_steps: &[],
                     residual_ignore_errors: false,
                     description: None,
                     depfile: None,
@@ -1965,10 +1994,18 @@ impl<'a> NinjaGenerator<'a> {
                 node.depfile_var.is_none() && self.ce.ev.session.flags.detect_depfiles;
             let mut preceding_storage = Vec::with_capacity(preceding_commands.len());
             for segment in &preceding_commands {
+                let render = SegmentRender {
+                    recipe_output: &recipe_output_str,
+                    shell: &nn.shell,
+                    script_flags: &script_flags,
+                    default_flags: self
+                        .ce
+                        .ev
+                        .default_shell_flag(segment.first().is_some_and(|c| c.dash_prefixed)),
+                };
                 preceding_storage.push(Self::residual_segment(
                     &self.ce.ev.session.flags,
-                    &recipe_output_str,
-                    &script_flags,
+                    &render,
                     segment,
                     detect_depfile,
                     &depfile,
@@ -1978,7 +2015,10 @@ impl<'a> NinjaGenerator<'a> {
                 .iter()
                 .zip(&preceding_storage)
                 .map(
-                    |((command, make, location), (preceding, preceding_ignore_errors))| {
+                    |(
+                        (command, make, location),
+                        (preceding, preceding_ignore_errors, preceding_steps),
+                    )| {
                         crate::build_sink::SinkSubninja {
                             command,
                             make,
@@ -1989,16 +2029,25 @@ impl<'a> NinjaGenerator<'a> {
                                     SinkCommand::Inline(preceding)
                                 }
                             }),
+                            preceding_steps,
                             preceding_ignore_errors: *preceding_ignore_errors,
                             location: location.as_deref(),
                         }
                     },
                 )
                 .collect::<Vec<_>>();
-            let (residual_script, residual_ignore_errors) = Self::residual_segment(
+            let residual_render = SegmentRender {
+                recipe_output: &recipe_output_str,
+                shell: &nn.shell,
+                script_flags: &script_flags,
+                default_flags: self
+                    .ce
+                    .ev
+                    .default_shell_flag(residual_commands.first().is_some_and(|c| c.dash_prefixed)),
+            };
+            let (residual_script, residual_ignore_errors, residual_steps) = Self::residual_segment(
                 &self.ce.ev.session.flags,
-                &recipe_output_str,
-                &script_flags,
+                &residual_render,
                 &residual_commands,
                 contains_recursive && detect_depfile,
                 &depfile,
@@ -2055,6 +2104,7 @@ impl<'a> NinjaGenerator<'a> {
                             SinkCommand::Inline(&residual_script)
                         },
                     ),
+                    residual_steps: &residual_steps,
                     residual_ignore_errors,
                     description: description.as_deref(),
                     depfile: depfile.as_deref(),
@@ -3691,6 +3741,7 @@ mod tests {
                     deferred_recipe: None,
                     subninjas: &[],
                     residual_command: None,
+                    residual_steps: &[],
                     residual_ignore_errors: false,
                     description,
                     depfile: None,
