@@ -5460,6 +5460,23 @@ impl<'a> DepBuilder<'a> {
     /// appends to what the earlier ones left, which is what reading down GNU
     /// Make's chain of variable sets does, and merging them first would lose
     /// every value but the last.
+    /// A variable's expression and the text beside it, for splicing into a
+    /// `+=` that is held unexpanded.
+    ///
+    /// A recursive variable is its own expression, taken as written so the
+    /// scope that reads the `+=` reads it too. A simple variable is a level GNU
+    /// Make's `variable_append` copies verbatim, so it becomes a literal that
+    /// is expanded no further. Anything else — an automatic or a computed name,
+    /// which a `+=` base is not in practice — is read once here and spliced as
+    /// that literal.
+    fn append_expression(&mut self, var: &Var) -> Result<(Arc<Value>, Bytes)> {
+        if let Some(pair) = var.read().append_source() {
+            return Ok(pair);
+        }
+        let text = var.read().eval_to_buf_mut(self.ev)?.freeze();
+        Ok((Arc::new(Value::Literal(None, text.clone())), text))
+    }
+
     fn apply_rule_vars(
         &mut self,
         scopes: &RuleScopes,
@@ -5526,48 +5543,54 @@ impl<'a> DepBuilder<'a> {
                                 .map(|(var, _)| var.clone())
                                 .or_else(|| public_now.get(name).cloned())
                                 .or_else(|| outer.get(name).cloned().flatten());
-                            let mut s = old_var.read().eval_to_buf_mut(self.ev)?;
-                            let base_len = s.len();
-                            if !s.is_empty() {
-                                s.put_u8(b' ')
-                            }
-                            new_var.read().eval(self.ev, &mut s)?;
-                            let joined = s.freeze();
-                            // The appended text, taken back out of the join
-                            // rather than expanded a second time: expanding it
-                            // twice would run whatever it reaches twice.
-                            let added =
-                                joined.slice(if base_len == 0 { 0 } else { base_len + 1 }..);
                             let origin = old_var.read().origin();
                             let loc = node.lock().loc.clone();
-                            new_var = Variable::with_simple_string(
-                                joined,
+                            // The tail as it was written, held unexpanded so it
+                            // is read in the scope that reads the whole. A
+                            // reader's own `$(shell)`, `$(flavor)` and any name
+                            // it binds differently all move with it, which a
+                            // string settled here could not carry.
+                            let (tail, tail_text) = self.append_expression(&new_var)?;
+                            // What the target's own recipe reads: the tail on
+                            // the base that stood in the target's scope.
+                            let (base, base_text) = self.append_expression(&old_var)?;
+                            let (guard, guard_text) = crate::var::appended_recursive_value(
+                                base, &base_text, tail.clone(), &tail_text,
+                            );
+                            new_var = Variable::new_recursive(
+                                guard,
                                 origin,
                                 frame.current(),
                                 loc.clone(),
+                                guard_text,
                             );
                             public_var = match public_base {
-                                Some(base) if Arc::ptr_eq(&base, &old_var) => new_var.clone(),
-                                Some(base) => {
-                                    let mut s = base.read().eval_to_buf_mut(self.ev)?;
-                                    if !s.is_empty() {
-                                        s.put_u8(b' ')
-                                    }
-                                    s.put_slice(&added);
-                                    Variable::with_simple_string(
-                                        s.freeze(),
-                                        base.read().origin(),
+                                Some(pb) if Arc::ptr_eq(&pb, &old_var) => new_var.clone(),
+                                Some(pb) => {
+                                    let po = pb.read().origin();
+                                    let (base, base_text) = self.append_expression(&pb)?;
+                                    let (public, public_text) =
+                                        crate::var::appended_recursive_value(
+                                            base, &base_text, tail.clone(), &tail_text,
+                                        );
+                                    Variable::new_recursive(
+                                        public,
+                                        po,
                                         frame.current(),
                                         loc,
+                                        public_text,
                                     )
                                 }
                                 // Nothing outward to append to, so the walk
-                                // hands back the appended text on its own.
-                                None => Variable::with_simple_string(
-                                    added,
+                                // hands back the tail on its own — still lazy,
+                                // so a reader outside the target reads it in its
+                                // own scope.
+                                None => Variable::new_recursive(
+                                    tail.clone(),
                                     origin,
                                     frame.current(),
                                     loc,
+                                    tail_text.clone(),
                                 ),
                             };
                         }

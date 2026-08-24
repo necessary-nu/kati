@@ -166,6 +166,30 @@ fn appended_values(prev: Arc<Value>, prev_text: &Bytes, added: Arc<Value>) -> Ve
     ]
 }
 
+/// The lazy shape a `+=` leaves, as an expression and the text beside it.
+///
+/// A target-specific `+=` is recursive whatever the base's flavour, and both
+/// its base and its tail are re-expanded in the scope that reads it — GNU
+/// Make's `variable_append` walks the chain under the reader's own `local`. So
+/// the value a reader is bound to is this join held unexpanded, not a string
+/// settled where it was written: a `$(shell)` in the tail runs once per reader
+/// and a name the two readers bind differently is read differently. A base
+/// already reduced to text is spliced as a literal, which is a simple level GNU
+/// Make copies verbatim rather than expanding again.
+pub(crate) fn appended_recursive_value(
+    base: Arc<Value>,
+    base_text: &Bytes,
+    tail: Arc<Value>,
+    tail_text: &Bytes,
+) -> (Arc<Value>, Bytes) {
+    let loc = base.loc();
+    let values = appended_values(base.clone(), base_text, tail);
+    (
+        Arc::new(Value::List(loc, values)),
+        appended_text(base_text, tail_text),
+    )
+}
+
 /// The same join over the text those values were written as.
 ///
 /// A recursive variable keeps its text beside its expression because `$(value)`
@@ -252,6 +276,22 @@ impl Variable {
     /// The expression a recursively expanded variable holds, which is what a
     /// caller reasoning about what an expansion could reach has to walk. A
     /// variable of any other flavour holds text rather than an expression.
+    /// This variable's expression and the text beside it, for splicing into a
+    /// `+=` that is held unexpanded, or `None` for a kind that is neither — an
+    /// automatic or computed variable a caller reads once and splices as a
+    /// literal instead. A simple variable becomes a literal here because it is
+    /// a level GNU Make's `variable_append` copies verbatim.
+    pub(crate) fn append_source(&self) -> Option<(Arc<Value>, Bytes)> {
+        match &self.value {
+            InnerVar::Recursive { v, orig } => Some((v.clone(), orig.clone())),
+            InnerVar::Simple(s) => {
+                let text = Bytes::from(s.clone());
+                Some((Arc::new(Value::Literal(None, text.clone())), text))
+            }
+            _ => None,
+        }
+    }
+
     pub fn recursive_definition(&self) -> Option<Arc<Value>> {
         match &self.value {
             InnerVar::Recursive { v, orig: _ } => Some(v.clone()),
