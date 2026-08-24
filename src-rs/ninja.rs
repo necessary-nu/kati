@@ -1071,6 +1071,12 @@ impl<'a> NinjaGenerator<'a> {
         cmd_buf.freeze()
     }
 
+    /// Whether this line asks for exactly the directory the output sits in.
+    ///
+    /// Absorbing it is sound only where the consumer of the graph creates that
+    /// directory itself, which Ninja does and GNU Make does not —
+    /// [`Flags::recipes_own_output_directories`](crate::flags::Flags::recipes_own_output_directories)
+    /// is the caller saying which of the two it is.
     fn is_output_mkdir(name: &Bytes, cmd: &Bytes) -> bool {
         let Some(cmd) = cmd.strip_prefix(b"mkdir -p ") else {
             return false;
@@ -1573,7 +1579,11 @@ impl<'a> NinjaGenerator<'a> {
                 }
                 translated = work;
                 absorbed = true;
-            } else if Self::is_output_mkdir(name, &translated) && !c.echo && !kept_any {
+            } else if !flags.recipes_own_output_directories
+                && Self::is_output_mkdir(name, &translated)
+                && !c.echo
+                && !kept_any
+            {
                 translated.clear();
                 absorbed = true;
             }
@@ -3452,6 +3462,58 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// The lines a recipe for `sub/out` keeps, with the flag either way.
+    fn kept_lines(lines: &[&'static [u8]], recipes_own_output_directories: bool) -> Vec<String> {
+        let mut names = Symtab::new();
+        let output = names.intern(&b"sub/out"[..]);
+        let commands: Vec<Command> = lines
+            .iter()
+            .map(|cmd| Command {
+                output,
+                cmd: Bytes::from_static(cmd),
+                echo: false,
+                ignore_error: false,
+                dash_prefixed: false,
+                shell_flag: Bytes::from_static(b"-c"),
+                force_no_subshell: false,
+                keeps_indent: false,
+                recursive_line: false,
+                recursive_make: Vec::new(),
+                nesting: None,
+                loc: None,
+            })
+            .collect();
+        let flags = Flags {
+            recipes_own_output_directories,
+            ..Flags::default()
+        };
+        NinjaGenerator::translate_recipe(&flags, &Bytes::from_static(b"sub/out"), &commands, None)
+            .kept()
+            .map(|line| String::from_utf8_lossy(&line.text).into_owned())
+            .collect()
+    }
+
+    /// A leading `mkdir -p` of the output's own directory is work Ninja has
+    /// already done by the time the command runs, so it is absorbed.
+    #[test]
+    fn a_redundant_output_mkdir_is_absorbed_for_ninja() {
+        assert_eq!(
+            kept_lines(&[b"mkdir -p sub", b"cp in sub/out"], false),
+            vec!["cp in sub/out".to_owned()]
+        );
+    }
+
+    /// And it is the line that makes the recipe work where nothing else creates
+    /// the directory, which is GNU Make's arrangement: `$@`'s directory is the
+    /// recipe's problem. Absorbing it there deletes a step of the build.
+    #[test]
+    fn a_recipes_own_output_mkdir_is_kept_where_it_owns_the_directory() {
+        assert_eq!(
+            kept_lines(&[b"mkdir -p sub", b"cp in sub/out"], true),
+            vec!["mkdir -p sub".to_owned(), "cp in sub/out".to_owned()]
+        );
     }
 
     /// GNU Make runs each command line of a recipe as its own process, so a

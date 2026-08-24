@@ -185,6 +185,19 @@ pub struct Flags {
     /// [`VarOrigin::EnvironmentOverride`](crate::var::VarOrigin::EnvironmentOverride).
     pub environment_overrides: bool,
     pub no_builtin_rules: bool,
+    /// Whether the recipe is the only thing that will create the directory its
+    /// output sits in.
+    ///
+    /// A `mkdir -p` of exactly `$(@D)`, standing first in a recipe, is absorbed
+    /// by default: the graph is going to be run by Ninja, Ninja creates an
+    /// edge's output directory before launching the command, and the line is
+    /// then work already done. Set this and the absorption stops, because the
+    /// consumer has said it will not do it — which is what GNU Make says, where
+    /// `$@`'s directory is the recipe's problem and `@mkdir -p $(@D)` is how
+    /// every makefile in the world says so.
+    ///
+    /// Left `false` for `rkati`, whose output is a manifest for Ninja to run.
+    pub recipes_own_output_directories: bool,
     pub no_ninja_prelude: bool,
     pub use_ninja_phony_output: bool,
     pub use_ninja_validations: bool,
