@@ -52,6 +52,9 @@ const FORMER_OWNERS: &[(&str, &str)] = &[
     ("KATI_READONLY_SYM", "kati-wellknown-symbols"),
     ("VARIABLES_SYM", "kati-wellknown-symbols"),
     ("KATI_SYMBOLS_SYM", "kati-wellknown-symbols"),
+    // The last three named surface the 2026-08-24 extension removal took away.
+    // They stay on this list because it is a list of statics that must never
+    // come back, and a name whose feature is gone can only come back as one.
     ("MAKEFILE_LIST", "kati-wellknown-symbols"),
     ("DEFAULT_FILENAME", "kati-wellknown-symbols"),
     ("GLOB_CACHE", "kati-caches-session"),

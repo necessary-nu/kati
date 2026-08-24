@@ -488,18 +488,8 @@ impl<'a> Parser<'a> {
                 "*** empty variable name ***"
             );
         }
-        let mut assign = parse_assign_statement(&line, separator_pos);
+        let assign = parse_assign_statement(&line, separator_pos);
         self.note_recipe_prefix(&assign);
-
-        // If rhs starts with '$=', this is 'final assignment',
-        // e.g., a combination of the assignment and
-        //  .KATI_READONLY := <lhs>
-        // statement. Note that we assume that ParseAssignStatement
-        // trimmed the left
-        let is_final = assign.rhs.starts_with(b"$=");
-        if is_final {
-            assign.rhs = trim_left_space(&assign.rhs[2..]);
-        }
 
         let assign_loc = self.loc.clone();
         let mut mutable_loc = self.loc.clone();
@@ -525,7 +515,6 @@ impl<'a> Parser<'a> {
             orig_rhs,
             assign.op,
             self.current_directive,
-            is_final,
         ));
         Ok(())
     }
@@ -641,7 +630,6 @@ impl<'a> Parser<'a> {
             orig_rhs,
             self.define_op,
             self.current_directive,
-            false,
         ));
         self.define_name = None;
         self.define_op = AssignOp::Eq;

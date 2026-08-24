@@ -257,7 +257,7 @@ fn install_worked_out_variables(ev: &mut Evaluator, targets: &[Symbol]) -> Resul
     let curdir = Bytes::from(std::env::current_dir()?.as_os_str().as_bytes().to_vec());
     let sym = ev.session.intern("CURDIR");
     let var = Variable::with_simple_string(curdir, VarOrigin::File, None, None);
-    ev.session.set_global_var(sym, var, false, None)
+    ev.session.set_global_var(sym, var, false)
 }
 
 /// The host this Make is running on, in the triple shape `MAKE_HOST` carries.
@@ -635,7 +635,6 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
         makefile_list_sym,
         Variable::with_simple_string(Bytes::new(), VarOrigin::File, Some(frame), loc),
         false,
-        None,
     )?;
     // GNU Make reads the environment before it decodes the switches, so every
     // variable it finds there is recorded as `environment` and none of them can
@@ -717,7 +716,7 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
         } else {
             VarExport::Export
         };
-        ev.session.set_global_var(sym, var, false, None)?;
+        ev.session.set_global_var(sym, var, false)?;
     }
     Ok(())
 }
@@ -773,7 +772,7 @@ pub fn expand_environment_option_stream(
         } else {
             VarExport::Export
         };
-        session.set_global_var(sym, var, false, None)?;
+        session.set_global_var(sym, var, false)?;
     }
     let mut loc = Loc::default();
     let parsed = parse_expr(
@@ -952,7 +951,6 @@ fn install_default_goal(ev: &mut Evaluator) -> Result<()> {
         Symbol::DEFAULT_GOAL,
         Variable::with_simple_string(Bytes::new(), VarOrigin::File, None, None),
         false,
-        None,
     )
 }
 
@@ -985,7 +983,7 @@ fn install_makefiles_variable(ev: &mut Evaluator) -> Result<()> {
     }
     let var = Variable::with_simple_string(Bytes::new(), VarOrigin::Default, None, None);
     var.write().export = VarExport::IfSet;
-    ev.session.set_global_var(sym, var, false, None)
+    ev.session.set_global_var(sym, var, false)
 }
 
 /// Read the makefiles `MAKEFILES` names, before the ones the invocation asked

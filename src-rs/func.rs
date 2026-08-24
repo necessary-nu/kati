@@ -1802,10 +1802,10 @@ mod tests {
         ev.avoid_io = true;
         ev.shell_evaluation = ShellEvaluation::Expansion;
         ev.session
-            .set_global_var(Symbol::SHELL, simple(b"/bin/sh"), false, None)
+            .set_global_var(Symbol::SHELL, simple(b"/bin/sh"), false)
             .unwrap();
         ev.session
-            .set_global_var(Symbol::SHELLFLAGS, simple(b"-c"), false, None)
+            .set_global_var(Symbol::SHELLFLAGS, simple(b"-c"), false)
             .unwrap();
 
         let (result, out) = eval_with(&mut ev, "$(subst b,B,$(shell echo abc))");
@@ -1893,7 +1893,7 @@ mod tests {
         let mut ev = Evaluator::new(Session::new());
         let sym = ev.session.intern("KATI_TEST_FOREACH_BOUND");
         ev.session
-            .set_global_var(sym, simple(b"outer"), false, None)
+            .set_global_var(sym, simple(b"outer"), false)
             .unwrap();
 
         let (result, out) = eval_with(
@@ -1934,7 +1934,6 @@ mod tests {
                     Bytes::from_static(body),
                 ),
                 false,
-                None,
             )
             .unwrap();
 
@@ -1960,7 +1959,7 @@ mod tests {
         let bound = ev.session.intern("KATI_TEST_LET_BOUND");
         let unbound = ev.session.intern("KATI_TEST_LET_UNBOUND");
         ev.session
-            .set_global_var(bound, simple(b"outer"), false, None)
+            .set_global_var(bound, simple(b"outer"), false)
             .unwrap();
 
         let (result, out) = eval_with(

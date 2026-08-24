@@ -25,7 +25,7 @@ use crate::func::{FuncInfo, get_func_info};
 use crate::loc::Loc;
 use crate::session::Session;
 use crate::strutil::{Pattern, WordWriter, trim_right_space, trim_suffix, word_scanner};
-use crate::symtab::{Symbol, Symtab};
+use crate::symtab::Symbol;
 use crate::{error_loc, kati_warn_loc, log};
 
 pub trait Evaluable {
@@ -40,18 +40,6 @@ pub trait Evaluable {
     fn eval_to_buf(&self, ev: &mut Evaluator) -> Result<Bytes> {
         Ok(self.eval_to_buf_mut(ev)?.freeze())
     }
-
-    // Whether this Evaluable is either knowably a function (e.g. one of the
-    // built-ins) or likely to be a function-type macro (i.e. one that has
-    // positional $(1) arguments to be expanded inside it. However, this is
-    // only a heuristic guess. In order to not actually evaluate the expression,
-    // because doing so could have side effects like calling $(error ...) or
-    // doing a nested eval that assigns variables, we don't handle the case where
-    // the variable name is itself a variable expansion inside a deferred
-    // expansion variable, and return true in that case. Implementations of this
-    // function must also not mark variables as used, as that can trigger unwanted
-    // warnings. They should use ev->PeekVar().
-    fn is_func(&self, names: &Symtab) -> bool;
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -289,33 +277,6 @@ impl Evaluable for Value {
             }
         }
         Ok(())
-    }
-
-    fn is_func(&self, names: &Symtab) -> bool {
-        match self {
-            Value::Func { .. } => true,
-            Value::List(_, list) => list.iter().any(|v| v.is_func(names)),
-            Value::SymRef(_, sym) => {
-                // This is a heuristic, where say that if a variable has positional
-                // parameters, we think it is likely to be a function. Callers can use
-                // .KATI_SYMBOLS to extract variables and their values, without evaluating
-                // macros that are likely to have side effects.
-                crate::strutil::is_integer(&sym.as_bytes(names))
-            }
-            Value::VarRef(_, _) => {
-                // This is the unhandled edge case as described in the Evaluable::is_func
-                true
-            }
-            Value::VarSubst {
-                name, pat, subst, ..
-            } => name.is_func(names) || pat.is_func(names) || subst.is_func(names),
-            // Evaluating it raises, which is the one thing a caller asking this
-            // question is trying not to provoke.
-            Value::Unreadable(_, _) => true,
-            Value::Literal(_, _) => false,
-            // Finished bytes either way; nothing in it is a call.
-            Value::Folded { .. } => false,
-        }
     }
 }
 

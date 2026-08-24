@@ -32,7 +32,7 @@ use crate::{
     loc::Loc,
     session::{Context, Session},
     strutil::WordWriter,
-    symtab::{Interner, Symtab},
+    symtab::Interner,
 };
 use crate::{
     eval::Evaluator,
@@ -120,7 +120,6 @@ pub struct Variable {
     origin: VarOrigin,
 
     pub assign_op: Option<AssignOp>,
-    pub readonly: bool,
     /// `private`: reachable from the scope that defined it and from nothing
     /// that reaches that scope through a parent.
     pub is_private: bool,
@@ -135,7 +134,7 @@ pub enum InnerVar {
     Recursive { v: Arc<Value>, orig: Bytes },
     AutoCommand(Symbol, AutoCommandVar),
     ShellStatus,
-    VariableNames { all: bool },
+    VariableNames,
 }
 
 /// The pieces of a recursive value that `+=` has appended to, in order.
@@ -314,7 +313,7 @@ impl Variable {
             // definition gave it, and a lookup only overwrites the value. So
             // it is `simple` there, and `$(flavor)` has four answers — this
             // was a fifth that no makefile branching on it can have expected.
-            InnerVar::VariableNames { .. } => "simple",
+            InnerVar::VariableNames => "simple",
         }
     }
     /// Whether the variable's text — what was written, before any expansion —
@@ -332,9 +331,7 @@ impl Variable {
         match &self.value {
             InnerVar::Simple(value) => value.is_empty(),
             InnerVar::Recursive { orig, .. } => orig.is_empty(),
-            InnerVar::AutoCommand(_, _)
-            | InnerVar::ShellStatus
-            | InnerVar::VariableNames { .. } => false,
+            InnerVar::AutoCommand(_, _) | InnerVar::ShellStatus | InnerVar::VariableNames => false,
         }
     }
     pub fn immediate_eval(&self) -> bool {
@@ -363,10 +360,7 @@ impl Variable {
     /// stored: the shell status and the two name lists. There is no text here
     /// for a `+=` to paste onto, and none for `$(value)` to hand back.
     pub fn value_is_computed(&self) -> bool {
-        matches!(
-            &self.value,
-            InnerVar::ShellStatus | InnerVar::VariableNames { .. }
-        )
+        matches!(&self.value, InnerVar::ShellStatus | InnerVar::VariableNames)
     }
 
     /// Whether reading this name regenerates its value whatever was last
@@ -379,7 +373,7 @@ impl Variable {
     /// is an ordinary variable that every `$(shell)` redefines at override
     /// origin, so an `override` write to it really does take.
     pub fn regenerated_at_lookup(&self) -> bool {
-        matches!(&self.value, InnerVar::VariableNames { .. })
+        matches!(&self.value, InnerVar::VariableNames)
     }
 
     /// Copy an existing value before appending, changing only the provenance
@@ -446,7 +440,7 @@ impl Variable {
                 );
             }
             InnerVar::ShellStatus => panic!(),
-            InnerVar::VariableNames { .. } => panic!(),
+            InnerVar::VariableNames => panic!(),
         }
         Ok(())
     }
@@ -479,7 +473,7 @@ impl Variable {
                 error!("appending to ${} is not supported", sym.display(names));
             }
             InnerVar::ShellStatus => panic!(),
-            InnerVar::VariableNames { .. } => panic!(),
+            InnerVar::VariableNames => panic!(),
         }
         Ok(())
     }
@@ -525,9 +519,9 @@ impl Variable {
             // construction and `$(value .VARIABLES)` is the list. Handing back
             // the name instead made this the one variable whose unexpanded text
             // was neither what it held nor what it produced.
-            InnerVar::VariableNames { all } => {
+            InnerVar::VariableNames => {
                 let mut names = BytesMut::new();
-                write_variable_names(session, *all, &mut names);
+                write_variable_names(session, &mut names);
                 Cow::Owned(names.to_vec())
             }
         })
@@ -543,7 +537,6 @@ impl Variable {
             definition: frame,
             origin,
             assign_op: None,
-            readonly: false,
             is_private: false,
             export: VarExport::Default,
             value: InnerVar::Simple(Vec::new()),
@@ -561,7 +554,6 @@ impl Variable {
             definition: frame,
             origin,
             assign_op: None,
-            readonly: false,
             is_private: false,
             export: VarExport::Default,
             value: InnerVar::Simple(value.to_vec()),
@@ -581,7 +573,6 @@ impl Variable {
             definition: frame,
             origin,
             assign_op: None,
-            readonly: false,
             is_private: false,
             export: VarExport::Default,
             value: InnerVar::Simple(value.to_vec()),
@@ -600,7 +591,6 @@ impl Variable {
             definition: frame,
             origin,
             assign_op: None,
-            readonly: false,
             is_private: false,
             export: VarExport::Default,
             value: InnerVar::Recursive { v, orig },
@@ -613,7 +603,6 @@ impl Variable {
             definition: None,
             origin: VarOrigin::Automatic,
             assign_op: None,
-            readonly: false,
             is_private: false,
             export: VarExport::Default,
             value: InnerVar::AutoCommand(sym, a),
@@ -633,14 +622,13 @@ impl Variable {
             definition: None,
             origin: VarOrigin::Override,
             assign_op: Some(AssignOp::ColonEq),
-            readonly: false,
             is_private: false,
             export: VarExport::Default,
             value: InnerVar::ShellStatus,
         }))
     }
 
-    /// `.VARIABLES` and `.KATI_SYMBOLS`, whose value is the live name list.
+    /// `.VARIABLES`, whose value is the live name list.
     ///
     /// GNU Make regenerates `.VARIABLES` at every lookup — `lookup_special_var`
     /// overwrites `var->value` whenever the table has changed since it last
@@ -658,45 +646,36 @@ impl Variable {
     /// name redefined afterwards is an ordinary variable holding whatever was
     /// written to it, which is what carrying the value rather than the name
     /// reproduces here.
-    pub fn new_variable_names(all: bool) -> Arc<RwLock<Self>> {
+    pub fn new_variable_names() -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(Self {
             loc: None,
             definition: None,
             origin: VarOrigin::Default,
             assign_op: Some(AssignOp::ColonEq),
-            readonly: false,
             is_private: false,
             export: VarExport::Default,
-            value: InnerVar::VariableNames { all },
+            value: InnerVar::VariableNames,
         }))
     }
 }
 
-/// Write the live name list `.VARIABLES` and `.KATI_SYMBOLS` answer with.
+/// Write the live name list `.VARIABLES` answers with.
 ///
-/// One loop for both readers, because GNU Make has one: `lookup_special_var`
-/// rebuilds the stored value, and the expansion then reads that value, so the
-/// text `$(value)` sees and the words `$(.VARIABLES)` produces cannot differ
-/// there. Writing it twice here is what let them differ.
+/// One writer, because GNU Make has one: `lookup_special_var` rebuilds the
+/// stored value, and the expansion then reads that value, so the text
+/// `$(value)` sees and the words `$(.VARIABLES)` produces cannot differ there.
+/// Writing it twice here is what let them differ.
 ///
-/// `all` is the whole of what separates the two names. `.VARIABLES` takes every
-/// binding; `.KATI_SYMBOLS` leaves out the ones whose value calls a function,
-/// which is kati's own name and kati's own rule for it. Both leave out the BASE
-/// automatic variables, which GNU Make's list also leaves out — `$@` and its
-/// siblings live in the FILE's variable set, and this walks the global table.
-fn write_variable_names(session: &Session, all: bool, out: &mut dyn BufMut) {
+/// The BASE automatic variables are left out, which GNU Make's list also leaves
+/// out — `$@` and its siblings live in the FILE's variable set, and this walks
+/// the global table.
+fn write_variable_names(session: &Session, out: &mut dyn BufMut) {
     let mut ww = WordWriter::new(out);
     let symbols = session.global_var_names(|var| {
         let var = var.read();
         !var.is_base_automatic_command()
     });
-    for (sym, entry) in symbols {
-        if !all
-            && let Some(var) = session.peek_global_var(sym)
-            && var.read().is_func(&session.symtab)
-        {
-            continue;
-        }
+    for (_, entry) in symbols {
         ww.write(&entry);
     }
 }
@@ -718,18 +697,9 @@ impl Evaluable for Variable {
                     out.put_slice(format!("{status}").as_bytes());
                 }
             }
-            InnerVar::VariableNames { all } => write_variable_names(&ev.session, *all, out),
+            InnerVar::VariableNames => write_variable_names(&ev.session, out),
         }
         Ok(())
-    }
-    fn is_func(&self, names: &Symtab) -> bool {
-        match &self.value {
-            InnerVar::Simple(_) => false,
-            InnerVar::Recursive { v, .. } => v.is_func(names),
-            InnerVar::AutoCommand(_, _) => true,
-            InnerVar::ShellStatus => false,
-            InnerVar::VariableNames { .. } => false,
-        }
     }
 }
 
@@ -811,8 +781,7 @@ impl GlobalVars {
             Symbol::SHELLFLAGS,
             Variable::with_simple_string(Bytes::from_static(b"-c"), VarOrigin::Default, None, None),
         );
-        vars.define(Symbol::VARIABLES, Variable::new_variable_names(true));
-        vars.define(Symbol::KATI_SYMBOLS, Variable::new_variable_names(false));
+        vars.define(Symbol::VARIABLES, Variable::new_variable_names());
         vars
     }
 
@@ -892,31 +861,11 @@ impl GlobalVars {
         }
     }
 
-    /// Assign to `sym` under GNU Make's readonly and origin precedence rules,
-    /// which can decline the assignment silently.
-    pub fn assign(
-        &mut self,
-        names: &impl Interner,
-        sym: Symbol,
-        var: Var,
-        is_override: bool,
-        readonly: Option<&mut bool>,
-    ) -> Result<()> {
+    /// Assign to `sym` under GNU Make's origin precedence rules, which can
+    /// decline the assignment silently.
+    pub fn assign(&mut self, sym: Symbol, var: Var, is_override: bool) -> Result<()> {
         let entry = self.writable_slot(sym);
         if let Some(orig) = entry {
-            if orig.read().readonly {
-                if let Some(readonly) = readonly {
-                    *readonly = true;
-                } else {
-                    error!(
-                        "*** cannot assign to readonly variable: {}",
-                        sym.display(names)
-                    );
-                }
-                return Ok(());
-            } else if let Some(readonly) = readonly {
-                *readonly = false;
-            }
             let origin = orig.read().origin();
             let assigning = var.read().origin();
             // `-e` lifts the environment above the makefile and no higher: a
@@ -969,26 +918,12 @@ impl GlobalVars {
     /// directive is `undefine_variable_global`, so an `undefine` written inside
     /// a `foreach` body withdraws what the name meant outside the loop while
     /// the loop word goes on being what `$(v)` reads.
-    pub fn undefine(
-        &mut self,
-        names: &impl Interner,
-        sym: Symbol,
-        is_override: bool,
-    ) -> Result<()> {
+    pub fn undefine(&mut self, sym: Symbol, is_override: bool) -> Result<()> {
         let slot = self.writable_slot(sym);
         let Some(var) = slot.clone() else {
             return Ok(());
         };
-        let (readonly, origin) = {
-            let var = var.read();
-            (var.readonly, var.origin())
-        };
-        if readonly {
-            error!(
-                "*** cannot undefine readonly variable: {}",
-                sym.display(names)
-            );
-        }
+        let origin = var.read().origin();
         let outranks = match origin {
             VarOrigin::Automatic => false,
             VarOrigin::EnvironmentOverride | VarOrigin::CommandLine | VarOrigin::Override => {
@@ -1082,14 +1017,9 @@ impl Vars {
         self.0.lock().get(&sym).cloned()
     }
 
-    pub fn assign(&self, sym: Symbol, var: Var, readonly: &mut bool) -> Result<()> {
-        *readonly = false;
+    pub fn assign(&self, sym: Symbol, var: Var) -> Result<()> {
         let mut vars = self.0.lock();
         if let Some(orig) = vars.get_mut(&sym) {
-            if orig.read().readonly {
-                *readonly = true;
-                return Ok(());
-            }
             let assigning = var.read().origin();
             match orig.read().origin() {
                 VarOrigin::Override if assigning != VarOrigin::Override => return Ok(()),
@@ -1195,7 +1125,6 @@ mod tests {
         let mut first = GlobalVars::new();
         first
             .assign(
-                &symtab,
                 sym,
                 Variable::with_simple_string(
                     Bytes::from_static(b"-O2"),
@@ -1204,7 +1133,6 @@ mod tests {
                     None,
                 ),
                 false,
-                None,
             )
             .unwrap();
         let session = Session::new();
@@ -1245,12 +1173,11 @@ mod tests {
     }
 
     /// A name whose reads regenerate it takes a write and still answers what
-    /// it computes — GNU Make's `lookup_special_var`, which is `.VARIABLES`
-    /// and, here, `.KATI_SYMBOLS` beside it. `.SHELLSTATUS` is not one: there
+    /// it computes — GNU Make's `lookup_special_var`, which is `.VARIABLES`.
+    /// `.SHELLSTATUS` is not one: there
     /// an `override` write really does replace what the name answers.
     #[test]
     fn a_write_lands_on_a_regenerated_name_without_changing_what_it_answers() {
-        let symtab = Symtab::new();
         let mut scope = GlobalVars::with_builtins();
         let written = || {
             Variable::with_simple_string(
@@ -1260,9 +1187,7 @@ mod tests {
                 None,
             )
         };
-        scope
-            .assign(&symtab, Symbol::VARIABLES, written(), true, None)
-            .unwrap();
+        scope.assign(Symbol::VARIABLES, written(), true).unwrap();
         let bound = scope.peek(Symbol::VARIABLES).expect("a binding");
         assert!(bound.read().regenerated_at_lookup());
         assert_eq!(bound.read().origin(), VarOrigin::Override);
@@ -1270,9 +1195,7 @@ mod tests {
         // The live shell status is published by `record_shell_status`, so an
         // assignment reaching this scope replaces what the name answers.
         scope.define(Symbol::SHELLSTATUS, Variable::new_shell_status_var());
-        scope
-            .assign(&symtab, Symbol::SHELLSTATUS, written(), true, None)
-            .unwrap();
+        scope.assign(Symbol::SHELLSTATUS, written(), true).unwrap();
         let bound = scope.peek(Symbol::SHELLSTATUS).expect("a binding");
         assert!(!bound.read().value_is_computed());
     }

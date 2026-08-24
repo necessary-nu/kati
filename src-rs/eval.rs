@@ -48,12 +48,6 @@ use crate::symtab::{Interner, Symbol, Symtab};
 use crate::var::{Var, VarExport, VarOrigin, Variable, Vars};
 use crate::{collect_stats_with_slow_report, error_loc, log, warn_loc};
 
-pub enum RulesAllowed {
-    Allowed,
-    Warning,
-    Error,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RuleState {
     None,
@@ -221,7 +215,6 @@ struct RuleAssignment {
     orig_rhs: Bytes,
     op: AssignOp,
     modifiers: AssignModifiers,
-    is_final: bool,
 }
 
 /// Find GNU Make's first effective separator while compacting each immediately
@@ -1231,7 +1224,7 @@ impl Evaluator {
             orig_rhs.clone(),
             ParseExprOpt::Normal,
         )?;
-        let statement = AssignStmt::new(loc, name, rhs, orig_rhs, definition.op, None, false);
+        let statement = AssignStmt::new(loc, name, rhs, orig_rhs, definition.op, None);
         self.eval_assign(&statement)
     }
 
@@ -1483,14 +1476,6 @@ impl Evaluator {
             AssignOp::PlusEq => {
                 let prev = self.lookup_var_in_current_scope(lhs)?;
                 if let Some(prev) = prev.clone() {
-                    if prev.read().readonly {
-                        error_loc!(
-                            self,
-                            self.loc.as_ref(),
-                            "*** cannot assign to readonly variable: {}",
-                            lhs.display(self)
-                        );
-                    }
                     // What `+=` has to paste on. A simple variable's value was
                     // expanded when it was set, so the right-hand side is
                     // expanded now to match it; a recursive one is appended to
@@ -1585,23 +1570,6 @@ impl Evaluator {
         self.rule_state = RuleState::None;
         let lhs = stmt.get_lhs_symbol(self)?;
 
-        if lhs == Symbol::KATI_READONLY {
-            let rhs = stmt.rhs.eval_to_buf(self)?;
-            for name in word_scanner(&rhs) {
-                let name = self.session.intern(rhs.slice_ref(name));
-                let Some(var) = self.session.get_global_var(name) else {
-                    error_loc!(
-                        self,
-                        self.loc.as_ref(),
-                        "*** unknown variable: {}",
-                        name.display(self)
-                    );
-                };
-                var.write().readonly = true;
-            }
-            return Ok(());
-        }
-
         let is_override = stmt.directive.map(|v| v.is_override).unwrap_or(false);
         // GNU Make redefines a global rather than replacing it, and nothing
         // clears `private`: once a name is private here, every later assignment
@@ -1621,17 +1589,7 @@ impl Evaluator {
         )?;
         if needs_assign {
             var.write().assign_op = Some(stmt.op);
-            let mut readonly = false;
-            self.session
-                .set_global_var(lhs, var.clone(), is_override, Some(&mut readonly))?;
-            if readonly {
-                error_loc!(
-                    self,
-                    self.loc.as_ref(),
-                    "*** cannot assign to readonly variable: {}",
-                    lhs.display(self)
-                );
-            }
+            self.session.set_global_var(lhs, var.clone(), is_override)?;
         }
 
         if is_private {
@@ -1644,9 +1602,6 @@ impl Evaluator {
             && directive.export != VarExport::Default
         {
             var.write().export = directive.export;
-        }
-        if stmt.is_final {
-            var.write().readonly = true
         }
         // A global assignment made after the graph was compiled can only have
         // come from a recipe, and a new value for an exported name is a new
@@ -1937,11 +1892,7 @@ impl Evaluator {
             text: definition.freeze(),
         };
         let name_range = scanned.definition.name;
-        let mut rhs_start = scanned.definition.value_start;
-        let is_final = definition.text[rhs_start..].starts_with(b"$=");
-        if is_final {
-            rhs_start = skip_make_space(&definition.text, rhs_start + 2);
-        }
+        let rhs_start = scanned.definition.value_start;
         let rhs_range = rhs_start..definition.text.len();
 
         Ok(Some(RuleAssignment {
@@ -1950,7 +1901,6 @@ impl Evaluator {
             orig_rhs: definition.text.slice(rhs_range),
             op: scanned.definition.op,
             modifiers: scanned.modifiers,
-            is_final,
         }))
     }
 
@@ -1984,24 +1934,6 @@ impl Evaluator {
             .trim_ascii_start()
             .trim_end_matches(|c: char| c.is_ascii_whitespace() || c == ':')
             .to_string()
-    }
-
-    pub fn mark_vars_readonly(&mut self, vars_list: &Value) -> Result<()> {
-        let vars_list_string = vars_list.eval_to_buf(self)?;
-        let scope = self.current_scope.clone().unwrap();
-        for name in word_scanner(&vars_list_string) {
-            let name = self.session.intern(vars_list_string.slice_ref(name));
-            let Some(var) = scope.lookup(&mut self.session.used_env_vars, name) else {
-                error_loc!(
-                    self,
-                    self.loc.as_ref(),
-                    "*** unknown variable: {}",
-                    name.display(self)
-                );
-            };
-            var.write().readonly = true;
-        }
-        Ok(())
     }
 
     /// Read `tgt: VAR = value`, expanding both halves in `tgt`'s own scope and
@@ -2111,9 +2043,7 @@ impl Evaluator {
                     .peek(var_sym)
                     .is_some_and(|prev| prev.read().assign_op != Some(AssignOp::PlusEq));
             self.current_scope = Some(scope);
-            if var_sym == Symbol::KATI_READONLY {
-                self.mark_vars_readonly(&assignment.rhs)?;
-            } else {
+            {
                 let (rhs_var, needs_assign) = self.eval_rhs(
                     var_sym,
                     assignment.rhs.clone(),
@@ -2123,7 +2053,6 @@ impl Evaluator {
                     is_pattern_rule,
                 )?;
                 if needs_assign {
-                    let mut readonly = false;
                     // A pending `+=` is one the build's own pass over the rule
                     // variables would finish, by appending it to whatever the
                     // target inherits. On the planned path that pass has
@@ -2140,19 +2069,10 @@ impl Evaluator {
                     } else {
                         assignment.op
                     });
-                    self.current_scope.as_ref().unwrap().assign(
-                        var_sym,
-                        rhs_var.clone(),
-                        &mut readonly,
-                    )?;
-                    if readonly {
-                        error_loc!(
-                            self,
-                            self.loc.as_ref(),
-                            "*** cannot assign to readonly variable: {}",
-                            var_sym.display(self)
-                        );
-                    }
+                    self.current_scope
+                        .as_ref()
+                        .unwrap()
+                        .assign(var_sym, rhs_var.clone())?;
                 }
                 if modifiers.directive.is_private {
                     rhs_var.write().is_private = true;
@@ -2162,9 +2082,6 @@ impl Evaluator {
                 // binding it marks is the one those scopes inherit.
                 if modifiers.directive.export != VarExport::Default {
                     rhs_var.write().export = modifiers.directive.export;
-                }
-                if assignment.is_final {
-                    rhs_var.write().readonly = true;
                 }
                 // Written last, so what travels down the link is the binding
                 // with its `private` and `export` marks already on it.
@@ -2208,8 +2125,7 @@ impl Evaluator {
             };
             let own = scope.own.get(&name).copied();
             if own.is_none() {
-                let mut readonly = false;
-                let _ = scope.vars.assign(name, var.clone(), &mut readonly);
+                let _ = scope.vars.assign(name, var.clone());
             }
             if own != Some(true) {
                 frontier.extend(scope.inheritors.iter().copied());
@@ -2369,25 +2285,6 @@ impl Evaluator {
         self.record_default_goal(&rule.outputs)?;
 
         log!("Rule: {:?}", rule);
-        match self.get_allow_rules()? {
-            RulesAllowed::Warning => {
-                warn_loc!(
-                    self,
-                    self.loc.as_ref(),
-                    "warning: Rule not allowed here for target: {}",
-                    Evaluator::format_rule_error(&before_term)
-                );
-            }
-            RulesAllowed::Error => {
-                error_loc!(
-                    self,
-                    self.loc.as_ref(),
-                    "*** Rule not allowed here for target: {}",
-                    Evaluator::format_rule_error(&before_term),
-                );
-            }
-            RulesAllowed::Allowed => {}
-        }
         self.rules.push(rule);
         self.rule_state = RuleState::Active;
         Ok(())
@@ -2438,7 +2335,6 @@ impl Evaluator {
                 Symbol::DEFAULT_GOAL,
                 Variable::with_simple_string(name, VarOrigin::File, Some(frame), loc),
                 false,
-                None,
             );
         }
         Ok(())
@@ -2709,7 +2605,6 @@ impl Evaluator {
             Symbol::MAKEFILE_LIST,
             Variable::with_simple_string(name, VarOrigin::File, Some(frame), loc),
             false,
-            None,
         )
     }
 
@@ -2998,7 +2893,7 @@ impl Evaluator {
         let var =
             Variable::with_simple_string(Bytes::new(), VarOrigin::File, frame, self.loc.clone());
         var.write().export = attribute;
-        self.session.set_global_var(name, var, false, None)
+        self.session.set_global_var(name, var, false)
     }
 
     pub fn lookup_var_global(&mut self, name: Symbol) -> Option<Var> {
@@ -3456,14 +3351,6 @@ impl Evaluator {
         }
     }
 
-    fn get_allow_rules(&mut self) -> Result<RulesAllowed> {
-        Ok(match self.eval_var(Symbol::KATI_ALLOW_RULES)?.as_ref() {
-            b"warning" => RulesAllowed::Warning,
-            b"error" => RulesAllowed::Error,
-            _ => RulesAllowed::Allowed,
-        })
-    }
-
     pub fn dump_include_json(&self, filename: &OsStr) -> Result<()> {
         let mut graph = IncludeGraph::new();
         graph.merge_tree_node(self.stack.lock().first().unwrap());
@@ -3851,7 +3738,7 @@ mod tests {
 
         ev.with_bound(sym, automatic(b"loop-word"), |ev| {
             ev.session
-                .set_global_var(sym, from_file(b"assigned"), false, None)?;
+                .set_global_var(sym, from_file(b"assigned"), false)?;
             let read = ev.session.peek_global_var(sym).unwrap();
             assert_eq!(string_of(&ev.session, read.clone()), "loop-word");
             assert_eq!(read.read().origin(), VarOrigin::Automatic);
@@ -3875,7 +3762,7 @@ mod tests {
         ev.with_bound(sym, automatic(b"first"), |ev| {
             ev.with_bound(sym, automatic(b"second"), |ev| {
                 ev.session
-                    .set_global_var(sym, from_file(b"assigned"), false, None)
+                    .set_global_var(sym, from_file(b"assigned"), false)
             })?;
             // The inner binding unwinds to the outer binding, not to the write.
             let read = ev.session.peek_global_var(sym).unwrap();

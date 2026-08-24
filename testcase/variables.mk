@@ -32,13 +32,5 @@ SET_BEFORE += should_not_appear_in_output_before
 $(info .VARIABLES (from make): $(sort $(filter-out $(BEFORE), $(.VARIABLES))))
 $(info .VARIABLES (hard coded): BEFORE EVALUABLE LOOKS_LIKE_A_FUNCTION_1 LOOKS_LIKE_A_FUNCTION_2 NOT_A_FUNCTION_1 NOT_A_FUNCTION_2 ONE THE_EDGE_CASE_1 THE_EDGE_CASE_2 THE_EDGE_CASE_3 THE_EDGE_CASE_4 THE_EDGE_CASE_5)
 
-ifdef KATI
-$(info .KATI_SYMBOLS: $(sort $(filter-out $(BEFORE), $(.KATI_SYMBOLS))))
-else
-# Make doesn't support .VARIABLES so output the expected values manually
-# for comparison
-$(info .KATI_SYMBOLS: BEFORE EVALUABLE NOT_A_FUNCTION_1 NOT_A_FUNCTION_2 ONE)
-endif
-
 # Updating this variable should not cause it to appear
 SET_BEFORE += a_new_value

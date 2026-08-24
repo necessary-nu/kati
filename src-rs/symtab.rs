@@ -63,10 +63,7 @@ impl<T: Interner + ?Sized> Interner for &T {
 const WELL_KNOWN: &[&[u8]] = &[
     b"<unknown>",
     b"SHELL",
-    b".KATI_ALLOW_RULES",
-    b".KATI_READONLY",
     b".VARIABLES",
-    b".KATI_SYMBOLS",
     b"MAKEFILE_LIST",
     b".POSIX",
     b".SHELLSTATUS",
@@ -100,17 +97,14 @@ impl Symbol {
 
     pub const UNKNOWN_FILENAME: Symbol = Symbol::well_known(0);
     pub const SHELL: Symbol = Symbol::well_known(1);
-    pub const KATI_ALLOW_RULES: Symbol = Symbol::well_known(2);
-    pub const KATI_READONLY: Symbol = Symbol::well_known(3);
-    pub const VARIABLES: Symbol = Symbol::well_known(4);
-    pub const KATI_SYMBOLS: Symbol = Symbol::well_known(5);
-    pub const MAKEFILE_LIST: Symbol = Symbol::well_known(6);
-    pub const POSIX: Symbol = Symbol::well_known(7);
-    pub const SHELLSTATUS: Symbol = Symbol::well_known(8);
-    pub const RECIPEPREFIX: Symbol = Symbol::well_known(9);
-    pub const SHELLFLAGS: Symbol = Symbol::well_known(10);
-    pub const DEFAULT_GOAL: Symbol = Symbol::well_known(11);
-    pub const SUFFIXES: Symbol = Symbol::well_known(12);
+    pub const VARIABLES: Symbol = Symbol::well_known(2);
+    pub const MAKEFILE_LIST: Symbol = Symbol::well_known(3);
+    pub const POSIX: Symbol = Symbol::well_known(4);
+    pub const SHELLSTATUS: Symbol = Symbol::well_known(5);
+    pub const RECIPEPREFIX: Symbol = Symbol::well_known(6);
+    pub const SHELLFLAGS: Symbol = Symbol::well_known(7);
+    pub const DEFAULT_GOAL: Symbol = Symbol::well_known(8);
+    pub const SUFFIXES: Symbol = Symbol::well_known(9);
 
     /// The bytes this handle was interned from, as borrowed from `names`.
     // [spec:ronin:req:make.no-ambient-state]
@@ -312,10 +306,7 @@ mod tests {
         for sym in [
             Symbol::UNKNOWN_FILENAME,
             Symbol::SHELL,
-            Symbol::KATI_ALLOW_RULES,
-            Symbol::KATI_READONLY,
             Symbol::VARIABLES,
-            Symbol::KATI_SYMBOLS,
             Symbol::MAKEFILE_LIST,
             Symbol::POSIX,
             Symbol::SHELLSTATUS,

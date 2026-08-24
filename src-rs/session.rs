@@ -449,7 +449,6 @@ impl Session {
             Symbol::SHELLSTATUS,
             crate::var::Variable::new_shell_status_var(),
             true,
-            None,
         )
     }
 
@@ -471,21 +470,11 @@ impl Session {
     }
 
     /// Assign to a global variable under Make's precedence rules.
-    pub fn set_global_var(
-        &mut self,
-        sym: Symbol,
-        var: Var,
-        is_override: bool,
-        readonly: Option<&mut bool>,
-    ) -> Result<()> {
+    pub fn set_global_var(&mut self, sym: Symbol, var: Var, is_override: bool) -> Result<()> {
         if self.flags.environment_overrides {
             self.globals.note_environment_outranks_the_makefile(sym);
         }
-        // Disjoint fields: the scope is written while the interner is read for
-        // the readonly diagnostic. They were two locks before, and taking both
-        // was the hazard this removes.
-        self.globals
-            .assign(&self.symtab, sym, var, is_override, readonly)
+        self.globals.assign(sym, var, is_override)
     }
 
     /// Remove a global variable, if the `undefine` outranks what defined it.
@@ -493,7 +482,7 @@ impl Session {
         if self.flags.environment_overrides {
             self.globals.note_environment_outranks_the_makefile(sym);
         }
-        self.globals.undefine(&self.symtab, sym, is_override)
+        self.globals.undefine(sym, is_override)
     }
 
     /// The names of the global variables satisfying `filter`, in symbol order.

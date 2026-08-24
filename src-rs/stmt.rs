@@ -127,7 +127,6 @@ pub struct AssignStmt {
     pub orig_rhs: Bytes,
     pub op: AssignOp,
     pub directive: Option<AssignDirective>,
-    pub is_final: bool,
 
     lhs_sym_cache: Mutex<Option<Symbol>>,
 }
@@ -169,7 +168,6 @@ impl AssignStmt {
         orig_rhs: Bytes,
         op: AssignOp,
         directive: Option<AssignDirective>,
-        is_final: bool,
     ) -> Arc<AssignStmt> {
         Arc::new(AssignStmt {
             loc,
@@ -179,7 +177,6 @@ impl AssignStmt {
             orig_rhs,
             op,
             directive,
-            is_final,
             lhs_sym_cache: Mutex::new(None),
         })
     }
