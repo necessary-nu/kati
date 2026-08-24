@@ -5555,7 +5555,10 @@ impl<'a> DepBuilder<'a> {
                             // the base that stood in the target's scope.
                             let (base, base_text) = self.append_expression(&old_var)?;
                             let (guard, guard_text) = crate::var::appended_recursive_value(
-                                base, &base_text, tail.clone(), &tail_text,
+                                base,
+                                &base_text,
+                                tail.clone(),
+                                &tail_text,
                             );
                             new_var = Variable::new_recursive(
                                 guard,
@@ -5571,7 +5574,10 @@ impl<'a> DepBuilder<'a> {
                                     let (base, base_text) = self.append_expression(&pb)?;
                                     let (public, public_text) =
                                         crate::var::appended_recursive_value(
-                                            base, &base_text, tail.clone(), &tail_text,
+                                            base,
+                                            &base_text,
+                                            tail.clone(),
+                                            &tail_text,
                                         );
                                     Variable::new_recursive(
                                         public,
