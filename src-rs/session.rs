@@ -56,7 +56,7 @@ use crate::{
 /// the same on every pass by construction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GroundQuestion {
-    /// `$(shell)`, `!=` and `KATI_shell_no_rerun`.
+    /// `$(shell)` and `!=`.
     Shell,
     /// `$(wildcard)`.
     Wildcard,
@@ -270,8 +270,8 @@ pub struct Session {
     /// Behind a lock because the regeneration check globs from a worker thread
     /// with only a `&Session`; it is session state either way.
     pub glob_cache: GlobCache,
-    /// Parsed makefiles, keyed by filename, and the extra file dependencies
-    /// `$(KATI_extra_file_deps)` adds.
+    /// Parsed makefiles, keyed by filename, and the files a read depended on
+    /// and could not open.
     pub makefiles: MakefileCache,
     /// The find emulator's directory tree, built on first use because building
     /// it walks the source tree.

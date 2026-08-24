@@ -565,16 +565,6 @@ fn collapse_rule_continuations(source: Bytes, posix: bool) -> Bytes {
     output.freeze()
 }
 
-/// Whether `export` directives are allowed.
-pub enum ExportAllowed {
-    /// Export directives are allowed, the default.
-    Allowed,
-    /// Export directives result in warnings with the specified message.
-    Warning(String),
-    /// Export directives result in errors with the specified message.
-    Error(String),
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum FrameType {
     Root,       // Root node. Exactly one of this exists.
@@ -979,11 +969,6 @@ pub struct Evaluator {
 
     is_posix: bool,
 
-    /// Whether `export`/`unexport` directives are allowed.
-    pub export_allowed: ExportAllowed,
-
-    pub profiled_files: Vec<OsString>,
-
     /// Missing `include` and `-include` inputs, in source order.
     pub(crate) missing_includes: Vec<MissingInclude>,
 
@@ -1295,9 +1280,6 @@ impl Evaluator {
             is_posix: false,
 
             environment_recursion: 0,
-            export_allowed: ExportAllowed::Allowed,
-
-            profiled_files: Vec::new(),
 
             missing_includes: Vec::new(),
             read_makefiles: Vec::new(),
@@ -1434,19 +1416,16 @@ impl Evaluator {
         };
 
         let result: Var;
-        let prev: Option<Var>;
         let mut needs_assign = true;
 
         match op {
             AssignOp::ColonEq => {
-                prev = self.peek_var_in_current_scope(lhs);
                 let loc = self.loc.clone();
                 result = self.in_ambient_scope(ambient_value, |ev| {
                     Variable::with_simple_value(origin, current_frame, loc, ev, &rhs_v)
                 })?;
             }
             AssignOp::ImmediateRecursive => {
-                prev = self.peek_var_in_current_scope(lhs);
                 let expanded = self.in_ambient_scope(ambient_value, |ev| rhs_v.eval_to_buf(ev))?;
                 let mut escaped = Vec::with_capacity(expanded.len());
                 for byte in expanded {
@@ -1475,7 +1454,6 @@ impl Evaluator {
             // `V != cmd` runs the command the way `$(shell)` does, down to
             // `.SHELLSTATUS`, then reads its output as a recursive value.
             AssignOp::ShellEq => {
-                prev = self.peek_var_in_current_scope(lhs);
                 let ran = Value::Func {
                     loc: self.loc.clone().unwrap_or_default(),
                     fi: &crate::func::SHELL_ASSIGNMENT,
@@ -1494,7 +1472,6 @@ impl Evaluator {
                     Variable::new_recursive(value, origin, current_frame, self.loc.clone(), output);
             }
             AssignOp::Eq => {
-                prev = self.peek_var_in_current_scope(lhs);
                 result = Variable::new_recursive(
                     rhs_v,
                     origin,
@@ -1504,7 +1481,7 @@ impl Evaluator {
                 );
             }
             AssignOp::PlusEq => {
-                prev = self.lookup_var_in_current_scope(lhs)?;
+                let prev = self.lookup_var_in_current_scope(lhs)?;
                 if let Some(prev) = prev.clone() {
                     if prev.read().readonly {
                         error_loc!(
@@ -1584,7 +1561,7 @@ impl Evaluator {
                 }
             }
             AssignOp::QuestionEq => {
-                prev = self.lookup_var_in_current_scope(lhs)?;
+                let prev = self.lookup_var_in_current_scope(lhs)?;
                 if let Some(prev) = prev.clone() {
                     result = prev;
                     needs_assign = false;
@@ -1597,14 +1574,6 @@ impl Evaluator {
                         orig_rhs,
                     );
                 }
-            }
-        }
-
-        if let Some(prev) = prev {
-            let prev = prev.read();
-            prev.used(self, &lhs)?;
-            if needs_assign && let Some(deprecated) = &prev.deprecated {
-                result.write().deprecated = Some(deprecated.clone());
             }
         }
 
@@ -1675,7 +1644,6 @@ impl Evaluator {
             && directive.export != VarExport::Default
         {
             var.write().export = directive.export;
-            self.check_export_allowed(lhs, directive.export == VarExport::Export)?;
         }
         if stmt.is_final {
             var.write().readonly = true
@@ -2555,7 +2523,6 @@ impl Evaluator {
                 let lhs = self.session.intern(var_name.slice_ref(lhs));
                 if let Some(v) = self.lookup_var_in_current_scope(lhs)? {
                     let v = v.read();
-                    v.used(self, &lhs)?;
                     v.string(&self.session)?.is_empty() == (stmt.op == CondOp::Ifndef)
                 } else {
                     stmt.op == CondOp::Ifndef
@@ -2695,11 +2662,6 @@ impl Evaluator {
             )
         })?;
 
-        if !self.profiled_files.is_empty() {
-            for mk in std::mem::take(&mut self.profiled_files) {
-                crate::stats::mark_interesting(self, "included makefiles", mk);
-            }
-        }
         Ok(())
     }
 
@@ -3001,33 +2963,6 @@ impl Evaluator {
             }
             let sym = self.session.intern(exports.slice_ref(lhs));
             self.mark_exported(sym, stmt.is_export)?;
-            self.check_export_allowed(sym, stmt.is_export)?;
-        }
-        Ok(())
-    }
-
-    /// Report an `export` a `$(KATI_deprecate_export)` or
-    /// `$(KATI_obsolete_export)` earlier in the read asked to hear about.
-    ///
-    /// Every way of saying it is one of these, so this is asked wherever the
-    /// attribute is set rather than only where the directive spells out a list
-    /// of names — `export NAME := value` is an export like any other.
-    fn check_export_allowed(&mut self, name: Symbol, is_export: bool) -> Result<()> {
-        let prefix = if is_export { "" } else { "un" };
-        match &self.export_allowed {
-            ExportAllowed::Allowed => {}
-            ExportAllowed::Error(msg) => error_loc!(
-                self,
-                self.loc.as_ref(),
-                "*** {}: {prefix}export is obsolete{msg}.",
-                name.display(self)
-            ),
-            ExportAllowed::Warning(msg) => warn_loc!(
-                self,
-                self.loc.as_ref(),
-                "{}: {prefix}export has been deprecated{msg}.",
-                name.display(self)
-            ),
         }
         Ok(())
     }

@@ -16,14 +16,11 @@ limitations under the License.
 
 use std::{
     collections::HashMap,
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     fmt::Debug,
     fs::File,
     io::{Read, Write},
-    os::unix::{
-        ffi::{OsStrExt, OsStringExt},
-        process::ExitStatusExt,
-    },
+    os::unix::{ffi::OsStrExt, process::ExitStatusExt},
     sync::{Arc, LazyLock},
 };
 
@@ -35,7 +32,7 @@ use crate::{
     collect_stats, collect_stats_with_slow_report,
     command::DEFERRED_NEW_INPUTS_REFERENCE,
     error_loc,
-    eval::{Evaluator, ExportAllowed, FrameType},
+    eval::{Evaluator, FrameType},
     expr::{Evaluable, Value},
     fileutil::{RedirectStderr, run_command},
     find::FindCommand,
@@ -46,8 +43,7 @@ use crate::{
     session::{GroundQuestion, Session},
     strutil::{
         Pattern, WordWriter, escape_printf_b, format_for_command_substitution,
-        format_for_shell_assignment, has_path_prefix, is_space_byte, normalize_path,
-        trim_left_space, trim_space, word_scanner,
+        format_for_shell_assignment, is_space_byte, trim_left_space, trim_space, word_scanner,
     },
     var::{VarOrigin, Variable},
     warn_loc,
@@ -942,80 +938,6 @@ fn shell_func_with(
     Ok(())
 }
 
-fn shell_no_rerun_func(
-    args: &[Arc<Value>],
-    ev: &mut Evaluator,
-    out: &mut dyn BufMut,
-) -> Result<()> {
-    let cmd = args[0].eval_to_buf(ev)?;
-    if ev.defers_shell_to_the_recipe() && !has_no_io_in_shell_script(&cmd) {
-        // In the regular ShellFunc, if it sees a $(shell) inside of a rule when in
-        // ninja mode, the shell command will just be written to the ninja file
-        // instead of run directly by kati. So it already has the benefits of not
-        // rerunning every time kati is invoked.
-        error_loc!(
-            ev,
-            ev.loc.as_ref(),
-            "KATI_shell_no_rerun provides no benefit over regular $(shell) inside of a rule."
-        );
-    }
-
-    if let Some(answered) = ev
-        .session
-        .ground_journal
-        .answered(GroundQuestion::Shell, &cmd)
-    {
-        out.put_slice(&answered.answer);
-        ev.session.record_shell_status(answered.status)?;
-        return Ok(());
-    }
-
-    let loc = ev.loc.clone().unwrap_or_default();
-    let shell = ev.get_shell()?;
-    // GNU Make passes no command flags here (`func_shell` hands
-    // `construct_command_argv` a zero), so `.POSIX:` keeps its `-e`.
-    let shellflag = ev.get_shell_flag(false)?;
-    // `one_shell` is a GLOBAL in GNU Make, not a parameter, and
-    // `func_shell_base` reaches `construct_command_argv` like every other
-    // launch — so under `.ONESHELL:` a `$(shell)` is read by the one-shell
-    // branch too, newline separator and all, and the question is only whether
-    // the line has been read YET. The bytes are what that branch's own
-    // recursion defaults its flags to while it re-reads `.SHELLFLAGS` for this
-    // launch; the zero line flags above are why `false` is the whole of what it
-    // asks.
-    let one_script = ev
-        .session
-        .flags
-        .one_shell
-        .then(|| ev.default_shell_flag(false));
-    let current_scope = ev.current_scope.clone();
-
-    let environment = crate::export::exported_environment(
-        ev,
-        current_scope.as_deref(),
-        crate::export::ChildKind::Expansion,
-    )?;
-    let (exit_code, output, _) = shell_func_impl(
-        &ev.session,
-        crate::fileutil::ShellToReadWith {
-            program: &shell,
-            flag: &shellflag,
-            stand_in: ev.session.flags.default_shell_program.as_deref(),
-            one_script,
-        },
-        &cmd,
-        &environment,
-        &loc,
-        Trailing::Drop,
-    )?;
-    out.put_slice(&output);
-    ev.session
-        .ground_journal
-        .record(GroundQuestion::Shell, cmd, output, Some(exit_code));
-    ev.session.record_shell_status(Some(exit_code))?;
-    Ok(())
-}
-
 /// `$(call name,...)` where the name is a built-in function's.
 ///
 /// GNU Make's `func_call` looks the name up in the function table before it
@@ -1080,10 +1002,7 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
     }
     let func_sym = ev.session.intern(func_name_buf.clone());
     let func = ev.lookup_var(func_sym)?;
-    if let Some(func) = &func {
-        let func = func.read();
-        func.used(ev, &func_sym)?;
-    } else if ev.session.flags.enable_kati_warnings {
+    if func.is_none() && ev.session.flags.enable_kati_warnings {
         kati_warn_loc!(
             ev,
             ev.loc.as_ref(),
@@ -1635,364 +1554,6 @@ fn file_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
     file_func_impl(args, ev, out, true)
 }
 
-fn file_no_rerun_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
-    file_func_impl(args, ev, out, false)
-}
-
-fn deprecated_var_func(
-    args: &[Arc<Value>],
-    ev: &mut Evaluator,
-    _out: &mut dyn BufMut,
-) -> Result<()> {
-    let vars_str = args[0].eval_to_buf(ev)?;
-    let msg = Arc::new(if let Some(v) = args.get(1) {
-        format!(". {}", String::from_utf8_lossy(&v.eval_to_buf(ev)?))
-    } else {
-        String::new()
-    });
-
-    if ev.avoid_io {
-        error_loc!(
-            ev,
-            ev.loc.as_ref(),
-            "*** $(KATI_deprecated_var ...) is not supported in rules."
-        );
-    }
-
-    for var in word_scanner(&vars_str) {
-        let var = vars_str.slice_ref(var);
-        let sym = ev.session.intern(var);
-        let v = match ev.peek_var(sym) {
-            Some(v) => v,
-            None => {
-                let frame = ev.current_frame();
-                let loc = ev.loc.clone();
-                let v = Variable::new_simple(VarOrigin::File, Some(frame), loc);
-                ev.session.set_global_var(sym, v.clone(), false, None)?;
-                v
-            }
-        };
-
-        let mut v = v.write();
-        if v.deprecated.is_some() {
-            error_loc!(
-                ev,
-                ev.loc.as_ref(),
-                "*** Cannot call KATI_deprecated_var on already deprecated variable: {}.",
-                sym.display(ev)
-            );
-        } else if v.obsolete() {
-            error_loc!(
-                ev,
-                ev.loc.as_ref(),
-                "*** Cannot call KATI_deprecated_var on already obsolete variable: {}.",
-                sym.display(ev)
-            );
-        }
-
-        v.deprecated = Some(msg.clone());
-    }
-    Ok(())
-}
-
-fn obsolete_var_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> Result<()> {
-    let vars_str = args[0].eval_to_buf(ev)?;
-    let msg = Arc::new(if let Some(v) = args.get(1) {
-        format!(". {}", String::from_utf8_lossy(&v.eval_to_buf(ev)?))
-    } else {
-        String::new()
-    });
-
-    if ev.avoid_io {
-        error_loc!(
-            ev,
-            ev.loc.as_ref(),
-            "*** $(KATI_obsolete_var ...) is not supported in rules."
-        );
-    }
-
-    for var in word_scanner(&vars_str) {
-        let var = vars_str.slice_ref(var);
-        let sym = ev.session.intern(var);
-        let v = match ev.peek_var(sym) {
-            Some(v) => v,
-            None => {
-                let frame = ev.current_frame();
-                let loc = ev.loc.clone();
-                let v = Variable::new_simple(VarOrigin::File, Some(frame), loc);
-                ev.session.set_global_var(sym, v.clone(), false, None)?;
-                v
-            }
-        };
-
-        let mut v = v.write();
-        if v.deprecated.is_some() {
-            error_loc!(
-                ev,
-                ev.loc.as_ref(),
-                "*** Cannot call KATI_obsolete_var on already deprecated variable: {}.",
-                sym.display(ev)
-            );
-        } else if v.obsolete() {
-            error_loc!(
-                ev,
-                ev.loc.as_ref(),
-                "*** Cannot call KATI_obsolete_var on already obsolete variable: {}.",
-                sym.display(ev)
-            );
-        }
-
-        v.set_obsolete(msg.clone());
-    }
-    Ok(())
-}
-
-fn deprecate_export_func(
-    args: &[Arc<Value>],
-    ev: &mut Evaluator,
-    _out: &mut dyn BufMut,
-) -> Result<()> {
-    let msg = format!(". {}", String::from_utf8_lossy(&args[0].eval_to_buf(ev)?));
-
-    if ev.avoid_io {
-        error_loc!(
-            ev,
-            ev.loc.as_ref(),
-            "*** $(KATI_deprecate_export) is not supported in rules."
-        );
-    }
-
-    match &ev.export_allowed {
-        ExportAllowed::Warning(_) => {
-            error_loc!(ev, ev.loc.as_ref(), "*** Export is already deprecated.")
-        }
-        ExportAllowed::Error(_) => {
-            error_loc!(ev, ev.loc.as_ref(), "*** Export is already obsolete.")
-        }
-        ExportAllowed::Allowed => {}
-    }
-
-    ev.export_allowed = ExportAllowed::Warning(msg);
-    Ok(())
-}
-
-fn obsolete_export_func(
-    args: &[Arc<Value>],
-    ev: &mut Evaluator,
-    _out: &mut dyn BufMut,
-) -> Result<()> {
-    let msg = format!(". {}", String::from_utf8_lossy(&args[0].eval_to_buf(ev)?));
-
-    if ev.avoid_io {
-        error_loc!(
-            ev,
-            ev.loc.as_ref(),
-            "*** $(KATI_obsolete_export) is not supported in rules."
-        );
-    }
-
-    if matches!(ev.export_allowed, ExportAllowed::Error(_)) {
-        error_loc!(ev, ev.loc.as_ref(), "*** Export is already obsolete.");
-    }
-
-    ev.export_allowed = ExportAllowed::Error(msg);
-    Ok(())
-}
-
-fn profile_makefile_func(
-    args: &[Arc<Value>],
-    ev: &mut Evaluator,
-    _out: &mut dyn BufMut,
-) -> Result<()> {
-    for arg in args {
-        let files = arg.eval_to_buf(ev)?;
-        for file in word_scanner(&files) {
-            ev.profiled_files.push(OsString::from_vec(file.to_vec()));
-        }
-    }
-    Ok(())
-}
-
-fn variable_location_func(
-    args: &[Arc<Value>],
-    ev: &mut Evaluator,
-    out: &mut dyn BufMut,
-) -> Result<()> {
-    let arg = args[0].eval_to_buf(ev)?;
-    let mut locations = Vec::new();
-    for var in word_scanner(&arg) {
-        let var = arg.slice_ref(var);
-        let sym = ev.session.intern(var);
-        let l = ev
-            .peek_var(sym)
-            .and_then(|v| v.read().loc().clone())
-            .unwrap_or_default();
-        locations.push(l.display(&ev.session).to_string());
-    }
-    let mut ww = WordWriter::new(out);
-    for l in locations {
-        ww.write(l.as_bytes());
-    }
-    Ok(())
-}
-
-fn extra_file_deps_func(
-    args: &[Arc<Value>],
-    ev: &mut Evaluator,
-    _out: &mut dyn BufMut,
-) -> Result<()> {
-    for arg in args {
-        let files = arg.eval_to_buf(ev)?;
-        for file in word_scanner(&files) {
-            let fname = <OsStr as OsStrExt>::from_bytes(file);
-            match std::fs::exists(fname) {
-                Ok(true) => {}
-                Ok(false) => error_loc!(
-                    ev,
-                    ev.loc.as_ref(),
-                    "*** file does not exist: {}",
-                    fname.to_string_lossy()
-                ),
-                // The system could not answer either way — a directory on the
-                // way that cannot be searched. Say so, at the line that asked.
-                Err(err) => error_loc!(
-                    ev,
-                    ev.loc.as_ref(),
-                    "*** {}: {}",
-                    fname.to_string_lossy(),
-                    crate::strerror(&err)
-                ),
-            }
-            ev.session
-                .makefiles
-                .add_extra_file_dep(fname.to_os_string());
-        }
-    }
-    Ok(())
-}
-
-fn foreach_sep_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
-    let name = args[0].eval_to_buf(ev)?;
-    let varname = ev.session.intern(name);
-    let separator = args[1].eval_to_buf(ev)?;
-    let list = args[2].eval_to_buf(ev)?;
-    ev.eval_depth -= 1;
-    let mut ww = WordWriter::new(out);
-    for tok in word_scanner(&list) {
-        let tok = list.slice_ref(tok);
-        let v = Variable::with_simple_string(tok, VarOrigin::Automatic, None, None);
-        ww.maybe_add_separator(&separator);
-        ev.with_bound(varname, v, |ev| args[3].eval(ev, ww.out))?;
-    }
-    ev.eval_depth += 1;
-    Ok(())
-}
-
-fn visibility_prefix_func(
-    args: &[Arc<Value>],
-    ev: &mut Evaluator,
-    _out: &mut dyn BufMut,
-) -> Result<()> {
-    let arg = args[0].eval_to_buf(ev)?;
-    let mut prefixes: Vec<OsString> = Vec::new();
-
-    for prefix in word_scanner(&args[1].eval_to_buf(ev)?) {
-        if prefix.starts_with(b"/") {
-            error_loc!(
-                ev,
-                ev.loc.as_ref(),
-                "Visibility prefix should not start with /"
-            );
-        }
-        if prefix.starts_with(b"../") {
-            error_loc!(
-                ev,
-                ev.loc.as_ref(),
-                "Visibility prefix should not start with ../"
-            );
-        }
-
-        let normalized_prefix = normalize_path(prefix);
-        if prefix != normalized_prefix {
-            error_loc!(
-                ev,
-                ev.loc.as_ref(),
-                "Visibility prefix {} is not normalized. Normalized prefix: {}",
-                String::from_utf8_lossy(prefix),
-                String::from_utf8_lossy(&normalized_prefix)
-            );
-        }
-
-        // one visibility prefix cannot be the prefix of another visibility prefix
-        for p in &prefixes {
-            if has_path_prefix(p.as_bytes(), prefix) {
-                error_loc!(
-                    ev,
-                    ev.loc.as_ref(),
-                    "Visibility prefix {} is the prefix of another visibility prefix {}",
-                    String::from_utf8_lossy(prefix),
-                    p.to_string_lossy(),
-                );
-            } else if has_path_prefix(prefix, p.as_bytes()) {
-                error_loc!(
-                    ev,
-                    ev.loc.as_ref(),
-                    "Visibility prefix {} is the prefix of another visibility prefix {}",
-                    p.to_string_lossy(),
-                    String::from_utf8_lossy(prefix),
-                );
-            }
-        }
-
-        prefixes.push(OsStringExt::from_vec(normalized_prefix.to_vec()));
-    }
-
-    let sym = ev.session.intern(arg);
-    let v = if let Some(v) = ev.peek_var(sym) {
-        v
-    } else {
-        // If variable is not defined, create an empty variable.
-        let frame = ev.current_frame();
-        let loc = ev.loc.clone();
-        let v = Variable::new_simple(VarOrigin::File, Some(frame), loc);
-        ev.session.set_global_var(sym, v.clone(), false, None)?;
-        v
-    };
-    if !prefixes.is_empty() {
-        v.write()
-            .set_visibility_prefix(&ev.session, prefixes, &sym)?;
-    }
-
-    Ok(())
-}
-
-fn debug_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> Result<()> {
-    let a = args[0].eval_to_buf(ev)?;
-    let loc = ev.loc.clone().unwrap_or_default();
-    let toks = word_scanner(&a)
-        .map(|tok| a.slice_ref(tok))
-        .collect::<Vec<_>>();
-    for tok in toks {
-        let tok = ev.session.intern(tok);
-        let Some(v) = ev.lookup_var(tok)? else {
-            println!(
-                "{}: Variable {:?} is undefined",
-                loc.display(&ev.session),
-                tok.display(&ev.session)
-            );
-            continue;
-        };
-        let v = v.read();
-        let val = v.eval_to_buf(ev)?;
-        println!(
-            "{}: Variable {:?}={val:?} ({v:?})",
-            loc.display(&ev.session),
-            tok.display(&ev.session)
-        )
-    }
-    Ok(())
-}
-
 const fn func(name: &'static [u8], f: MakeFuncImpl, arity: i16) -> FuncInfo {
     FuncInfo {
         name,
@@ -2092,51 +1653,12 @@ const FUNC_INFO: &[FuncInfo] = &[
         pre_expanded_args: true,
         trim_right_space_1st: false,
     },
-    /* Kati custom extension functions */
-    FuncInfo {
-        name: b"KATI_deprecated_var",
-        func: deprecated_var_func,
-        arity: 2,
-        min_arity: 1,
-        trim_space: false,
-        pre_expanded_args: true,
-        trim_right_space_1st: false,
-    },
-    FuncInfo {
-        name: b"KATI_obsolete_var",
-        func: obsolete_var_func,
-        arity: 2,
-        min_arity: 1,
-        trim_space: false,
-        pre_expanded_args: true,
-        trim_right_space_1st: false,
-    },
-    func(b"KATI_deprecate_export", deprecate_export_func, 1),
-    func(b"KATI_obsolete_export", obsolete_export_func, 1),
-    func(b"KATI_profile_makefile", profile_makefile_func, 0),
-    func(b"KATI_variable_location", variable_location_func, 1),
-    func(b"KATI_extra_file_deps", extra_file_deps_func, 0),
-    func(b"KATI_shell_no_rerun", shell_no_rerun_func, 1),
-    lazy_func(b"KATI_foreach_sep", foreach_sep_func, 4),
-    FuncInfo {
-        name: b"KATI_file_no_rerun",
-        func: file_no_rerun_func,
-        arity: 2,
-        min_arity: 1,
-        trim_space: false,
-        pre_expanded_args: true,
-        trim_right_space_1st: false,
-    },
-    FuncInfo {
-        name: b"KATI_visibility_prefix",
-        func: visibility_prefix_func,
-        arity: 2,
-        min_arity: 1,
-        trim_space: false,
-        pre_expanded_args: true,
-        trim_right_space_1st: false,
-    },
-    func(b"KATI_debug_var", debug_func, 1),
+    // The twelve `KATI_*` functions kati added to this table were removed on
+    // 2026-08-24 by the operator's ruling: Ronin implements GNU Make, and a
+    // function GNU Make has no name for is surface nobody asked for. This
+    // table is GNU Make 4.4.1's, and the one entry it is missing —
+    // `$(guile ...)` — is a gap rather than an extension. See
+    // docs/make-kati-extensions.md.
 ];
 
 // no-globals-gate: read-only dispatch table built once from the const array
@@ -2385,24 +1907,6 @@ mod tests {
         assert_eq!(out.as_ref(), b"a ");
         let var = ev.session.peek_global_var(sym).unwrap();
         assert_eq!(string_of(&ev.session, var), "outer");
-    }
-
-    /// `foreach_sep` takes the same path with a separator in front of the body.
-    #[test]
-    fn test_foreach_sep_restores_unbound_variable_when_body_fails() {
-        let mut ev = Evaluator::new(Session::new());
-        let sym = ev.session.intern("KATI_TEST_FOREACH_SEP_UNBOUND");
-        assert!(ev.session.peek_global_var(sym).is_none());
-
-        let (result, _) = eval_with(
-            &mut ev,
-            "$(KATI_foreach_sep KATI_TEST_FOREACH_SEP_UNBOUND,:,a b c,\
-             $(if $(filter b,$(KATI_TEST_FOREACH_SEP_UNBOUND)),\
-             $(error stop),$(KATI_TEST_FOREACH_SEP_UNBOUND)))",
-        );
-
-        assert!(result.is_err());
-        assert!(ev.session.peek_global_var(sym).is_none());
     }
 
     /// `call` binds every positional argument at once. A body that fails must

@@ -158,12 +158,6 @@ impl Stats {
         }
         elapsed
     }
-
-    /// Mark the specific execution as interesting. It will be logged even if
-    /// it isn't in the top 10 executions.
-    pub fn mark_interesting(&self, name: OsString) {
-        self.interesting.lock().insert(name);
-    }
 }
 
 impl Display for Stats {
@@ -215,11 +209,6 @@ pub fn start_scope_with_slow_report(
         ctx.stats().get_or_create(name),
         msg.to_os_string(),
     ))
-}
-
-/// Mark the makefile `name` as interesting at the `included makefiles` site.
-pub fn mark_interesting(ctx: &impl Context, site: &'static str, name: OsString) {
-    ctx.stats().get_or_create(site).mark_interesting(name);
 }
 
 #[doc(hidden)]

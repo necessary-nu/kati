@@ -17,9 +17,7 @@ limitations under the License.
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    ffi::OsString,
     fmt::Debug,
-    os::unix::ffi::OsStrExt,
     sync::Arc,
 };
 
@@ -33,9 +31,8 @@ use crate::{
     eval::Frame,
     loc::Loc,
     session::{Context, Session},
-    strutil::{WordWriter, has_path_prefix},
+    strutil::WordWriter,
     symtab::{Interner, Symtab},
-    warn_loc,
 };
 use crate::{
     eval::Evaluator,
@@ -129,11 +126,6 @@ pub struct Variable {
     pub is_private: bool,
     /// What an `export` or `unexport` directive said about this binding.
     pub export: VarExport,
-    pub deprecated: Option<Arc<String>>,
-    obsolete: Option<Arc<String>>,
-
-    visibility_prefix: Option<Vec<OsString>>,
-
     value: InnerVar,
 }
 
@@ -310,12 +302,6 @@ impl Variable {
             _ => None,
         }
     }
-    pub fn obsolete(&self) -> bool {
-        self.obsolete.is_some()
-    }
-    pub fn set_obsolete(&mut self, message: Arc<String>) {
-        self.obsolete = Some(message);
-    }
     pub fn flavor(&self) -> &'static str {
         match &self.value {
             InnerVar::Simple(_) => "simple",
@@ -350,41 +336,6 @@ impl Variable {
             | InnerVar::ShellStatus
             | InnerVar::VariableNames { .. } => false,
         }
-    }
-    pub fn used(&self, ev: &Evaluator, sym: &Symbol) -> Result<()> {
-        if let Some(obsolete) = &self.obsolete {
-            error_loc!(
-                ev,
-                ev.loc.as_ref(),
-                "*** {} is obsolete{obsolete}.",
-                sym.display(ev)
-            );
-        }
-        if let Some(deprecated) = &self.deprecated {
-            warn_loc!(
-                ev,
-                ev.loc.as_ref(),
-                "{} has been deprecated{deprecated}.",
-                sym.display(ev)
-            );
-        }
-        Ok(())
-    }
-    pub fn set_visibility_prefix(
-        &mut self,
-        names: &impl Interner,
-        prefixes: Vec<OsString>,
-        name: &Symbol,
-    ) -> Result<()> {
-        if self.visibility_prefix.is_none() {
-            self.visibility_prefix = Some(prefixes);
-        } else if self.visibility_prefix != Some(prefixes) {
-            error!(
-                "Visibility prefix conflict on variable: {}",
-                name.display(names)
-            );
-        }
-        Ok(())
     }
     pub fn immediate_eval(&self) -> bool {
         matches!(&self.value, InnerVar::Simple(_))
@@ -532,38 +483,6 @@ impl Variable {
         }
         Ok(())
     }
-    pub fn check_current_referencing_file(
-        &self,
-        names: &impl Interner,
-        loc: &Option<Loc>,
-        sym: Symbol,
-    ) -> Result<()> {
-        let Some(prefixes) = &self.visibility_prefix else {
-            return Ok(());
-        };
-        let loc = loc.clone().unwrap_or_default();
-        let mut valid = false;
-        for prefix in prefixes {
-            if has_path_prefix(&loc.filename.as_bytes(names), prefix.as_bytes()) {
-                valid = true;
-                break;
-            }
-        }
-        if !valid {
-            let s = prefixes
-                .iter()
-                .map(|s| s.to_string_lossy())
-                .collect::<Vec<Cow<str>>>()
-                .join("\n");
-            error!(
-                "{} is not a valid file to reference variable {}. Line #{}.\nValid file prefixes:\n{s}",
-                loc.filename.display(names),
-                sym.display(names),
-                loc.line
-            );
-        }
-        Ok(())
-    }
     /// The automatic-variable command behind this variable, when that is what
     /// it holds.
     ///
@@ -627,9 +546,6 @@ impl Variable {
             readonly: false,
             is_private: false,
             export: VarExport::Default,
-            deprecated: None,
-            obsolete: None,
-            visibility_prefix: None,
             value: InnerVar::Simple(Vec::new()),
         }))
     }
@@ -648,9 +564,6 @@ impl Variable {
             readonly: false,
             is_private: false,
             export: VarExport::Default,
-            deprecated: None,
-            obsolete: None,
-            visibility_prefix: None,
             value: InnerVar::Simple(value.to_vec()),
         }))
     }
@@ -671,9 +584,6 @@ impl Variable {
             readonly: false,
             is_private: false,
             export: VarExport::Default,
-            deprecated: None,
-            obsolete: None,
-            visibility_prefix: None,
             value: InnerVar::Simple(value.to_vec()),
         })))
     }
@@ -693,9 +603,6 @@ impl Variable {
             readonly: false,
             is_private: false,
             export: VarExport::Default,
-            deprecated: None,
-            obsolete: None,
-            visibility_prefix: None,
             value: InnerVar::Recursive { v, orig },
         }))
     }
@@ -709,9 +616,6 @@ impl Variable {
             readonly: false,
             is_private: false,
             export: VarExport::Default,
-            deprecated: None,
-            obsolete: None,
-            visibility_prefix: None,
             value: InnerVar::AutoCommand(sym, a),
         }))
     }
@@ -732,9 +636,6 @@ impl Variable {
             readonly: false,
             is_private: false,
             export: VarExport::Default,
-            deprecated: None,
-            obsolete: None,
-            visibility_prefix: None,
             value: InnerVar::ShellStatus,
         }))
     }
@@ -766,9 +667,6 @@ impl Variable {
             readonly: false,
             is_private: false,
             export: VarExport::Default,
-            deprecated: None,
-            obsolete: None,
-            visibility_prefix: None,
             value: InnerVar::VariableNames { all },
         }))
     }
@@ -790,7 +688,7 @@ fn write_variable_names(session: &Session, all: bool, out: &mut dyn BufMut) {
     let mut ww = WordWriter::new(out);
     let symbols = session.global_var_names(|var| {
         let var = var.read();
-        !var.obsolete() && !var.is_base_automatic_command()
+        !var.is_base_automatic_command()
     });
     for (sym, entry) in symbols {
         if !all

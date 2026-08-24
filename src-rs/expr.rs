@@ -165,7 +165,6 @@ impl Evaluable for Value {
                     // diagnostic raised inside the value will carry --
                     // `recursively_expand_for_file` in expand.c.
                     ev.enter_expanding_var(v.expansion_loc());
-                    v.used(ev, &sym)?;
                     if is_make {
                         let expanded = v.eval_to_buf(ev)?;
                         out.put_slice(&expanded);
@@ -173,8 +172,6 @@ impl Evaluable for Value {
                     } else {
                         v.eval(ev, out)?;
                     }
-                    let loc = ev.loc.clone();
-                    v.check_current_referencing_file(&ev.session, &loc, sym)?;
                     drop(v);
                     ev.leave_expanding_var();
                     ev.var_eval_complete(&var);
@@ -193,7 +190,6 @@ impl Evaluable for Value {
                     // diagnostic raised inside the value will carry --
                     // `recursively_expand_for_file` in expand.c.
                     ev.enter_expanding_var(v.expansion_loc());
-                    v.used(ev, &sym)?;
                     if is_make {
                         let expanded = v.eval_to_buf(ev)?;
                         out.put_slice(&expanded);
@@ -201,8 +197,6 @@ impl Evaluable for Value {
                     } else {
                         v.eval(ev, out)?;
                     }
-                    let loc = ev.loc.clone();
-                    v.check_current_referencing_file(&ev.session, &loc, sym)?;
                     drop(v);
                     ev.leave_expanding_var();
                     ev.var_eval_complete(&var);
@@ -226,7 +220,6 @@ impl Evaluable for Value {
                     // `$(V:a=b)` reaches V's value through `recursively_expand`
                     // as well, so it installs the location too.
                     ev.enter_expanding_var(v.expansion_loc());
-                    v.used(ev, &sym)?;
                     let value = v.eval_to_buf(ev)?;
                     ev.leave_expanding_var();
                     let mut ww = WordWriter::new(out);

@@ -40,7 +40,10 @@ pub struct MakefileCache {
     /// Make's one read saw, so the front end takes these out when a read ends
     /// and supplies them to the read that repeats it.
     sources: HashMap<OsString, Bytes>,
-    extra_file_deps: HashSet<OsString>,
+    /// Files this session depended on and could not read — an `include` whose
+    /// name would not open. They are not in `cache`, because nothing was
+    /// cached, and a later run still has to compare their timestamps.
+    unread: HashSet<OsString>,
 }
 
 impl Default for MakefileCache {
@@ -55,12 +58,8 @@ impl MakefileCache {
             cache: HashMap::new(),
             supplied: HashMap::new(),
             sources: HashMap::new(),
-            extra_file_deps: HashSet::new(),
+            unread: HashSet::new(),
         }
-    }
-
-    pub fn add_extra_file_dep(&mut self, filename: OsString) {
-        self.extra_file_deps.insert(filename);
     }
 
     /// Supply a makefile's bytes without requiring a filesystem path.
@@ -86,7 +85,7 @@ impl MakefileCache {
         for p in self.cache.keys() {
             ret.insert(p.clone());
         }
-        for f in &self.extra_file_deps {
+        for f in &self.unread {
             ret.insert(f.clone());
         }
         ret
@@ -124,7 +123,7 @@ pub fn get_makefile(session: &mut Session, filename: &OsStr) -> Result<Source> {
             session.makefiles.cache.insert(filename, None);
         }
         Source::Unopened(_) | Source::Unreadable(_) | Source::Exhausted(_) => {
-            session.makefiles.extra_file_deps.insert(filename);
+            session.makefiles.unread.insert(filename);
         }
     }
     Ok(source)

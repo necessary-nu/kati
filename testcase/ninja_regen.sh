@@ -33,8 +33,6 @@ fi
 
 sleep 1
 cat <<EOF > Makefile
-\$(KATI_deprecated_var VAR4)
-\$(KATI_obsolete_var VAR5)
 VAR3 := unused
 all:
 	echo bar
