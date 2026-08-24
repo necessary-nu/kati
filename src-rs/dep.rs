@@ -883,6 +883,16 @@ fn apply_output_pattern(
         // `enter_prereqs` and not `patsubst`: a prerequisite pattern that holds
         // no wildcard is left exactly as the makefile wrote it.
         let buf = pat.append_subst_prerequisite(&output_str, &input.as_bytes(&*session));
+        // A name the substitution emptied is no prerequisite at all. GNU Make's
+        // `enter_prereqs` (file.c) drops it from the chain outright — "If the
+        // name expanded to the empty string, ignore it" — and it is a stem of
+        // `` that produces one: `foo` against `foo%` leaves nothing to fill in,
+        // so a prerequisite written `%` loses its only character while `%.x`
+        // keeps `.x`. Carrying the empty name on would ask the build for a file
+        // with no name.
+        if buf.is_empty() {
+            continue;
+        }
         ret.push(session.intern(buf));
     }
     ret
