@@ -927,7 +927,7 @@ impl<'a> Parser<'a> {
         ))));
         match directive {
             b"include" | b"-include" | b"sinclude" => self.parse_include(rest, directive)?,
-            b"define" => self.parse_define(rest)?,
+            b"define" if !starts_assignment(&rest) => self.parse_define(rest)?,
             b"ifdef" | b"ifndef" => self.parse_ifdef(rest, directive)?,
             b"ifeq" | b"ifneq" => self.parse_ifeq(rest, directive)?,
             b"else" => self.parse_else(rest)?,
@@ -962,7 +962,7 @@ impl<'a> Parser<'a> {
             &line[directive.len()..],
         ))));
         match directive {
-            b"define" => self.parse_define(rest)?,
+            b"define" if !starts_assignment(&rest) => self.parse_define(rest)?,
             b"override" if !starts_assignment(&rest) => self.parse_override(rest)?,
             b"export" if !starts_assignment(&rest) => self.parse_export(rest)?,
             b"private" if !starts_assignment(&rest) => self.parse_private(rest)?,
@@ -1035,6 +1035,18 @@ fn is_variable_definition(line: &[u8]) -> bool {
     name_end == 0 || is_variable_name(parse_assign_statement(line, name_end).lhs)
 }
 
+/// Whether an assignment operator stands where the directive's argument would,
+/// which makes the keyword in front of it the variable's name rather than a
+/// directive: `define = x` defines `define`, exactly as `undefine = x` does.
+///
+/// GNU Make asks the whole line to `parse_variable_definition` (variable.c)
+/// before it looks for a keyword, and that walk sets `end` at the first blank
+/// and then wants the operator: reaching one makes the first word the name, and
+/// reaching any other character with `end` already set (`goto other`) makes the
+/// line no assignment at all. `rest` is the argument with its blanks taken off,
+/// so the two answers are exactly whether it opens with an operator — which is
+/// why `define V =` and `define X= x` stay directives while `define ?= x`,
+/// `define != cmd` and `define :::= x` are assignments to `define`.
 fn starts_assignment(rest: &[u8]) -> bool {
     [b"=".as_slice(), b":=", b"::=", b":::=", b"+=", b"?=", b"!="]
         .iter()
@@ -1493,5 +1505,57 @@ mod tests {
         for name in [b"x y".as_slice(), b"x $X", b"x $(a b)", b"a\\ b"] {
             assert!(!is_variable_name(name), "{}", String::from_utf8_lossy(name));
         }
+    }
+
+    /// GNU Make asks whether a line defines a variable before it asks which
+    /// directive the first word is, so an assignment operator standing where
+    /// `define`'s name would be makes `define` itself the name: `define = x`
+    /// assigns, exactly as `undefine = x` already did.
+    ///
+    /// Read as a directive instead, the operator was the whole of the name, and
+    /// `define = x` reached `parse_assign_statement` with the separator at
+    /// position zero — where its `sep != 0` invariant took the process down
+    /// with a panic. The spellings whose operator does not open with `=` or `:`
+    /// did not crash; they waited for an `endef` that never came.
+    #[test]
+    fn an_assignment_operator_after_define_names_define() {
+        let parsed = |source: &'static [u8]| {
+            let mut session = Session::new();
+            let stmts =
+                parse_buf_no_stats(&mut session, &Bytes::from_static(source), Loc::default())
+                    .expect("a parsed makefile");
+            let stmts = stmts.lock();
+            assert_eq!(stmts.len(), 1, "{}", source.escape_ascii());
+            format!("{:?}", stmts[0])
+        };
+        for (source, op) in [
+            (b"define = x".as_slice(), AssignOp::Eq),
+            (b"define := x", AssignOp::ColonEq),
+            (b"define ::= x", AssignOp::ColonEq),
+            (b"define :::= x", AssignOp::ImmediateRecursive),
+            (b"define += x", AssignOp::PlusEq),
+            (b"define ?= x", AssignOp::QuestionEq),
+            (b"define != echo x", AssignOp::ShellEq),
+            (b"define  =  x", AssignOp::Eq),
+        ] {
+            let stmt = parsed(source);
+            assert!(
+                stmt.starts_with("AssignStmt(lhs=Literal(None, b\"define\")"),
+                "{}: {stmt}",
+                source.escape_ascii()
+            );
+            assert!(
+                stmt.contains(&format!("opstr={op:?}")),
+                "{}: {stmt}",
+                source.escape_ascii()
+            );
+        }
+        // A word before the operator is the defined variable's name, which
+        // leaves `define` the directive it is written as.
+        let stmt = parsed(b"define V =\nbody\nendef");
+        assert!(
+            stmt.starts_with("AssignStmt(lhs=Literal(None, b\"V\")"),
+            "{stmt}"
+        );
     }
 }
