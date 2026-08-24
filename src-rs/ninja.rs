@@ -2063,12 +2063,17 @@ impl<'a> NinjaGenerator<'a> {
             // several — the same list a deferred recipe carries on its
             // expansion, made here because this recipe was read here.
             //
-            // Withheld where the edge does not run the assembled script as
-            // written: a depfile extraction rewrites it and names a file off
-            // it, and a recipe composed into child graphs runs in segments
-            // that are not these lines. In both cases the script is what the
-            // edge is, and the steps would be a different program.
-            let steps = if depfile.is_some() || contains_recursive {
+            // Withheld where the edge does not run these lines as written: a
+            // recipe composed into child graphs runs in segments that are not
+            // these lines, and a `--detect_depfiles` run rewrites the assembled
+            // script — appending an Android `&& cp` hack or cutting an `rm` out
+            // of it — so a step made from the pre-rewrite line would run text
+            // the edge no longer holds. A `.KATI_DEPFILE` names the file in a
+            // variable and leaves the script untouched (`get_depfile` returns
+            // before it reaches `cmd_buf`), so its lines ARE the launches and
+            // are handed over like any other recipe's.
+            let depfile_rewrote_script = depfile.is_some() && node.depfile_var.is_none();
+            let steps = if depfile_rewrote_script || contains_recursive {
                 Vec::new()
             } else {
                 recipe_steps(
