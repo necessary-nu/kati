@@ -230,6 +230,18 @@ pub struct Flags {
     /// earlier one, and the default goal comes from the first file that
     /// declares an eligible target rather than the last.
     pub makefiles: Vec<OsString>,
+    /// The `--eval` fragments the invocation carried, as makefile text.
+    ///
+    /// Read before any makefile is, which is where GNU Make reads them:
+    /// `eval_buffer (p, NULL)` for each fragment sits above the call to
+    /// `read_all_makefiles` (main.c), so a fragment's assignments are in scope
+    /// while `MAKEFILES` and the named files are read, and a rule one carries
+    /// can be the default goal for a run with no makefile at all.
+    ///
+    /// The `NULL` location is the other half: a fragment is not a file, so it
+    /// does not join `MAKEFILE_LIST` and a fragment reading that variable finds
+    /// it still empty.
+    pub command_line_evals: Vec<Bytes>,
     pub ninja_dir: Option<OsString>,
     pub ninja_suffix: OsString,
     pub working_dir: Option<OsString>, // -C <dir>

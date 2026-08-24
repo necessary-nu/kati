@@ -2471,7 +2471,27 @@ impl<'a> DepBuilder<'a> {
             // GNU Make's own wording, because its test suite matches this
             // message exactly to learn what the program under test is called.
             // The name and the `Stop.` are added on the way out.
-            error_loc!(self.ev, None, "*** No targets.");
+            //
+            // Which of the two it is turns on whether a makefile was read at
+            // all, and GNU Make asks `MAKEFILE_LIST` (main.c) rather than
+            // asking what the command line named: a run with nothing to read
+            // and nothing to aim at has no makefile to blame, and a run that
+            // read one and still found no goal does.
+            //
+            // Nothing to read is not itself the refusal. A run may reach a goal
+            // without a makefile — `--eval` text carries rules of its own, and
+            // a goal named on the command line is a goal whether or not
+            // anything can make it — and GNU Make refuses only where there is
+            // no goal at the end of all of it.
+            let read_any = !self.ev.eval_var(Symbol::MAKEFILE_LIST)?.is_empty();
+            if read_any {
+                error_loc!(self.ev, None, "*** No targets.");
+            }
+            error_loc!(
+                self.ev,
+                None,
+                "*** No targets specified and no makefile found."
+            );
         };
         if named.next().is_none() {
             return Ok(self.ev.session.intern(goal.to_vec()));

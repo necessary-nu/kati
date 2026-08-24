@@ -569,6 +569,38 @@ fn claim_recursive_at_default(session: &mut Session, name: &str, text: Bytes) ->
     Ok(())
 }
 
+/// The names GNU Make looks for when no `-f` names a makefile, in its order
+/// (`default_makefiles`, read.c). Kept here because they are the names a run
+/// that found none of them still tries to REMAKE, which is a question about the
+/// read rather than about the front end's search.
+const DEFAULT_MAKEFILES: [&[u8]; 3] = [b"GNUmakefile", b"makefile", b"Makefile"];
+
+/// Read the `--eval` fragments, in the order the invocation gave them.
+///
+/// GNU Make reads each as its own buffer — `eval_buffer (p, NULL)`, main.c —
+/// above `read_all_makefiles`, and the `NULL` says the text came from no file:
+/// it joins neither `MAKEFILE_LIST` nor the set of makefiles that can be
+/// remade. What it leaves behind is the same as any makefile's, so a rule a
+/// fragment carries can be the default goal for a run with nothing on disk.
+fn read_command_line_evals(ev: &mut Evaluator) -> Result<()> {
+    let fragments = ev.session.flags.command_line_evals.clone();
+    if fragments.is_empty() {
+        return Ok(());
+    }
+    let name = Bytes::from_static(b"*command line eval*");
+    let _file_frame = ev.enter(FrameType::Parse, name.clone(), Loc::default());
+    let filename = ev.session.intern(name);
+    for fragment in fragments {
+        let loc = Loc { filename, line: 0 };
+        let stmts = crate::parser::parse_buf(&mut ev.session, &fragment, loc)?;
+        let stmts = stmts.lock().clone();
+        for stmt in stmts {
+            stmt.eval(ev)?;
+        }
+    }
+    Ok(())
+}
+
 /// Read one Makefile the command line named, into the session already open.
 ///
 /// A Makefile that is not there is not the end of the read: GNU Make says so
@@ -1160,6 +1192,13 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
         );
         let _tr = ScopedTimeReporter::new(&ev.session, "eval time");
 
+        // The `--eval` fragments come before any of it. GNU Make evaluates
+        // each of them with `eval_buffer (p, NULL)` above the call to
+        // `read_all_makefiles` (main.c), so what a fragment assigns is in
+        // scope while `MAKEFILES` and the named files are read, and a rule a
+        // fragment carries is a rule whether or not there is a makefile.
+        read_command_line_evals(&mut ev)?;
+
         // What `MAKEFILES` names comes first, so an assignment one of those
         // files makes is in scope while the invocation's own Makefile is read.
         read_makefiles_variable(&mut ev)?;
@@ -1171,6 +1210,24 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
         // declared a target.
         for makefile in ev.session.flags.makefiles.clone() {
             read_named_makefile(&mut ev, &makefile)?;
+        }
+
+        // Nothing to read is not nothing to try. GNU Make, having found none of
+        // its default names on disk, puts all three on the `read_files` chain
+        // with `RM_DONTCARE` so the update pass will remake them if any rule
+        // can — "Tell update_goal_chain to bail out as soon as this file is
+        // made, and main not to die if we can't make this file" (read.c). A
+        // `--eval` fragment carrying `%:` is such a rule, which is how a run
+        // with an empty directory still reaches them.
+        //
+        // Don't-care, so failing to make one says nothing: this is the shape
+        // `-include` already has, and it is what keeps an ordinary empty
+        // directory silent.
+        if ev.session.flags.makefiles.is_empty() {
+            let reason = crate::strerror(&std::io::Error::from_raw_os_error(libc::ENOENT));
+            for name in DEFAULT_MAKEFILES {
+                ev.note_unread_include(Bytes::from_static(name), false, None, &reason);
+            }
         }
     }
 
