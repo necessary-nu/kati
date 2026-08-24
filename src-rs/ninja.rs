@@ -49,7 +49,6 @@ use crate::{
     },
     dep::{DepNode, NamedDepNode, is_buildable_target},
     eval::Evaluator,
-    expr::Evaluable,
     flags::Flags,
     loc::Loc,
     strutil::{escape_shell, trim_left_space},
@@ -256,7 +255,7 @@ pub struct TranslatedLine {
     pub recursive_line: bool,
     /// The flags the shell for this line takes.
     pub shell_flag: Bytes,
-    /// kati's own `.KATI_DEPFILE`-adjacent request that the line not be put in
+    /// kati's own depfile-adjacent request that the line not be put in
     /// a subshell when a script is assembled. Nothing to a destination that
     /// gives the line a process of its own.
     pub force_no_subshell: bool,
@@ -752,16 +751,11 @@ impl<'a> NinjaGenerator<'a> {
         if node.cmds.iter().all(|cmd| is_blank_recipe_line(cmd)) {
             return false;
         }
-        // A depfile is a dependency read at runtime: `--detect_depfiles` finds
-        // it by rewriting the assembled script, and `.KATI_DEPFILE` names it in
-        // a variable, but either way the edge it is read for has to declare it,
-        // and a deferred rule has no path to. So a recipe naming a depfile is
-        // read where it is built, and its `$(file ...)` is performed there — a
-        // divergence confined to a kati extension no GNU makefile reaches.
-        if node.depfile_var.is_some()
-            || self.ce.ev.session.flags.detect_depfiles
-            || node.grouped_double_join
-        {
+        // A depfile is a dependency read at runtime — `--detect_depfiles` finds
+        // it by rewriting the assembled script — and the edge it is read for has
+        // to declare it, which a deferred rule has no path to. So a recipe
+        // naming a depfile is read where it is built.
+        if self.ce.ev.session.flags.detect_depfiles || node.grouped_double_join {
             return false;
         }
         // An ordinary multi-target `::` action's `$@` is the name the chain walk
@@ -921,11 +915,6 @@ impl<'a> NinjaGenerator<'a> {
 
         let order_onlys = node.lock().order_onlys.clone();
         for (_symbol, depnode) in order_onlys {
-            self.populate_ninja_node(&depnode)?;
-        }
-
-        let validations = node.lock().validations.clone();
-        for (_symbol, depnode) in validations {
             self.populate_ninja_node(&depnode)?;
         }
 
@@ -1811,11 +1800,7 @@ impl<'a> NinjaGenerator<'a> {
         Ok((script, ignore_errors, steps))
     }
 
-    fn get_depfile(&mut self, node: &DepNode, cmd_buf: &mut BytesMut) -> Result<Option<Bytes>> {
-        if let Some(depfile_var) = node.depfile_var.clone() {
-            let depfile = depfile_var.read().eval_to_buf(self.ce.ev)?;
-            return Ok(Some(depfile));
-        }
+    fn get_depfile(&mut self, cmd_buf: &mut BytesMut) -> Result<Option<Bytes>> {
         if !self.ce.ev.session.flags.detect_depfiles {
             return Ok(None);
         }
@@ -1828,23 +1813,10 @@ impl<'a> NinjaGenerator<'a> {
 
     /// Which pool this node's edge belongs in.
     ///
-    /// `.KATI_NINJA_POOL` wins, and names `none` to opt out of the fallbacks.
-    /// Failing that `--default_pool` applies to anything that runs a command,
-    /// and failing that `--remote_num_jobs` puts every edge in kati's own pool
-    /// so that a wide ninja does not run wide locally.
-    fn resolve_pool(&mut self, node: &DepNode, has_rule: bool) -> Result<Option<Bytes>> {
-        let named = if let Some(ninja_pool_var) = &node.ninja_pool_var {
-            Some(ninja_pool_var.read().eval_to_buf(self.ce.ev)?)
-        } else {
-            None
-        };
-        if let Some(named) = named.filter(|pool| !pool.is_empty()) {
-            return Ok(if named.as_ref() == b"none" {
-                None
-            } else {
-                Some(named)
-            });
-        }
+    /// `--default_pool` applies to anything that runs a command, and failing
+    /// that `--remote_num_jobs` puts every edge in kati's own pool so that a
+    /// wide ninja does not run wide locally.
+    fn resolve_pool(&mut self, has_rule: bool) -> Result<Option<Bytes>> {
         let flags = &self.ce.ev.session.flags;
         if !flags.default_pool.is_empty() && has_rule {
             return Ok(Some(Bytes::copy_from_slice(flags.default_pool.as_bytes())));
@@ -1895,12 +1867,11 @@ impl<'a> NinjaGenerator<'a> {
                     residual_steps: &[],
                     residual_ignore_errors: false,
                     description: None,
-                    // A `.KATI_DEPFILE` recipe is not deferred (`defers_recipe`
+                    // A depfile recipe is not deferred (`defers_recipe`
                     // refuses it): the depfile it names becomes a runtime
                     // dependency the deferred rule has no path to declare, so it
                     // is read where it is built. No deferred rule carries one.
                     depfile: None,
-                    restat: node.is_restat,
                     ignore_errors: false,
                     sandbox_disabled: self.ce.ev.session.flags.emit_sandbox_disabled,
                     loc: node.loc.as_ref(),
@@ -1935,7 +1906,7 @@ impl<'a> NinjaGenerator<'a> {
             }
             // Extracting the depfile can rewrite the command, so it has to
             // happen before the command is measured or handed over.
-            let depfile = self.get_depfile(&node, &mut cmd_buf)?;
+            let depfile = self.get_depfile(&mut cmd_buf)?;
 
             // It seems Linux is OK with ~130kB and Mac's limit is ~250kB.
             // TODO: Find this number automatically.
@@ -2023,8 +1994,7 @@ impl<'a> NinjaGenerator<'a> {
                 }
                 residual_commands = segment;
             }
-            let detect_depfile =
-                node.depfile_var.is_none() && self.ce.ev.session.flags.detect_depfiles;
+            let detect_depfile = self.ce.ev.session.flags.detect_depfiles;
             let mut preceding_storage = Vec::with_capacity(preceding_commands.len());
             for segment in &preceding_commands {
                 let render = SegmentRender {
@@ -2101,11 +2071,8 @@ impl<'a> NinjaGenerator<'a> {
             // these lines, and a `--detect_depfiles` run rewrites the assembled
             // script — appending an Android `&& cp` hack or cutting an `rm` out
             // of it — so a step made from the pre-rewrite line would run text
-            // the edge no longer holds. A `.KATI_DEPFILE` names the file in a
-            // variable and leaves the script untouched (`get_depfile` returns
-            // before it reaches `cmd_buf`), so its lines ARE the launches and
-            // are handed over like any other recipe's.
-            let depfile_rewrote_script = depfile.is_some() && node.depfile_var.is_none();
+            // the edge no longer holds.
+            let depfile_rewrote_script = depfile.is_some();
             let steps = if depfile_rewrote_script || contains_recursive {
                 Vec::new()
             } else {
@@ -2146,7 +2113,6 @@ impl<'a> NinjaGenerator<'a> {
                     residual_ignore_errors,
                     description: description.as_deref(),
                     depfile: depfile.as_deref(),
-                    restat: node.is_restat,
                     ignore_errors,
                     sandbox_disabled: self.ce.ev.session.flags.emit_sandbox_disabled,
                     loc: node.loc.as_ref(),
@@ -2155,13 +2121,7 @@ impl<'a> NinjaGenerator<'a> {
             Some(id)
         };
 
-        let pool = self.resolve_pool(&node, rule_id.is_some())?;
-        let tags = if let Some(tags_var) = &node.tags_var {
-            let tags = tags_var.read().eval_to_buf(self.ce.ev)?;
-            if tags.is_empty() { None } else { Some(tags) }
-        } else {
-            None
-        };
+        let pool = self.resolve_pool(rule_id.is_some())?;
 
         // The sink is given the names, not the nodes behind them: an edge
         // refers to its inputs, it does not own them.
@@ -2179,7 +2139,6 @@ impl<'a> NinjaGenerator<'a> {
         let inputs = symbols(&node.deps);
         let order_only_inputs = symbols(&node.order_onlys);
         let forgiven_order_only_inputs = named(&node.forgiven_order_onlys);
-        let validations = symbols(&node.validations);
         let implicit_outputs = named(&node.implicit_outputs);
         let output = self.phony_aliases.resolve(node.output);
         let withdrawable_outputs = named(&node.withdrawable_outputs);
@@ -2288,7 +2247,6 @@ impl<'a> NinjaGenerator<'a> {
                 inputs: &inputs,
                 order_only_inputs: &order_only_inputs,
                 forgiven_order_only_inputs: &forgiven_order_only_inputs,
-                validations: &validations,
                 always_dirty: node.is_phony || node.unconditional_double_colon,
                 deferred_freshness_outputs: &deferred_freshness_outputs,
                 // A completion join owns no members of its own, so it has no
@@ -2343,7 +2301,6 @@ impl<'a> NinjaGenerator<'a> {
                 // join is the edge that carries it.
                 declared_by_double_colon: node.declared_by_double_colon,
                 pool: pool.as_deref(),
-                tags: tags.as_deref(),
                 loc: node.loc.as_ref(),
             },
         )?;
@@ -2977,9 +2934,6 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
         // whether a current target needs rebuilding. `generator` carries that
         // policy in the emitted Ninja graph just as GraphSink does directly.
         writeln!(self.out, " generator = 1")?;
-        if rule.restat {
-            writeln!(self.out, " restat = 1")?;
-        }
         if rule.sandbox_disabled {
             writeln!(self.out, " sandbox_disabled = true")?;
         }
@@ -3018,10 +2972,6 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
             write!(self.out, " ||")?;
             self.write_targets(names, edge.order_only_inputs)?;
         }
-        if !edge.validations.is_empty() {
-            write!(self.out, " |@")?;
-            self.write_targets(names, edge.validations)?;
-        }
         writeln!(self.out)?;
 
         if let Some(pool) = edge.pool {
@@ -3031,11 +2981,6 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
         }
         if edge.always_dirty && self.options.phony_output {
             writeln!(self.out, " phony_output = true")?;
-        }
-        if let Some(tags) = edge.tags {
-            write!(self.out, " tags = ")?;
-            self.out.write_all(tags)?;
-            writeln!(self.out)?;
         }
         Ok(())
     }
@@ -3210,7 +3155,6 @@ mod tests {
                     inputs: &[input],
                     order_only_inputs: &[],
                     forgiven_order_only_inputs: &[],
-                    validations: &[],
                     always_dirty: true,
                     deferred_freshness_outputs: &[],
                     deferred_freshness_always_dirty: false,
@@ -3230,7 +3174,6 @@ mod tests {
                     written_as: None,
                     declared_by_double_colon: None,
                     pool: None,
-                    tags: None,
                     loc: None,
                 },
             )
@@ -3835,7 +3778,6 @@ mod tests {
                     residual_ignore_errors: false,
                     description,
                     depfile: None,
-                    restat: false,
                     ignore_errors,
                     sandbox_disabled: false,
                     loc: None,

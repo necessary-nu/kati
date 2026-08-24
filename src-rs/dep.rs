@@ -494,7 +494,6 @@ pub struct DepNode {
     /// is clear), so the edge that serialises one entry behind another has to
     /// mean "after it, whatever it did" rather than "after it succeeded".
     pub forgiven_order_onlys: Vec<Symbol>,
-    pub validations: Vec<NamedDepNode>,
     pub has_rule: bool,
     /// Whether this node is the first rule of the read. Read only where a
     /// manifest needs a `default` line and the goals cannot supply one —
@@ -505,7 +504,6 @@ pub struct DepNode {
     /// that action whenever the target is considered, even when the file is
     /// otherwise current.
     pub unconditional_double_colon: bool,
-    pub is_restat: bool,
     /// `.IGNORE` named this target: a failing recipe line is not a failure.
     pub is_ignore_error: bool,
     /// This file's absence is no reason to remake what reads it: the implicit
@@ -558,11 +556,7 @@ pub struct DepNode {
     pub pattern_group: bool,
     pub actual_inputs: Vec<Symbol>,
     pub actual_order_only_inputs: Vec<Symbol>,
-    pub actual_validations: Vec<Symbol>,
     pub rule_vars: Option<Arc<Vars>>,
-    pub depfile_var: Option<Var>,
-    pub ninja_pool_var: Option<Var>,
-    pub tags_var: Option<Var>,
     pub output_pattern: Option<Symbol>,
     /// What `%` stood for, as the implicit search read it.
     ///
@@ -646,7 +640,6 @@ impl DepNode {
     fn new(
         output: Symbol,
         is_phony: bool,
-        is_restat: bool,
         is_ignore_error: bool,
         is_intermediate: bool,
         is_disposable: bool,
@@ -662,12 +655,10 @@ impl DepNode {
             deps: Vec::new(),
             order_onlys: Vec::new(),
             forgiven_order_onlys: Vec::new(),
-            validations: Vec::new(),
             has_rule: false,
             is_default_target: false,
             is_phony,
             unconditional_double_colon: false,
-            is_restat,
             is_ignore_error,
             is_intermediate,
             is_disposable,
@@ -678,11 +669,7 @@ impl DepNode {
             pattern_group: false,
             actual_inputs: Vec::new(),
             actual_order_only_inputs: Vec::new(),
-            actual_validations: Vec::new(),
             rule_vars: None,
-            depfile_var: None,
-            ninja_pool_var: None,
-            tags_var: None,
             output_pattern: None,
             stem: None,
             planning_parent: None,
@@ -1180,11 +1167,7 @@ fn is_suffix_rule(names: &impl Interner, output: &Symbol) -> bool {
 #[derive(Debug)]
 struct RuleMerger {
     rules: Vec<Arc<Rule>>,
-    implicit_outputs: Vec<(Symbol, Arc<Mutex<RuleMerger>>)>,
-    validations: Vec<Symbol>,
     primary_rule: Option<Arc<Rule>>,
-    parent: Option<Arc<Mutex<RuleMerger>>>,
-    parent_sym: Option<Symbol>,
     is_double_colon: bool,
 }
 
@@ -1192,74 +1175,9 @@ impl RuleMerger {
     fn new() -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
             rules: Vec::new(),
-            implicit_outputs: Vec::new(),
-            validations: Vec::new(),
             primary_rule: None,
-            parent: None,
-            parent_sym: None,
             is_double_colon: false,
         }))
-    }
-
-    fn add_implicit_output(&mut self, output: Symbol, merger: Arc<Mutex<RuleMerger>>) {
-        self.implicit_outputs.push((output, merger))
-    }
-
-    fn add_validation(&mut self, validation: Symbol) {
-        self.validations.push(validation)
-    }
-
-    fn set_implicit_output(
-        &mut self,
-        ctx: &impl Context,
-        output: Symbol,
-        p: Symbol,
-        merger: Arc<Mutex<RuleMerger>>,
-    ) -> Result<()> {
-        {
-            let merger = merger.lock();
-            if merger.primary_rule.is_none() {
-                error_loc!(
-                    ctx,
-                    None,
-                    "*** implicit output '{}' on phony target '{}'",
-                    output.display(ctx),
-                    p.display(ctx)
-                );
-            }
-            if let Some(parent) = &self.parent {
-                let parent = parent.lock();
-                error_loc!(
-                    ctx,
-                    merger
-                        .primary_rule
-                        .as_ref()
-                        .and_then(|r| r.cmd_loc.clone())
-                        .as_ref(),
-                    "*** implicit output '{}' of '{}' was already defined by '{}' at {}",
-                    output.display(ctx),
-                    p.display(ctx),
-                    self.parent_sym.unwrap().display(ctx),
-                    parent
-                        .primary_rule
-                        .as_ref()
-                        .and_then(|r| r.cmd_loc.clone())
-                        .unwrap_or_default()
-                        .display(ctx)
-                );
-            }
-            if let Some(primary_rule) = &self.primary_rule {
-                error_loc!(
-                    ctx,
-                    primary_rule.cmd_loc.as_ref(),
-                    "*** implicit output '{}' may not have commands",
-                    output.display(ctx)
-                );
-            }
-        }
-        self.parent = Some(merger);
-        self.parent_sym = Some(p);
-        Ok(())
     }
 
     fn add_rule(&mut self, ctx: &impl Context, output: Symbol, r: Arc<Rule>) -> Result<()> {
@@ -1410,19 +1328,6 @@ impl RuleMerger {
 
         let mut all_outputs = HashSet::new();
         all_outputs.insert(output);
-
-        for (sym, merger) in &self.implicit_outputs {
-            n.implicit_outputs.push(*sym);
-            all_outputs.insert(*sym);
-            let merger = merger.lock();
-            for r in &merger.rules {
-                self.fill_dep_node_from_rule(session, declared, r, &mut n);
-            }
-        }
-
-        for validation in &self.validations {
-            n.actual_validations.push(*validation)
-        }
     }
 }
 
@@ -1601,7 +1506,6 @@ struct DepBuilder<'a> {
     /// because the `::` record the refusal is about is gone by the time the
     /// graph exists.
     assumed_new: HashSet<Symbol>,
-    restat: HashSet<Symbol>,
     /// The targets `.IGNORE` named. Empty when it named none, which is the
     /// form that means every target and sets the flag instead.
     ignore_errors: HashSet<Symbol>,
@@ -1620,7 +1524,6 @@ struct DepBuilder<'a> {
     /// neither.
     precious: HashSet<Symbol>,
     precious_patterns: HashSet<Symbol>,
-    depfile_var_name: Symbol,
     /// `VPATH`, the variable form of the directory search.
     vpath_var_name: Symbol,
     /// `.LIBPATTERNS`, which says how a `-lNAME` prerequisite is spelt on disk.
@@ -1659,10 +1562,6 @@ struct DepBuilder<'a> {
     /// still part of it — its prerequisites, its variables, and its recipe when
     /// the found name has none — which is what this records.
     merged_from: HashMap<Symbol, Symbol>,
-    implicit_outputs_var_name: Symbol,
-    ninja_pool_var_name: Symbol,
-    validations_var_name: Symbol,
-    tags_var_name: Symbol,
 }
 
 #[derive(Debug)]
@@ -1685,14 +1584,9 @@ impl<'a> DepBuilder<'a> {
             .collect::<Vec<_>>();
         // Stable, so patterns of equal length keep the order they were written.
         pattern_var_order.sort_by_key(|(_, pattern)| pattern.as_bytes().len());
-        let depfile_var_name = ev.session.intern(".KATI_DEPFILE");
         let vpath_var_name = ev.session.intern("VPATH");
         let libpatterns_var_name = ev.session.intern(".LIBPATTERNS");
         let gpath_var_name = ev.session.intern("GPATH");
-        let implicit_outputs_var_name = ev.session.intern(".KATI_IMPLICIT_OUTPUTS");
-        let ninja_pool_var_name = ev.session.intern(".KATI_NINJA_POOL");
-        let validations_var_name = ev.session.intern(".KATI_VALIDATIONS");
-        let tags_var_name = ev.session.intern(".KATI_TAGS");
         let wait_sym = ev.session.intern(".WAIT");
         let bootstrap_filename = ev.session.intern("*bootstrap*");
         let extra_prereqs_var_name = ev.session.intern(".EXTRA_PREREQS");
@@ -1758,12 +1652,10 @@ impl<'a> DepBuilder<'a> {
             phony: HashSet::new(),
             assumed_old,
             assumed_new,
-            restat: HashSet::new(),
             ignore_errors: HashSet::new(),
             delete_on_error: false,
             precious: HashSet::new(),
             precious_patterns: HashSet::new(),
-            depfile_var_name,
             vpath_var_name,
             libpatterns_var_name,
             gpath_var_name,
@@ -1771,10 +1663,6 @@ impl<'a> DepBuilder<'a> {
             gpath_origin: HashMap::new(),
             searched_at: HashMap::new(),
             merged_from: HashMap::new(),
-            implicit_outputs_var_name,
-            ninja_pool_var_name,
-            validations_var_name,
-            tags_var_name,
         };
         let _tr = ScopedTimeReporter::new(&ret.ev.session, "make dep (populate)");
         ret.populate_rules()?;
@@ -1818,12 +1706,6 @@ impl<'a> DepBuilder<'a> {
         if let Some((targets, _)) = self.get_rule_inputs(phony)? {
             for t in targets {
                 self.phony.insert(t);
-            }
-        }
-        let restat = self.ev.session.intern(".KATI_RESTAT");
-        if let Some((targets, _)) = self.get_rule_inputs(restat)? {
-            for t in targets {
-                self.restat.insert(t);
             }
         }
         // Bare `.IGNORE:` is `-i` asked for by the Makefile; with prerequisites
@@ -2724,7 +2606,7 @@ impl<'a> DepBuilder<'a> {
     fn an_implicit_rule_could_make(&mut self, name: Symbol) -> Result<bool> {
         let intermediates = self.intermediates.clone();
         let tried_implicit = self.tried_implicit.clone();
-        let scratch = DepNode::new(name, false, false, false, false, false);
+        let scratch = DepNode::new(name, false, false, false, false);
         let picked = self.implicit_rule_for(name, &scratch, &None, &[], &None);
         self.intermediates = intermediates;
         self.tried_implicit = tried_implicit;
@@ -3456,14 +3338,12 @@ impl<'a> DepBuilder<'a> {
             self.rules.insert(found, from);
             return Ok(());
         };
-        let (from_rules, from_double, from_primary, from_implicit, from_validations) = {
+        let (from_rules, from_double, from_primary) = {
             let from = from.lock();
             (
                 from.rules.clone(),
                 from.is_double_colon,
                 from.primary_rule.clone(),
-                from.implicit_outputs.clone(),
-                from.validations.clone(),
             )
         };
         let mut to = to.lock();
@@ -3525,8 +3405,6 @@ impl<'a> DepBuilder<'a> {
         if keep_commands {
             to.primary_rule = from_primary;
         }
-        to.implicit_outputs.extend(from_implicit);
-        to.validations.extend(from_validations);
         Ok(())
     }
 
@@ -3951,48 +3829,6 @@ impl<'a> DepBuilder<'a> {
                 self.populate_implicit_rule(rule, true)?;
             } else {
                 self.populate_explicit_rule(rule)?;
-            }
-        }
-        // TODO: This clone likely isn't necessary with some refactoring
-        for (symbol, merger) in self.rules.clone() {
-            let Some(vars) = self.lookup_rule_vars(symbol) else {
-                continue;
-            };
-            if let Some(var) = vars.lookup(
-                &mut self.ev.session.used_env_vars,
-                self.implicit_outputs_var_name,
-            ) {
-                let implicit_outputs = var.read().eval_to_buf(self.ev)?;
-
-                for output in word_scanner(&implicit_outputs) {
-                    let sym = self
-                        .ev
-                        .session
-                        .intern(implicit_outputs.slice_ref(trim_leading_curdir(output)));
-                    self.rules
-                        .entry(sym)
-                        .or_insert_with(RuleMerger::new)
-                        .lock()
-                        .set_implicit_output(&*self.ev, sym, symbol, merger.clone())?;
-                    merger
-                        .lock()
-                        .add_implicit_output(sym, self.rules[&sym].clone());
-                }
-            }
-
-            if let Some(var) = vars.lookup(
-                &mut self.ev.session.used_env_vars,
-                self.validations_var_name,
-            ) {
-                let validations = var.read().eval_to_buf(self.ev)?;
-
-                for validation in word_scanner(&validations) {
-                    let sym = self
-                        .ev
-                        .session
-                        .intern(validations.slice_ref(trim_leading_curdir(validation)));
-                    merger.lock().add_validation(sym);
-                }
             }
         }
         Ok(())
@@ -4483,7 +4319,6 @@ impl<'a> DepBuilder<'a> {
         let action = DepNode::new(
             graph_output,
             false,
-            false,
             self.moved_flag(&self.ignore_errors, trigger),
             false,
             false,
@@ -4655,31 +4490,6 @@ impl<'a> DepBuilder<'a> {
         Ok((action, true))
     }
 
-    fn add_validations(
-        &mut self,
-        output: Symbol,
-        n: &Arc<Mutex<DepNode>>,
-        validations: Vec<Symbol>,
-    ) -> Result<()> {
-        for validation in validations {
-            if n.lock().actual_validations.contains(&validation) {
-                continue;
-            }
-            if !self.ev.session.flags.use_ninja_validations {
-                error_loc!(
-                    self.ev,
-                    n.lock().loc.as_ref(),
-                    ".KATI_VALIDATIONS not allowed without --use_ninja_validations"
-                );
-            }
-            let dependency = self.build_plan(validation, Some(output))?;
-            let mut node = n.lock();
-            node.actual_validations.push(validation);
-            node.validations.push((validation, dependency));
-        }
-        Ok(())
-    }
-
     /// Every real member is a public completion join. It owns no recipe;
     /// consumers wait for every independent action that declared the member.
     fn build_grouped_double_member(
@@ -4687,7 +4497,6 @@ impl<'a> DepBuilder<'a> {
         output: Symbol,
         join: Arc<Mutex<DepNode>>,
         rules: Vec<Arc<Rule>>,
-        validations: Vec<Symbol>,
     ) -> Result<Arc<Mutex<DepNode>>> {
         let declared = self.written_as(output);
         let shared = self
@@ -4760,7 +4569,6 @@ impl<'a> DepBuilder<'a> {
                 .any(|(_, action)| action.lock().unconditional_double_colon);
         }
         self.done.insert(output, join.clone());
-        self.add_validations(output, &join, validations)?;
         Ok(join)
     }
 
@@ -5397,10 +5205,6 @@ impl<'a> DepBuilder<'a> {
         if let Some(rule_merger) = &rule_merger
             && rule_merger.lock().primary_rule.is_some()
         {
-            let mut vars = vars;
-            for (sym, _) in &rule_merger.lock().implicit_outputs {
-                vars = self.merge_implicit_rule_vars(*sym, vars);
-            }
             return Ok(Some(PickedRuleInfo {
                 merger: Some(rule_merger.clone()),
                 pattern_rule: None,
@@ -5638,16 +5442,7 @@ impl<'a> DepBuilder<'a> {
                 }
                 pending.insert(*name, (public_var.clone(), is_private));
 
-                if *name == self.depfile_var_name {
-                    node.lock().depfile_var = Some(new_var);
-                } else if *name == self.implicit_outputs_var_name
-                    || *name == self.validations_var_name
                 {
-                } else if *name == self.ninja_pool_var_name {
-                    node.lock().ninja_pool_var = Some(new_var);
-                } else if *name == self.tags_var_name {
-                    node.lock().tags_var = Some(new_var);
-                } else {
                     bound.push(RuleBinding {
                         guard: ScopedVar::new(
                             self.cur_rule_vars.clone().unwrap(),
@@ -5759,7 +5554,7 @@ impl<'a> DepBuilder<'a> {
 
     fn build_plan(
         &mut self,
-        mut output: Symbol,
+        output: Symbol,
         needed_by: Option<Symbol>,
     ) -> Result<Arc<Mutex<DepNode>>> {
         log!(
@@ -5779,7 +5574,6 @@ impl<'a> DepBuilder<'a> {
         let n = DepNode::new(
             output,
             self.phony.contains(&output),
-            self.moved_flag(&self.restat, output),
             self.moved_flag(&self.ignore_errors, output),
             is_intermediate,
             // `remove_intermediates` (file.c) asks for `intermediate` and
@@ -5806,18 +5600,6 @@ impl<'a> DepBuilder<'a> {
         let Some(mut picked_rule_info) = self.pick_rule(output, &n)? else {
             return Ok(n);
         };
-        if let Some(merger) = &picked_rule_info.merger
-            && merger.lock().parent.is_some()
-        {
-            output = merger.lock().parent_sym.unwrap();
-            self.done.insert(output, n.clone());
-            n.lock().output = output;
-            let Some(new_picked_rule_info) = self.pick_rule(output, &n)? else {
-                return Ok(n);
-            };
-            // Update the picked_rule_info with the new values
-            picked_rule_info = new_picked_rule_info;
-        }
         if let Some(merger) = &picked_rule_info.merger {
             // Said of the node the Makefile named, for both shapes: the join
             // below is this same node, and a lone `::` record falls through to
@@ -5841,10 +5623,10 @@ impl<'a> DepBuilder<'a> {
                             .rules
                             .iter()
                             .any(|rule| rule.is_grouped && rule.is_double_colon)))
-                .then(|| (merger.rules.clone(), merger.validations.clone()))
+                .then(|| merger.rules.clone())
             };
-            if let Some((rules, validations)) = grouped_double {
-                return self.build_grouped_double_member(output, n, rules, validations);
+            if let Some(rules) = grouped_double {
+                return self.build_grouped_double_member(output, n, rules);
             }
         }
         let mut grouped_outputs = Vec::new();
@@ -6227,19 +6009,6 @@ impl<'a> DepBuilder<'a> {
             n.lock().order_onlys.push((input, c));
         }
 
-        let actual_validations = n.lock().actual_validations.clone();
-        for validation in actual_validations {
-            if !self.ev.session.flags.use_ninja_validations {
-                error_loc!(
-                    self.ev,
-                    n.lock().loc.as_ref(),
-                    ".KATI_VALIDATIONS not allowed without --use_ninja_validations"
-                );
-            }
-            let c = self.build_plan(validation, Some(output))?;
-            n.lock().validations.push((validation, c));
-        }
-
         // Block on werror_writable/werror_phony_looks_real, because otherwise we
         // can't rely on is_phony being valid for this check.
         if !n.lock().is_phony
@@ -6269,7 +6038,7 @@ impl<'a> DepBuilder<'a> {
                     error_loc!(
                         self.ev,
                         n.loc.as_ref(),
-                        "*** target \"{}\" has no commands. Should \"{}\" be using .KATI_IMPLICIT_OUTPUTS?",
+                        "*** target \"{}\" has no commands, and \"{}\" is the only thing that could have made it",
                         output.display(self.ev),
                         n.actual_inputs[0].display(self.ev)
                     );
@@ -6277,7 +6046,7 @@ impl<'a> DepBuilder<'a> {
                     warn_loc!(
                         self.ev,
                         n.loc.as_ref(),
-                        "warning: target \"{}\" has no commands. Should \"{}\" be using .KATI_IMPLICIT_OUTPUTS?",
+                        "warning: target \"{}\" has no commands, and \"{}\" is the only thing that could have made it",
                         output.display(self.ev),
                         n.actual_inputs[0].display(self.ev)
                     );
@@ -6286,14 +6055,14 @@ impl<'a> DepBuilder<'a> {
                 error_loc!(
                     self.ev,
                     n.loc.as_ref(),
-                    "*** target \"{}\" has no commands that could create output file. Is a dependency missing .KATI_IMPLICIT_OUTPUTS?",
+                    "*** target \"{}\" has no commands that could create output file",
                     output.display(self.ev)
                 );
             } else if self.ev.session.flags.warn_real_no_cmds {
                 warn_loc!(
                     self.ev,
                     n.loc.as_ref(),
-                    "warning: target \"{}\" has no commands that could create output file. Is a dependency missing .KATI_IMPLICIT_OUTPUTS?",
+                    "warning: target \"{}\" has no commands that could create output file",
                     output.display(self.ev)
                 );
             }
@@ -6463,7 +6232,6 @@ pub fn is_special_target(names: &impl Interner, output: &Symbol) -> bool {
 const CONSUMED_BUILTIN_TARGETS: &[&str] = &[
     ".PHONY",
     ".SUFFIXES",
-    ".KATI_RESTAT",
     ".WAIT",
     ".DEFAULT",
     ".SECONDEXPANSION",
@@ -6740,7 +6508,7 @@ mod tests {
                 "{name} should be built"
             );
         }
-        for name in [".PHONY", ".SUFFIXES", ".KATI_RESTAT", ".ONESHELL", ".WAIT"] {
+        for name in [".PHONY", ".SUFFIXES", ".ONESHELL", ".WAIT"] {
             let sym = session.intern(name);
             assert!(
                 !is_buildable_target(&session, &sym, true),

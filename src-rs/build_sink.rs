@@ -199,9 +199,9 @@ pub enum OutputEvaluation {
 
 /// A pool kati declares for itself.
 ///
-/// Pools kati only *refers* to — the ones `.KATI_NINJA_POOL` and
-/// `--default_pool` name — are declared by whoever wrote the ninja fragment
-/// that includes kati's output, and never appear here.
+/// Pools kati only *refers* to — the ones `--default_pool` names — are declared
+/// by whoever wrote the ninja fragment that includes kati's output, and never
+/// appear here.
 pub struct SinkPool<'a> {
     pub name: &'a [u8],
     /// How many edges bound to this pool may run at once.
@@ -376,9 +376,6 @@ pub struct SinkRule<'a> {
     /// A file the command writes its discovered dependencies to, in the format
     /// `cc -MD` produces. kati never emits any other format.
     pub depfile: Option<&'a [u8]>,
-    /// The command may leave its output unchanged, so downstream edges should
-    /// re-check rather than assume they are dirty.
-    pub restat: bool,
     /// A nonzero status from this command is an error Make was told to ignore:
     /// the `-` recipe prefix on every line, `-i`, or `.IGNORE`.
     ///
@@ -422,8 +419,6 @@ pub struct SinkEdge<'a> {
     /// runs a target's later entries after an earlier entry failed, which is an
     /// ordering with the status taken out of it.
     pub forgiven_order_only_inputs: &'a [Symbol],
-    /// Targets to build alongside this one, whose results it does not consume.
-    pub validations: &'a [Symbol],
     /// The Make target is `.PHONY`: it names no file, so nothing can find it up
     /// to date and it must run every time it is reached.
     ///
@@ -610,9 +605,6 @@ pub struct SinkEdge<'a> {
     pub declared_by_double_colon: Option<Symbol>,
     /// The pool that limits how many edges like this run at once, unescaped.
     pub pool: Option<&'a [u8]>,
-    /// Opaque per-edge metadata from `.KATI_TAGS`, for consumers of the graph
-    /// rather than for the build itself.
-    pub tags: Option<&'a [u8]>,
     /// The line of the Makefile this came from.
     pub loc: Option<&'a Loc>,
 }
