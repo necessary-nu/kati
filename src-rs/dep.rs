@@ -999,6 +999,17 @@ struct ImplicitSearch<'a> {
     output: Symbol,
     /// The name the patterns are matched against and the stem is read out of.
     name: &'a Bytes,
+    /// The prerequisites the Makefile already wrote for this target, which is
+    /// GNU Make's `file->deps` at the moment `pattern_search` runs.
+    ///
+    /// A candidate's prerequisite that is on this list "ought to exist": it is
+    /// going to be built whichever rule the search picks, so the candidate is
+    /// satisfied without inventing anything and wins on the first pass, ahead
+    /// of a later candidate whose prerequisite merely happens to be on disk.
+    /// `foo: foo.o` beside `%: %.o` and `%: %.c` is exactly that — GNU links
+    /// `foo.o`, and reading `foo.o` as an invented intermediate instead hands
+    /// the `%: %.c` rule the win and the linker a `.c` file.
+    declared: &'a [Symbol],
     /// Which of the four relaxations of `pattern_search` this is.
     pass: SearchPass,
 }
@@ -4791,6 +4802,7 @@ impl<'a> DepBuilder<'a> {
     fn implicit_prerequisites_reachable(
         &mut self,
         inputs: Vec<(Symbol, bool)>,
+        declared: &[Symbol],
         pass: SearchPass,
     ) -> Result<Option<ReachedPrerequisites>> {
         let mut reached = ReachedPrerequisites::default();
@@ -4800,7 +4812,15 @@ impl<'a> DepBuilder<'a> {
             if self.proven_impossible(sym, 0) {
                 return Ok(None);
             }
-            if self.exists(sym) {
+            // A name this target already asks for is going to be built whatever
+            // rule the search settles on, so the rule that wants it needs to
+            // invent nothing and applies on the strict pass. GNU Make asks it
+            // beside `df->is_target` and ahead of the file's existence — "'%s'
+            // ought to exist" — by walking `file->deps` for the name
+            // (reference/gnumake/src/implicit.c). It is what makes
+            // `foo: foo.o` pick `%: %.o` over the `%: %.c` written under it,
+            // even though only `foo.c` is on disk.
+            if self.exists(sym) || declared.contains(&sym) {
                 reached.found.push(sym);
                 continue;
             }
@@ -4929,8 +4949,9 @@ impl<'a> DepBuilder<'a> {
             None => self.resolved_prerequisites(&rule.inputs, &matched_at),
         };
         let resolved_inputs: Vec<Symbol> = inputs.iter().map(|(input, _)| *input).collect();
+        let declared = search.declared;
         let Some(reached) = self.while_rule_in_use(rule, |builder| {
-            builder.implicit_prerequisites_reachable(inputs, pass)
+            builder.implicit_prerequisites_reachable(inputs, declared, pass)
         })?
         else {
             return Ok(None);
@@ -5158,6 +5179,12 @@ impl<'a> DepBuilder<'a> {
         vars: &Option<Arc<Vars>>,
     ) -> Result<Option<PickedRuleInfo>> {
         let whole_name = output.as_bytes(&self.ev.session);
+        // GNU Make's `file->deps`, read once for the whole search: `snap_deps`
+        // has already run by the time `pattern_search` is reached, so what the
+        // Makefile wrote for this target is settled and the same for every
+        // candidate and every pass.
+        let (recorded, recorded_order_only) = self.recorded_prerequisites(output);
+        let declared: Vec<Symbol> = recorded.into_iter().chain(recorded_order_only).collect();
         let outer_compat = std::mem::replace(&mut self.found_compat_rule, false);
         let mut picked = None;
         for pass in SearchPass::all() {
@@ -5171,6 +5198,7 @@ impl<'a> DepBuilder<'a> {
                 ImplicitSearch {
                     output,
                     name: &whole_name,
+                    declared: &declared,
                     pass,
                 },
                 n,
@@ -5201,6 +5229,7 @@ impl<'a> DepBuilder<'a> {
                     ImplicitSearch {
                         output,
                         name: &archive_name,
+                        declared: &declared,
                         pass,
                     },
                     n,
@@ -5544,12 +5573,15 @@ impl<'a> DepBuilder<'a> {
             if self.proven_impossible(input, 0) {
                 continue;
             }
+            // The same "ought to exist" question the pattern candidates are
+            // asked, on the path a suffix rule reaches the search by.
+            let available = self.exists(input) || search.declared.contains(&input);
             let mut taken_on_trust = false;
-            if !self.exists(input) && self.is_written_down(input) {
+            if !available && self.is_written_down(input) {
                 taken_on_trust = pass.compat;
                 self.found_compat_rule |= !pass.compat;
             }
-            if !self.exists(input) && !taken_on_trust {
+            if !available && !taken_on_trust {
                 let reachable = self.while_rule_in_use(&irule, |builder| {
                     Ok(pass.chaining && builder.intermediate_reachable(input, 0, pass.compat)?)
                 })?;
