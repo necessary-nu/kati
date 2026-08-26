@@ -472,7 +472,15 @@ impl AutoCommandVar {
                 }
             }
             AutoCommand::Bar => {
-                let mut seen = HashSet::new();
+                // A name declared both ways is an ordinary prerequisite and
+                // nothing else. GNU Make holds one prerequisite chain with an
+                // `ignore_mtime` bit per entry, and `set_file_variables`
+                // (commands.c) upgrades both entries — "if so then we need to
+                // 'upgrade' one that is order-only" — before it reads any of
+                // the three lists off, so the name leaves `$|` and stays in
+                // `$^`. Two lists say the same thing by leaving it out here.
+                let mut seen: HashSet<Symbol> =
+                    current_dep_node.actual_inputs.iter().copied().collect();
                 let mut ww = WordWriter::new(out);
                 for oi in current_dep_node.actual_order_only_inputs.iter() {
                     if seen.insert(*oi) {
