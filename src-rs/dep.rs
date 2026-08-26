@@ -6011,6 +6011,22 @@ impl<'a> DepBuilder<'a> {
             }
         }
 
+        // A pattern rule with several target patterns is the same shape reached
+        // by the implicit search: the recipe makes the peers too, and GNU Make
+        // walks their prerequisites while it updates the one it was asked for.
+        // `update_file_1` (remake.c) says so in as many words — "we need to walk
+        // our deps, AND the deps of any also_make targets to ensure everything
+        // happens in the correct order" — and the walk is the one that decides
+        // `must_make`, so a peer's own recipe-less rule is built, and built
+        // first. It stays out of the automatic variables because it was never
+        // in this file's own prerequisite chain.
+        let pattern_peers = n.lock().peer_outputs.clone();
+        for peer in pattern_peers {
+            let (inputs, order_only) = self.recorded_prerequisites(peer);
+            grouped_peer_inputs.extend(inputs);
+            grouped_peer_order_only.extend(order_only);
+        }
+
         // What `.EXTRA_PREREQS` adds is the same shape as a hidden peer: in the
         // graph and in the freshness test, out of every automatic variable. It
         // rides the same pass so VPATH and `.WAIT` reach it too, and it goes on
