@@ -1070,6 +1070,16 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
 
 fn foreach_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
     let name = args[0].eval_to_buf(ev)?;
+    // The name is the first token of what the first argument expanded to, and
+    // nothing else: GNU Make's `func_foreach` runs `next_token` over it to skip
+    // leading whitespace and then writes a NUL at `end_of_token`, so
+    // `$(foreach  a , ...)` binds `a` and so does `$(foreach a b, ...)`. A
+    // continuation is whitespace like any other, which is how a `foreach`
+    // written across several lines binds anything at all.
+    let name = word_scanner(&name)
+        .next()
+        .map(|token| name.slice_ref(token))
+        .unwrap_or_default();
     let varname = ev.session.intern(name);
     let list = args[1].eval_to_buf(ev)?;
     ev.eval_depth -= 1;
