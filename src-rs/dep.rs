@@ -1318,6 +1318,16 @@ impl RuleMerger {
         }
     }
 
+    /// Fill in what the rule lines wrote out in full, and say where the ones
+    /// held for a second expansion belong among them.
+    ///
+    /// The order is GNU Make's `record_files` (read.c): a rule line carrying a
+    /// recipe has its prerequisites put in FRONT of what the target already
+    /// had, and a recipe-less one has its put on the end — so what comes out is
+    /// the recipe's line first and the rest as written. `expand_deps` (file.c)
+    /// then expands a deferred entry where it stands, so a deferred line's
+    /// prerequisites land at that line's place in the chain rather than after
+    /// everything else.
     fn fill_dep_node(
         &self,
         session: &mut Session,
@@ -1326,10 +1336,21 @@ impl RuleMerger {
         pattern_rule: &Option<Arc<Rule>>,
         grouped_outputs: &[Symbol],
         n: &Arc<Mutex<DepNode>>,
-    ) {
+    ) -> Vec<DeferredSegment> {
         let mut n = n.lock();
+        let mut deferred = Vec::new();
+        let mut note_deferred = |r: &Arc<Rule>, n: &DepNode| {
+            if r.deferred_prerequisites.is_some() {
+                deferred.push(DeferredSegment {
+                    rule: r.clone(),
+                    at_input: n.actual_inputs.len(),
+                    at_order_only: n.actual_order_only_inputs.len(),
+                });
+            }
+        };
         if let Some(primary_rule) = &self.primary_rule {
             assert!(pattern_rule.is_none());
+            note_deferred(primary_rule, &n);
             self.fill_dep_node_from_rule(session, declared, primary_rule, &mut n);
             if primary_rule.is_grouped && !primary_rule.is_double_colon {
                 for grouped_output in grouped_outputs {
@@ -1343,6 +1364,11 @@ impl RuleMerger {
             self.fill_dep_node_loc(primary_rule, &mut n);
             n.cmds = primary_rule.cmds.clone();
         } else if let Some(pattern_rule) = pattern_rule {
+            // Deliberately not noted for a second expansion. The implicit
+            // search has already expanded whatever the rule it picked held, and
+            // the one rule that reaches here still holding it is `.DEFAULT` —
+            // whose prerequisites GNU Make never reads at all: `update_file_1`
+            // takes `default_file->cmds` and nothing else (remake.c).
             self.fill_dep_node_from_rule(session, declared, pattern_rule, &mut n);
             self.fill_dep_node_loc(pattern_rule, &mut n);
             n.cmds = pattern_rule.cmds.clone();
@@ -1354,6 +1380,7 @@ impl RuleMerger {
             {
                 continue;
             }
+            note_deferred(r, &n);
             self.fill_dep_node_from_rule(session, declared, r, &mut n);
             if self.is_double_colon {
                 self.fill_grouped_outputs(output, r, &mut n);
@@ -1365,7 +1392,16 @@ impl RuleMerger {
 
         let mut all_outputs = HashSet::new();
         all_outputs.insert(output);
+        deferred
     }
+}
+
+/// A rule line whose prerequisites are held for a second expansion, with where
+/// among the ones already written out its own belong.
+struct DeferredSegment {
+    rule: Arc<Rule>,
+    at_input: usize,
+    at_order_only: usize,
 }
 
 type SuffixRuleMap = HashMap<Bytes, Vec<Arc<Rule>>>;
@@ -5819,31 +5855,11 @@ impl<'a> DepBuilder<'a> {
         let declared_str = declared.as_bytes(&self.ev.session);
         let output_str = output.as_bytes(&self.ev.session);
 
-        // A static pattern rule reaches this the same way an explicit one does,
-        // so its stem is read off the rule rather than off the search.
-        let (deferred, independent, unconditional_double_colon) = picked_rule_info
+        let (independent, unconditional_double_colon) = picked_rule_info
             .merger
             .as_ref()
             .map(|merger| {
                 let merger = merger.lock();
-                let deferred = merger
-                    .rules
-                    .iter()
-                    .filter(|rule| {
-                        rule.deferred_prerequisites.is_some()
-                            && prerequisites_reach(&self.ev.session, rule, declared)
-                    })
-                    .map(|rule| {
-                        (
-                            rule.deferred_prerequisites.clone().unwrap(),
-                            self.stem_of(rule, &declared_str),
-                            merger.is_double_colon
-                                && !rule.cmds.is_empty()
-                                && rule.inputs.is_empty()
-                                && rule.order_only_inputs.is_empty(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
                 let unconditional = merger.is_double_colon
                     && merger.rules.iter().any(|rule| {
                         !rule.cmds.is_empty()
@@ -5851,11 +5867,11 @@ impl<'a> DepBuilder<'a> {
                             && rule.order_only_inputs.is_empty()
                             && rule.deferred_prerequisites.is_none()
                     });
-                (deferred, merger.is_double_colon, unconditional)
+                (merger.is_double_colon, unconditional)
             })
             .unwrap_or_default();
         n.lock().unconditional_double_colon = unconditional_double_colon;
-        picked_rule_info
+        let deferred = picked_rule_info
             .merger
             .clone()
             .unwrap_or_else(RuleMerger::new)
@@ -5868,6 +5884,25 @@ impl<'a> DepBuilder<'a> {
                 &grouped_outputs,
                 &n,
             );
+        // A static pattern rule reaches this the same way an explicit one does,
+        // so its stem is read off the rule rather than off the search.
+        let deferred = deferred
+            .into_iter()
+            .filter(|segment| prerequisites_reach(&self.ev.session, &segment.rule, declared))
+            .map(|segment| {
+                let unconditional_candidate = independent
+                    && !segment.rule.cmds.is_empty()
+                    && segment.rule.inputs.is_empty()
+                    && segment.rule.order_only_inputs.is_empty();
+                (
+                    segment.rule.deferred_prerequisites.clone().unwrap(),
+                    self.stem_of(&segment.rule, &declared_str),
+                    unconditional_candidate,
+                    segment.at_input,
+                    segment.at_order_only,
+                )
+            })
+            .collect::<Vec<_>>();
         let grouped_is_phony = picked_rule_info.merger.as_ref().is_some_and(|merger| {
             let merger = merger.lock();
             grouped_outputs
@@ -5897,7 +5932,11 @@ impl<'a> DepBuilder<'a> {
         // that comes out wrong.
         let previous_scope = self.push_expansion_scope(&picked_rule_info.vars);
         let expanded = (|| -> Result<()> {
-            for (text, stem, unconditional_candidate) in deferred {
+            // What earlier segments put in front of the position each later one
+            // was measured at, since the positions were read off the list as
+            // the rule lines that wrote their prerequisites out left it.
+            let (mut spliced_inputs, mut spliced_order_only) = (0usize, 0usize);
+            for (text, stem, unconditional_candidate, at_input, at_order_only) in deferred {
                 // Each `::` rule stands on its own, so nothing another one
                 // declared is in scope for this one's automatic variables.
                 let recorded = if independent {
@@ -5919,8 +5958,12 @@ impl<'a> DepBuilder<'a> {
                     unconditional_candidate && inputs.is_empty() && order_only.is_empty();
                 let mut node = n.lock();
                 node.unconditional_double_colon |= unconditional;
-                node.actual_inputs.extend(inputs);
-                node.actual_order_only_inputs.extend(order_only);
+                let at = at_input + spliced_inputs;
+                spliced_inputs += inputs.len();
+                node.actual_inputs.splice(at..at, inputs);
+                let at = at_order_only + spliced_order_only;
+                spliced_order_only += order_only.len();
+                node.actual_order_only_inputs.splice(at..at, order_only);
             }
             Ok(())
         })();
