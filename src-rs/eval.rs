@@ -1451,7 +1451,10 @@ impl Evaluator {
                 );
             }
             // `V != cmd` runs the command the way `$(shell)` does, down to
-            // `.SHELLSTATUS`, then reads its output as a recursive value.
+            // `.SHELLSTATUS`, then reads its output as a recursive value. What
+            // the command wrote is a value and not a line of makefile: the
+            // whole of it is kept, whatever a `#` in it might have meant had
+            // anyone read it as source.
             AssignOp::ShellEq => {
                 let ran = Value::Func {
                     loc: self.loc.clone().unwrap_or_default(),
@@ -1464,7 +1467,7 @@ impl Evaluator {
                     &mut self.session,
                     &mut loc,
                     output.clone(),
-                    ParseExprOpt::Normal,
+                    ParseExprOpt::Captured,
                 )?
                 .resolve_folds(self.is_posix);
                 result =

@@ -48,6 +48,12 @@ pub enum ParseExprOpt {
     Define,
     Command,
     Func,
+    /// Text a command wrote, which a `!=` assignment stores as a recursive
+    /// value. It is not makefile source and was never read as a line, so
+    /// nothing in it opens a comment — GNU Make hands the output straight to
+    /// `define_variable_in_set` and only `variable_expand_string` ever looks at
+    /// it again, and that reads `$` and nothing else.
+    Captured,
 }
 
 /// Text a read could not make a call or a reference out of.
@@ -390,12 +396,12 @@ fn close_paren(c: u8) -> Option<u8> {
 /// (read.c), and `MAP_VARIABLE` is what makes the scan step over a `$(` or `${`
 /// to its close without looking inside: a `#` in there was never going to start
 /// a comment, so nothing unquotes the backslash in front of it and the value
-/// keeps both characters. A `define` body and a recipe line are the other two
-/// places the scan does not reach.
+/// keeps both characters. A `define` body, a recipe line and text a command
+/// wrote are the other three places the scan does not reach.
 fn should_handle_comments(opt: ParseExprOpt) -> bool {
     !matches!(
         opt,
-        ParseExprOpt::Define | ParseExprOpt::Command | ParseExprOpt::Func
+        ParseExprOpt::Define | ParseExprOpt::Command | ParseExprOpt::Func | ParseExprOpt::Captured
     )
 }
 
