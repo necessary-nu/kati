@@ -67,6 +67,12 @@ pub enum Source {
 
 impl Makefile {
     /// Parse `buf` as the makefile named by `filename`.
+    ///
+    /// The bytes are noted as they were read and parsed with any byte order
+    /// mark taken off the front, because those are two different questions: a
+    /// pass that re-reads this unit is handed back what the file holds, and the
+    /// read that makes statements out of it is the one GNU Make skips the mark
+    /// for.
     pub(crate) fn from_bytes(
         session: &mut Session,
         filename: &OsStr,
@@ -76,7 +82,7 @@ impl Makefile {
             .makefiles
             .note_source(filename.to_os_string(), buf.clone());
         let filename = session.intern(filename.as_bytes().to_vec());
-        let stmts = parse_file(session, &buf, filename)?;
+        let stmts = parse_file(session, &without_byte_order_mark(&buf), filename)?;
         Ok(Arc::new(Self { filename, stmts }))
     }
 
@@ -115,6 +121,21 @@ impl Makefile {
             filename,
             Bytes::from(buf),
         )?))
+    }
+}
+
+/// A makefile's text with a leading UTF-8 byte order mark taken off.
+///
+/// GNU Make skips one at the head of a makefile and nowhere else: `eval`
+/// (read.c) tests for `EF BB BF` only while `ebuf->floc.lineno == 1`, so an
+/// editor that writes the mark does not give the first target a three-byte
+/// prefix nobody can name. A mark further into the file is ordinary text on
+/// both sides, and this is why: the test is on the line, not on the bytes.
+fn without_byte_order_mark(buf: &Bytes) -> Bytes {
+    const MARK: &[u8] = b"\xEF\xBB\xBF";
+    match buf.starts_with(MARK) {
+        true => buf.slice(MARK.len()..),
+        false => buf.clone(),
     }
 }
 
