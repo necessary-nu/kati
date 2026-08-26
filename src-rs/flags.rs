@@ -92,6 +92,37 @@ pub struct DecodedMakeflags {
     pub complaints: Vec<Bytes>,
 }
 
+/// Quote one word so `MAKEFLAGS` carries it back as the single word it was.
+///
+/// GNU Make's `quote_for_env`: a `$` is doubled so reading the variable does
+/// not expand it, and a backslash or a blank is backslash-escaped so word
+/// splitting does not end the word there. It serves command-line assignments
+/// and `--eval` fragments alike, because both are arbitrary text that has to
+/// survive being read back as a command line.
+///
+/// One byte is treated differently from GNU Make's, and deliberately: GNU
+/// escapes only space and tab, leaving a newline raw, because its own reader
+/// splits on blanks alone and a raw newline therefore stays inside the word.
+/// A reader that splits on any ASCII whitespace needs the newline escaped to
+/// keep the same word whole on the way back. The two choices are one choice —
+/// change either and the round trip breaks.
+#[must_use]
+pub fn quote_for_makeflags(word: &[u8]) -> Vec<u8> {
+    let mut quoted = Vec::with_capacity(word.len());
+    for byte in word {
+        match byte {
+            b'\\' => quoted.extend_from_slice(b"\\\\"),
+            b'$' => quoted.extend_from_slice(b"$$"),
+            byte if byte.is_ascii_whitespace() => {
+                quoted.push(b'\\');
+                quoted.push(*byte);
+            }
+            byte => quoted.push(*byte),
+        }
+    }
+    quoted
+}
+
 /// Decode one evaluated Makefile assignment into GNU Make's switch table.
 pub type MakeflagsDecoder =
     fn(previous: &[u8], assigned: &[u8], protected: &[u8]) -> Result<DecodedMakeflags, String>;

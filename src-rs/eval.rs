@@ -902,6 +902,11 @@ pub struct Evaluator {
     pub loc: Option<Loc>,
     is_bootstrap: bool,
     is_commandline: bool,
+    /// The names the command line bound, in the order it first named each of
+    /// them. GNU Make's `command_variables`, and the only record of that order
+    /// there is: the variable table is keyed by name and says nothing about
+    /// which argument introduced which.
+    command_line_names: Vec<Symbol>,
     /// Whether the read in progress is one whose targets may not choose the
     /// default goal — the makefiles `MAKEFILES` names.
     default_goal_withheld: bool,
@@ -1256,6 +1261,7 @@ impl Evaluator {
             loc: None,
             is_bootstrap: false,
             is_commandline: false,
+            command_line_names: Vec::new(),
             default_goal_withheld: false,
 
             trace,
@@ -1364,6 +1370,11 @@ impl Evaluator {
         }
     }
 
+    /// The names the command line bound, in the order it first named each.
+    pub fn command_line_names(&self) -> &[Symbol] {
+        &self.command_line_names
+    }
+
     pub fn current_frame(&self) -> Arc<Frame> {
         self.stack.lock().last().unwrap().clone()
     }
@@ -1411,6 +1422,15 @@ impl Evaluator {
         let (origin, current_frame) = if self.is_bootstrap {
             (VarOrigin::Default, None)
         } else if self.is_commandline {
+            // Where the name first appeared on the command line, which is the
+            // order `MAKEOVERRIDES` is rendered in and cannot be read back off
+            // the variable table. GNU Make keeps the same record — a
+            // `command_variable` per distinct variable, prepended as it is
+            // introduced (main.c) — and reading a second assignment to the same
+            // name leaves it where the first put it.
+            if !self.command_line_names.contains(&lhs) {
+                self.command_line_names.push(lhs);
+            }
             (VarOrigin::CommandLine, None)
         } else if is_override {
             (VarOrigin::Override, self.stack.lock().last().cloned())

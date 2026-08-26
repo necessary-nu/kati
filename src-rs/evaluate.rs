@@ -852,6 +852,59 @@ fn decode_gnumakeflags_after_read(ev: &mut Evaluator) -> Result<()> {
     Ok(())
 }
 
+/// Re-render `-*-command-variables-*-` from the variables the command line
+/// actually bound, now that they are bound.
+///
+/// GNU Make writes this table from the variable table rather than from argv:
+/// `quote_for_env (p, v->name)`, a `:` where the variable came out simple, `=`,
+/// then `quote_for_env (p, v->value)` — the STORED value, which for `!=` is
+/// what the shell answered, for `:=` is the expansion, and for `=` is the text
+/// as written (main.c, `define_makeflags`). So an assignment reaches a child in
+/// the flavour and value it settled to, and never as the operator it was
+/// spelled with: `FOO!=echo hi` arrives as `FOO=hi`, and the child does not run
+/// the command a second time.
+///
+/// The frontend renders this table once from argv, before anything is bound,
+/// because `MAKEFLAGS` has to exist while the command line is read. This is the
+/// second rendering, at GNU Make's own moment: `decode_switches` has entered the
+/// command line's variables and no makefile has been read.
+fn resettle_command_variables(ev: &mut Evaluator) {
+    let command_variables = ev.session.intern("-*-command-variables-*-");
+    if ev.session.peek_global_var(command_variables).is_none() {
+        return;
+    }
+    let mut rendered: Vec<u8> = Vec::new();
+    // Reverse of first-introduction order, which is what walking GNU Make's
+    // prepended `command_variables` chain produces.
+    for name in ev.command_line_names().iter().rev() {
+        let Some(variable) = ev.session.peek_global_var(*name) else {
+            continue;
+        };
+        let (simple, value) = {
+            let variable = variable.read();
+            let Ok(value) = variable.string(&ev.session) else {
+                continue;
+            };
+            (variable.flavor() == "simple", value.into_owned())
+        };
+        if !rendered.is_empty() {
+            rendered.push(b' ');
+        }
+        rendered.extend_from_slice(&crate::flags::quote_for_makeflags(
+            &name.as_bytes(&ev.session),
+        ));
+        if simple {
+            rendered.push(b':');
+        }
+        rendered.push(b'=');
+        rendered.extend_from_slice(&crate::flags::quote_for_makeflags(&value));
+    }
+    ev.session.globals.define(
+        command_variables,
+        Variable::with_simple_string(Bytes::from(rendered), VarOrigin::Automatic, None, None),
+    );
+}
+
 /// Set `MAKEFLAGS` up again once the read is over, in case the makefiles gave
 /// `MAKEOVERRIDES` something to carry.
 ///
@@ -1230,6 +1283,7 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
             asts[0].eval(&mut ev)?;
         }
         ev.capture_command_line_environment();
+        resettle_command_variables(&mut ev);
     }
     // GNU Make's `define_automatic_variables` runs after `decode_switches` has
     // entered the command line's own variables and before `read_all_makefiles`,
