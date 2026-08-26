@@ -1992,6 +1992,35 @@ impl Evaluator {
         Ok(())
     }
 
+    /// Replace a target-specific binding with the command line's, where the
+    /// command line bound the same name.
+    ///
+    /// GNU Make's `record_target_var` (read.c) copies `gv->value`, `gv->origin`
+    /// and `gv->recursive` onto the per-target variable and clears its `append`.
+    /// The environment counts too when `-e` lifted it: `o_env_override` is the
+    /// second origin the test names.
+    fn take_command_line_value(&mut self, name: Symbol, binding: &Var) {
+        let Some(outer) = self.lookup_var_global(name) else {
+            return;
+        };
+        if !matches!(
+            outer.read().origin(),
+            VarOrigin::CommandLine | VarOrigin::EnvironmentOverride
+        ) {
+            return;
+        }
+        let taken = outer.read().clone();
+        let mut binding = binding.write();
+        // What this rule line said about the binding is the rule line's, not
+        // the command line's: `record_target_var` writes `private` and `export`
+        // onto the variable after this, over whatever it just copied in.
+        let (is_private, export) = (binding.is_private, binding.export);
+        *binding = taken;
+        binding.is_private = is_private;
+        binding.export = export;
+        binding.assign_op = Some(AssignOp::Eq);
+    }
+
     fn record_rule_specific_assign(
         &mut self,
         targets: &[Symbol],
@@ -2089,6 +2118,19 @@ impl Evaluator {
                     } else {
                         assignment.op
                     });
+                    // A command-line definition outranks a target's own, exactly
+                    // as it outranks a makefile's. `record_target_var` (read.c)
+                    // ends by saying so: "If it's not an override, check to see
+                    // if there was a command-line setting. If so, reset the
+                    // value" — and it resets the value, the origin, the flavour
+                    // and the append together, so what the target reads is the
+                    // command line's and not a paste onto it. Asked of the
+                    // global set rather than the one being written into, which
+                    // is where GNU Make's `current_variable_set_list` is
+                    // restored to before the question.
+                    if !modifiers.directive.is_override {
+                        self.take_command_line_value(var_sym, &rhs_var);
+                    }
                     self.current_scope
                         .as_ref()
                         .unwrap()
