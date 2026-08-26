@@ -966,6 +966,23 @@ pub fn references_new_inputs(value: &Value, names: &impl Interner) -> bool {
     }
 }
 
+/// GNU Make's `lines_flags[i] & COMMANDS_RECURSE` for one written recipe line:
+/// a `+` among the prefixes it opens with, or a `$(MAKE)` reference anywhere in
+/// it.
+///
+/// Read off the line AS WRITTEN, which `chop_commands` (commands.c) does at
+/// parse time over the unexpanded text. That is the whole of why a `$(FOO)`
+/// whose value is `+` is not a recursive line and a written `+` is.
+pub fn written_line_recurses(value: &Value, names: &impl Interner) -> bool {
+    let mut prefixes = LinePrefixes {
+        echo: true,
+        dash_prefixed: false,
+        recursive_line: references_make(value, names),
+    };
+    scan_written_prefixes(value, &mut prefixes);
+    prefixes.recursive_line
+}
+
 fn references_make(value: &Value, names: &impl Interner) -> bool {
     match value {
         Value::Literal(_, _) => false,

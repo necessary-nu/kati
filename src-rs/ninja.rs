@@ -2282,6 +2282,11 @@ impl<'a> NinjaGenerator<'a> {
                 deferred_new_input_names: &deferred_new_input_names,
                 settled_names: &settled_names,
                 completion_join: node.grouped_double_join,
+                has_touchable_recipe: !node.cmds.is_empty()
+                    && !node
+                        .cmds
+                        .iter()
+                        .all(|cmd| crate::command::written_line_recurses(cmd, &self.ce.ev.session)),
                 intermediate: node.is_intermediate,
                 disposable: node.is_disposable,
                 withdrawable_outputs: &withdrawable_outputs,
@@ -3165,6 +3170,7 @@ mod tests {
                     settled_names: &[],
                     deferred_new_input_names: &[],
                     completion_join: false,
+                    has_touchable_recipe: false,
                     intermediate: false,
                     disposable: false,
                     withdrawable_outputs: &[],

@@ -488,6 +488,27 @@ pub struct SinkEdge<'a> {
     /// This edge publishes a real output only after its private action inputs
     /// have settled.  It runs no command itself.
     pub completion_join: bool,
+    /// The Make target has a recipe `-t` may stand in for, whatever that recipe
+    /// came to.
+    ///
+    /// A recipe that expands to no command at all — `b: c;`, or `$(FOO)` where
+    /// `FOO` is empty — compiles to the same commandless edge as a target with
+    /// no recipe written for it, and `-t` is the one thing that tells them
+    /// apart. GNU Make touches a target that HAS a recipe it did not run and
+    /// leaves alone one that never had one: "According to POSIX, -t doesn't
+    /// affect targets with no cmds" is `notice_finished_file`'s whole test
+    /// (remake.c), and it asks `file->cmds != 0` rather than what the recipe
+    /// expands to.
+    ///
+    /// False for a recipe every written line of which is recursive, which is
+    /// GNU Make's one carve-out: those lines run under `-t` instead of being
+    /// stood in for, so the target is made by making it. Read off the lines as
+    /// written, so a `$(FOO)` whose value is `+` is not one of them.
+    ///
+    /// Nothing in a manifest says this — Ninja has no `-t` and no notion of a
+    /// command that came to nothing — so the writer ignores it as it ignores
+    /// [`Self::intermediate`], and a sink that runs the build answers for it.
+    pub has_touchable_recipe: bool,
     /// The output's absence is no reason to remake what reads it: the implicit
     /// rule search invented the name to complete a chain, or `.INTERMEDIATE` or
     /// `.SECONDARY` said so.
