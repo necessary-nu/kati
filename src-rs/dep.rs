@@ -3333,13 +3333,16 @@ impl<'a> DepBuilder<'a> {
             Some((found, true)) => Ok(self.take_found_name(name, found, true)),
             Some((found, false)) => {
                 let found = self.ev.session.intern(found);
-                // Two names the Makefile declared separately, which the search
-                // has just found to be one file. GNU Make keeps the object
+                // The search found a name the Makefile declares a rule for,
+                // which makes the two one file. GNU Make keeps the object
                 // standing at the found path and merges the searched name's
                 // into it, so what is left answers to the found name — a
                 // replacement here, not a second name for the build to choose
-                // between.
-                if self.declares_a_target(found) && self.is_declared(name) {
+                // between. The searched name need not have been declared at
+                // all: `f_mtime` rehashes whatever object it was searching for,
+                // and a bare name whose found path carries a rule takes that
+                // rule rather than falling to the implicit search.
+                if self.declares_a_target(found) {
                     self.merge_into_found_name(name, found)?;
                     return Ok(found);
                 }
@@ -3621,7 +3624,7 @@ impl<'a> DepBuilder<'a> {
                 // whose found path is a declared target is the same one file
                 // two names were written for.
                 let found = self.ev.session.intern(found);
-                if self.declares_a_target(found) && self.is_declared(name) {
+                if self.declares_a_target(found) {
                     self.merge_into_found_name(name, found)?;
                     return Ok(found);
                 }
@@ -3779,16 +3782,6 @@ impl<'a> DepBuilder<'a> {
     /// recipe, and which `.PHONY` sets for every name it lists.
     fn declares_a_target(&self, name: Symbol) -> bool {
         self.rules.contains_key(&name) || self.phony.contains(&name)
-    }
-
-    /// Whether the Makefile said anything about `name` that the merge has to
-    /// carry: a rule, `.PHONY`, or a target-specific binding.
-    ///
-    /// Wider than [`Self::declares_a_target`] because `rehash_file` merges the
-    /// variable set lists whether or not either object had a recipe, and
-    /// `record_target_var` is enough to put an object in the table.
-    fn is_declared(&self, name: Symbol) -> bool {
-        self.declares_a_target(name) || self.rule_vars.contains_key(&name)
     }
 
     /// The same question over a name that may never have been interned, which
