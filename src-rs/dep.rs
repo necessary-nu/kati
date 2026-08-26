@@ -445,6 +445,15 @@ struct ReachedPrerequisites {
     found: Vec<Symbol>,
 }
 
+/// What a second expansion made of a rule's prerequisites: the ordinary list
+/// and the order-only one, each name paired with whether the raw word it came
+/// from held a `%`.
+///
+/// The flag is GNU Make's `!is_explicit`, and it is settled on the word as
+/// written rather than on what the word expanded to
+/// (reference/gnumake/src/implicit.c).
+type SecondExpandedPrerequisites = (Vec<(Symbol, bool)>, Vec<(Symbol, bool)>);
+
 #[derive(Debug)]
 pub struct DepNode {
     /// The graph edge's primary output. An exact grouped action uses a private
@@ -691,9 +700,16 @@ impl DepNode {
 /// Which reference depends on whether the search is holding a directory aside.
 /// `$*` is the whole stem; `$(*F)` is what is left once the directory that is
 /// about to go in front of this prerequisite is taken off. The returned flag
-/// says whether any `%` was replaced, because a word that named no stem takes
-/// no directory either — GNU Make's `add_dir` is set on the same branch that
-/// writes the reference.
+/// says whether any `%` was replaced, which is GNU Make's `!is_explicit` for
+/// this word: a word that named no stem takes no directory either — `add_dir`
+/// is set on the same branch that writes the reference — and nothing it
+/// expands to may be treated as a file the search invented.
+/// Drop the pattern-origin flag from a list of prerequisites, for a caller
+/// whose rule has no `%` to have come from.
+fn forget_pattern_origin(named: Vec<(Symbol, bool)>) -> Vec<Symbol> {
+    named.into_iter().map(|(name, _)| name).collect()
+}
+
 fn stem_references(text: &Bytes, hold_directory: bool) -> (Bytes, bool) {
     if memchr(b'%', text).is_none() {
         return (text.clone(), false);
@@ -1393,7 +1409,7 @@ struct DepBuilder<'a> {
     /// candidate's definition order and requested output. The candidate order
     /// distinguishes two target patterns of the same rule, including duplicate
     /// patterns whose expansions can have side effects.
-    expanded: HashMap<(usize, Symbol), (Vec<Symbol>, Vec<Symbol>)>,
+    expanded: HashMap<(usize, Symbol), SecondExpandedPrerequisites>,
     /// Cycle guard for the recursive implicit rule search.
     chaining: HashSet<Symbol>,
     /// The pattern rules a search further out is already working through.
@@ -3057,7 +3073,12 @@ impl<'a> DepBuilder<'a> {
             directory: Bytes::new(),
             stem,
         });
-        self.expand_deferred_prerequisites(output, matched, prerequisites, vec![text.clone()])
+        let (inputs, order_only) =
+            self.expand_deferred_prerequisites(output, matched, prerequisites, vec![text.clone()])?;
+        Ok((
+            forget_pattern_origin(inputs),
+            forget_pattern_origin(order_only),
+        ))
     }
 
     /// An implicit pattern rule expands each raw prerequisite word
@@ -3070,7 +3091,7 @@ impl<'a> DepBuilder<'a> {
         matched_at: PatternMatch,
         prerequisites: (&[Symbol], &[Symbol]),
         text: &Bytes,
-    ) -> Result<(Vec<Symbol>, Vec<Symbol>)> {
+    ) -> Result<SecondExpandedPrerequisites> {
         self.expand_deferred_prerequisites(
             output,
             Some(matched_at),
@@ -3112,13 +3133,19 @@ impl<'a> DepBuilder<'a> {
         Ok(bound)
     }
 
+    /// Each name is paired with whether the raw word it came from held a `%`.
+    /// GNU Make settles that before it expands anything — `is_explicit` is set
+    /// from `strchr (nptr, '%')` on the word as written
+    /// (reference/gnumake/src/implicit.c) and every prerequisite the word
+    /// expands to inherits it — and it is what decides whether the implicit
+    /// search may treat the name as an intermediate file it invented.
     fn expand_deferred_prerequisites(
         &mut self,
         output: Symbol,
         matched: Option<PatternMatch>,
         prerequisites: (&[Symbol], &[Symbol]),
         texts: Vec<Bytes>,
-    ) -> Result<(Vec<Symbol>, Vec<Symbol>)> {
+    ) -> Result<SecondExpandedPrerequisites> {
         let at = self.ev.session.intern("@");
         let star = self.ev.session.intern("*");
         let less = self.ev.session.intern("<");
@@ -3189,7 +3216,7 @@ impl<'a> DepBuilder<'a> {
         let mut inputs = Vec::new();
         let mut order_only_inputs = Vec::new();
         let mut order_only = false;
-        for (expanded_word, add_directory) in expanded {
+        for (expanded_word, from_pattern) in expanded {
             let (before, after) = if order_only {
                 (Bytes::new(), expanded_word)
             } else {
@@ -3200,23 +3227,25 @@ impl<'a> DepBuilder<'a> {
             for (text, into) in [(before, &mut inputs), (after, &mut order_only_inputs)] {
                 for word in makefile_word_scanner(&text) {
                     let word = word.slice_ref(trim_leading_curdir(&word));
-                    if !add_directory {
-                        glob_word(&mut self.ev.session, word, into);
-                        continue;
-                    }
-                    // GNU Make hands the directory to `parse_file_seq` as a
-                    // prefix, which puts it on each name the sequence yields —
-                    // after any globbing rather than before it, so the pattern
-                    // is matched where the rule was written and the answer is
-                    // then read one directory down.
                     let mut named = Vec::new();
                     glob_word(&mut self.ev.session, word, &mut named);
                     for name in named {
-                        let name = name.as_bytes(&self.ev.session);
-                        let mut buf = BytesMut::with_capacity(directory.len() + name.len());
-                        buf.put_slice(&directory);
-                        buf.put_slice(&name);
-                        into.push(self.ev.session.intern(buf.freeze()));
+                        // GNU Make hands the directory to `parse_file_seq` as a
+                        // prefix, which puts it on each name the sequence
+                        // yields — after any globbing rather than before it, so
+                        // the pattern is matched where the rule was written and
+                        // the answer is then read one directory down. Only a
+                        // word that named the stem held a directory aside.
+                        let name = if from_pattern && !directory.is_empty() {
+                            let name = name.as_bytes(&self.ev.session);
+                            let mut buf = BytesMut::with_capacity(directory.len() + name.len());
+                            buf.put_slice(&directory);
+                            buf.put_slice(&name);
+                            self.ev.session.intern(buf.freeze())
+                        } else {
+                            name
+                        };
+                        into.push((name, from_pattern));
                     }
                 }
             }
@@ -4657,7 +4686,7 @@ impl<'a> DepBuilder<'a> {
         candidate_order: usize,
         output: Symbol,
         matched_at: &PatternMatch,
-    ) -> Result<Option<(Vec<Symbol>, Vec<Symbol>)>> {
+    ) -> Result<Option<SecondExpandedPrerequisites>> {
         let Some(text) = rule.deferred_prerequisites.clone() else {
             return Ok(None);
         };
@@ -4956,9 +4985,7 @@ impl<'a> DepBuilder<'a> {
         };
         let deferred = self.expanded_pattern_inputs(rule, candidate_order, output, &matched_at)?;
         let inputs: Vec<(Symbol, bool)> = match &deferred {
-            // A deferred list is one string until it is expanded, so
-            // which word the `%` was in is no longer knowable.
-            Some((inputs, _)) => inputs.iter().map(|input| (*input, false)).collect(),
+            Some((inputs, _)) => inputs.clone(),
             None => self.resolved_prerequisites(&rule.inputs, &matched_at),
         };
         let resolved_inputs: Vec<Symbol> = inputs.iter().map(|(input, _)| *input).collect();
@@ -4993,8 +5020,8 @@ impl<'a> DepBuilder<'a> {
         match deferred {
             Some((inputs, order_only_inputs)) => {
                 rule.deferred_prerequisites = None;
-                rule.inputs = inputs;
-                rule.order_only_inputs = order_only_inputs;
+                rule.inputs = forget_pattern_origin(inputs);
+                rule.order_only_inputs = forget_pattern_origin(order_only_inputs);
             }
             None => {
                 let order_only = self.resolved_prerequisites(&rule.order_only_inputs, &matched_at);
@@ -5102,9 +5129,9 @@ impl<'a> DepBuilder<'a> {
             let Some(matched_at) = PatternMatch::of(&pat, &output_str) else {
                 continue;
             };
-            let inputs =
+            let inputs: Vec<Symbol> =
                 match self.expanded_pattern_inputs(&rule, candidate.order, output, &matched_at)? {
-                    Some((inputs, _)) => inputs,
+                    Some((inputs, _)) => forget_pattern_origin(inputs),
                     None => rule
                         .inputs
                         .iter()
