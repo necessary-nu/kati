@@ -1008,10 +1008,15 @@ fn install_compiler_invocation_variables(ev: &mut Evaluator) {
     } else {
         VarOrigin::File
     };
-    ev.session.globals.define(
-        makeflags,
-        Variable::new_recursive(value, origin, None, None, original),
-    );
+    let variable = Variable::new_recursive(value, origin, None, None, original);
+    // Exported by name rather than by origin: `define_makeflags (0)->export =
+    // v_export` (main.c) marks it, which is how every child of this make — a
+    // recursive `$(MAKE)`, and equally a `$(shell)` that launches one — is told
+    // what switches and command-line definitions the invocation carried. A
+    // file-origin variable is not exported otherwise, so without this the
+    // child starts from the makefile alone.
+    variable.write().export = VarExport::Export;
+    ev.session.globals.define(makeflags, variable);
 }
 
 /// Bind `.DEFAULT_GOAL` to the empty selection every read starts from.
