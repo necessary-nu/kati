@@ -383,8 +383,20 @@ fn close_paren(c: u8) -> Option<u8> {
     }
 }
 
+/// Whether a `\#` written here is an escape the read takes off.
+///
+/// It is one only where the `#` it hides would otherwise open a comment. GNU
+/// Make removes comments with `find_map_unquote (line, MAP_COMMENT|MAP_VARIABLE)`
+/// (read.c), and `MAP_VARIABLE` is what makes the scan step over a `$(` or `${`
+/// to its close without looking inside: a `#` in there was never going to start
+/// a comment, so nothing unquotes the backslash in front of it and the value
+/// keeps both characters. A `define` body and a recipe line are the other two
+/// places the scan does not reach.
 fn should_handle_comments(opt: ParseExprOpt) -> bool {
-    !matches!(opt, ParseExprOpt::Define | ParseExprOpt::Command)
+    !matches!(
+        opt,
+        ParseExprOpt::Define | ParseExprOpt::Command | ParseExprOpt::Func
+    )
 }
 
 /// How GNU Make's `collapse_continuations` (misc.c) reads the run of
