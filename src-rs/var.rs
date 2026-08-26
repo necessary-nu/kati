@@ -52,6 +52,29 @@ pub enum VarOrigin {
     Automatic,
 }
 
+/// Whether a definition already standing in a variable set refuses to be
+/// replaced by one arriving with `assigning` origin.
+///
+/// GNU Make's `define_variable_in_set` (variable.c): "A variable of this name
+/// is already defined. If the old definition is from a stronger source than
+/// this one, don't redefine it." The question is asked per SET — a weaker
+/// definition in a set searched earlier still shadows a stronger one further
+/// out, which is how a plain target-specific assignment shadows an `override`
+/// pattern one.
+///
+/// `-e` lifts the environment above the makefile and no higher: a command-line
+/// assignment still outranks it, as does an `override`.
+pub fn origin_outranks(standing: VarOrigin, assigning: VarOrigin) -> bool {
+    match standing {
+        VarOrigin::Override => assigning != VarOrigin::Override,
+        VarOrigin::EnvironmentOverride => {
+            !matches!(assigning, VarOrigin::CommandLine | VarOrigin::Override)
+        }
+        VarOrigin::CommandLine => assigning == VarOrigin::File,
+        _ => false,
+    }
+}
+
 /// What an `export` or `unexport` directive said about one variable.
 ///
 /// GNU Make's `enum variable_export`, kept on the variable rather than in a
@@ -1021,18 +1044,12 @@ impl Vars {
         let mut vars = self.0.lock();
         if let Some(orig) = vars.get_mut(&sym) {
             let assigning = var.read().origin();
-            match orig.read().origin() {
-                VarOrigin::Override if assigning != VarOrigin::Override => return Ok(()),
-                VarOrigin::EnvironmentOverride
-                    if !matches!(assigning, VarOrigin::CommandLine | VarOrigin::Override) =>
-                {
-                    return Ok(());
-                }
-                VarOrigin::CommandLine if assigning == VarOrigin::File => return Ok(()),
-                VarOrigin::Automatic => {
-                    error!("overriding automatic variable is not implemented yet");
-                }
-                _ => {}
+            let standing = orig.read().origin();
+            if standing == VarOrigin::Automatic {
+                error!("overriding automatic variable is not implemented yet");
+            }
+            if origin_outranks(standing, assigning) {
+                return Ok(());
             }
             carry_export_attribute(orig, &var);
             *orig = var;

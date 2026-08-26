@@ -838,11 +838,17 @@ pub struct Evaluator {
     pub session: Session,
 
     pub rule_vars: HashMap<Symbol, Arc<Vars>>,
-    /// The pattern keys of `rule_vars`, in the order their first assignment was
-    /// read. GNU Make keeps its pattern variables in one list and applies every
-    /// entry that matches a target, so which of two equally specific patterns
-    /// wins is decided by which was written first; a `HashMap` alone cannot say.
-    pub pattern_rule_var_order: Vec<Symbol>,
+    /// Every pattern-specific assignment, one entry each, paired with the
+    /// pattern it was written for and in the order it was read.
+    ///
+    /// GNU Make keeps one `pattern_var` per ASSIGNMENT rather than per pattern
+    /// (`create_pattern_var`, variable.c) and replays every entry that matches
+    /// a target into one accumulating set, so a `+=` or `?=` under one pattern
+    /// composes with what a different pattern's assignment left before it.
+    /// Collecting each pattern's assignments into a set of its own would settle
+    /// them against each other first and lose that interleaving, so a fresh set
+    /// per assignment is what keeps GNU Make's order sayable.
+    pub pattern_rule_var_sets: Vec<(Symbol, Arc<Vars>)>,
     pub rules: Vec<Rule>,
     /// The variables an expansion is currently inside, by identity.
     ///
@@ -1234,7 +1240,7 @@ impl Evaluator {
         Self {
             session,
             rule_vars: HashMap::new(),
-            pattern_rule_var_order: Vec::new(),
+            pattern_rule_var_sets: Vec::new(),
             rules: Vec::new(),
             expanding_vars: HashSet::new(),
             expanding_var_locs: Vec::new(),
@@ -2008,18 +2014,28 @@ impl Evaluator {
                 })
                 .flatten();
             let planned_scope = planned.is_some();
-            let fresh = !self.rule_vars.contains_key(target);
+            let own = self
+                .rule_vars
+                .entry(*target)
+                .or_insert_with(|| Arc::new(Vars::new()))
+                .clone();
             let scope = match planned {
                 Some(planned) => planned,
-                None => self
-                    .rule_vars
-                    .entry(*target)
-                    .or_insert_with(|| Arc::new(Vars::new()))
-                    .clone(),
+                // A pattern's assignments do not settle against each other as
+                // they are read: GNU Make stores each one on its own and
+                // replays them all, in one order across every pattern, into the
+                // set it builds for the target that matched. A set of this
+                // assignment's own is what leaves the composing to that replay,
+                // so a `+=` here appends to whatever a different pattern left
+                // rather than to this pattern's earlier line alone.
+                None if is_pattern_rule => {
+                    let assignment_set = Arc::new(Vars::new());
+                    self.pattern_rule_var_sets
+                        .push((*target, assignment_set.clone()));
+                    assignment_set
+                }
+                None => own,
             };
-            if fresh && is_pattern_rule {
-                self.pattern_rule_var_order.push(*target);
-            }
 
             let name = if is_pattern_rule {
                 assignment.name.eval_to_buf(self)?

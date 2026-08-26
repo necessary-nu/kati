@@ -41,7 +41,7 @@ use crate::{
     },
     symtab::{Interner, Symbol},
     timeutil::ScopedTimeReporter,
-    var::{ScopedVar, Var, VarExport, Variable, Vars},
+    var::{ScopedVar, Var, VarExport, VarOrigin, Variable, Vars, origin_outranks},
     warn_loc,
 };
 
@@ -1374,12 +1374,17 @@ struct DepBuilder<'a> {
     ev: &'a mut Evaluator,
     rules: HashMap<Symbol, Arc<Mutex<RuleMerger>>>,
     rule_vars: HashMap<Symbol, Arc<Vars>>,
-    /// The pattern keys of `rule_vars` in the order GNU Make would reach them:
+    /// Every pattern-specific assignment in the order GNU Make would reach it:
     /// shortest pattern first, and among patterns of one length, the order they
     /// were written. Every entry matching a target applies, and a later one
     /// outranks an earlier one, so a longer pattern — which is to say the one
     /// leaving the shorter stem — wins.
-    pattern_var_order: Vec<(Symbol, Pattern)>,
+    ///
+    /// One entry per ASSIGNMENT rather than per pattern, because that is what
+    /// GNU Make's list holds: `%b: X += 1` written between two `a%` lines
+    /// composes with whichever of them ran first, and a per-pattern collection
+    /// could not say which that was.
+    pattern_var_order: Vec<(Pattern, Arc<Vars>)>,
     cur_rule_vars: Option<Arc<Vars>>,
     /// Every explicit double-colon record is an independent action. Grouped
     /// records can share a real member, so the graph needs the full membership
@@ -1612,15 +1617,17 @@ struct PickedRuleInfo {
 impl<'a> DepBuilder<'a> {
     fn new(ev: &'a mut Evaluator) -> Result<Self> {
         let rule_vars = std::mem::take(&mut ev.rule_vars);
-        let mut pattern_var_order = std::mem::take(&mut ev.pattern_rule_var_order)
+        let mut pattern_var_order = std::mem::take(&mut ev.pattern_rule_var_sets)
             .into_iter()
-            .map(|sym| {
+            .map(|(sym, vars)| {
                 let text = sym.as_bytes(&ev.session);
-                (sym, Pattern::new(text))
+                (Pattern::new(text), vars)
             })
             .collect::<Vec<_>>();
-        // Stable, so patterns of equal length keep the order they were written.
-        pattern_var_order.sort_by_key(|(_, pattern)| pattern.as_bytes().len());
+        // Stable, so assignments under patterns of equal length keep the order
+        // they were written — GNU Make's `create_pattern_var` inserts at the
+        // end of the pack of its own length for the same reason.
+        pattern_var_order.sort_by_key(|(pattern, _)| pattern.as_bytes().len());
         let vpath_var_name = ev.session.intern("VPATH");
         let libpatterns_var_name = ev.session.intern(".LIBPATTERNS");
         let gpath_var_name = ev.session.intern("GPATH");
@@ -4261,11 +4268,14 @@ impl<'a> DepBuilder<'a> {
     ///
     /// The scopes stay separate rather than being merged, because `+=` in one
     /// of them appends to what the ones before it left rather than to the
-    /// makefile-level value, and a merged map cannot say what came first.
+    /// makefile-level value, and a merged map cannot say what came first. One
+    /// per assignment, which is the unit GNU Make orders them in: what it
+    /// builds is one set per TARGET, filled by replaying every matching
+    /// assignment into it (`initialize_file_variables`, variable.c).
     fn matching_pattern_vars(&self, output: Symbol) -> Vec<Arc<Vars>> {
         let name = output.as_bytes(&self.ev.session);
         let mut scopes = Vec::new();
-        for (sym, pattern) in &self.pattern_var_order {
+        for (pattern, vars) in &self.pattern_var_order {
             // A pattern variable needs a stem to have matched: GNU Make skips
             // any pattern at least as long as the name, so `%.z` reaches `a.z`
             // and not `.z`. Pattern *rules* match the empty stem, which is why
@@ -4273,9 +4283,7 @@ impl<'a> DepBuilder<'a> {
             if pattern.as_bytes().len() > name.len() || !pattern.matches(&name) {
                 continue;
             }
-            if let Some(vars) = self.rule_vars.get(sym) {
-                scopes.push(vars.clone());
-            }
+            scopes.push(vars.clone());
         }
         scopes
     }
@@ -5403,6 +5411,16 @@ impl<'a> DepBuilder<'a> {
         // to be taken as the name is first met: the scope is installed into as
         // the run goes, so asking again later answers with the run's own work.
         let mut outer: HashMap<Symbol, Option<Var>> = HashMap::new();
+        // Which origin each name was last defined WITH inside the pattern set.
+        // Every matching pattern assignment lands in one set in GNU Make
+        // (`file->pat_variables`), so `define_variable_in_set`'s "if the old
+        // definition is from a stronger source than this one, don't redefine
+        // it" is asked across all of them: `a%: override FOO += f1` followed by
+        // `a%: FOO += f2` leaves `f1`. Ronin holds one scope per assignment so
+        // the order they compose in is sayable, which puts the answer here
+        // rather than in `Vars::assign`. The target's own scopes are genuinely
+        // separate sets and are not compared this way.
+        let mut pattern_set_origins: HashMap<Symbol, VarOrigin> = HashMap::new();
         for (kind, vars) in scopes.iter() {
             if installing != Some(kind) {
                 commit_public(&mut public_now, std::mem::take(&mut pending));
@@ -5425,6 +5443,18 @@ impl<'a> DepBuilder<'a> {
             // outer one.
             targeted.sort_by_key(|(_, var)| var.read().assign_op == Some(AssignOp::PlusEq));
             for (name, var) in &targeted {
+                // The origin the assignment was WRITTEN with, which a `+=`
+                // rewrite below replaces with the base's, so it is read here.
+                let assigning = var.read().origin();
+                if kind == RuleScopeKind::Pattern {
+                    if pattern_set_origins
+                        .get(name)
+                        .is_some_and(|standing| origin_outranks(*standing, assigning))
+                    {
+                        continue;
+                    }
+                    pattern_set_origins.insert(*name, assigning);
+                }
                 // Off the declaration rather than the value: `+=` resolves to a
                 // fresh simple variable and would leave the keyword behind.
                 let is_private = var.read().is_private;
