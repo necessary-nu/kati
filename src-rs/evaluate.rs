@@ -852,6 +852,54 @@ fn decode_gnumakeflags_after_read(ev: &mut Evaluator) -> Result<()> {
     Ok(())
 }
 
+/// Set `MAKEFLAGS` up again once the read is over, in case the makefiles gave
+/// `MAKEOVERRIDES` something to carry.
+///
+/// GNU Make's `define_makeflags (0)` under the comment "Set up 'MAKEFLAGS'
+/// again for the normal targets" (main.c). The suffix that reference sits
+/// behind is decided there, from what `MAKEOVERRIDES` HOLDS: "If there are any
+/// overrides to add, write a reference to $(MAKEOVERRIDES) ... Separate the
+/// variables from the switches with a '--' arg", guarded by
+/// `v && v->value && v->value[0] != '\0'`.
+///
+/// Deciding it once at startup is right for the command line's own assignments
+/// and misses the other way in: `MAKEOVERRIDES` is defined only where there
+/// were command variables, so a makefile appending to it defines it from
+/// nothing — and that value is how a makefile hands definitions of its own to a
+/// recursive invocation. Sticky in one direction, as the startup answer is: a
+/// makefile can make `MAKEFLAGS` name the variable and cannot make it stop.
+fn republish_makeflags_after_read(ev: &mut Evaluator) -> Result<()> {
+    let Some(state) = &ev.session.flags.makeflags_assignment else {
+        return Ok(());
+    };
+    if state.has_overrides {
+        return Ok(());
+    }
+    let (published, has_evals) = (state.published.clone(), state.has_evals);
+    let overrides = ev.session.intern("MAKEOVERRIDES");
+    // The stored text rather than what it expands to, which is what
+    // `v->value[0] != '\0'` reads: the default definition is a reference to
+    // make's own hidden variable and is non-empty whatever that holds.
+    let carries_something = ev
+        .session
+        .peek_global_var(overrides)
+        .is_some_and(|var| !var.read().text_is_empty());
+    if !carries_something {
+        return Ok(());
+    }
+    if let Some(state) = &mut ev.session.flags.makeflags_assignment {
+        state.has_overrides = true;
+    }
+    let eval_flags = ev.session.intern(crate::eval::EVAL_FLAGS_NAME);
+    let (value, original) =
+        crate::eval::makeflags_value(published, has_evals, true, eval_flags, overrides);
+    let makeflags = ev.session.intern("MAKEFLAGS");
+    if let Some(variable) = ev.session.globals.peek(makeflags) {
+        variable.write().replace_recursive_value(value, original);
+    }
+    Ok(())
+}
+
 /// Install the Make interface variables an embedding frontend already parsed.
 ///
 /// `MAKEFLAGS` is a recursive file-origin variable whose raw value refers to
@@ -1244,6 +1292,7 @@ pub fn evaluate(session: Session) -> Result<Evaluated> {
     // is not a special variable, so its whole effect is decided once, here, by
     // what it holds when the last makefile has been read.
     decode_gnumakeflags_after_read(&mut ev)?;
+    republish_makeflags_after_read(&mut ev)?;
     // A Makefile's own `MAKEFLAGS += -rR` is decoded where it is written, but
     // GNU Make withdraws the catalogue only once the whole read is over. The
     // difference is visible: `$(origin CC)` on the next line still answers

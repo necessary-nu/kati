@@ -1140,6 +1140,9 @@ impl Evaluator {
         let eval_flags = self.session.intern(EVAL_FLAGS_NAME);
         let has_evals = has_evals || !decoded.eval_flags.is_empty();
         let overrides = self.session.intern("MAKEOVERRIDES");
+        if let Some(state) = &mut self.session.flags.makeflags_assignment {
+            state.published = decoded.makeflags.clone();
+        }
         let (published, original) = makeflags_value(
             decoded.makeflags.clone(),
             has_evals,

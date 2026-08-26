@@ -109,6 +109,15 @@ pub struct MakeflagsAssignment {
     /// Command-line overrides make `$(MAKEOVERRIDES)` a permanent recursive
     /// suffix of `MAKEFLAGS`, even if the Makefile later empties it.
     pub has_overrides: bool,
+    /// The switch table as it was last PUBLISHED, without the two references
+    /// `MAKEFLAGS` ends with.
+    ///
+    /// Kept because GNU Make sets `MAKEFLAGS` up a second time once the read is
+    /// over (`define_makeflags (0)`, main.c, "Set up 'MAKEFLAGS' again for the
+    /// normal targets"), and that pass decides the `-- $(MAKEOVERRIDES)` suffix
+    /// afresh from what the makefiles left in `MAKEOVERRIDES`. Re-deriving the
+    /// value needs the switches it is built on top of.
+    pub published: Bytes,
     /// Whether a `--eval` has been seen at all, which is what decides that
     /// `MAKEFLAGS` names `$(-*-eval-flags-*-)`.
     ///
