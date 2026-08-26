@@ -2600,6 +2600,17 @@ impl Evaluator {
 
         let v = fname.slice_ref(trim_leading_curdir(fname));
         self.note_read_makefile(v.clone(), required);
+        // A name this read GOT is not a name it went without, whatever an
+        // earlier line was told about it. GNU Make keeps one goaldep per
+        // `include` line and the errno on the one that failed, so a `-include`
+        // that missed and an `include` below it that read the file are two
+        // entries and only the first carries a failure — and that one is
+        // `RM_DONTCARE`, which `show_goal_error` (remake.c) returns from without
+        // a word. Ronin holds one entry per NAME, so the failure has to be taken
+        // off it here for the pair to mean the same thing.
+        let read = self.session.intern(v.clone());
+        self.missing_includes
+            .retain(|include| include.filename != read);
         self.note_makefile_list(v)?;
         let stmts = mk.stmts.lock().clone();
         // The inclusion stack belongs to what the included file says, not to

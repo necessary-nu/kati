@@ -31,7 +31,10 @@ use crate::{
 /// Parsed makefiles and extra file dependencies, for one session.
 // [spec:ronin:req:make.no-ambient-state]
 pub struct MakefileCache {
-    cache: HashMap<OsString, Option<Arc<Makefile>>>,
+    /// The makefiles this session has READ, by name. A name that is not
+    /// here is a name to ask the system about again, not one known to be
+    /// absent.
+    cache: HashMap<OsString, Arc<Makefile>>,
     supplied: HashMap<OsString, Bytes>,
     /// The bytes this session got for every makefile it read, by name.
     ///
@@ -40,9 +43,10 @@ pub struct MakefileCache {
     /// Make's one read saw, so the front end takes these out when a read ends
     /// and supplies them to the read that repeats it.
     sources: HashMap<OsString, Bytes>,
-    /// Files this session depended on and could not read — an `include` whose
-    /// name would not open. They are not in `cache`, because nothing was
-    /// cached, and a later run still has to compare their timestamps.
+    /// Files this session depended on and did not get — an `include` whose name
+    /// is not there, or would not open. They are not in `cache`, because
+    /// nothing is cached about a file the session has not read, and a later run
+    /// still has to compare their timestamps.
     unread: HashSet<OsString>,
 }
 
@@ -96,17 +100,15 @@ impl MakefileCache {
 ///
 /// Parsing interns, so this takes the whole session rather than the cache.
 ///
-/// A file that would not open is still a file this evaluation depended on and
-/// did not get, so it joins the set a later run compares timestamps against.
-/// The failure itself is handed straight back rather than cached, so a second
-/// `include` of it asks the system again rather than being told it is absent —
-/// which it is not.
+/// A file the session did not get is still a file this evaluation depended on,
+/// so it joins the set a later run compares timestamps against. What is NOT
+/// remembered is the failure: a second `include` of the same name asks the
+/// system again, because the answer can have changed since — a makefile is
+/// allowed to create the file between two `include` lines, and GNU Make's
+/// `eval_makefile` (read.c) opens the name every time.
 pub fn get_makefile(session: &mut Session, filename: &OsStr) -> Result<Source> {
     if let Some(mk) = session.makefiles.cache.get(filename) {
-        return Ok(match mk {
-            Some(mk) => Source::Read(mk.clone()),
-            None => Source::Absent,
-        });
+        return Ok(Source::Read(mk.clone()));
     }
     let filename = filename.to_os_string();
     let supplied = session.makefiles.supplied.get(&filename).cloned();
@@ -117,12 +119,16 @@ pub fn get_makefile(session: &mut Session, filename: &OsStr) -> Result<Source> {
     };
     match &source {
         Source::Read(mk) => {
-            session.makefiles.cache.insert(filename, Some(mk.clone()));
+            session.makefiles.cache.insert(filename, mk.clone());
         }
-        Source::Absent => {
-            session.makefiles.cache.insert(filename, None);
-        }
-        Source::Unopened(_) | Source::Unreadable(_) | Source::Exhausted(_) => {
+        // Absence is not cached either, for the same reason and one more: a
+        // makefile can create the file between two `include` lines. GNU Make's
+        // `eval_makefile` (read.c) opens the name every time it is included, so
+        // a `$(shell)` that writes `hello.mk` after an `-include` of it failed
+        // is a file the `include` below finds. The name still joins the set a
+        // later run compares timestamps against — an evaluation that asked for
+        // a file and did not get one depends on its absence.
+        Source::Absent | Source::Unopened(_) | Source::Unreadable(_) | Source::Exhausted(_) => {
             session.makefiles.unread.insert(filename);
         }
     }
