@@ -206,6 +206,9 @@ impl Evaluable for Value {
                 let name = name.eval_to_buf(ev)?;
                 let sym = ev.session.intern(name);
                 let v = ev.lookup_var(sym)?;
+                if v.is_none() {
+                    ev.warn_undefined(sym);
+                }
                 let pat_str = pat.eval_to_buf(ev)?;
                 let subst = subst.eval_to_buf(ev)?;
                 ev.eval_depth -= 1;

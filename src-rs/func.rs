@@ -1002,13 +1002,18 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
     }
     let func_sym = ev.session.intern(func_name_buf.clone());
     let func = ev.lookup_var(func_sym)?;
-    if func.is_none() && ev.session.flags.enable_kati_warnings {
-        kati_warn_loc!(
-            ev,
-            ev.loc.as_ref(),
-            "*warning*: undefined user function: {}",
-            func_sym.display(ev)
-        );
+    if func.is_none() {
+        // `func_call` (function.c) asks `warn_undefined` about the name it was
+        // handed, exactly as an expansion of `$(name)` would.
+        ev.warn_undefined(func_sym);
+        if ev.session.flags.enable_kati_warnings {
+            kati_warn_loc!(
+                ev,
+                ev.loc.as_ref(),
+                "*warning*: undefined user function: {}",
+                func_sym.display(ev)
+            );
+        }
     }
     let mut av = Vec::with_capacity(args.len() - 1);
     for arg in &args[1..] {

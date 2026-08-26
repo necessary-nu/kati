@@ -560,6 +560,18 @@ impl<'a> Parser<'a> {
         }
         if let Some(separator) = find_outside_reference(&line, b"=") {
             let assign = parse_assign_statement(&line, separator);
+            // `do_define` (read.c) says so for anything left after the
+            // assignment token — "extraneous text after 'define' directive" —
+            // and reads the body anyway. The line reached here with its comment
+            // already off and its tail already trimmed, which is what makes
+            // `define NAME = # hi` and `define NAME =   ` silent on both sides.
+            if !assign.rhs.is_empty() {
+                warn_loc!(
+                    &*self.session,
+                    Some(&self.loc),
+                    "extraneous text after 'define' directive"
+                );
+            }
             self.define_name = Some(line.slice_ref(assign.lhs));
             self.define_op = assign.op;
         } else {

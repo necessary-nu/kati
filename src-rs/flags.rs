@@ -80,6 +80,7 @@ pub struct DecodedMakeflags {
     pub environment_overrides: bool,
     pub no_builtin_rules: bool,
     pub no_builtin_variables: bool,
+    pub warn_undefined_variables: bool,
     /// What the write had to say about a switch it dropped rather than died of.
     ///
     /// GNU Make's `decode_switches` complains about an empty string argument,
@@ -339,6 +340,10 @@ pub struct Flags {
     /// `-R`: no `CC`, `CXX` or `AR` unless the Makefile says so itself. What
     /// Make defines about itself stays, which is why this is not `-r`.
     pub no_builtin_variables: bool,
+
+    /// `--warn-undefined-variables`: say so every time an expansion reads a
+    /// name nothing has defined.
+    pub warn_undefined_variables: bool,
 
     /// `.ONESHELL`: the whole recipe is one script rather than a line at a
     /// time, so a `cd` carries and a failing line does not stop the rest.
@@ -613,6 +618,7 @@ impl Flags {
                 b"-e" => flags.environment_overrides = true,
                 b"-r" => flags.no_builtin_rules = true,
                 b"-R" => flags.no_builtin_variables = true,
+                b"--warn-undefined-variables" => flags.warn_undefined_variables = true,
                 b"-s" => flags.is_silent_mode = true,
                 b"-d" => flags.enable_debug = true,
                 b"--kati_stats" => flags.enable_stat_logs = true,

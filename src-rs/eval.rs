@@ -1176,6 +1176,7 @@ impl Evaluator {
         self.session.flags.environment_overrides = decoded.environment_overrides;
         self.session.flags.no_builtin_rules = decoded.no_builtin_rules;
         self.session.flags.no_builtin_variables = decoded.no_builtin_variables;
+        self.session.flags.warn_undefined_variables = decoded.warn_undefined_variables;
         // `construct_include_path (include_dirs ? include_dirs->list : NULL)`,
         // the middle of `reset_makeflags`'s three calls (main.c:3126). The
         // search path is not a startup fact: a makefile writing `MAKEFLAGS`
@@ -2998,8 +2999,55 @@ impl Evaluator {
     pub fn lookup_var_for_eval(&mut self, name: Symbol) -> Result<Option<Var>> {
         match self.lookup_var(name)? {
             Some(var) => Ok(Some(self.begin_var_expansion(name, var)?)),
-            None => Ok(None),
+            None => {
+                self.warn_undefined(name);
+                Ok(None)
+            }
         }
+    }
+
+    /// Say so when an expansion read a name nothing has defined, if
+    /// `--warn-undefined-variables` asked.
+    ///
+    /// GNU Make's `warn_undefined` (variable.c), called from the three places
+    /// that EXPAND a reference — `reference_variable` and the `$(V:a=b)` arm of
+    /// `variable_expand_string` (expand.c), and `func_call` (function.c). Asking
+    /// about a name without expanding it does not warn, which is why `$(origin)`,
+    /// `$(flavor)` and `$(value)` are silent about one nobody defined.
+    ///
+    /// The location is where the read has got to rather than where the value
+    /// was written, because GNU Make passes `reading_file`.
+    pub fn warn_undefined(&mut self, name: Symbol) {
+        if !self.session.flags.warn_undefined_variables {
+            return;
+        }
+        // Names GNU Make holds to be defined for this question whether or not
+        // they are, listed in `defined_vars` beside `warn_undefined`: its own
+        // workings, which a makefile is entitled to read before make has had
+        // cause to define them.
+        const ALWAYS_DEFINED: [&[u8]; 10] = [
+            b"MAKECMDGOALS",
+            b"MAKE_RESTARTS",
+            b"MAKE_TERMOUT",
+            b"MAKE_TERMERR",
+            b"MAKEOVERRIDES",
+            b".DEFAULT",
+            b"-*-command-variables-*-",
+            b"-*-eval-flags-*-",
+            b"VPATH",
+            b"GPATH",
+        ];
+        let text = name.as_bytes(&self.session);
+        if ALWAYS_DEFINED.contains(&text.as_ref()) {
+            return;
+        }
+        let loc = self.loc.clone();
+        crate::warn_loc!(
+            self,
+            loc.as_ref(),
+            "warning: undefined variable '{}'",
+            String::from_utf8_lossy(&text)
+        );
     }
 
     /// Mark `var` as being expanded, refusing a variable that is already.
