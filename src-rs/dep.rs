@@ -1533,6 +1533,14 @@ struct DepBuilder<'a> {
     /// being finished can change the answer. GNU Make answers from `struct
     /// file` and a directory read it keeps; this is the same bargain.
     exists_cache: FastMap<Symbol, bool>,
+    /// What each directory the search asked about held when it was read.
+    ///
+    /// Beside `exists_cache` rather than instead of it: that one remembers the
+    /// names actually asked after, this one answers for every name in a
+    /// directory it has read, which is what turns the search's hundred
+    /// invented candidates per target into one `getdents64`. It only ever
+    /// proves absence, and it empties itself if a command runs.
+    directories: crate::dircache::DirectoryCache,
     /// Names the search invented to complete a chain, which the Makefile
     /// therefore never says.
     intermediates: FastSet<Symbol>,
@@ -1733,6 +1741,7 @@ impl<'a> DepBuilder<'a> {
             tried_implicit: FastSet::default(),
             chain_truncated: false,
             exists_cache: FastMap::default(),
+            directories: crate::dircache::DirectoryCache::default(),
             intermediates: FastSet::default(),
             declared_intermediate: FastSet::default(),
             secondary: FastSet::default(),
@@ -3066,11 +3075,31 @@ impl<'a> DepBuilder<'a> {
         }
         let answer = self.rules.contains_key(&target)
             || self.phony.contains(&target)
-            || std::fs::exists(OsStr::from_bytes(&target.as_bytes(&self.ev.session)))
-                .is_ok_and(|v| v)
+            || self.on_disk(target)
             || self.vpath_of(target).is_some();
         self.exists_cache.insert(target, answer);
         answer
+    }
+
+    /// Whether a name is a file, asking the directory it is in before asking
+    /// about the name.
+    ///
+    /// The search invents most of the names it asks about — every pattern in
+    /// the catalogue proposes one — so almost every answer here is no, and a
+    /// `stat` per no is what made a 4,000-rule no-op issue 480,137 of them
+    /// where GNU Make issued 8,010 and six directory reads. The listing can
+    /// only ever prove absence; a name it holds still gets its `stat`, because
+    /// a directory entry whose symlink target is gone is listed and does not
+    /// exist. See [`kati::dircache`](crate::dircache).
+    fn on_disk(&mut self, target: Symbol) -> bool {
+        let name = target.as_bytes(&self.ev.session);
+        if self
+            .directories
+            .certainly_absent(self.ev.session.filesystem_epoch(), &name)
+        {
+            return false;
+        }
+        std::fs::exists(OsStr::from_bytes(&name)).is_ok_and(|v| v)
     }
 
     /// Replace each prerequisite with where the directory search found it.

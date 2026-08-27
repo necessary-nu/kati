@@ -515,6 +515,17 @@ impl Session {
         self.glob_cache.invalidate();
     }
 
+    /// What the filesystem's contents may be believed against.
+    ///
+    /// Changes whenever [`Self::note_command_ran`] is called, which is
+    /// wherever a makefile could have changed the disk. A cache of what the
+    /// filesystem held stamps itself with this and gives up what it holds when
+    /// the value moves.
+    #[must_use]
+    pub fn filesystem_epoch(&self) -> u64 {
+        self.glob_cache.epoch()
+    }
+
     pub fn clear_glob_cache(&self) {
         self.glob_cache.clear();
     }

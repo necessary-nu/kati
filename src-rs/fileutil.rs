@@ -406,6 +406,17 @@ impl GlobCache {
         self.inner.lock().epoch += 1;
     }
 
+    /// The epoch every entry read now would be stamped with.
+    ///
+    /// Published so that a cache of the filesystem which is NOT this one can
+    /// be kept honest by the same counter rather than by a second one of its
+    /// own. [`crate::dircache::DirectoryCache`] is the other, and two counters
+    /// would be two things to remember to bump.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.inner.lock().epoch
+    }
+
     /// Forget everything, including what was recorded for the stamp.
     pub fn clear(&self) {
         let mut inner = self.inner.lock();
