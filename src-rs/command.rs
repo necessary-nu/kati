@@ -1471,7 +1471,7 @@ const BOURNE_COMPATIBLE_SHELLS: [&[u8]; 7] =
 /// a recipe is being compiled and the answer decides whether the text keeps its
 /// interior prefixes, and again in [`crate::fileutil`], where a launch is being
 /// assembled and `construct_command_argv_internal` asks it for itself.
-pub(crate) fn is_bourne_compatible_shell(shell: &[u8]) -> bool {
+pub fn is_bourne_compatible_shell(shell: &[u8]) -> bool {
     let basename = match shell.iter().rposition(|&byte| byte == b'/') {
         Some(separator) => &shell[separator + 1..],
         None => shell,

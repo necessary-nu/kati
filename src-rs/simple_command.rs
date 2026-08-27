@@ -51,6 +51,29 @@ use bytes::{BufMut, Bytes, BytesMut};
 /// is willing to stand in for.
 pub const DEFAULT_SHELL: &[u8] = b"/bin/sh";
 
+/// Whether GNU Make would start no process at all for this argument list.
+///
+/// `start_job_command` (job.c): "Optimize an empty command. People use this
+/// for timestamp rules, so avoid forking a useless shell." A
+/// Bourne-compatible shell, a lone `-c` or `-ec`, and a script of exactly `:`
+/// goes to the next command line instead of being run.
+///
+/// Everything else about the line still happens. The test sits after the echo
+/// and after `commands_started++`, so the line is reported and the target
+/// counts as remade — what is skipped is the fork, and only the fork. The
+/// argument list is compared exactly, argv word by argv word, which is why
+/// this takes one rather than a shell and a script: `sh -c ': ; date'` is not
+/// the empty command and neither is `sh -c :` with a fourth word after it.
+#[must_use]
+pub fn is_the_empty_command(argv: &[&[u8]]) -> bool {
+    let [shell, flag, script] = argv else {
+        return false;
+    };
+    crate::command::is_bourne_compatible_shell(shell)
+        && matches!(*flag, b"-c" | b"-ec")
+        && *script == b":"
+}
+
 /// The process that runs the shell spelled `named`.
 ///
 /// Where `named` is the default shell and `stand_in` names a program, the

@@ -191,6 +191,27 @@ fn resolved_bindings(
     resolved
 }
 
+/// A name the environment could not be given a value for, and what reading it
+/// said.
+///
+/// GNU Make expands an exported recursive value in exactly one place —
+/// `target_environment`, reached from a job it is about to launch and from a
+/// `$(shell)` — so a value nothing ever runs under is never read at all, and a
+/// value that cannot be read is charged to the job that would have carried it.
+/// A run launching no job never asks the question and never sees the failure.
+///
+/// A compiler settles the environment once instead, before any job, which is
+/// why the failure has to be held rather than raised: raising it there would
+/// refuse a makefile GNU Make builds. Held here, it is charged where GNU
+/// charges it — to whatever tries to run in this environment.
+#[derive(Clone, Debug)]
+pub struct Unreadable {
+    /// The name whose value could not be read.
+    pub name: Bytes,
+    /// What reading it said, in the words a refusal would have carried.
+    pub why: String,
+}
+
 /// The environment changes a child of this evaluation should be started with.
 ///
 /// `scope` is the target-specific set a recipe or a recipe-time `$(shell)` runs
@@ -199,12 +220,45 @@ fn resolved_bindings(
 ///
 /// # Errors
 ///
-/// Whatever expanding an exported variable's value rejects.
+/// Whatever expanding an exported variable's value rejects. A caller that is
+/// materialising the environment for something it is starting right now wants
+/// exactly that; one settling it ahead of the jobs that will run in it wants
+/// [`settled_environment`] instead.
 pub fn exported_environment(
     ev: &mut Evaluator,
     scope: Option<&Vars>,
     kind: ChildKind,
 ) -> Result<Vec<EnvironmentChange>> {
+    let (changes, _) = environment(ev, scope, kind, false)?;
+    Ok(changes)
+}
+
+/// The same answer, with a value that cannot be read held back rather than
+/// refused.
+///
+/// For a caller settling one environment ahead of every job that will run in
+/// it. The first name whose value could not be read comes back beside the
+/// changes and is left out of them; see [`Unreadable`] for why that is the
+/// faithful reading of GNU Make rather than a lenience.
+///
+/// # Errors
+///
+/// Whatever the walk over the variable table rejects. A value that will not
+/// expand is not one of those any more.
+pub fn settled_environment(
+    ev: &mut Evaluator,
+    scope: Option<&Vars>,
+    kind: ChildKind,
+) -> Result<(Vec<EnvironmentChange>, Option<Unreadable>)> {
+    environment(ev, scope, kind, true)
+}
+
+fn environment(
+    ev: &mut Evaluator,
+    scope: Option<&Vars>,
+    kind: ChildKind,
+    defer_unreadable: bool,
+) -> Result<(Vec<EnvironmentChange>, Option<Unreadable>)> {
     let export_all = ev.session.flags.export_all_variables;
     let mut candidates = resolved_bindings(ev, scope, kind)
         .into_iter()
@@ -216,6 +270,7 @@ pub fn exported_environment(
 
     let exported = candidates.iter().map(|(name, _)| *name).collect();
     let mut changes = Vec::with_capacity(candidates.len());
+    let mut unreadable: Option<Unreadable> = None;
     for (name, var) in candidates {
         // An untouched environment variable goes back out as the bytes it came
         // in as. Its origin is still the environment precisely because nothing
@@ -230,7 +285,21 @@ pub fn exported_environment(
         // can, and GNU Make answers that from the invocation's environment
         // rather than refusing the makefile.
         let guarded = kind == ChildKind::Expansion;
-        let value = ev.expand_for_environment(name, &var, guarded)?;
+        let value = match ev.expand_for_environment(name, &var, guarded) {
+            Ok(value) => value,
+            Err(refusal) if defer_unreadable => {
+                // Only the first, because only the first is reachable: GNU
+                // Make builds the environment name by name and the job dies at
+                // the one it cannot read, so the names behind it are never
+                // asked either.
+                unreadable.get_or_insert_with(|| Unreadable {
+                    name: name.as_bytes(&ev.session),
+                    why: format!("{refusal}"),
+                });
+                continue;
+            }
+            Err(refusal) => return Err(refusal),
+        };
         changes.push((name.as_bytes(&ev.session), Some(value)));
     }
     for name in withdrawn_names(ev, &exported) {
@@ -239,7 +308,7 @@ pub fn exported_environment(
     changes.retain(|(name, _)| name != MAKELEVEL);
     changes.push((Bytes::from_static(MAKELEVEL), Some(child_makelevel(ev))));
     changes.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(changes)
+    Ok((changes, unreadable))
 }
 
 /// The name whose value is one deeper in every child, whatever the makefile

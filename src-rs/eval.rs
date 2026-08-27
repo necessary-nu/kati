@@ -3238,10 +3238,18 @@ impl Evaluator {
         if guarded {
             self.environment_recursion += 1;
         }
+        // `recursively_expand_for_file` (variable.c) sets `expanding_var` to
+        // the variable's own `fileinfo` before it expands, so a value that
+        // will not expand is reported against where it was DEFINED rather
+        // than wherever the read had got to. Nothing else enters this
+        // variable: an environment is built by walking the table, not by
+        // expanding a `$(NAME)` that would have entered it on the way in.
+        self.enter_expanding_var(var.read().expansion_loc());
         let value = var
             .read()
             .eval_to_buf_mut(self)
             .map(bytes::BytesMut::freeze);
+        self.leave_expanding_var();
         if guarded {
             self.environment_recursion -= 1;
         }
