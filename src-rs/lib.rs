@@ -58,6 +58,7 @@ pub mod evaluate;
 pub mod exec;
 pub mod export;
 pub mod expr;
+pub mod fasthash;
 pub mod file;
 pub mod file_cache;
 pub mod fileutil;

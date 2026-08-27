@@ -837,7 +837,7 @@ pub struct Evaluator {
     /// Everything that used to be a process global.
     pub session: Session,
 
-    pub rule_vars: HashMap<Symbol, Arc<Vars>>,
+    pub rule_vars: crate::fasthash::FastMap<Symbol, Arc<Vars>>,
     /// Every pattern-specific assignment, one entry each, paired with the
     /// pattern it was written for and in the order it was read.
     ///
@@ -1248,7 +1248,7 @@ impl Evaluator {
             || session.flags.dump_include_graph.is_some();
         Self {
             session,
-            rule_vars: HashMap::new(),
+            rule_vars: crate::fasthash::FastMap::default(),
             pattern_rule_var_sets: Vec::new(),
             rules: Vec::new(),
             expanding_vars: HashSet::new(),

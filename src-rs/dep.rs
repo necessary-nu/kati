@@ -30,6 +30,7 @@ use crate::{
     error_loc,
     eval::{Evaluator, FrameType, MissingInclude, PlannedScope, ReadMakefile, ScopedFrame},
     expr::{Evaluable, Value},
+    fasthash::{FastMap, FastSet},
     loc::Loc,
     log,
     rule::{Rule, glob_word, split_order_only},
@@ -1430,8 +1431,8 @@ type SuffixRuleMap = HashMap<Bytes, Vec<Arc<Rule>>>;
 
 struct DepBuilder<'a> {
     ev: &'a mut Evaluator,
-    rules: HashMap<Symbol, Arc<Mutex<RuleMerger>>>,
-    rule_vars: HashMap<Symbol, Arc<Vars>>,
+    rules: FastMap<Symbol, Arc<Mutex<RuleMerger>>>,
+    rule_vars: FastMap<Symbol, Arc<Vars>>,
     /// Every pattern-specific assignment in the order GNU Make would reach it:
     /// shortest pattern first, and among patterns of one length, the order they
     /// were written. Every entry matching a target applies, and a later one
@@ -1472,9 +1473,9 @@ struct DepBuilder<'a> {
     /// candidate's definition order and requested output. The candidate order
     /// distinguishes two target patterns of the same rule, including duplicate
     /// patterns whose expansions can have side effects.
-    expanded: HashMap<(usize, Symbol), SecondExpandedPrerequisites>,
+    expanded: FastMap<(usize, Symbol), SecondExpandedPrerequisites>,
     /// Cycle guard for the recursive implicit rule search.
-    chaining: HashSet<Symbol>,
+    chaining: FastSet<Symbol>,
     /// The pattern rules a search further out is already working through.
     ///
     /// GNU Make marks a rule `in_use` while it decides whether the
@@ -1483,7 +1484,7 @@ struct DepBuilder<'a> {
     /// supplies its own prerequisite. With a catalogue of rules that chain into
     /// one another this is what bounds the search rather than merely tidying
     /// it, and it is the "Avoiding implicit rule recursion" its `-d` reports.
-    rules_in_use: HashSet<usize>,
+    rules_in_use: FastSet<usize>,
     /// Whether the search just run passed over a rule for a prerequisite the
     /// Makefile writes down somewhere.
     ///
@@ -1509,7 +1510,7 @@ struct DepBuilder<'a> {
     /// about the same name at depth one, and the recorded depth is what tells
     /// the two apart — a later search may reuse the answer only from at least
     /// as deep, where it has no more budget than the search that proved it.
-    impossible: HashMap<Symbol, usize>,
+    impossible: FastMap<Symbol, usize>,
     /// Names a terminal rule was handed, which no implicit search may make.
     ///
     /// GNU Make's `tried_implicit`, set where a chosen terminal rule takes a
@@ -1517,7 +1518,7 @@ struct DepBuilder<'a> {
     /// whether a target with no recipe is worth searching for one. Terminal is
     /// the whole claim: the rule applies to what is there, so the name it was
     /// given has to be there rather than be arrived at.
-    tried_implicit: HashSet<Symbol>,
+    tried_implicit: FastSet<Symbol>,
     /// Whether the last chain search stopped because the cycle guard cut it
     /// short rather than because the rules ran out.
     ///
@@ -1531,27 +1532,27 @@ struct DepBuilder<'a> {
     /// theirs — and nothing between the first Makefile closing and the graph
     /// being finished can change the answer. GNU Make answers from `struct
     /// file` and a directory read it keeps; this is the same bargain.
-    exists_cache: HashMap<Symbol, bool>,
+    exists_cache: FastMap<Symbol, bool>,
     /// Names the search invented to complete a chain, which the Makefile
     /// therefore never says.
-    intermediates: HashSet<Symbol>,
+    intermediates: FastSet<Symbol>,
     /// What `.INTERMEDIATE` and `.SECONDARY` named outright, which outranks
     /// every reason a name might have not to be intermediate.
-    declared_intermediate: HashSet<Symbol>,
+    declared_intermediate: FastSet<Symbol>,
     /// The targets `.SECONDARY` named, which are intermediate without the
     /// deletion. Empty when it named none, which is the form that means every
     /// target and sets `all_secondary` instead.
-    secondary: HashSet<Symbol>,
+    secondary: FastSet<Symbol>,
     all_secondary: bool,
     /// What `.NOTINTERMEDIATE` named, by name and by pattern, and whether it
     /// named nothing at all — which is every target.
-    not_intermediate: HashSet<Symbol>,
+    not_intermediate: FastSet<Symbol>,
     not_intermediate_patterns: Vec<Symbol>,
     no_intermediates: bool,
     /// Every name an explicit rule writes down as a prerequisite. A name the
     /// Makefile says is not intermediate however the search reached it, and a
     /// pattern is not a name.
-    mentioned: HashSet<Symbol>,
+    mentioned: FastSet<Symbol>,
     wait_sym: Symbol,
     /// Each prerequisite that followed a `.WAIT`, with what preceded it.
     wait_barriers: Vec<(Symbol, Vec<Symbol>)>,
@@ -1590,7 +1591,7 @@ struct DepBuilder<'a> {
     /// wants one of them written on its `default` line.
     first_rule: Option<Symbol>,
     done: HashMap<Symbol, Arc<Mutex<DepNode>>>,
-    phony: HashSet<Symbol>,
+    phony: FastSet<Symbol>,
     /// The names `-o` asserted a date for, interned once.
     ///
     /// Read only by [`Self::found_before_the_build`]: the switch's whole effect
@@ -1608,7 +1609,7 @@ struct DepBuilder<'a> {
     assumed_new: HashSet<Symbol>,
     /// The targets `.IGNORE` named. Empty when it named none, which is the
     /// form that means every target and sets the flag instead.
-    ignore_errors: HashSet<Symbol>,
+    ignore_errors: FastSet<Symbol>,
     /// The Makefile declared `.DELETE_ON_ERROR`, which is one global answer:
     /// GNU Make reads the name once, as a target rather than a prerequisite,
     /// and any prerequisites it was given mean nothing.
@@ -1622,8 +1623,8 @@ struct DepBuilder<'a> {
     /// about a `foo.bar` an explicit rule built. Matching the pattern against
     /// the finished name instead would protect both, and GNU Make protects
     /// neither.
-    precious: HashSet<Symbol>,
-    precious_patterns: HashSet<Symbol>,
+    precious: FastSet<Symbol>,
+    precious_patterns: FastSet<Symbol>,
     /// `VPATH`, the variable form of the directory search.
     vpath_var_name: Symbol,
     /// `.LIBPATTERNS`, which says how a `-lNAME` prerequisite is spelt on disk.
@@ -1710,7 +1711,7 @@ impl<'a> DepBuilder<'a> {
             .collect::<HashSet<_>>();
         let mut ret = Self {
             ev,
-            rules: HashMap::new(),
+            rules: FastMap::default(),
             rule_vars,
             pattern_var_order,
             cur_rule_vars: None,
@@ -1724,22 +1725,22 @@ impl<'a> DepBuilder<'a> {
             implicit_rules: RuleTrie::new(),
             implicit_rule_defs: Vec::new(),
             implicit_rule_order: 0,
-            expanded: HashMap::new(),
-            chaining: HashSet::new(),
-            rules_in_use: HashSet::new(),
+            expanded: FastMap::default(),
+            chaining: FastSet::default(),
+            rules_in_use: FastSet::default(),
             found_compat_rule: false,
-            impossible: HashMap::new(),
-            tried_implicit: HashSet::new(),
+            impossible: FastMap::default(),
+            tried_implicit: FastSet::default(),
             chain_truncated: false,
-            exists_cache: HashMap::new(),
-            intermediates: HashSet::new(),
-            declared_intermediate: HashSet::new(),
-            secondary: HashSet::new(),
+            exists_cache: FastMap::default(),
+            intermediates: FastSet::default(),
+            declared_intermediate: FastSet::default(),
+            secondary: FastSet::default(),
             all_secondary: false,
-            not_intermediate: HashSet::new(),
+            not_intermediate: FastSet::default(),
             not_intermediate_patterns: Vec::new(),
             no_intermediates: false,
-            mentioned: HashSet::new(),
+            mentioned: FastSet::default(),
             wait_sym,
             wait_barriers: Vec::new(),
             default_rule: None,
@@ -1751,13 +1752,13 @@ impl<'a> DepBuilder<'a> {
 
             first_rule: None,
             done: HashMap::new(),
-            phony: HashSet::new(),
+            phony: FastSet::default(),
             assumed_old,
             assumed_new,
-            ignore_errors: HashSet::new(),
+            ignore_errors: FastSet::default(),
             delete_on_error: false,
-            precious: HashSet::new(),
-            precious_patterns: HashSet::new(),
+            precious: FastSet::default(),
+            precious_patterns: FastSet::default(),
             vpath_var_name,
             libpatterns_var_name,
             gpath_var_name,
@@ -4331,7 +4332,7 @@ impl<'a> DepBuilder<'a> {
     /// `MERGE(field)` names are taken from the searched name's. `precious`,
     /// `secondary`, `notintermediate` and `phony` are in that run, so they are
     /// in force whichever of the two names declared them.
-    fn merged_flag(&self, set: &HashSet<Symbol>, name: Symbol) -> bool {
+    fn merged_flag(&self, set: &FastSet<Symbol>, name: Symbol) -> bool {
         set.contains(&name) || set.contains(&self.written_as(name))
     }
 
@@ -4340,7 +4341,7 @@ impl<'a> DepBuilder<'a> {
     /// omission from the run carries its own comment. Such a flag reaches the
     /// found path only by riding the whole object there, so it survives the
     /// rename exactly when the Makefile named that path nowhere at all.
-    fn moved_flag(&self, set: &HashSet<Symbol>, name: Symbol) -> bool {
+    fn moved_flag(&self, set: &FastSet<Symbol>, name: Symbol) -> bool {
         set.contains(&name) || (!self.names_an_object(name) && set.contains(&self.written_as(name)))
     }
 
@@ -4893,7 +4894,7 @@ impl<'a> DepBuilder<'a> {
         if path_len == 0 {
             return pool;
         }
-        let mut seen: HashSet<(usize, Symbol)> = pool
+        let mut seen: FastSet<(usize, Symbol)> = pool
             .iter()
             .map(|candidate| (Self::rule_id(&candidate.rule), candidate.pattern))
             .collect();

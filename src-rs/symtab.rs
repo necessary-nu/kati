@@ -22,13 +22,14 @@ limitations under the License.
 //! reads a variable binding. See `[spec:ronin:req:make.scope-separation]`.
 
 use std::{
-    collections::HashMap,
     fmt::{Debug, Display},
     num::NonZeroUsize,
     vec,
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
+
+use crate::fasthash::FastMap;
 
 /// Anything that can hand out the interner a [`Symbol`] was minted from.
 ///
@@ -166,7 +167,7 @@ impl Debug for SymbolDisplay<'_> {
 // [spec:ronin:req:make.scope-separation]
 pub struct Symtab {
     symbols: Vec<Bytes>,
-    index: HashMap<Bytes, Symbol>,
+    index: FastMap<Bytes, Symbol>,
 }
 
 impl Default for Symtab {
@@ -183,7 +184,7 @@ impl Symtab {
     pub fn new() -> Self {
         let mut symtab = Self {
             symbols: vec![Bytes::new()],
-            index: HashMap::new(),
+            index: FastMap::default(),
         };
         for i in 1u8..=255 {
             assert!(symtab.symbols.len() == i as usize);
