@@ -2823,7 +2823,7 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
         Ok(())
     }
 
-    // [spec:ronin:req:make.state-outside-the-tree+2]
+    // [spec:ronin:req:make.state-outside-the-tree+3]
     fn declare_rule(&mut self, names: &dyn Interner, rule: &SinkRule<'_>) -> Result<()> {
         self.write_location(names, rule.loc)?;
         writeln!(self.out, "rule rule{}", rule.id)?;
@@ -3912,7 +3912,7 @@ mod tests {
         );
     }
 
-    // [spec:ronin:req:make.state-outside-the-tree+2/test]
+    // [spec:ronin:req:make.state-outside-the-tree+3/test]
     #[test]
     fn writer_marks_recipes_timestamp_only() {
         let manifest = declare_rule_for(SinkCommand::Inline(b"true"), None);
