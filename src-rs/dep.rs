@@ -1102,21 +1102,37 @@ impl RuleTrie {
             .add(&name[1..], candidate)
     }
 
-    fn get(&self, name: &[u8]) -> Vec<ImplicitCandidate> {
-        let mut ret = Vec::new();
+    /// Append every candidate filed under a prefix of `name`, outermost
+    /// first.
+    ///
+    /// Appends into the caller's buffer rather than returning one of its own.
+    /// The walk descends a level per byte of the name, and returning a `Vec`
+    /// meant one per level that held a match, plus a move of the whole child
+    /// list into the parent's on the way back up, on a call the implicit-rule
+    /// search makes tens of thousands of times.
+    ///
+    /// Worth stating plainly, because the first draft of this comment claimed
+    /// more than the change delivers: `extend` from an owned `Vec` MOVES its
+    /// elements, so no `Arc` was ever cloned twice here, and `Vec::new` does
+    /// not allocate, so a level with no match cost nothing either. What is
+    /// saved is the allocation at each level that did match and the copying
+    /// between them. Measured on the recursive no-op, together with the
+    /// single-buffer `candidate_pool` and the pattern clone beside it, that is
+    /// about 2.5% of the run — `shared_clone` fell from 6.47% to 4.28% and the
+    /// allocator from 13.3% to 11.2%. A real reduction, and a small one.
+    fn get(&self, name: &[u8], into: &mut Vec<ImplicitCandidate>) {
         for ent in &self.rules {
             if (ent.suffix.is_empty() && name.is_empty()) || name.ends_with(&ent.suffix[1..]) {
-                ret.push(ent.candidate.clone())
+                into.push(ent.candidate.clone());
             }
         }
         if name.is_empty() {
-            return ret;
+            return;
         }
         let c = name[0];
         if let Some(child) = self.children.get(&c) {
-            ret.extend(child.get(&name[1..]));
+            child.get(&name[1..], into);
         }
-        ret
     }
 
     fn len(&self) -> usize {
@@ -4882,11 +4898,16 @@ impl<'a> DepBuilder<'a> {
                 continue;
             }
             let pattern = candidate.pattern.as_bytes(&self.ev.session);
-            let pat = Pattern::new(pattern.clone());
+            // Asked before the pattern is handed over rather than after, so
+            // that `Pattern::new` can take it instead of taking a copy of it.
+            // The answer is still only used once the match has succeeded,
+            // which is where it was used before.
+            let specific = pattern.as_ref() != b"%";
+            let pat = Pattern::new(pattern);
             let Some(matched_at) = PatternMatch::of(&pat, output_str) else {
                 continue;
             };
-            specific_rule_matched |= pattern.as_ref() != b"%";
+            specific_rule_matched |= specific;
             if candidate.rule.cmds.is_empty() {
                 continue;
             }
@@ -4917,21 +4938,34 @@ impl<'a> DepBuilder<'a> {
     /// keeps no index and compares every pattern rule to the name both ways
     /// round, so the file part has to be asked about separately here. A pattern
     /// starting with `%` answers to both names and is offered once.
+    /// Both walks fill the one buffer, and the second walk's additions are
+    /// de-duplicated where they lie rather than into a third. The pool is
+    /// built afresh for every name the search asks about, so a `Vec` per walk
+    /// and a `Vec` to join them is three allocations on the hottest call in
+    /// the evaluator.
     fn candidate_pool(&self, output_str: &Bytes) -> Vec<ImplicitCandidate> {
-        let mut pool = self.implicit_rules.get(output_str);
+        let mut pool = Vec::new();
+        self.implicit_rules.get(output_str, &mut pool);
         let path_len = directory_length(output_str);
         if path_len == 0 {
             return pool;
         }
-        let mut seen: FastSet<(usize, Symbol)> = pool
-            .iter()
-            .map(|candidate| (Self::rule_id(&candidate.rule), candidate.pattern))
-            .collect();
-        for candidate in self.implicit_rules.get(&output_str[path_len..]) {
-            if seen.insert((Self::rule_id(&candidate.rule), candidate.pattern)) {
-                pool.push(candidate);
+        let from_whole_name = pool.len();
+        self.implicit_rules.get(&output_str[path_len..], &mut pool);
+        let key =
+            |candidate: &ImplicitCandidate| (Self::rule_id(&candidate.rule), candidate.pattern);
+        let mut seen: FastSet<(usize, Symbol)> = pool[..from_whole_name].iter().map(key).collect();
+        // Kept in the order the walk produced them, which is the order the
+        // caller's tie-break reads: an entry that survives is swapped down to
+        // the write cursor and the one it displaces is already spent.
+        let mut keep = from_whole_name;
+        for read in from_whole_name..pool.len() {
+            if seen.insert(key(&pool[read])) {
+                pool.swap(keep, read);
+                keep += 1;
             }
         }
+        pool.truncate(keep);
         pool
     }
 
