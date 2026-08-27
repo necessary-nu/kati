@@ -521,7 +521,24 @@ pub struct DepNode {
     pub is_intermediate: bool,
     /// The build deletes this file once it has finished with it, which every
     /// intermediate but a `.SECONDARY` one and a goal is.
+    ///
+    /// This node's own name. [`Self::disposable_outputs`] is the whole answer,
+    /// because a rule with several target patterns makes several names and GNU
+    /// Make asks the question of each of them separately.
     pub is_disposable: bool,
+    /// Every name this node writes that the build may sweep up.
+    ///
+    /// GNU Make decides intermediacy PER FILE — `f->intermediate |=
+    /// !f->is_explicit && !f->notintermediate` (implicit.c) — so one rule with
+    /// several target patterns can make one name the search invented beside one
+    /// the makefile mentioned, and only the first of them goes. A single flag
+    /// on the action answers for whichever name the walk reached first, which
+    /// is an order the makefile never wrote down.
+    ///
+    /// A name that stays a peer is not in here and never was: GNU Make stamps
+    /// `is_target` on an `also_make` entry precisely "so that this file is not
+    /// treated as intermediate", and nothing reached it in its own right.
+    pub disposable_outputs: Vec<Symbol>,
     /// The outputs of this action a stopped recipe may be made to give back.
     ///
     /// Every output the action writes, less the ones GNU Make's `delete_target`
@@ -671,6 +688,11 @@ impl DepNode {
             is_ignore_error,
             is_intermediate,
             is_disposable,
+            disposable_outputs: if is_disposable {
+                vec![output]
+            } else {
+                Vec::new()
+            },
             withdrawable_outputs: Vec::new(),
             delete_on_error: false,
             implicit_outputs: Vec::new(),
@@ -2058,10 +2080,18 @@ impl<'a> DepBuilder<'a> {
             }
             let mut node = node.lock();
             // The rule's target pattern speaks for the name the search matched
-            // it against, so it is read beside that name and no other.
-            if node.is_disposable && self.is_precious(node.recipe_output, node.output_pattern) {
+            // it against, so it is read beside that name and no other. Every
+            // other name this action writes was protected by the pattern that
+            // spelled it, back where `pick_rule` recorded it, so asking about
+            // the name alone is the whole of the question for those.
+            let matched = node.recipe_output;
+            let pattern = node.output_pattern;
+            if node.is_disposable && self.is_precious(matched, pattern) {
                 node.is_disposable = false;
             }
+            node.disposable_outputs.retain(|name| {
+                !self.is_precious(*name, if *name == matched { pattern } else { None })
+            });
         }
     }
 
@@ -2159,6 +2189,21 @@ impl<'a> DepBuilder<'a> {
         // is read first: it answers without going to the filesystem.
         self.intermediates.contains(&output)
             || (self.all_secondary && !self.found_before_the_build(output))
+    }
+
+    /// Whether the build may sweep the file this name stands for once it has
+    /// finished with it.
+    ///
+    /// `remove_intermediates` (file.c) asks for `intermediate` and against
+    /// `secondary` and `notintermediate` separately, so a name both a
+    /// `.INTERMEDIATE` and a `.NOTINTERMEDIATE` reached is intermediate and is
+    /// still not swept up. Only a rename can put a name in that position: the
+    /// two written for one name are a read-time error.
+    fn disposable_name(&self, output: Symbol) -> bool {
+        self.treat_as_intermediate(output)
+            && !self.all_secondary
+            && !self.merged_flag(&self.secondary, output)
+            && !self.merged_flag(&self.not_intermediate, output)
     }
 
     /// Whether the file this name stands for was there before anything ran.
@@ -2880,6 +2925,7 @@ impl<'a> DepBuilder<'a> {
             let mut n = n.lock();
             n.is_intermediate = false;
             n.is_disposable = false;
+            n.disposable_outputs.retain(|name| *name != target);
         }
         self.ev.current_scope = None;
         self.cur_rule_vars = None;
@@ -5770,11 +5816,25 @@ impl<'a> DepBuilder<'a> {
             output.display(&self.ev.session)
         );
 
-        if let Some(found) = self.done.get(&output) {
+        if let Some(found) = self.done.get(&output).cloned() {
             // Reaching a name in its own right is what stops it being a peer:
             // GNU Make decides that name's freshness from that name, so its
             // absence has to be able to make the recipe run again.
-            found.lock().peer_outputs.retain(|peer| *peer != output);
+            let was_peer = {
+                let mut found = found.lock();
+                let before = found.peer_outputs.len();
+                found.peer_outputs.retain(|peer| *peer != output);
+                found.peer_outputs.len() != before
+            };
+            // And it is what gives the name a sweep answer of its own. A rule
+            // with several target patterns makes several names off one action,
+            // and GNU Make asks `!is_explicit` of each of them; taking the
+            // action's answer would take whichever name the walk happened to
+            // reach first. Asked here rather than where the peer was recorded,
+            // because the question is about having been reached.
+            if was_peer && self.disposable_name(output) {
+                found.lock().disposable_outputs.push(output);
+            }
             return Ok(found.clone());
         }
 
@@ -5784,16 +5844,7 @@ impl<'a> DepBuilder<'a> {
             self.phony.contains(&output),
             self.moved_flag(&self.ignore_errors, output),
             is_intermediate,
-            // `remove_intermediates` (file.c) asks for `intermediate` and
-            // against `secondary` and `notintermediate` separately, so a name
-            // both a `.INTERMEDIATE` and a `.NOTINTERMEDIATE` reached is
-            // intermediate and is still not swept up. Only a rename can put a
-            // name in that position: the two written for one name are a
-            // read-time error.
-            is_intermediate
-                && !self.all_secondary
-                && !self.merged_flag(&self.secondary, output)
-                && !self.merged_flag(&self.not_intermediate, output),
+            self.disposable_name(output),
         );
         // Set here and only here: the memoised return above is what makes the
         // first caller the parent, which is the whole of GNU Make's rule.

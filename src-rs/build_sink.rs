@@ -517,9 +517,16 @@ pub struct SinkEdge<'a> {
     /// build is allowed to skip — so the writer ignores it and a sink that runs
     /// the build is the one that answers for it.
     pub intermediate: bool,
-    /// The build should delete this output once it has finished with it, which
-    /// is every intermediate but a `.SECONDARY` one and a goal.
-    pub disposable: bool,
+    /// The outputs the build should delete once it has finished with them,
+    /// which is every intermediate but a `.SECONDARY` one and a goal.
+    ///
+    /// The names rather than a flag, for the reason
+    /// [`Self::withdrawable_outputs`] gives about its own: the answer is per
+    /// output and not per edge. One rule with several target patterns writes
+    /// several names, and GNU Make asks `!is_explicit` of each of them
+    /// (implicit.c), so a name the search invented and a name the makefile
+    /// mentioned can come off the same action with different answers.
+    pub disposable_outputs: &'a [Symbol],
     /// The outputs a stopped recipe may be made to give back.
     ///
     /// The names rather than a flag, because the exclusions are per output and

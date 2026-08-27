@@ -2288,7 +2288,7 @@ impl<'a> NinjaGenerator<'a> {
                         .iter()
                         .all(|cmd| crate::command::written_line_recurses(cmd, &self.ce.ev.session)),
                 intermediate: node.is_intermediate,
-                disposable: node.is_disposable,
+                disposable_outputs: &node.disposable_outputs,
                 withdrawable_outputs: &withdrawable_outputs,
                 delete_on_error: node.delete_on_error,
                 peer_outputs: &peer_outputs,
@@ -3172,7 +3172,7 @@ mod tests {
                     completion_join: false,
                     has_touchable_recipe: false,
                     intermediate: false,
-                    disposable: false,
+                    disposable_outputs: &[],
                     withdrawable_outputs: &[],
                     delete_on_error: false,
                     peer_outputs: &[],
