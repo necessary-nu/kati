@@ -236,6 +236,17 @@ impl Symtab {
         self.symbols[sym.0.get()].clone()
     }
 
+    /// The same bytes, borrowed from the interner rather than handed over as a
+    /// second holder of them.
+    ///
+    /// [`Self::name`] hands back a `Bytes`, which is a shared owner: taking one
+    /// out and dropping it again is a pair of atomic read-modify-writes on a
+    /// refcount that never went anywhere. A caller that reads the name and is
+    /// done with it before it touches the interner again wants this one.
+    pub fn name_bytes(&self, sym: Symbol) -> &[u8] {
+        &self.symbols[sym.0.get()]
+    }
+
     /// The number of interned names, counting the reserved slot 0.
     pub fn count(&self) -> usize {
         self.symbols.len()

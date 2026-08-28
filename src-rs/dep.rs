@@ -38,7 +38,7 @@ use crate::{
     stmt::AssignOp,
     strutil::{
         Pattern, WordWriter, is_space_byte, makefile_word_scanner, substitute_stem,
-        trim_leading_curdir, word_scanner,
+        trim_leading_curdir, word_scanner, write_substituted_stem,
     },
     symtab::{Interner, Symbol},
     timeutil::ScopedTimeReporter,
@@ -1012,6 +1012,14 @@ impl PatternMatch {
     fn prerequisite(&self, prerequisite: &Bytes) -> Bytes {
         substitute_stem(prerequisite, &self.directory, &self.stem)
     }
+
+    /// The same name, written into a buffer the caller reuses.
+    ///
+    /// For the chain search, which proposes a name per prerequisite of every
+    /// candidate rule and keeps almost none of them.
+    fn write_prerequisite(&self, prerequisite: &[u8], out: &mut Vec<u8>) {
+        write_substituted_stem(prerequisite, &self.directory, &self.stem, out);
+    }
 }
 
 /// How much of `name` is the directory it sits in, including the slash.
@@ -1491,7 +1499,14 @@ struct DepBuilder<'a> {
     /// patterns whose expansions can have side effects.
     expanded: FastMap<(usize, Symbol), SecondExpandedPrerequisites>,
     /// Cycle guard for the recursive implicit rule search.
-    chaining: FastSet<Symbol>,
+    ///
+    /// Keyed by the name rather than by a symbol for it, because the names a
+    /// chain search walks are ones it invented and asking about them must not
+    /// mint them. It holds the road currently being walked and nothing else —
+    /// one entry per level, so at most [`MAX_IMPLICIT_CHAIN`] of them at a
+    /// time — so keying it by bytes stores no name the search is not already
+    /// holding on its own stack.
+    chaining: FastSet<Bytes>,
     /// The pattern rules a search further out is already working through.
     ///
     /// GNU Make marks a rule `in_use` while it decides whether the
@@ -1526,7 +1541,15 @@ struct DepBuilder<'a> {
     /// about the same name at depth one, and the recorded depth is what tells
     /// the two apart — a later search may reuse the answer only from at least
     /// as deep, where it has no more budget than the search that proved it.
-    impossible: FastMap<Symbol, usize>,
+    ///
+    /// Keyed by the name, for the same reason [`Self::chaining`] is: the names
+    /// it records are ones the search invented, so keying it by `Symbol` meant
+    /// minting one for each. This is the one place the search does have to
+    /// keep an invented name, and it is a small fraction of the names it
+    /// proposes — on the 4,000-rule no-op measured in [`crate::dircache`] this
+    /// map ends with 76,019 entries where the interner it used to key this by
+    /// ended with 489,846.
+    impossible: FastMap<Bytes, usize>,
     /// Names a terminal rule was handed, which no implicit search may make.
     ///
     /// GNU Make's `tried_implicit`, set where a chosen terminal rule takes a
@@ -2191,7 +2214,7 @@ impl<'a> DepBuilder<'a> {
     /// them worth writing beside a `.NOTINTERMEDIATE` pattern. Either way the
     /// bit only lasts until the file is found already lying there; see
     /// [`Self::found_before_the_build`].
-    fn treat_as_intermediate(&self, output: Symbol) -> bool {
+    fn treat_as_intermediate(&mut self, output: Symbol) -> bool {
         if self.moved_flag(&self.declared_intermediate, output) {
             return !self.found_before_the_build(output);
         }
@@ -2225,7 +2248,7 @@ impl<'a> DepBuilder<'a> {
     /// `.INTERMEDIATE` and a `.NOTINTERMEDIATE` reached is intermediate and is
     /// still not swept up. Only a rename can put a name in that position: the
     /// two written for one name are a read-time error.
-    fn disposable_name(&self, output: Symbol) -> bool {
+    fn disposable_name(&mut self, output: Symbol) -> bool {
         self.treat_as_intermediate(output)
             && !self.all_secondary
             && !self.merged_flag(&self.secondary, output)
@@ -2251,7 +2274,7 @@ impl<'a> DepBuilder<'a> {
     /// (`main.c`). So an `-o` name that is lying there is swept up where the
     /// same file without the switch is kept, which is measured against 4.4.1
     /// and is the switch's sharpest edge.
-    fn found_before_the_build(&self, output: Symbol) -> bool {
+    fn found_before_the_build(&mut self, output: Symbol) -> bool {
         if self.phony.contains(&output)
             || self.gpath_origin.contains_key(&output)
             || self.assumed_old.contains(&output)
@@ -2299,13 +2322,16 @@ impl<'a> DepBuilder<'a> {
     ///
     /// The source suffix is held without the dot it was written with, because
     /// that is how the map is keyed, so the dot goes back on here.
-    fn suffix_rule_input(&mut self, stem: &Bytes, rule: &Rule) -> Symbol {
+    /// As a name and not as a symbol: the search asks after far more of these
+    /// than it ever chooses, and a name it turns down should leave nothing
+    /// behind. The one caller that goes on to use the answer interns it there.
+    fn suffix_rule_name(&self, stem: &Bytes, rule: &Rule) -> Bytes {
         let source = rule.inputs[0].as_bytes(&self.ev.session);
         let mut name = BytesMut::with_capacity(stem.len() + source.len() + 1);
         name.put_slice(stem);
         name.put_u8(b'.');
         name.put_slice(&source);
-        self.ev.session.intern(name.freeze())
+        name.freeze()
     }
 
     /// Turn `.SUFFIXES` into rules, and add the rules that were always
@@ -3089,12 +3115,34 @@ impl<'a> DepBuilder<'a> {
         if let Some(answer) = self.exists_cache.get(&target) {
             return *answer;
         }
+        let name = target.as_bytes(&self.ev.session);
         let answer = self.rules.contains_key(&target)
             || self.phony.contains(&target)
-            || self.on_disk(target)
-            || self.vpath_of(target).is_some();
+            || self.on_disk(&name)
+            || self.vpath_search(&name).is_some();
         self.exists_cache.insert(target, answer);
         answer
+    }
+
+    /// The same question over a name the interner may never have seen, which is
+    /// how the implicit search asks it.
+    ///
+    /// A name with no symbol cannot be a key of anything keyed by one, so the
+    /// lookup coming back empty has already answered the first two halves of
+    /// [`Self::exists`] and the cache in front of it. What is left is the two
+    /// halves that read the ground, and the first of those is answered by the
+    /// directory listing rather than by a `stat` — so the invented name that is
+    /// not there costs a lookup in the interner and a lookup in
+    /// [`crate::dircache`], and leaves nothing behind in either.
+    ///
+    /// Deliberately without a cache of its own. One keyed by these names would
+    /// hold every name the search ever proposed — 480,120 of them on the
+    /// 4,000-rule no-op — which is the table this exists to stop growing.
+    fn exists_named(&mut self, name: &[u8]) -> bool {
+        if let Some(target) = self.ev.session.symtab.peek_symbol(name) {
+            return self.exists(target);
+        }
+        self.on_disk(name) || self.vpath_search(name).is_some()
     }
 
     /// Whether a name is a file, asking the directory it is in before asking
@@ -3107,15 +3155,14 @@ impl<'a> DepBuilder<'a> {
     /// only ever prove absence; a name it holds still gets its `stat`, because
     /// a directory entry whose symlink target is gone is listed and does not
     /// exist. See [`kati::dircache`](crate::dircache).
-    fn on_disk(&mut self, target: Symbol) -> bool {
-        let name = target.as_bytes(&self.ev.session);
+    fn on_disk(&mut self, name: &[u8]) -> bool {
         if self
             .directories
-            .certainly_absent(self.ev.session.filesystem_epoch(), &name)
+            .certainly_absent(self.ev.session.filesystem_epoch(), name)
         {
             return false;
         }
-        std::fs::exists(OsStr::from_bytes(&name)).is_ok_and(|v| v)
+        std::fs::exists(OsStr::from_bytes(name)).is_ok_and(|v| v)
     }
 
     /// Replace each prerequisite with where the directory search found it.
@@ -3821,7 +3868,7 @@ impl<'a> DepBuilder<'a> {
     /// `GPATH` is what takes that decision out of the build — it says the
     /// directory the search looked in is where the name belongs, so the file
     /// is renamed before anything else is asked about it and remade there.
-    fn at_vpath(&self, input: Symbol) -> Option<(Bytes, bool)> {
+    fn at_vpath(&mut self, input: Symbol) -> Option<(Bytes, bool)> {
         if self.phony.contains(&input) {
             return None;
         }
@@ -3842,7 +3889,7 @@ impl<'a> DepBuilder<'a> {
     /// pattern that matches decides which directories are looked in; a name no
     /// pattern matches falls back to `VPATH`, which is a variable rather than a
     /// directive and so is read here rather than recorded.
-    fn vpath_of(&self, target: Symbol) -> Option<Bytes> {
+    fn vpath_of(&mut self, target: Symbol) -> Option<Bytes> {
         let name = target.as_bytes(&self.ev.session);
         Some(self.vpath_search(&name)?.0)
     }
@@ -3856,7 +3903,7 @@ impl<'a> DepBuilder<'a> {
     /// earliest `vpath` entry wins whichever element reached it. A name is a
     /// symbol only once it is a target, and a library candidate is a name the
     /// search invented, so this half takes bytes.
-    fn vpath_search(&self, name: &[u8]) -> Option<(Bytes, VpathRank)> {
+    fn vpath_search(&mut self, name: &[u8]) -> Option<(Bytes, VpathRank)> {
         if name.is_empty() || self.ev.session.vpaths.is_empty() && self.vpath_variable().is_empty()
         {
             return None;
@@ -3866,15 +3913,25 @@ impl<'a> DepBuilder<'a> {
         // rather than about any candidate.
         let searching_for_a_target = self.names_a_target(name);
         let mut matched_any = false;
-        for (entry, (pattern, directories)) in self.ev.session.vpaths.iter().enumerate() {
-            if !pattern.matches(name) {
+        // Reached by index rather than by iterator so that the borrow of the
+        // recorded entries ends before the probe, which reads the directory
+        // listings and so needs the builder to itself.
+        for entry in 0..self.ev.session.vpaths.len() {
+            if !self.ev.session.vpaths[entry].0.matches(name) {
                 continue;
             }
             matched_any = true;
-            if let Some((found, directory)) =
-                self.first_directory_offering(directories, name, searching_for_a_target)
-            {
-                return Some((found, VpathRank { entry, directory }));
+            for index in 0..self.ev.session.vpaths[entry].1.len() {
+                let candidate = Self::under(&self.ev.session.vpaths[entry].1[index], name);
+                if self.directory_offers(&candidate, searching_for_a_target) {
+                    return Some((
+                        candidate,
+                        VpathRank {
+                            entry,
+                            directory: index,
+                        },
+                    ));
+                }
             }
         }
         if matched_any {
@@ -3883,13 +3940,35 @@ impl<'a> DepBuilder<'a> {
         // `VPATH` is a variable rather than a directive and so is read here
         // rather than recorded. It is searched after every `vpath` entry, which
         // is where its rank puts it.
-        let (found, directory) =
-            self.first_directory_offering(&self.vpath_variable(), name, searching_for_a_target)?;
-        let entry = self.ev.session.vpaths.len();
-        Some((found, VpathRank { entry, directory }))
+        let directories = self.vpath_variable();
+        for (index, directory) in directories.iter().enumerate() {
+            let candidate = Self::under(directory, name);
+            if self.directory_offers(&candidate, searching_for_a_target) {
+                let entry = self.ev.session.vpaths.len();
+                return Some((
+                    candidate,
+                    VpathRank {
+                        entry,
+                        directory: index,
+                    },
+                ));
+            }
+        }
+        None
     }
 
-    /// The first of `directories` that offers `name`, and which one it was.
+    /// `directory/name`, with the one slash between them the caller may not
+    /// have written.
+    fn under(directory: &Bytes, name: &[u8]) -> Bytes {
+        let mut candidate = BytesMut::from(directory.as_ref());
+        if !candidate.ends_with(b"/") {
+            candidate.put_u8(b'/');
+        }
+        candidate.put_slice(name);
+        candidate.freeze()
+    }
+
+    /// Whether the directory this name was built under offers it.
     ///
     /// A directory offers the name when it holds a file of that name, and also
     /// when the Makefile has written the joined path down — the search is for
@@ -3898,26 +3977,14 @@ impl<'a> DepBuilder<'a> {
     /// a "makefile-mentioned file need not exist", and the two are asked in
     /// this order per directory rather than in two passes, so a mentioned name
     /// in an earlier directory beats a file in a later one.
-    fn first_directory_offering(
-        &self,
-        directories: &[Bytes],
-        name: &[u8],
-        searching_for_a_target: bool,
-    ) -> Option<(Bytes, usize)> {
-        for (index, directory) in directories.iter().enumerate() {
-            let mut candidate = BytesMut::from(directory.as_ref());
-            if !candidate.ends_with(b"/") {
-                candidate.put_u8(b'/');
-            }
-            candidate.put_slice(name);
-            let candidate = candidate.freeze();
-            if self.makefile_offers(&candidate, searching_for_a_target)
-                || std::fs::exists(OsStr::from_bytes(&candidate)).is_ok_and(|found| found)
-            {
-                return Some((candidate, index));
-            }
-        }
-        None
+    ///
+    /// The filesystem half goes through the directory listing, which is what
+    /// GNU Make's `selective_vpath_search` does too: it asks
+    /// `dir_file_exists_p` and then confirms a yes with a `stat`, "because the
+    /// cache may be out of date" (`vpath.c`). The listing is the same one
+    /// [`Self::on_disk`] reads and is honest for the same reason.
+    fn directory_offers(&mut self, candidate: &Bytes, searching_for_a_target: bool) -> bool {
+        self.makefile_offers(candidate, searching_for_a_target) || self.on_disk(candidate)
     }
 
     /// Whether the Makefile answers for `candidate` well enough for the search
@@ -5003,9 +5070,10 @@ impl<'a> DepBuilder<'a> {
     ) -> Result<Option<ReachedPrerequisites>> {
         let mut reached = ReachedPrerequisites::default();
         for (sym, from_pattern) in inputs {
+            let name = sym.as_bytes(&self.ev.session);
             // A name an earlier search proved nothing can make fails this rule
             // outright, on either pass: the answer cannot have changed.
-            if self.proven_impossible(sym, 0) {
+            if self.proven_impossible(&name, 0) {
                 return Ok(None);
             }
             // A name this target already asks for is going to be built whatever
@@ -5034,7 +5102,7 @@ impl<'a> DepBuilder<'a> {
                 // acted on: this rule may still apply by making the name.
                 self.found_compat_rule = true;
             }
-            if !(pass.chaining && self.intermediate_reachable(sym, 0, pass.compat)?) {
+            if !(pass.chaining && self.intermediate_reachable(&name, 0, pass.compat)?) {
                 return Ok(None);
             }
             if from_pattern && !self.mentioned.contains(&sym) {
@@ -5051,7 +5119,7 @@ impl<'a> DepBuilder<'a> {
     /// and every later search rejects a rule that asks for it without walking
     /// the subtree again. A name the Makefile writes down is left unmarked, so
     /// that a compatibility pass can still take it on trust.
-    fn intermediate_reachable(&mut self, name: Symbol, depth: usize, compat: bool) -> Result<bool> {
+    fn intermediate_reachable(&mut self, name: &Bytes, depth: usize, compat: bool) -> Result<bool> {
         if self.proven_impossible(name, depth) {
             return Ok(false);
         }
@@ -5059,8 +5127,8 @@ impl<'a> DepBuilder<'a> {
         let reachable = self.can_be_made_implicitly(name, depth, compat)?;
         let conclusive = !self.chain_truncated;
         self.chain_truncated |= outer_truncated;
-        if !reachable && conclusive && !self.is_written_down(name) {
-            let shallowest = self.impossible.entry(name).or_insert(depth);
+        if !reachable && conclusive && !self.is_written_down_named(name) {
+            let shallowest = self.impossible.entry(name.clone()).or_insert(depth);
             *shallowest = (*shallowest).min(depth);
         }
         Ok(reachable)
@@ -5068,9 +5136,9 @@ impl<'a> DepBuilder<'a> {
 
     /// Whether a search with no more budget than this one already failed on
     /// this name.
-    fn proven_impossible(&self, name: Symbol, depth: usize) -> bool {
+    fn proven_impossible(&self, name: &[u8], depth: usize) -> bool {
         self.impossible
-            .get(&name)
+            .get(name)
             .is_some_and(|shallowest| *shallowest <= depth)
     }
 
@@ -5094,6 +5162,17 @@ impl<'a> DepBuilder<'a> {
             || self.phony.contains(&name)
             || self.rule_vars.contains_key(&name)
             || self.ev.goals.contains(&name)
+    }
+
+    /// The same question over a name that may never have been interned. Every
+    /// set it consults is keyed by a symbol, so a name with none is in none of
+    /// them and the lookup coming back empty is the whole answer.
+    fn is_written_down_named(&self, name: &[u8]) -> bool {
+        self.ev
+            .session
+            .symtab
+            .peek_symbol(name)
+            .is_some_and(|name| self.is_written_down(name))
     }
 
     /// The names a matched pattern rule's prerequisites stand for, with each
@@ -5240,14 +5319,14 @@ impl<'a> DepBuilder<'a> {
     /// prerequisite anyway, and the search one level down succeeds normally.
     fn can_be_made_implicitly(
         &mut self,
-        output: Symbol,
+        output: &Bytes,
         depth: usize,
         compat: bool,
     ) -> Result<bool> {
         if depth >= MAX_IMPLICIT_CHAIN {
             return Ok(false);
         }
-        if !self.chaining.insert(output) {
+        if !self.chaining.insert(output.clone()) {
             self.chain_truncated = true;
             return Ok(false);
         }
@@ -5261,18 +5340,33 @@ impl<'a> DepBuilder<'a> {
             answer = self.implicit_chain_exists(output, depth, true);
         }
         self.found_compat_rule = outer_compat;
-        self.chaining.remove(&output);
+        self.chaining.remove(output);
         answer
     }
 
+    /// Whether some chain of implicit rules could make this name, asked over
+    /// the name rather than over a symbol for it.
+    ///
+    /// Every name reached here was invented by the search — it is a
+    /// prerequisite a pattern proposed — and almost none of them is there. GNU
+    /// Make asks after such a name with `lookup_file` and `file_exists_p`
+    /// (`implicit.c`) and calls `enter_file` only once a rule has been chosen,
+    /// so the names it turns down leave nothing behind. Interning each of them
+    /// in order to ask is what made this the most expensive thing Ronin does
+    /// on a makefile with many targets: on the 4,000-rule no-op measured in
+    /// [`crate::dircache`] this one call site interned 796,199 names, 388,097
+    /// of which the table had never seen, and not one of them was there.
     fn implicit_chain_exists(
         &mut self,
-        output: Symbol,
+        output_str: &Bytes,
         depth: usize,
         compat: bool,
     ) -> Result<bool> {
-        let output_str = output.as_bytes(&self.ev.session);
-        for candidate in self.ordered_candidates(&output_str) {
+        // One buffer for every name the candidates propose, refilled per
+        // prerequisite: a name that is not there is read three times and then
+        // forgotten, so nothing is gained by giving each its own allocation.
+        let mut candidate_name = Vec::new();
+        for candidate in self.ordered_candidates(output_str) {
             let rule = candidate.rule;
             // Make's step 6a: a non-terminal match-anything rule is not allowed
             // to make an intermediate.
@@ -5280,40 +5374,58 @@ impl<'a> DepBuilder<'a> {
                 continue;
             }
             let pat = Pattern::new(candidate.pattern.as_bytes(&self.ev.session));
-            let Some(matched_at) = PatternMatch::of(&pat, &output_str) else {
+            let Some(matched_at) = PatternMatch::of(&pat, output_str) else {
                 continue;
             };
-            let inputs: Vec<Symbol> =
-                match self.expanded_pattern_inputs(&rule, candidate.order, output, &matched_at)? {
-                    Some((inputs, _)) => forget_pattern_origin(inputs),
-                    None => rule
-                        .inputs
-                        .iter()
-                        .map(|input| {
-                            let buf = matched_at.prerequisite(&input.as_bytes(&self.ev.session));
-                            self.ev.session.intern(buf)
-                        })
-                        .collect(),
-                };
+            // A second expansion reads the target's own variable scope, which
+            // is keyed by the target's name — so a candidate that has one is
+            // the case where the name being searched for does have to be a
+            // symbol. It is also the case GNU Make expands once per rule and
+            // target and remembers, so the interning is bounded by that.
+            let expanded = if rule.deferred_prerequisites.is_some() {
+                let output = self.ev.session.intern(output_str.clone());
+                self.expanded_pattern_inputs(&rule, candidate.order, output, &matched_at)?
+                    .map(|(inputs, _)| forget_pattern_origin(inputs))
+            } else {
+                None
+            };
             // The same terminal restriction, one level in. A terminal rule is
             // never offered the pass that invents its prerequisites, so it can
             // serve as a link in a chain only when what it reads is there.
             let terminal = rule.is_double_colon;
             let reachable = self.while_rule_in_use(&rule, |builder| {
-                for i in inputs {
-                    if builder.proven_impossible(i, depth + 1) {
+                for at in 0..expanded.as_ref().map_or(rule.inputs.len(), Vec::len) {
+                    candidate_name.clear();
+                    let symtab = &builder.ev.session.symtab;
+                    match &expanded {
+                        Some(inputs) => {
+                            candidate_name.extend_from_slice(symtab.name_bytes(inputs[at]));
+                        }
+                        None => matched_at.write_prerequisite(
+                            symtab.name_bytes(rule.inputs[at]),
+                            &mut candidate_name,
+                        ),
+                    }
+                    if builder.proven_impossible(&candidate_name, depth + 1) {
                         return Ok(false);
                     }
-                    if builder.exists(i) {
+                    if builder.exists_named(&candidate_name) {
                         continue;
                     }
-                    if builder.is_written_down(i) {
+                    if builder.is_written_down_named(&candidate_name) {
                         if compat {
                             continue;
                         }
                         builder.found_compat_rule = true;
                     }
-                    if terminal || !builder.intermediate_reachable(i, depth + 1, compat)? {
+                    if terminal {
+                        return Ok(false);
+                    }
+                    // Only here does the name outlive the question being asked
+                    // about it, because this is where a failure gets recorded
+                    // against it.
+                    let name = Bytes::copy_from_slice(&candidate_name);
+                    if !builder.intermediate_reachable(&name, depth + 1, compat)? {
                         return Ok(false);
                     }
                 }
@@ -5324,25 +5436,25 @@ impl<'a> DepBuilder<'a> {
             }
         }
 
-        for (stem, irule) in self.suffix_rule_candidates(&output_str) {
+        for (stem, irule) in self.suffix_rule_candidates(output_str) {
             if self.rules_in_use.contains(&Self::rule_id(&irule)) {
                 continue;
             }
-            let input = self.suffix_rule_input(&stem, &irule);
+            let input = self.suffix_rule_name(&stem, &irule);
             let reachable = self.while_rule_in_use(&irule, |builder| {
-                if builder.proven_impossible(input, depth + 1) {
+                if builder.proven_impossible(&input, depth + 1) {
                     return Ok(false);
                 }
-                if builder.exists(input) {
+                if builder.exists_named(&input) {
                     return Ok(true);
                 }
-                if builder.is_written_down(input) {
+                if builder.is_written_down_named(&input) {
                     if compat {
                         return Ok(true);
                     }
                     builder.found_compat_rule = true;
                 }
-                builder.intermediate_reachable(input, depth + 1, compat)
+                builder.intermediate_reachable(&input, depth + 1, compat)
             })?;
             if reachable {
                 return Ok(true);
@@ -5830,10 +5942,15 @@ impl<'a> DepBuilder<'a> {
             if self.rules_in_use.contains(&Self::rule_id(&irule)) {
                 continue;
             }
-            let input = self.suffix_rule_input(&stem, &irule);
-            if self.proven_impossible(input, 0) {
+            let name = self.suffix_rule_name(&stem, &irule);
+            if self.proven_impossible(&name, 0) {
                 continue;
             }
+            // Past the one question the search can answer without a symbol, so
+            // the name becomes one: what follows measures it against the
+            // target's own prerequisites and may make it a node of the graph,
+            // and both of those are done in symbols.
+            let input = self.ev.session.intern(name.clone());
             // The same "ought to exist" question the pattern candidates are
             // asked, on the path a suffix rule reaches the search by.
             let available = self.exists(input) || search.declared.contains(&input);
@@ -5844,7 +5961,7 @@ impl<'a> DepBuilder<'a> {
             }
             if !available && !taken_on_trust {
                 let reachable = self.while_rule_in_use(&irule, |builder| {
-                    Ok(pass.chaining && builder.intermediate_reachable(input, 0, pass.compat)?)
+                    Ok(pass.chaining && builder.intermediate_reachable(&name, 0, pass.compat)?)
                 })?;
                 if !reachable {
                     continue;

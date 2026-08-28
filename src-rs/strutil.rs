@@ -390,6 +390,29 @@ pub fn substitute_stem(prerequisite: &Bytes, directory: &[u8], stem: &[u8]) -> B
     ret.freeze()
 }
 
+/// The same substitution, written into a buffer the caller owns.
+///
+/// For a caller that proposes a great many names and keeps almost none of
+/// them: the implicit chain search asks after one per prerequisite of every
+/// candidate rule, so handing each of them its own allocation is the cost of
+/// the search rather than a detail of it.
+pub fn write_substituted_stem(
+    prerequisite: &[u8],
+    directory: &[u8],
+    stem: &[u8],
+    out: &mut Vec<u8>,
+) {
+    let Some(at) = memchr(b'%', prerequisite) else {
+        out.extend_from_slice(prerequisite);
+        return;
+    };
+    out.reserve(directory.len() + prerequisite.len() + stem.len());
+    out.extend_from_slice(directory);
+    out.extend_from_slice(&prerequisite[..at]);
+    out.extend_from_slice(stem);
+    out.extend_from_slice(&prerequisite[at + 1..]);
+}
+
 pub fn no_line_break(s: Cow<str>) -> Cow<str> {
     if !s.contains('\n') {
         return s;

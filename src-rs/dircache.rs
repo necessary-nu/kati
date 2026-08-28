@@ -102,11 +102,18 @@ impl DirectoryCache {
         if file.is_empty() || file == b"." || file == b".." || file.last() == Some(&b'/') {
             return false;
         }
-        match self
-            .directories
-            .entry(directory.into())
-            .or_insert_with(|| read(directory))
-        {
+        // Asked before it is filled rather than through `entry`, which wants an
+        // owned key that it throws away again whenever the directory has
+        // already been read — and every call but the first has. Now that the
+        // implicit search asks this rather than interning the name it is asking
+        // about, it asks it 900,000 times on the workload above, and the six
+        // directories those questions are in are read once each: `entry` there
+        // is 900,000 allocations to store six keys.
+        if !self.directories.contains_key(directory) {
+            let listing = read(directory);
+            self.directories.insert(directory.into(), listing);
+        }
+        match &self.directories[directory] {
             Listing::Read(entries) => !entries.contains(file),
             Listing::Nothing => true,
             Listing::Unknown => false,
