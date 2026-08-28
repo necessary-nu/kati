@@ -142,37 +142,77 @@ fn should_export(name: Symbol, var: &Var, export_all: bool, names: &impl Interne
         VarOrigin::File | VarOrigin::Override if export_all => {}
         VarOrigin::File | VarOrigin::Override => return false,
     }
-    is_exportable_name(&name.as_bytes(names))
+    // Borrowed from the interner rather than taken out of it: this reads the
+    // name and is done with it, and taking a `Bytes` out would be a pair of
+    // atomic read-modify-writes on a refcount that never went anywhere. Asked
+    // once per binding in the table, per compilation unit.
+    is_exportable_name(names.symtab().name_bytes(name))
 }
 
-/// The bindings a child's environment is computed from.
+/// The bindings a child's environment is built from, already reduced to the
+/// ones that reach it.
+///
+/// Split in two by whether there is a target set in front of the globals,
+/// because only one of the two halves has anything to resolve. With a target
+/// set, a binding can shadow a global and a global can lend a shadowing
+/// binding its export attribute, so the whole table has to be walked into a
+/// map first — [`resolved_bindings`]. With none, nothing shadows and nothing
+/// is lent, so the answer is just the globals that export, and building that
+/// map would be filling it with every variable in the table to throw all but
+/// a handful of them away.
+///
+/// The unscoped half is the one a compilation unit's own environment takes,
+/// and a recursive tree takes it once per unit on the one thread every unit
+/// passes through. Filtering where the table is walked is the same answer
+/// rather than a cheaper approximation of it: the caller sorts by name before
+/// it reads any of this, so the order a binding was reached in was never
+/// observable, and no two symbols share a name to sort under.
+fn exportable_bindings(
+    ev: &Evaluator,
+    scope: Option<&Vars>,
+    kind: ChildKind,
+    export_all: bool,
+) -> Vec<(Symbol, Var)> {
+    let Some(scope) = scope else {
+        // With no target scope the global set is itself the innermost one,
+        // which is why a `private` global reaches a read-time `$(shell)` and
+        // reaches no recipe at all — a recipe always has a set of its own in
+        // front of it.
+        let global_is_local = kind == ChildKind::Expansion;
+        return ev.session.globals.matching_named(|name, var| {
+            (global_is_local || !var.read().is_private)
+                && should_export(name, var, export_all, &ev.session)
+        });
+    };
+    resolved_bindings(ev, scope)
+        .into_iter()
+        .filter(|(name, var)| should_export(*name, var, export_all, &ev.session))
+        .collect()
+}
+
+/// The bindings a child's environment is computed from, where a target set
+/// stands in front of the global one.
 ///
 /// GNU Make walks the scope chain from most specific to least and keeps the
 /// first binding it finds for each name, so a target-specific value outranks
 /// the global one. The export *attribute* travels the other way when the
 /// specific binding has none of its own: `all: V = local` beside a global
 /// `export V` is exported, because the target-specific assignment said nothing
-/// about exporting and the global binding did.
-fn resolved_bindings(
-    ev: &Evaluator,
-    scope: Option<&Vars>,
-    kind: ChildKind,
-) -> HashMap<Symbol, Var> {
+/// about exporting and the global binding did. That second rule is why every
+/// global is visited here and not only the ones that export: a global nobody
+/// exports still lends its `unexport` to the binding in front of it.
+fn resolved_bindings(ev: &Evaluator, scope: &Vars) -> HashMap<Symbol, Var> {
     let mut resolved: HashMap<Symbol, Var> = HashMap::new();
-    if let Some(scope) = scope {
-        for (name, var) in scope.0.lock().iter() {
-            resolved.insert(*name, var.clone());
-        }
+    for (name, var) in scope.0.lock().iter() {
+        resolved.insert(*name, var.clone());
     }
-    // With no target scope the global set is itself the innermost one, which
-    // is why a `private` global reaches a read-time `$(shell)` and reaches no
-    // recipe at all — a recipe always has a set of its own in front of it.
-    let global_is_local = scope.is_none() && kind == ChildKind::Expansion;
     for (name, var) in ev.session.globals.matching(|_| true) {
         // A `private` binding is invisible from every set but its own — not
         // merely unexported. It lends nothing, so a target-specific binding
-        // beside it is left to answer for itself.
-        if !global_is_local && var.read().is_private {
+        // beside it is left to answer for itself. A target set in front of the
+        // globals is what makes the global set the outer one, so `private`
+        // always hides here.
+        if var.read().is_private {
             continue;
         }
         match resolved.entry(name) {
@@ -260,10 +300,7 @@ fn environment(
     defer_unreadable: bool,
 ) -> Result<(Vec<EnvironmentChange>, Option<Unreadable>)> {
     let export_all = ev.session.flags.export_all_variables;
-    let mut candidates = resolved_bindings(ev, scope, kind)
-        .into_iter()
-        .filter(|(name, var)| should_export(*name, var, export_all, &ev.session))
-        .collect::<Vec<_>>();
+    let mut candidates = exportable_bindings(ev, scope, kind, export_all);
     // By name, because a map's order is not one and a recipe's environment
     // should not depend on which way the hash fell.
     candidates.sort_by_cached_key(|(name, _)| name.as_bytes(&ev.session));
@@ -436,11 +473,20 @@ pub fn late_environment(ev: &mut Evaluator, names: &[Symbol]) -> Result<Vec<Envi
 /// see: `unexport`ed, `undefine`d, or replaced by a binding that is not
 /// exported.
 fn withdrawn_names(ev: &Evaluator, exported: &HashSet<Symbol>) -> Vec<Symbol> {
-    let inherited = ev
-        .session
-        .invocation_environment
-        .clone()
-        .unwrap_or_else(|| std::env::vars_os().collect());
+    // Borrowed where the invocation kept its own environment, and owned only
+    // where there is none to borrow. The walk reads the names and keeps
+    // nothing, so copying every name and value the process was started with in
+    // order to look at them was an allocation each, twice per compilation
+    // unit, on the one thread every unit passes through.
+    let read_from_process;
+    let inherited: &[(std::ffi::OsString, std::ffi::OsString)] =
+        match &ev.session.invocation_environment {
+            Some(inherited) => inherited,
+            None => {
+                read_from_process = std::env::vars_os().collect::<Vec<_>>();
+                &read_from_process
+            }
+        };
     let mut withdrawn = Vec::new();
     for (name, _) in inherited {
         let bytes = name.as_os_str().as_encoded_bytes();

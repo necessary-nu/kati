@@ -962,13 +962,26 @@ impl GlobalVars {
 
     /// Every binding satisfying `filter`, in symbol order.
     pub fn matching<F: Fn(&Var) -> bool>(&self, filter: F) -> Vec<(Symbol, Var)> {
+        self.matching_named(|_, var| filter(var))
+    }
+
+    /// The same, for a filter that has to know the name a binding is under.
+    ///
+    /// Two things separate this from [`Self::matching`], and both are about
+    /// what a caller has to take in order to look. The filter is asked while
+    /// the binding is still borrowed, so a `Var` — an `Arc` — is cloned only
+    /// for the bindings that are kept rather than for every binding in the
+    /// table. And it is handed the name, which is what a filter asking whether
+    /// a binding may be exported needs: without it such a caller has to take
+    /// the whole table to decide any of it.
+    pub fn matching_named<F: Fn(Symbol, &Var) -> bool>(&self, filter: F) -> Vec<(Symbol, Var)> {
         self.vars
             .iter()
             .enumerate()
             .filter_map(|(idx, var)| {
-                let var = var.clone()?;
+                let var = var.as_ref()?;
                 let sym = Symbol::from_index(idx)?;
-                filter(&var).then_some((sym, var))
+                filter(sym, var).then(|| (sym, var.clone()))
             })
             .collect()
     }
