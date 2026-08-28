@@ -913,7 +913,10 @@ pub struct Evaluator {
 
     trace: bool,
     stack: Arc<Mutex<Vec<Arc<Frame>>>>,
-    assignment_tracefile: Option<Box<dyn std::io::Write>>,
+    /// `+ Send` because an evaluator is read on whichever thread compiles its
+    /// unit, and both writers this can hold — stderr and a file — already are.
+    /// Without it this one field would make the whole evaluator thread-bound.
+    assignment_tracefile: Option<Box<dyn std::io::Write + Send>>,
     assignment_sep: String,
 
     pub avoid_io: bool,

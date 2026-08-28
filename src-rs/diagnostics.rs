@@ -46,6 +46,17 @@ impl Diagnostics {
         }
     }
 
+    /// Whether what is raised is held rather than written through.
+    ///
+    /// Worth asking before reading two Makefiles at once: a held diagnostic can
+    /// be drained into the order the Makefiles were written in, and one that
+    /// went straight to standard error as it was raised is already in whatever
+    /// order the threads happened to run.
+    #[must_use]
+    pub const fn is_collecting(&self) -> bool {
+        self.held.is_some()
+    }
+
     /// Write one rendered diagnostic, which is a whole line.
     pub fn write_line(&self, rendered: &str) {
         let Some(held) = &self.held else {
@@ -57,6 +68,29 @@ impl Diagnostics {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         held.extend_from_slice(rendered.as_bytes());
         held.push(b'\n');
+    }
+
+    /// Take everything `held` has raised and put it here, behind everything
+    /// already written.
+    ///
+    /// What a Makefile read on one thread said reaches the invocation's own
+    /// descriptor at the moment the reader is reached, not the moment it spoke,
+    /// so that reads which overlapped still land in the order their recipes
+    /// were written in.
+    pub fn absorb(&self, held: &Self) {
+        let raised = held.take();
+        if raised.is_empty() {
+            return;
+        }
+        let Some(mine) = &self.held else {
+            // Writing through: the bytes already carry their own line endings,
+            // so they go out as they are rather than through `write_line`.
+            eprint!("{}", String::from_utf8_lossy(&raised));
+            return;
+        };
+        mine.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(&raised);
     }
 
     /// Everything raised since the last drain, and nothing if this descriptor
