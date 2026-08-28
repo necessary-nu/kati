@@ -357,10 +357,6 @@ pub struct GroupedDoubleAction {
     pub is_grouped: bool,
 }
 
-/// The cycle guard cannot catch `%.a: %.b.a` against `%.b.a: %.a`, where every
-/// name visited is new. The deepest chain in GNU Make's suite is three.
-const MAX_IMPLICIT_CHAIN: usize = 6;
-
 /// The directories `library_search` looks in once the working directory and
 /// the `vpath` search have both come up empty, in the order it looks.
 ///
@@ -1498,23 +1494,35 @@ struct DepBuilder<'a> {
     /// distinguishes two target patterns of the same rule, including duplicate
     /// patterns whose expansions can have side effects.
     expanded: FastMap<(usize, Symbol), SecondExpandedPrerequisites>,
-    /// Cycle guard for the recursive implicit rule search.
-    ///
-    /// Keyed by the name rather than by a symbol for it, because the names a
-    /// chain search walks are ones it invented and asking about them must not
-    /// mint them. It holds the road currently being walked and nothing else —
-    /// one entry per level, so at most [`MAX_IMPLICIT_CHAIN`] of them at a
-    /// time — so keying it by bytes stores no name the search is not already
-    /// holding on its own stack.
-    chaining: FastSet<Bytes>,
     /// The pattern rules a search further out is already working through.
     ///
     /// GNU Make marks a rule `in_use` while it decides whether the
     /// prerequisites that rule would need can be had, and `pattern_search`
     /// passes over a marked rule: no rule may be a link in the chain that
-    /// supplies its own prerequisite. With a catalogue of rules that chain into
-    /// one another this is what bounds the search rather than merely tidying
-    /// it, and it is the "Avoiding implicit rule recursion" its `-d` reports.
+    /// supplies its own prerequisite. It is the "Avoiding implicit rule
+    /// recursion" its `-d` reports.
+    ///
+    /// This is what makes the search finite, and it is the whole of what does.
+    /// Every level of the recursion stands inside [`Self::while_rule_in_use`]
+    /// for the rule that proposed the name being asked about, and a rule
+    /// already marked is struck from the candidates before it can be matched,
+    /// so each level has strictly fewer rules to offer than the one outside it.
+    /// A road can therefore be no longer than the catalogue, however the names
+    /// along it are spelled: `%.a: %.b.a` against `%.b.a: %.a` invents a longer
+    /// name at every step and never repeats one, and it still stops on the
+    /// third level with both rules spent.
+    ///
+    /// Nothing else guards it, and a guard on the NAMES on the road was tried
+    /// and taken back out. Such a guard also makes the search finite and it
+    /// gives the same answers, but it turns round where GNU Make walks on:
+    /// against ten `%.a: %.gN.a` rules each paired with `%.gN.a: %.a`, GNU
+    /// walks back to `out.a` under both rules of each pair and takes it on
+    /// trust at the bottom, while a search that stops at the repeated name has
+    /// to prove the same answer over every other rule in the catalogue. That
+    /// makefile is 0.00 s of GNU Make 4.4.1 and was 9.91 s of this search with
+    /// the name guard in; without it, 0.01 s. GNU Make bounds `pattern_search`
+    /// by `rule->in_use` alone and counts neither names nor depth, so neither
+    /// does this.
     rules_in_use: FastSet<usize>,
     /// Whether the search just run passed over a rule for a prerequisite the
     /// Makefile writes down somewhere.
@@ -1524,7 +1532,7 @@ struct DepBuilder<'a> {
     /// clears it, and puts it back. Only a search that set it is retried taking
     /// written-down names on trust — which matters for more than fidelity,
     /// since with a catalogue of chaining rules an unconditional retry doubles
-    /// the work at every level of a search that is already six deep.
+    /// the work at every level of a search that may already be deep.
     found_compat_rule: bool,
     /// Names a chain search has already proven nothing can make.
     ///
@@ -1535,31 +1543,19 @@ struct DepBuilder<'a> {
     /// down is never marked, because the compatibility pass has to be free to
     /// take it on trust later.
     ///
-    /// Recorded against the shallowest depth the answer holds from, which GNU
-    /// Make has no need of: its search has no depth limit, so a failure is a
-    /// failure and it is remembered for the whole run. Here a name that ran out
-    /// of budget at depth five says nothing about the same name at depth one,
-    /// and the recorded depth is what tells the two apart — such an answer may
-    /// be reused only from at least as deep, where the search has no more
-    /// budget than the one that proved it.
+    /// A bare set of names, as `file_impossible` is: the search has no budget
+    /// to run out of and no name it will not walk back to, so a failure is the
+    /// rules' own answer about the name and holds however the name is reached
+    /// again.
     ///
-    /// A failure the limit never bit into is not that: the rules ran out with
-    /// budget still in hand, so a shallower search would walk the same tree and
-    /// reach the same end. That one is recorded at depth zero and holds
-    /// wherever the name comes up again, which is GNU Make's own reading of it.
-    /// [`Self::budget_spent`] is what tells the two apart, and the difference is
-    /// most of the search: on the recursive no-op the depth-keyed record had
-    /// every chain name proved twice, once on the road that reached it deepest
-    /// and again from the top.
-    ///
-    /// Keyed by the name, for the same reason [`Self::chaining`] is: the names
-    /// it records are ones the search invented, so keying it by `Symbol` meant
-    /// minting one for each. This is the one place the search does have to
+    /// Keyed by the name rather than by a symbol for it: the names it records
+    /// are ones the search invented, and asking about one of those must not
+    /// mint it. This is the one place the search does have to
     /// keep an invented name, and it is a small fraction of the names it
     /// proposes — on the 4,000-rule no-op measured in [`crate::dircache`] this
-    /// map ends with 76,019 entries where the interner it used to key this by
+    /// set ends with 76,019 entries where the interner it used to key this by
     /// ended with 489,846.
-    impossible: FastMap<Bytes, usize>,
+    impossible: FastSet<Bytes>,
     /// Names a terminal rule was handed, which no implicit search may make.
     ///
     /// GNU Make's `tried_implicit`, set where a chosen terminal rule takes a
@@ -1568,26 +1564,6 @@ struct DepBuilder<'a> {
     /// the whole claim: the rule applies to what is there, so the name it was
     /// given has to be there rather than be arrived at.
     tried_implicit: FastSet<Symbol>,
-    /// Whether the last chain search stopped because the cycle guard cut it
-    /// short rather than because the rules ran out.
-    ///
-    /// A failure reached that way is about the road taken to the name, not
-    /// about the name, so it must not be remembered at any depth.
-    chain_truncated: bool,
-    /// Whether the last chain search met [`MAX_IMPLICIT_CHAIN`] anywhere under
-    /// it.
-    ///
-    /// The limit is Ronin's and not GNU Make's — `pattern_search` recurses
-    /// until `rule->in_use` stops it and counts no depth — so a failure the
-    /// limit produced is a failure of this search rather than of the rules, and
-    /// a search with more budget left may still find a way. That is the only
-    /// case [`Self::impossible`] has to record a depth against; every other
-    /// failure is the rules' own answer and holds from anywhere. Told apart
-    /// from [`Self::chain_truncated`] because the two want opposite things: a
-    /// road cut by the cycle guard is worth nothing to any later search, while
-    /// a road cut by the limit is still worth something to a search standing no
-    /// shallower than this one.
-    budget_spent: bool,
     /// Whether each name asked about is there, asked once.
     ///
     /// The search asks the same question thousands of times over — every rule
@@ -1797,13 +1773,10 @@ impl<'a> DepBuilder<'a> {
             implicit_rule_defs: Vec::new(),
             implicit_rule_order: 0,
             expanded: FastMap::default(),
-            chaining: FastSet::default(),
             rules_in_use: FastSet::default(),
             found_compat_rule: false,
-            impossible: FastMap::default(),
+            impossible: FastSet::default(),
             tried_implicit: FastSet::default(),
-            chain_truncated: false,
-            budget_spent: false,
             exists_cache: FastMap::default(),
             directories: crate::dircache::DirectoryCache::default(),
             intermediates: FastSet::default(),
@@ -5120,7 +5093,7 @@ impl<'a> DepBuilder<'a> {
             let name = sym.as_bytes(&self.ev.session);
             // A name an earlier search proved nothing can make fails this rule
             // outright, on either pass: the answer cannot have changed.
-            if self.proven_impossible(&name, 0) {
+            if self.proven_impossible(&name) {
                 return Ok(None);
             }
             // A name this target already asks for is going to be built whatever
@@ -5149,7 +5122,7 @@ impl<'a> DepBuilder<'a> {
                 // acted on: this rule may still apply by making the name.
                 self.found_compat_rule = true;
             }
-            if !(pass.chaining && self.intermediate_reachable(&name, 0, pass.compat)?) {
+            if !(pass.chaining && self.intermediate_reachable(&name, pass.compat)?) {
                 return Ok(None);
             }
             if from_pattern && !self.mentioned.contains(&sym) {
@@ -5159,48 +5132,32 @@ impl<'a> DepBuilder<'a> {
         Ok(Some(reached))
     }
 
-    /// Whether an implicit chain could make this name, remembering a failure
-    /// that was the rules' answer rather than the search's own limits.
+    /// Whether an implicit chain could make this name, remembering the failures
+    /// so the same subtree is not walked once per road into it.
     ///
     /// GNU Make marks the name where it gives up on making it an intermediate,
     /// and every later search rejects a rule that asks for it without walking
     /// the subtree again. A name the Makefile writes down is left unmarked, so
     /// that a compatibility pass can still take it on trust.
-    fn intermediate_reachable(&mut self, name: &Bytes, depth: usize, compat: bool) -> Result<bool> {
-        if self.proven_impossible(name, depth) {
+    fn intermediate_reachable(&mut self, name: &Bytes, compat: bool) -> Result<bool> {
+        if self.proven_impossible(name) {
             return Ok(false);
         }
-        let outer_truncated = std::mem::replace(&mut self.chain_truncated, false);
-        let outer_spent = std::mem::replace(&mut self.budget_spent, false);
-        let reachable = self.can_be_made_implicitly(name, depth, compat)?;
-        let conclusive = !self.chain_truncated;
-        // Whether the chain limit cut anything short anywhere under this name.
-        // Read before the outer answer is put back, so an earlier sibling's
-        // limit is not charged to this one.
-        let spent = self.budget_spent;
-        self.chain_truncated |= outer_truncated;
-        self.budget_spent |= outer_spent;
-        if !reachable && conclusive && !self.is_written_down_named(name) {
-            // A failure the chain limit never cut short is the rules' whole
-            // answer about this name, so it holds however the name is reached
-            // again: GNU Make's `file_impossible` records exactly that and has
-            // no depth to record it against, because its search has no limit
-            // to run out of. Only where the limit did bite is the depth worth
-            // keeping, and then it means what it always meant — a search with
-            // no more budget than this one gets the same answer.
-            let at = if spent { depth } else { 0 };
-            let shallowest = self.impossible.entry(name.clone()).or_insert(at);
-            *shallowest = (*shallowest).min(at);
+        let reachable = self.can_be_made_implicitly(name, compat)?;
+        if !reachable && !self.is_written_down_named(name) {
+            // The rules had their whole say about this name, so the answer
+            // holds however the name is reached again — which is what
+            // `file_impossible` means, recorded where GNU Make records it and
+            // withheld from a written-down name for the reason GNU Make
+            // withholds it (`if (df == 0) file_impossible (d->name)`).
+            self.impossible.insert(name.clone());
         }
         Ok(reachable)
     }
 
-    /// Whether a search with no more budget than this one already failed on
-    /// this name.
-    fn proven_impossible(&self, name: &[u8], depth: usize) -> bool {
-        self.impossible
-            .get(name)
-            .is_some_and(|shallowest| *shallowest <= depth)
+    /// Whether an earlier search already failed on this name.
+    fn proven_impossible(&self, name: &[u8]) -> bool {
+        self.impossible.contains(name)
     }
 
     /// Whether the rule was written with prerequisites, however they are held.
@@ -5378,31 +5335,17 @@ impl<'a> DepBuilder<'a> {
     /// Step 6 of GNU Make's implicit rule search: whether an implicit rule could
     /// make this. Nothing is built here — build_plan descends into the
     /// prerequisite anyway, and the search one level down succeeds normally.
-    fn can_be_made_implicitly(
-        &mut self,
-        output: &Bytes,
-        depth: usize,
-        compat: bool,
-    ) -> Result<bool> {
-        if depth >= MAX_IMPLICIT_CHAIN {
-            self.budget_spent = true;
-            return Ok(false);
-        }
-        if !self.chaining.insert(output.clone()) {
-            self.chain_truncated = true;
-            return Ok(false);
-        }
+    fn can_be_made_implicitly(&mut self, output: &Bytes, compat: bool) -> Result<bool> {
         // One recursion is one whole search, so it runs a compatibility pass of
         // its own once its strict pass has failed and passed over a rule for a
         // written-down name — unless the search that reached it is already the
         // compatibility pass, which it inherits.
         let outer_compat = std::mem::replace(&mut self.found_compat_rule, false);
-        let mut answer = self.implicit_chain_exists(output, depth, compat);
+        let mut answer = self.implicit_chain_exists(output, compat);
         if matches!(answer, Ok(false)) && !compat && self.found_compat_rule {
-            answer = self.implicit_chain_exists(output, depth, true);
+            answer = self.implicit_chain_exists(output, true);
         }
         self.found_compat_rule = outer_compat;
-        self.chaining.remove(output);
         answer
     }
 
@@ -5418,12 +5361,7 @@ impl<'a> DepBuilder<'a> {
     /// on a makefile with many targets: on the 4,000-rule no-op measured in
     /// [`crate::dircache`] this one call site interned 796,199 names, 388,097
     /// of which the table had never seen, and not one of them was there.
-    fn implicit_chain_exists(
-        &mut self,
-        output_str: &Bytes,
-        depth: usize,
-        compat: bool,
-    ) -> Result<bool> {
+    fn implicit_chain_exists(&mut self, output_str: &Bytes, compat: bool) -> Result<bool> {
         // One buffer for every name the candidates propose, refilled per
         // prerequisite: a name that is not there is read three times and then
         // forgotten, so nothing is gained by giving each its own allocation.
@@ -5468,7 +5406,7 @@ impl<'a> DepBuilder<'a> {
                             &mut candidate_name,
                         ),
                     }
-                    if builder.proven_impossible(&candidate_name, depth + 1) {
+                    if builder.proven_impossible(&candidate_name) {
                         return Ok(false);
                     }
                     if builder.exists_named(&candidate_name) {
@@ -5487,7 +5425,7 @@ impl<'a> DepBuilder<'a> {
                     // about it, because this is where a failure gets recorded
                     // against it.
                     let name = Bytes::copy_from_slice(&candidate_name);
-                    if !builder.intermediate_reachable(&name, depth + 1, compat)? {
+                    if !builder.intermediate_reachable(&name, compat)? {
                         return Ok(false);
                     }
                 }
@@ -5504,7 +5442,7 @@ impl<'a> DepBuilder<'a> {
             }
             let input = self.suffix_rule_name(&stem, &irule);
             let reachable = self.while_rule_in_use(&irule, |builder| {
-                if builder.proven_impossible(&input, depth + 1) {
+                if builder.proven_impossible(&input) {
                     return Ok(false);
                 }
                 if builder.exists_named(&input) {
@@ -5516,7 +5454,7 @@ impl<'a> DepBuilder<'a> {
                     }
                     builder.found_compat_rule = true;
                 }
-                builder.intermediate_reachable(&input, depth + 1, compat)
+                builder.intermediate_reachable(&input, compat)
             })?;
             if reachable {
                 return Ok(true);
@@ -6005,7 +5943,7 @@ impl<'a> DepBuilder<'a> {
                 continue;
             }
             let name = self.suffix_rule_name(&stem, &irule);
-            if self.proven_impossible(&name, 0) {
+            if self.proven_impossible(&name) {
                 continue;
             }
             // Past the one question the search can answer without a symbol, so
@@ -6023,7 +5961,7 @@ impl<'a> DepBuilder<'a> {
             }
             if !available && !taken_on_trust {
                 let reachable = self.while_rule_in_use(&irule, |builder| {
-                    Ok(pass.chaining && builder.intermediate_reachable(&name, 0, pass.compat)?)
+                    Ok(pass.chaining && builder.intermediate_reachable(&name, pass.compat)?)
                 })?;
                 if !reachable {
                     continue;
