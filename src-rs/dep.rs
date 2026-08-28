@@ -440,7 +440,59 @@ struct ReachedPrerequisites {
     invented: Vec<Symbol>,
     /// Names the search was given rather than making them.
     found: Vec<Symbol>,
+    /// The road the search walked for the prerequisites it had to make, which
+    /// is GNU Make's `patdeps.file`. Kept beside the answer rather than acted
+    /// on, because a candidate that fails on a later prerequisite takes its
+    /// roads down with it.
+    road: ChainRoad,
 }
+
+/// The rule a chain search settled on for one name.
+///
+/// GNU Make's `int_file`. A recursive `pattern_search` does not answer whether
+/// a name could be made; it fills in a whole `struct file` for it — recipe,
+/// prerequisites and stem — and the search that wanted the name hands that
+/// file to `enter_file` (`pat->file = int_file`, then `f->deps = imf->deps`
+/// in reference/gnumake/src/implicit.c). The name is a target from then on and
+/// is never searched for a second time.
+///
+/// Answering a bare yes instead is what made a catalogue of mutually chaining
+/// rules exponential here. The road is proved under the rules the outer search
+/// has marked in use; re-deriving it from [`DepBuilder::build_plan`], where
+/// those marks are gone, opens every branch the outer search had closed.
+struct SettledChain {
+    rule: Arc<Rule>,
+    /// How the rule was reached, which is what applying it again needs.
+    by: SettledBy,
+    /// The relaxation the road was proved under. Applying the rule again has
+    /// to read its prerequisites the same way, or a name the search took on
+    /// trust is read as one it must make.
+    pass: SearchPass,
+}
+
+/// The two shapes a link can have, which are the two halves of the search.
+///
+/// GNU Make has one: `convert_to_pattern` turns every suffix rule into a
+/// pattern rule before the search runs. Ronin keeps two-suffix rules in the map
+/// they were read into, so which half a link came from decides how it is
+/// applied a second time.
+#[derive(Clone)]
+enum SettledBy {
+    /// A pattern rule: which of its target patterns matched, and where the
+    /// candidate sat, which keys the second-expansion memo.
+    Pattern { matched: Symbol, order: usize },
+    /// A suffix rule, applied whole. The stem its target suffix left is what
+    /// names the file it reads.
+    Suffix { stem: Bytes },
+}
+
+/// Every name a road settles, outermost first.
+///
+/// Flat rather than nested because installing it is the only thing done with
+/// it, and the order is the whole of what installing needs: a name reached
+/// twice keeps the rule the outermost search chose for it, and a road that
+/// walks back to a name it has already passed stops there.
+type ChainRoad = Vec<(Bytes, SettledChain)>;
 
 /// What a second expansion made of a rule's prerequisites: the ordinary list
 /// and the order-only one, each name paired with whether the raw word it came
@@ -1556,6 +1608,18 @@ struct DepBuilder<'a> {
     /// set ends with 76,019 entries where the interner it used to key this by
     /// ended with 489,846.
     impossible: FastSet<Bytes>,
+    /// The rule a chain search already settled on for each name it had to
+    /// make, which [`Self::build_plan`] applies instead of searching again.
+    ///
+    /// GNU Make's file database does this job: a materialised intermediate is
+    /// `enter_file`d carrying the recipe and prerequisites the recursive
+    /// `pattern_search` found for it, so `update_file` reaching that name
+    /// finds a target with a recipe and asks for no implicit rule. Every name
+    /// on a chosen road is entered, not only the ones the Makefile never
+    /// mentions, which is why a later search asking after such a name is
+    /// answered by `df->is_target` — "ought to exist" — rather than by walking
+    /// the subtree again.
+    settled: FastMap<Symbol, SettledChain>,
     /// Names a terminal rule was handed, which no implicit search may make.
     ///
     /// GNU Make's `tried_implicit`, set where a chosen terminal rule takes a
@@ -1776,6 +1840,7 @@ impl<'a> DepBuilder<'a> {
             rules_in_use: FastSet::default(),
             found_compat_rule: false,
             impossible: FastSet::default(),
+            settled: FastMap::default(),
             tried_implicit: FastSet::default(),
             exists_cache: FastMap::default(),
             directories: crate::dircache::DirectoryCache::default(),
@@ -5122,9 +5187,14 @@ impl<'a> DepBuilder<'a> {
                 // acted on: this rule may still apply by making the name.
                 self.found_compat_rule = true;
             }
-            if !(pass.chaining && self.intermediate_reachable(&name, pass.compat)?) {
+            let found = match pass.chaining {
+                true => self.intermediate_reachable(&name, pass.compat)?,
+                false => None,
+            };
+            let Some(road) = found else {
                 return Ok(None);
-            }
+            };
+            reached.road.extend(road);
             if from_pattern && !self.mentioned.contains(&sym) {
                 reached.invented.push(sym);
             }
@@ -5132,19 +5202,27 @@ impl<'a> DepBuilder<'a> {
         Ok(Some(reached))
     }
 
-    /// Whether an implicit chain could make this name, remembering the failures
-    /// so the same subtree is not walked once per road into it.
+    /// The chain that could make this name, remembering both answers so the
+    /// same subtree is not walked once per road into it.
     ///
     /// GNU Make marks the name where it gives up on making it an intermediate,
     /// and every later search rejects a rule that asks for it without walking
     /// the subtree again. A name the Makefile writes down is left unmarked, so
     /// that a compatibility pass can still take it on trust.
-    fn intermediate_reachable(&mut self, name: &Bytes, compat: bool) -> Result<bool> {
+    ///
+    /// A name a chosen road already settled is answered as quickly and for the
+    /// same reason: GNU Make entered it in the file database with the recipe
+    /// the road found, so a later search reads `df->is_target` and stops. The
+    /// road it settled on stands; this one has nothing to add to it.
+    fn intermediate_reachable(&mut self, name: &Bytes, compat: bool) -> Result<Option<ChainRoad>> {
         if self.proven_impossible(name) {
-            return Ok(false);
+            return Ok(None);
         }
-        let reachable = self.can_be_made_implicitly(name, compat)?;
-        if !reachable && !self.is_written_down_named(name) {
+        if self.already_settled(name) {
+            return Ok(Some(ChainRoad::new()));
+        }
+        let reached = self.can_be_made_implicitly(name, compat)?;
+        if reached.is_none() && !self.is_written_down_named(name) {
             // The rules had their whole say about this name, so the answer
             // holds however the name is reached again — which is what
             // `file_impossible` means, recorded where GNU Make records it and
@@ -5152,7 +5230,33 @@ impl<'a> DepBuilder<'a> {
             // withholds it (`if (df == 0) file_impossible (d->name)`).
             self.impossible.insert(name.clone());
         }
-        Ok(reachable)
+        Ok(reached)
+    }
+
+    /// Whether a road already chosen settled this name, asked without interning
+    /// it: the map is keyed by symbol, so a name that has never been interned
+    /// is in no road and the lookup coming back empty is the whole answer.
+    fn already_settled(&self, name: &[u8]) -> bool {
+        self.ev
+            .session
+            .symtab
+            .peek_symbol(name)
+            .is_some_and(|name| self.settled.contains_key(&name))
+    }
+
+    /// Put a road into the file database, as `pattern_search` does once the
+    /// rule that wanted the name is the rule it chose.
+    ///
+    /// Every name on the road is entered, down to the bottom, because GNU Make
+    /// enters each level's intermediates as that level succeeds and hands its
+    /// own name up to the level that asked. A name already settled keeps what
+    /// settled it, which is what makes the road outermost-first: the outer
+    /// search is the one that committed to it.
+    fn install_chain(&mut self, road: ChainRoad) {
+        for (name, settled) in road {
+            let name = self.ev.session.intern(name);
+            self.settled.entry(name).or_insert(settled);
+        }
     }
 
     /// Whether an earlier search already failed on this name.
@@ -5248,6 +5352,12 @@ impl<'a> DepBuilder<'a> {
             return Ok(None);
         };
         self.intermediates.extend(reached.invented);
+        // The rule is chosen, so the roads its prerequisites were proved by are
+        // the ones that stand. This is `pattern_search` walking its `deplist`
+        // once a rule applies and entering every `pat->file` in the database
+        // with the recipe and prerequisites the recursion found for it: those
+        // names are targets from here on and are not searched for again.
+        self.install_chain(reached.road);
         // A terminal rule reads what is already there, so a prerequisite it was
         // given rather than made is one no implicit search may go on to make.
         // GNU Make stamps it `tried_implicit` (`implicit.c`), which is what
@@ -5332,25 +5442,38 @@ impl<'a> DepBuilder<'a> {
         Some(found)
     }
 
-    /// Step 6 of GNU Make's implicit rule search: whether an implicit rule could
-    /// make this. Nothing is built here — build_plan descends into the
-    /// prerequisite anyway, and the search one level down succeeds normally.
-    fn can_be_made_implicitly(&mut self, output: &Bytes, compat: bool) -> Result<bool> {
+    /// Step 6 of GNU Make's implicit rule search, over a name the search
+    /// invented: which chain of rules would make it.
+    fn can_be_made_implicitly(
+        &mut self,
+        output: &Bytes,
+        compat: bool,
+    ) -> Result<Option<ChainRoad>> {
         // One recursion is one whole search, so it runs a compatibility pass of
         // its own once its strict pass has failed and passed over a rule for a
         // written-down name — unless the search that reached it is already the
         // compatibility pass, which it inherits.
         let outer_compat = std::mem::replace(&mut self.found_compat_rule, false);
-        let mut answer = self.implicit_chain_exists(output, compat);
-        if matches!(answer, Ok(false)) && !compat && self.found_compat_rule {
-            answer = self.implicit_chain_exists(output, true);
+        let mut answer = self.implicit_chain_search(output, compat);
+        if matches!(answer, Ok(None)) && !compat && self.found_compat_rule {
+            answer = self.implicit_chain_search(output, true);
         }
         self.found_compat_rule = outer_compat;
         answer
     }
 
-    /// Whether some chain of implicit rules could make this name, asked over
-    /// the name rather than over a symbol for it.
+    /// The chain of implicit rules that would make this name, asked over the
+    /// name rather than over a symbol for it.
+    ///
+    /// This is `pattern_search` recursing (`implicit.c`), and it settles on a
+    /// road rather than reporting that one exists. The road is what the caller
+    /// installs if the rule that wanted the name is the rule it chooses, so
+    /// which road this picks is an answer and not an implementation detail: the
+    /// two intermediate passes below are what makes it GNU Make's road. A
+    /// single pass that let each candidate invent as it was reached would take
+    /// `%.b: %.d` over a `%.b: %.c` written under it with `out.c` on disk,
+    /// where GNU Make offers the whole list the chance to be satisfied by what
+    /// is already there before any of it may invent.
     ///
     /// Every name reached here was invented by the search — it is a
     /// prerequisite a pattern proposed — and almost none of them is there. GNU
@@ -5361,106 +5484,162 @@ impl<'a> DepBuilder<'a> {
     /// on a makefile with many targets: on the 4,000-rule no-op measured in
     /// [`crate::dircache`] this one call site interned 796,199 names, 388,097
     /// of which the table had never seen, and not one of them was there.
-    fn implicit_chain_exists(&mut self, output_str: &Bytes, compat: bool) -> Result<bool> {
+    fn implicit_chain_search(
+        &mut self,
+        output_str: &Bytes,
+        compat: bool,
+    ) -> Result<Option<ChainRoad>> {
+        // Both lists are read once and offered to both passes, as
+        // `pattern_search` fills `tryrules` once ahead of its own pass loop.
+        // What each pattern's `%` stood for is read once with them: it is
+        // settled by the candidate and the name, and neither moves between the
+        // passes. So is step 6a, which is why a rule it rules out is not in the
+        // list at all.
+        let candidates: Vec<(ImplicitCandidate, PatternMatch)> = self
+            .ordered_candidates(output_str)
+            .into_iter()
+            // Make's step 6a: a non-terminal match-anything rule is not allowed
+            // to make an intermediate.
+            .filter(|candidate| {
+                candidate.rule.is_double_colon || !self.matches_anything(&candidate.rule)
+            })
+            .filter_map(|candidate| {
+                let pat = Pattern::new(candidate.pattern.as_bytes(&self.ev.session));
+                PatternMatch::of(&pat, output_str).map(|matched_at| (candidate, matched_at))
+            })
+            .collect();
+        let suffix_candidates = self.suffix_rule_candidates(output_str);
         // One buffer for every name the candidates propose, refilled per
         // prerequisite: a name that is not there is read three times and then
         // forgotten, so nothing is gained by giving each its own allocation.
         let mut candidate_name = Vec::new();
-        for candidate in self.ordered_candidates(output_str) {
-            let rule = candidate.rule;
-            // Make's step 6a: a non-terminal match-anything rule is not allowed
-            // to make an intermediate.
-            if !rule.is_double_colon && self.matches_anything(&rule) {
-                continue;
-            }
-            let pat = Pattern::new(candidate.pattern.as_bytes(&self.ev.session));
-            let Some(matched_at) = PatternMatch::of(&pat, output_str) else {
-                continue;
-            };
-            // A second expansion reads the target's own variable scope, which
-            // is keyed by the target's name — so a candidate that has one is
-            // the case where the name being searched for does have to be a
-            // symbol. It is also the case GNU Make expands once per rule and
-            // target and remembers, so the interning is bounded by that.
-            let expanded = if rule.deferred_prerequisites.is_some() {
-                let output = self.ev.session.intern(output_str.clone());
-                self.expanded_pattern_inputs(&rule, candidate.order, output, &matched_at)?
-                    .map(|(inputs, _)| forget_pattern_origin(inputs))
-            } else {
-                None
-            };
-            // The same terminal restriction, one level in. A terminal rule is
-            // never offered the pass that invents its prerequisites, so it can
-            // serve as a link in a chain only when what it reads is there.
-            let terminal = rule.is_double_colon;
-            let reachable = self.while_rule_in_use(&rule, |builder| {
-                for at in 0..expanded.as_ref().map_or(rule.inputs.len(), Vec::len) {
-                    candidate_name.clear();
-                    let symtab = &builder.ev.session.symtab;
-                    match &expanded {
-                        Some(inputs) => {
-                            candidate_name.extend_from_slice(symtab.name_bytes(inputs[at]));
+        // "Try each rule once without intermediate files, then once with
+        // them." Every candidate is offered the list before any of them may
+        // invent what it needs, so a rule satisfied by what is on disk beats
+        // one written above it that would have to make its prerequisites.
+        for chaining in [false, true] {
+            for (candidate, matched_at) in &candidates {
+                let rule = &candidate.rule;
+                // A terminal rule is never offered the pass that invents its
+                // prerequisites, so it can serve as a link in a chain only when
+                // what it reads is there.
+                if chaining && rule.is_double_colon {
+                    continue;
+                }
+                // A second expansion reads the target's own variable scope,
+                // which is keyed by the target's name — so a candidate that has
+                // one is the case where the name being searched for does have
+                // to be a symbol. It is also the case GNU Make expands once per
+                // rule and target and remembers, so the interning is bounded by
+                // that.
+                let expanded = if rule.deferred_prerequisites.is_some() {
+                    let output = self.ev.session.intern(output_str.clone());
+                    self.expanded_pattern_inputs(rule, candidate.order, output, matched_at)?
+                        .map(|(inputs, _)| forget_pattern_origin(inputs))
+                } else {
+                    None
+                };
+                let below = self.while_rule_in_use(rule, |builder| {
+                    let mut below = ChainRoad::new();
+                    for at in 0..expanded.as_ref().map_or(rule.inputs.len(), Vec::len) {
+                        candidate_name.clear();
+                        let symtab = &builder.ev.session.symtab;
+                        match &expanded {
+                            Some(inputs) => {
+                                candidate_name.extend_from_slice(symtab.name_bytes(inputs[at]));
+                            }
+                            None => matched_at.write_prerequisite(
+                                symtab.name_bytes(rule.inputs[at]),
+                                &mut candidate_name,
+                            ),
                         }
-                        None => matched_at.write_prerequisite(
-                            symtab.name_bytes(rule.inputs[at]),
-                            &mut candidate_name,
-                        ),
-                    }
-                    if builder.proven_impossible(&candidate_name) {
-                        return Ok(false);
-                    }
-                    if builder.exists_named(&candidate_name) {
-                        continue;
-                    }
-                    if builder.is_written_down_named(&candidate_name) {
-                        if compat {
+                        if builder.proven_impossible(&candidate_name) {
+                            return Ok(None);
+                        }
+                        if builder.exists_named(&candidate_name) {
                             continue;
+                        }
+                        if builder.is_written_down_named(&candidate_name) {
+                            if compat {
+                                continue;
+                            }
+                            builder.found_compat_rule = true;
+                        }
+                        if !chaining {
+                            return Ok(None);
+                        }
+                        // Only here does the name outlive the question being
+                        // asked about it, because this is where an answer gets
+                        // recorded against it.
+                        let name = Bytes::copy_from_slice(&candidate_name);
+                        let Some(road) = builder.intermediate_reachable(&name, compat)? else {
+                            return Ok(None);
+                        };
+                        below.extend(road);
+                    }
+                    Ok(Some(below))
+                })?;
+                if let Some(below) = below {
+                    return Ok(Some(Self::road_through(
+                        output_str,
+                        SettledChain {
+                            rule: rule.clone(),
+                            by: SettledBy::Pattern {
+                                matched: candidate.pattern,
+                                order: candidate.order,
+                            },
+                            pass: SearchPass { chaining, compat },
+                        },
+                        below,
+                    )));
+                }
+            }
+
+            for (stem, irule) in &suffix_candidates {
+                if self.rules_in_use.contains(&Self::rule_id(irule)) {
+                    continue;
+                }
+                let input = self.suffix_rule_name(stem, irule);
+                let below = self.while_rule_in_use(irule, |builder| {
+                    if builder.proven_impossible(&input) {
+                        return Ok(None);
+                    }
+                    if builder.exists_named(&input) {
+                        return Ok(Some(ChainRoad::new()));
+                    }
+                    if builder.is_written_down_named(&input) {
+                        if compat {
+                            return Ok(Some(ChainRoad::new()));
                         }
                         builder.found_compat_rule = true;
                     }
-                    if terminal {
-                        return Ok(false);
+                    if !chaining {
+                        return Ok(None);
                     }
-                    // Only here does the name outlive the question being asked
-                    // about it, because this is where a failure gets recorded
-                    // against it.
-                    let name = Bytes::copy_from_slice(&candidate_name);
-                    if !builder.intermediate_reachable(&name, compat)? {
-                        return Ok(false);
-                    }
+                    builder.intermediate_reachable(&input, compat)
+                })?;
+                if let Some(below) = below {
+                    return Ok(Some(Self::road_through(
+                        output_str,
+                        SettledChain {
+                            rule: irule.clone(),
+                            by: SettledBy::Suffix { stem: stem.clone() },
+                            pass: SearchPass { chaining, compat },
+                        },
+                        below,
+                    )));
                 }
-                Ok(true)
-            })?;
-            if reachable {
-                return Ok(true);
             }
         }
+        Ok(None)
+    }
 
-        for (stem, irule) in self.suffix_rule_candidates(output_str) {
-            if self.rules_in_use.contains(&Self::rule_id(&irule)) {
-                continue;
-            }
-            let input = self.suffix_rule_name(&stem, &irule);
-            let reachable = self.while_rule_in_use(&irule, |builder| {
-                if builder.proven_impossible(&input) {
-                    return Ok(false);
-                }
-                if builder.exists_named(&input) {
-                    return Ok(true);
-                }
-                if builder.is_written_down_named(&input) {
-                    if compat {
-                        return Ok(true);
-                    }
-                    builder.found_compat_rule = true;
-                }
-                builder.intermediate_reachable(&input, compat)
-            })?;
-            if reachable {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+    /// The road for a name, in front of the roads for everything under it.
+    fn road_through(name: &Bytes, settled: SettledChain, below: ChainRoad) -> ChainRoad {
+        let mut road = Vec::with_capacity(below.len() + 1);
+        road.push((name.clone(), settled));
+        road.extend(below);
+        road
     }
 
     fn matches_anything(&self, rule: &Rule) -> bool {
@@ -5552,6 +5731,95 @@ impl<'a> DepBuilder<'a> {
         Ok(picked)
     }
 
+    /// The rule an outer search already settled on for this name, applied.
+    ///
+    /// GNU Make does not reach a search at all here: the recursion that proved
+    /// the name entered it in the file database carrying the recipe and the
+    /// prerequisites it found, so `update_file` finds a target that already has
+    /// a rule. Applying the settled rule is how that is said with a builder
+    /// that keeps its graph in one pass — and it has to be applied rather than
+    /// merely remembered, because the names its prerequisites stand for are
+    /// what the node is built from.
+    ///
+    /// Searching again instead is not only work: the road was proved under the
+    /// rules the outer search had marked in use, and here those marks are gone.
+    /// A second search may take a road the first had closed, and it walks the
+    /// branches the first never opened — which on a catalogue of mutually
+    /// chaining rules is the difference between linear and exponential.
+    fn settled_rule_for(
+        &mut self,
+        output: Symbol,
+        n: &Arc<Mutex<DepNode>>,
+        rule_merger: &Option<Arc<Mutex<RuleMerger>>>,
+        patterns: &[Arc<Vars>],
+        vars: &Option<Arc<Vars>>,
+    ) -> Result<Option<PickedRuleInfo>> {
+        let Some(settled) = self.settled.get(&output) else {
+            return Ok(None);
+        };
+        let rule = settled.rule.clone();
+        let pass = settled.pass;
+        let by = settled.by.clone();
+        let whole_name = output.as_bytes(&self.ev.session);
+        let (recorded, recorded_order_only) = self.recorded_prerequisites(output);
+        let declared: Vec<Symbol> = recorded.into_iter().chain(recorded_order_only).collect();
+        let (matched, order) = match by {
+            SettledBy::Pattern { matched, order } => (matched, order),
+            SettledBy::Suffix { stem } => {
+                // A suffix rule is applied whole, as [`Self::pick_pattern_rule`]
+                // applies one. The name it reads has to be measured against this
+                // target's own prerequisites again and, when the road made it up,
+                // recorded as invented — the file the road settles on being one
+                // of GNU Make's intermediates is what excuses its absence, and
+                // an intermediate whose flag is missing is a file the build
+                // makes where GNU Make leaves it alone.
+                let name = self.suffix_rule_name(&stem, &rule);
+                let input = self.ev.session.intern(name);
+                let available = self.exists(input) || declared.contains(&input);
+                let on_trust = !available && pass.compat && self.is_written_down(input);
+                if !available && !on_trust && !self.mentioned.contains(&input) {
+                    self.intermediates.insert(input);
+                }
+                // It keeps `.c.o` as its written name, so variables set against
+                // that name still belong to what it makes.
+                let mut vars = vars.clone();
+                if rule_merger.is_none() && vars.is_some() {
+                    assert!(rule.outputs.len() == 1);
+                    vars = self.merge_implicit_rule_vars(rule.outputs[0], vars);
+                }
+                return Ok(Some(PickedRuleInfo {
+                    merger: rule_merger.clone(),
+                    pattern_rule: Some(rule),
+                    vars: Self::scopes_for(patterns, self.merged_scopes(output, vars)),
+                }));
+            }
+        };
+        // The pass the road was proved under and no other: a prerequisite the
+        // road took on trust has to be read that way again, or applying the
+        // rule turns it into a name this node must make.
+        let picked = self.can_pick_implicit_rule(
+            &rule,
+            matched,
+            order,
+            ImplicitSearch {
+                output,
+                name: &whole_name,
+                declared: &declared,
+                pass,
+            },
+            n.clone(),
+        )?;
+        // A road that will not apply is one this builder cannot replay — a
+        // wildcard in a prerequisite that stands for different names now, and
+        // little else. Falling back to the search leaves such a target exactly
+        // where it was before the road was kept at all.
+        Ok(picked.map(|pattern_rule| PickedRuleInfo {
+            merger: rule_merger.clone(),
+            pattern_rule: Some(pattern_rule),
+            vars: Self::scopes_for(patterns, self.merged_scopes(output, vars.clone())),
+        }))
+    }
+
     fn pick_rule(
         &mut self,
         output: Symbol,
@@ -5584,7 +5852,10 @@ impl<'a> DepBuilder<'a> {
         // Nor for a name a terminal rule has already been given, which is the
         // other half of the same condition: `!file->tried_implicit`.
         if !self.phony.contains(&output) && !self.tried_implicit.contains(&output) {
-            let picked = self.implicit_rule_for(output, n, &rule_merger, &patterns, &vars)?;
+            let picked = match self.settled_rule_for(output, n, &rule_merger, &patterns, &vars)? {
+                Some(picked) => Some(picked),
+                None => self.implicit_rule_for(output, n, &rule_merger, &patterns, &vars)?,
+            };
             if picked.is_some() {
                 return Ok(picked);
             }
@@ -5960,12 +6231,14 @@ impl<'a> DepBuilder<'a> {
                 self.found_compat_rule |= !pass.compat;
             }
             if !available && !taken_on_trust {
-                let reachable = self.while_rule_in_use(&irule, |builder| {
-                    Ok(pass.chaining && builder.intermediate_reachable(&name, pass.compat)?)
+                let road = self.while_rule_in_use(&irule, |builder| match pass.chaining {
+                    true => builder.intermediate_reachable(&name, pass.compat),
+                    false => Ok(None),
                 })?;
-                if !reachable {
+                let Some(road) = road else {
                     continue;
-                }
+                };
+                self.install_chain(road);
                 if !self.mentioned.contains(&input) {
                     self.intermediates.insert(input);
                 }
