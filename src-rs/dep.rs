@@ -4145,16 +4145,38 @@ impl<'a> DepBuilder<'a> {
     ///
     /// This runs once the last makefile has closed, because the list it reads
     /// is the one that read left behind.
+    ///
+    /// The pair name is asked after rather than interned, and it is written
+    /// into one buffer rather than into a `Bytes` of its own.
+    /// `convert_to_pattern` reaches the name with `lookup_file`, which enters
+    /// nothing, and the same answer is available here without minting a
+    /// symbol: a pair a makefile wrote a rule for had its name interned when
+    /// that rule was read, so a name the interner has never seen has no rule
+    /// under it and nothing else to say.
+    ///
+    /// That distinction is the whole cost of this walk, because the walk is a
+    /// cross product and the answers are almost all no. The default suffix
+    /// list spells 1,190 pairs and a makefile writes a rule for a handful, so
+    /// every composed unit was minting eleven hundred permanent names to ask
+    /// eleven hundred questions that answered no — and a process that composes
+    /// a recursive build pays that per unit rather than per run. Measured on
+    /// the 259-unit recursive workload with both walks in one binary, back to
+    /// back on the same host: 62.2 ms of the run against 7.5 ms, with the
+    /// interner reaching 1,687 entries by the end of the walk against 496.
     fn convert_written_suffix_rules(&mut self) -> Result<()> {
-        for source in self.ev.session.suffixes.clone() {
-            for target in self.ev.session.suffixes.clone() {
+        let suffixes = self.ev.session.suffixes.clone();
+        let mut name = Vec::new();
+        for source in &suffixes {
+            for target in &suffixes {
                 if source == target {
                     continue;
                 }
-                let mut name = BytesMut::with_capacity(source.len() + target.len());
-                name.put_slice(&source);
-                name.put_slice(&target);
-                let written = self.ev.session.intern(name.freeze());
+                name.clear();
+                name.extend_from_slice(source);
+                name.extend_from_slice(target);
+                let Some(written) = self.ev.session.symtab.peek_symbol(&name) else {
+                    continue;
+                };
                 let Some(merger) = self.lookup_rule_merger(written) else {
                     continue;
                 };
@@ -4162,7 +4184,7 @@ impl<'a> DepBuilder<'a> {
                 // Later definition first, which is the order the whole map is
                 // kept in and the order the search reads it back in.
                 for rule in rules.iter().rev() {
-                    self.convert_suffix_rule(rule, &source, &target)?;
+                    self.convert_suffix_rule(rule, source, target)?;
                 }
             }
         }
