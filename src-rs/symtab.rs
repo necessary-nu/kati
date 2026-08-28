@@ -170,6 +170,29 @@ pub struct Symtab {
     index: FastMap<Bytes, Symbol>,
 }
 
+/// Every byte in order, so that the one-byte name for byte `b` can be a slice
+/// of this rather than a `Vec` of its own. See [`Symtab::new`].
+///
+/// A `static` rather than a `const` because `Bytes::from_static` wants a
+/// `&'static [u8]`, and a `const` array read at a runtime index yields a
+/// temporary rather than a borrow of one place.
+// no-globals-gate: 256 constant bytes, read-only, holding no evaluation state
+static SINGLE_BYTE_NAMES: [u8; 256] = {
+    let mut names = [0u8; 256];
+    let mut byte = 0usize;
+    while byte < 256 {
+        // `as` rather than a fallible conversion: the loop bound is the width
+        // of the type being written, and a `const` block has no `?` to take a
+        // conversion's answer with.
+        #[expect(clippy::cast_possible_truncation, reason = "byte < 256 by the loop")]
+        {
+            names[byte] = byte as u8;
+        }
+        byte += 1;
+    }
+    names
+};
+
 impl Default for Symtab {
     fn default() -> Self {
         Self::new()
@@ -181,6 +204,19 @@ impl Symtab {
     /// at the slot equal to their byte so that `intern` can answer for them
     /// without consulting the map, followed by the [`WELL_KNOWN`] names at
     /// fixed slots.
+    ///
+    /// The single-byte names are not in the map, and that is what the sentence
+    /// above buys rather than an oversight: both readers of the map —
+    /// [`Self::intern`] and [`Self::peek_symbol`] — answer a one-byte name from
+    /// its byte and return before they reach it, so an entry for one could
+    /// never be looked up. Two hundred and fifty-five unreachable entries were
+    /// being hashed into every interner a session built, and a session is built
+    /// per compilation unit.
+    ///
+    /// They are also carved out of one static byte table rather than allocated.
+    /// A `Bytes` over a static is not refcounted at all, so beyond the two
+    /// allocations per name this saves at construction, holding one of these
+    /// names afterwards costs no atomic either.
     pub fn new() -> Self {
         let mut symtab = Self {
             symbols: vec![Bytes::new()],
@@ -188,10 +224,10 @@ impl Symtab {
         };
         for i in 1u8..=255 {
             assert!(symtab.symbols.len() == i as usize);
-            let name = Bytes::from(vec![i]);
-            let sym = Symbol(NonZeroUsize::new(i.into()).unwrap());
-            symtab.symbols.push(name.clone());
-            symtab.index.insert(name, sym);
+            let at = usize::from(i);
+            symtab
+                .symbols
+                .push(Bytes::from_static(&SINGLE_BYTE_NAMES[at..=at]));
         }
         for (i, name) in WELL_KNOWN.iter().enumerate() {
             let sym = symtab.intern(*name);

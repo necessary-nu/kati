@@ -202,9 +202,9 @@ fn test_no_mutable_process_globals() {
     }
 }
 
-/// The two statics that are permitted are the two that are meant to be, and
-/// each says why. A new exemption has to be added here as well as in the
-/// source, so it cannot be granted quietly.
+/// The statics that are permitted are the ones that are meant to be, and each
+/// says why. A new exemption has to be added here as well as in the source, so
+/// it cannot be granted quietly.
 // [spec:ronin:req:make.no-ambient-state/test]
 #[test]
 fn test_permitted_statics_are_the_expected_ones() {
@@ -215,7 +215,7 @@ fn test_permitted_statics_are_the_expected_ones() {
     let names: Vec<&str> = permitted.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
         names,
-        vec!["FUNC_INFO_MAP", "GLOBAL"],
+        vec!["FUNC_INFO_MAP", "GLOBAL", "SINGLE_BYTE_NAMES"],
         "the set of permitted statics changed: {permitted:?}"
     );
     for (_, reason) in &permitted {
