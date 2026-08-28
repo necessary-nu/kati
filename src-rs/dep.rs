@@ -1535,12 +1535,22 @@ struct DepBuilder<'a> {
     /// down is never marked, because the compatibility pass has to be free to
     /// take it on trust later.
     ///
-    /// Recorded against the shallowest depth the failure was reached at, which
-    /// GNU Make has no need of: its search has no depth limit, so a failure is
-    /// a failure. Here a name that ran out of budget at depth five says nothing
-    /// about the same name at depth one, and the recorded depth is what tells
-    /// the two apart — a later search may reuse the answer only from at least
-    /// as deep, where it has no more budget than the search that proved it.
+    /// Recorded against the shallowest depth the answer holds from, which GNU
+    /// Make has no need of: its search has no depth limit, so a failure is a
+    /// failure and it is remembered for the whole run. Here a name that ran out
+    /// of budget at depth five says nothing about the same name at depth one,
+    /// and the recorded depth is what tells the two apart — such an answer may
+    /// be reused only from at least as deep, where the search has no more
+    /// budget than the one that proved it.
+    ///
+    /// A failure the limit never bit into is not that: the rules ran out with
+    /// budget still in hand, so a shallower search would walk the same tree and
+    /// reach the same end. That one is recorded at depth zero and holds
+    /// wherever the name comes up again, which is GNU Make's own reading of it.
+    /// [`Self::budget_spent`] is what tells the two apart, and the difference is
+    /// most of the search: on the recursive no-op the depth-keyed record had
+    /// every chain name proved twice, once on the road that reached it deepest
+    /// and again from the top.
     ///
     /// Keyed by the name, for the same reason [`Self::chaining`] is: the names
     /// it records are ones the search invented, so keying it by `Symbol` meant
@@ -1564,6 +1574,20 @@ struct DepBuilder<'a> {
     /// A failure reached that way is about the road taken to the name, not
     /// about the name, so it must not be remembered at any depth.
     chain_truncated: bool,
+    /// Whether the last chain search met [`MAX_IMPLICIT_CHAIN`] anywhere under
+    /// it.
+    ///
+    /// The limit is Ronin's and not GNU Make's — `pattern_search` recurses
+    /// until `rule->in_use` stops it and counts no depth — so a failure the
+    /// limit produced is a failure of this search rather than of the rules, and
+    /// a search with more budget left may still find a way. That is the only
+    /// case [`Self::impossible`] has to record a depth against; every other
+    /// failure is the rules' own answer and holds from anywhere. Told apart
+    /// from [`Self::chain_truncated`] because the two want opposite things: a
+    /// road cut by the cycle guard is worth nothing to any later search, while
+    /// a road cut by the limit is still worth something to a search standing no
+    /// shallower than this one.
+    budget_spent: bool,
     /// Whether each name asked about is there, asked once.
     ///
     /// The search asks the same question thousands of times over — every rule
@@ -1779,6 +1803,7 @@ impl<'a> DepBuilder<'a> {
             impossible: FastMap::default(),
             tried_implicit: FastSet::default(),
             chain_truncated: false,
+            budget_spent: false,
             exists_cache: FastMap::default(),
             directories: crate::dircache::DirectoryCache::default(),
             intermediates: FastSet::default(),
@@ -5146,12 +5171,26 @@ impl<'a> DepBuilder<'a> {
             return Ok(false);
         }
         let outer_truncated = std::mem::replace(&mut self.chain_truncated, false);
+        let outer_spent = std::mem::replace(&mut self.budget_spent, false);
         let reachable = self.can_be_made_implicitly(name, depth, compat)?;
         let conclusive = !self.chain_truncated;
+        // Whether the chain limit cut anything short anywhere under this name.
+        // Read before the outer answer is put back, so an earlier sibling's
+        // limit is not charged to this one.
+        let spent = self.budget_spent;
         self.chain_truncated |= outer_truncated;
+        self.budget_spent |= outer_spent;
         if !reachable && conclusive && !self.is_written_down_named(name) {
-            let shallowest = self.impossible.entry(name.clone()).or_insert(depth);
-            *shallowest = (*shallowest).min(depth);
+            // A failure the chain limit never cut short is the rules' whole
+            // answer about this name, so it holds however the name is reached
+            // again: GNU Make's `file_impossible` records exactly that and has
+            // no depth to record it against, because its search has no limit
+            // to run out of. Only where the limit did bite is the depth worth
+            // keeping, and then it means what it always meant — a search with
+            // no more budget than this one gets the same answer.
+            let at = if spent { depth } else { 0 };
+            let shallowest = self.impossible.entry(name.clone()).or_insert(at);
+            *shallowest = (*shallowest).min(at);
         }
         Ok(reachable)
     }
@@ -5346,6 +5385,7 @@ impl<'a> DepBuilder<'a> {
         compat: bool,
     ) -> Result<bool> {
         if depth >= MAX_IMPLICIT_CHAIN {
+            self.budget_spent = true;
             return Ok(false);
         }
         if !self.chaining.insert(output.clone()) {
