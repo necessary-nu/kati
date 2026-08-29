@@ -1433,9 +1433,9 @@ impl RuleMerger {
         declared: Symbol,
         r: &Rule,
         n: &mut DepNode,
-    ) {
+    ) -> Result<()> {
         if self.is_double_colon {
-            n.cmds.extend(r.cmds.iter().cloned());
+            n.cmds.extend_from_slice(r.cmds.lines(session)?);
         }
 
         n.actual_inputs
@@ -1451,6 +1451,7 @@ impl RuleMerger {
             assert!(r.output_patterns.len() == 1);
             n.output_pattern = Some(r.output_patterns[0]);
         }
+        Ok(())
     }
 
     fn fill_grouped_outputs(&self, output: Symbol, rule: &Rule, node: &mut DepNode) {
@@ -1491,7 +1492,7 @@ impl RuleMerger {
         pattern_rule: &Option<Arc<Rule>>,
         grouped_outputs: &[Symbol],
         n: &Arc<Mutex<DepNode>>,
-    ) -> Vec<DeferredSegment> {
+    ) -> Result<Vec<DeferredSegment>> {
         let mut n = n.lock();
         let mut deferred = Vec::new();
         let mut note_deferred = |r: &Arc<Rule>, n: &DepNode| {
@@ -1506,7 +1507,7 @@ impl RuleMerger {
         if let Some(primary_rule) = &self.primary_rule {
             assert!(pattern_rule.is_none());
             note_deferred(primary_rule, &n);
-            self.fill_dep_node_from_rule(session, declared, primary_rule, &mut n);
+            self.fill_dep_node_from_rule(session, declared, primary_rule, &mut n)?;
             if primary_rule.is_grouped && !primary_rule.is_double_colon {
                 for grouped_output in grouped_outputs {
                     if *grouped_output != output && !n.implicit_outputs.contains(grouped_output) {
@@ -1517,16 +1518,16 @@ impl RuleMerger {
                 self.fill_grouped_outputs(output, primary_rule, &mut n);
             }
             self.fill_dep_node_loc(primary_rule, &mut n);
-            n.cmds = primary_rule.cmds.clone();
+            n.cmds = primary_rule.cmds.lines(session)?.to_vec();
         } else if let Some(pattern_rule) = pattern_rule {
             // Deliberately not noted for a second expansion. The implicit
             // search has already expanded whatever the rule it picked held, and
             // the one rule that reaches here still holding it is `.DEFAULT` —
             // whose prerequisites GNU Make never reads at all: `update_file_1`
             // takes `default_file->cmds` and nothing else (remake.c).
-            self.fill_dep_node_from_rule(session, declared, pattern_rule, &mut n);
+            self.fill_dep_node_from_rule(session, declared, pattern_rule, &mut n)?;
             self.fill_dep_node_loc(pattern_rule, &mut n);
-            n.cmds = pattern_rule.cmds.clone();
+            n.cmds = pattern_rule.cmds.lines(session)?.to_vec();
         }
 
         for r in &self.rules {
@@ -1536,7 +1537,7 @@ impl RuleMerger {
                 continue;
             }
             note_deferred(r, &n);
-            self.fill_dep_node_from_rule(session, declared, r, &mut n);
+            self.fill_dep_node_from_rule(session, declared, r, &mut n)?;
             if self.is_double_colon {
                 self.fill_grouped_outputs(output, r, &mut n);
             }
@@ -1547,7 +1548,7 @@ impl RuleMerger {
 
         let mut all_outputs = HashSet::new();
         all_outputs.insert(output);
-        deferred
+        Ok(deferred)
     }
 }
 
@@ -2475,6 +2476,12 @@ impl<'a> DepBuilder<'a> {
     /// withhold.
     fn install_builtin_rules(&mut self) -> Result<()> {
         let withheld = self.ev.session.flags.no_builtin_rules;
+        // Where parsing the catalogue's recipes used to intern them. The parse
+        // now waits for something to run the recipe, and `$(.VARIABLES)` is
+        // the order names were interned in, so the names it would have minted
+        // are minted here instead. See
+        // [`crate::builtin_rules::RECIPE_ONLY_VARIABLE_NAMES`].
+        crate::builtin_rules::intern_recipe_variable_names(&mut self.ev.session);
         self.convert_written_suffix_rules()?;
         for source in self.ev.session.suffixes.clone() {
             self.install_suffix_disqualifier(&source)?;
@@ -2597,8 +2604,7 @@ impl<'a> DepBuilder<'a> {
                     return Ok(());
                 };
                 let loc = crate::builtin_rules::builtin_loc(&mut self.ev.session);
-                let cmds = crate::builtin_rules::recipe_lines(&mut self.ev.session, recipe)?;
-                (loc, None, cmds)
+                (loc, None, crate::rule::Recipe::builtin(recipe))
             }
         };
         let mut rule = Rule::new(loc, false, false);
@@ -2645,7 +2651,7 @@ impl<'a> DepBuilder<'a> {
             rule.inputs.push(input);
             rule.prerequisite_names.push(input);
             rule.is_suffix_rule = true;
-            rule.cmds = crate::builtin_rules::recipe_lines(&mut self.ev.session, recipe)?;
+            rule.cmds = crate::rule::Recipe::builtin(recipe);
             self.suffix_rules
                 .entry(undotted(&target))
                 .or_default()
@@ -4769,7 +4775,7 @@ impl<'a> DepBuilder<'a> {
                 heads_the_record: false,
                 is_grouped: rule.is_grouped,
             });
-            node.cmds = rule.cmds.clone();
+            node.cmds = rule.cmds.lines(&mut self.ev.session)?.to_vec();
             node.actual_inputs =
                 apply_output_pattern(&mut self.ev.session, &rule, declared, &rule.inputs);
             node.actual_order_only_inputs = apply_output_pattern(
@@ -6475,7 +6481,7 @@ impl<'a> DepBuilder<'a> {
                 &picked_rule_info.pattern_rule,
                 &grouped_outputs,
                 &n,
-            );
+            )?;
         // A static pattern rule reaches this the same way an explicit one does,
         // so its stem is read off the rule rather than off the search.
         let deferred = deferred

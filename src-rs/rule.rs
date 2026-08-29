@@ -60,7 +60,7 @@ pub struct Rule {
     /// or a static pattern rule — has not been through that search and is
     /// substituted where it is read instead.
     pub prerequisites_are_resolved: bool,
-    pub cmds: Vec<Arc<Value>>,
+    pub cmds: Recipe,
     pub loc: Loc,
     pub cmd_loc: Option<Loc>,
 }
@@ -80,7 +80,7 @@ impl Rule {
             prerequisite_names: Vec::new(),
             deferred_prerequisites: None,
             prerequisites_are_resolved: false,
-            cmds: Vec::new(),
+            cmds: Recipe::none(),
             loc,
             cmd_loc: None,
         }
@@ -446,5 +446,161 @@ mod tests {
         assert_eq!(find_unescaped_colon(br"dep\:name"), None);
         assert_eq!(find_unescaped_colon(br"dep\\:pattern"), Some(5));
         assert_eq!(find_unescaped_colon(br"dep\\\:name:pattern"), Some(11));
+    }
+}
+
+/// A rule's recipe: the command lines it will run.
+///
+/// Two shapes, because they are filled at two different times. A recipe a
+/// makefile wrote is parsed where it is read — the text is gone by the time
+/// the rule exists, and the lines are what the read produced. A built-in
+/// rule's recipe is a `&'static str` in [`crate::builtin_rules`]'s tables, and
+/// it is held as that text until something asks to run it.
+///
+/// The catalogue is installed into every session — 259 of them on a recursive
+/// build of 259 makefiles — and a session that reaches none of the built-in
+/// rules expands none of these recipes. Parsing all of them anyway was 5.68%
+/// of the read workers' samples on that build, spent on `Value` trees that
+/// were dropped unread. So the parse waits until [`Recipe::lines`] is asked
+/// for the lines, which is where a rule has been chosen for a node.
+///
+/// What must NOT happen is a parse shared between sessions. A [`Value`] holds
+/// [`Symbol`]s and a [`Loc`], and a symbol means nothing outside the interner
+/// that minted it, so a recipe parsed against one session's symtab is
+/// gibberish to another's. [`Recipe::builtin`] therefore mints a fresh memo
+/// per call — the `Arc` is shared only between the rules one session copies
+/// from another, which is one session's rules sharing one session's parse.
+#[derive(Clone)]
+pub enum Recipe {
+    /// The command lines, already parsed. What a makefile's own recipe always
+    /// is, and what a built-in recipe becomes when it is copied line by line.
+    Read(Vec<Arc<Value>>),
+    /// A built-in rule's recipe, still the table text it was written as.
+    Builtin(Arc<BuiltinRecipe>),
+}
+
+/// One built-in recipe: the catalogue's text, and the parse of it if it has
+/// been asked for.
+pub struct BuiltinRecipe {
+    /// The table entry, exactly as `default.c` writes it.
+    text: &'static str,
+    /// How many command lines the text will parse to, which is one per
+    /// newline-separated line and is knowable without parsing any of them.
+    /// Every caller that only wants to know whether there is a recipe, or how
+    /// many lines it has, is answered from here.
+    lines: usize,
+    /// The parse, once one has been asked for. `OnceLock` rather than a plain
+    /// cell because it is what says the parse happens exactly once per rule
+    /// per session however many nodes reach it.
+    parsed: std::sync::OnceLock<Vec<Arc<Value>>>,
+}
+
+impl Recipe {
+    /// The empty recipe: no command lines, and none deferred.
+    #[must_use]
+    pub fn none() -> Self {
+        Recipe::Read(Vec::new())
+    }
+
+    /// A built-in rule's recipe, held as the catalogue text it is written as.
+    ///
+    /// Empty text is no recipe at all rather than one empty command line,
+    /// which is what the suffix rules that exist only to be matched are
+    /// written as — the same reading [`crate::builtin_rules::recipe_lines`]
+    /// gives it.
+    #[must_use]
+    pub fn builtin(text: &'static str) -> Self {
+        if text.is_empty() {
+            return Recipe::none();
+        }
+        Recipe::Builtin(Arc::new(BuiltinRecipe {
+            text,
+            lines: text.split('\n').count(),
+            parsed: std::sync::OnceLock::new(),
+        }))
+    }
+
+    /// Whether this rule has no recipe.
+    ///
+    /// Answered without parsing: [`Recipe::builtin`] never holds empty text,
+    /// so a deferred recipe always has at least one line.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Recipe::Read(lines) => lines.is_empty(),
+            Recipe::Builtin(_) => false,
+        }
+    }
+
+    /// How many command lines the recipe runs, without parsing them.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Recipe::Read(lines) => lines.len(),
+            Recipe::Builtin(builtin) => builtin.lines,
+        }
+    }
+
+    /// Take the recipe away, leaving the rule with none.
+    pub fn clear(&mut self) {
+        *self = Recipe::none();
+    }
+
+    /// Add a command line to a recipe a makefile is still writing.
+    ///
+    /// Only ever a `Read` recipe: a built-in recipe is a table entry, and the
+    /// evaluator that appends lines is reading a makefile. A makefile writing
+    /// its own recipe for a name the catalogue also holds builds a `Read`
+    /// recipe from its own first line and never reaches the table's.
+    pub fn push(&mut self, line: Arc<Value>) {
+        match self {
+            Recipe::Read(lines) => lines.push(line),
+            Recipe::Builtin(_) => {
+                unreachable!("a built-in recipe is a table entry and is never appended to")
+            }
+        }
+    }
+
+    /// The command lines, parsing the catalogue text if this is the first ask.
+    ///
+    /// The session is the one the lines are parsed against, and it has to be
+    /// the session that will read them: a [`Symbol`] in the result indexes
+    /// this interner and no other.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse failure for a table entry, which is a defect in the
+    /// table.
+    pub fn lines(&self, session: &mut Session) -> Result<&[Arc<Value>]> {
+        match self {
+            Recipe::Read(lines) => Ok(lines),
+            Recipe::Builtin(builtin) => {
+                if let Some(parsed) = builtin.parsed.get() {
+                    return Ok(parsed);
+                }
+                let parsed = crate::builtin_rules::recipe_lines(session, builtin.text)?;
+                // `set` losing means another reference to this same memo won
+                // the race and its parse is the one every reader will see.
+                // Both parses are of the same text against the same session,
+                // so which one wins is not observable.
+                let _ = builtin.parsed.set(parsed);
+                Ok(builtin
+                    .parsed
+                    .get()
+                    .expect("the memo is filled by the line above or by the writer that beat it"))
+            }
+        }
+    }
+}
+
+impl Debug for Recipe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Recipe::Read(lines) => write!(f, "{lines:?}"),
+            // The text rather than the parse, so that a rule printed before
+            // anything asked for its lines reads the same as one printed
+            // after.
+            Recipe::Builtin(builtin) => write!(f, "<builtin {:?}>", builtin.text),
+        }
     }
 }

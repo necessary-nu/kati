@@ -228,7 +228,7 @@ pub fn pattern_rule(
     session: &mut Session,
     target: &str,
     prerequisites: &str,
-    recipe: &str,
+    recipe: &'static str,
     terminal: bool,
 ) -> Result<Rule> {
     let mut rule = Rule::new(builtin_loc(session), terminal, false);
@@ -239,7 +239,7 @@ pub fn pattern_rule(
         rule.inputs.push(sym);
         rule.prerequisite_names.push(sym);
     }
-    rule.cmds = recipe_lines(session, recipe)?;
+    rule.cmds = crate::rule::Recipe::builtin(recipe);
     Ok(rule)
 }
 
@@ -275,9 +275,102 @@ pub fn recipe_lines(session: &mut Session, recipe: &str) -> Result<Vec<Arc<Value
     Ok(cmds)
 }
 
+/// The variable names the catalogue's recipes refer to that nothing else in a
+/// session's startup interns.
+///
+/// A built-in recipe is parsed when something asks to run it — see
+/// [`crate::rule::Recipe`] — and a session that runs none of them parses none.
+/// But parsing is also what used to intern the names those recipes refer to,
+/// and `$(.VARIABLES)` is a list of every name a session has interned, in the
+/// order it interned them (`GlobalVars::matching_named`). Deferring the parse
+/// would take these six names out of that list, or move them within it,
+/// depending on what a makefile did later — the one way a symbol's ordinal is
+/// observable in output.
+///
+/// So they are interned where the parse used to intern them, and the parse
+/// that follows finds them already there. Every other name the tables refer to
+/// — `CC`, `CFLAGS`, `TARGET_ARCH` and the rest — is interned before this by
+/// [`crate::builtins::install_default_variables`], which parses each built-in
+/// variable's value.
+///
+/// [`recipes_intern_no_name_outside_the_catalogue_list`] is what keeps this
+/// list honest: it parses every recipe in the tables and fails if one of them
+/// mints a name that is not here.
+/// In the order the recipes refer to them, walking the three tables in the
+/// order the installers walk them, so that each of the six lands on the
+/// ordinal the parse used to give it.
+pub const RECIPE_ONLY_VARIABLE_NAMES: &[&str] = &[
+    "LOADLIBES",
+    "LDLIBS",
+    "MAKEINFO_FLAGS",
+    "TEXI2DVI_FLAGS",
+    "GFLAGS",
+    "SCCS_OUTPUT_OPTION",
+];
+
+/// Intern the names in [`RECIPE_ONLY_VARIABLE_NAMES`], in table order.
+pub fn intern_recipe_variable_names(session: &mut Session) {
+    for name in RECIPE_ONLY_VARIABLE_NAMES {
+        session.intern(*name);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every name the catalogue's recipes mint is on
+    /// [`RECIPE_ONLY_VARIABLE_NAMES`], and every name on that list is one they
+    /// mint.
+    ///
+    /// The list exists because the recipes are no longer parsed at install —
+    /// see [`crate::rule::Recipe`] — and interning them there is what keeps a
+    /// symbol's ordinal, and so `$(.VARIABLES)`, where it was. A name added to
+    /// a table recipe without being added here would be interned late again;
+    /// a name left here after the recipe referring to it went would intern a
+    /// symbol nothing asks for. This fails on either.
+    #[test]
+    fn recipes_intern_no_name_outside_the_catalogue_list() {
+        let mut session = Session::new();
+        crate::builtins::install_default_variables(&mut session)
+            .expect("the built-in variable table parses");
+        // `<builtin>` is minted by rule construction rather than by a recipe
+        // parse, and it is minted before the first recipe either way.
+        let _ = builtin_loc(&mut session);
+        let before = session.symtab.count();
+
+        let mut recipes = DEFAULT_SUFFIX_RULES
+            .iter()
+            .map(|(_, recipe)| *recipe)
+            .collect::<Vec<_>>();
+        recipes.extend(DEFAULT_PATTERN_RULES.iter().map(|(_, _, recipe)| *recipe));
+        recipes.extend(DEFAULT_TERMINAL_RULES.iter().map(|(_, _, recipe)| *recipe));
+        for recipe in recipes {
+            recipe_lines(&mut session, recipe).expect("a table recipe parses");
+        }
+
+        let minted = (before..session.symtab.count())
+            .map(|index| {
+                let sym = crate::symtab::Symbol::from_index(index)
+                    .expect("an index below the interner's count names a symbol");
+                String::from_utf8(session.symtab.name(sym).to_vec())
+                    .expect("a built-in name is text")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(minted, RECIPE_ONLY_VARIABLE_NAMES);
+    }
+
+    /// Interning the list twice mints nothing the second time, which is what
+    /// says [`intern_recipe_variable_names`] is safe to call on a session that
+    /// already read a makefile naming one of them.
+    #[test]
+    fn interning_the_recipe_names_twice_mints_them_once() {
+        let mut session = Session::new();
+        intern_recipe_variable_names(&mut session);
+        let after_first = session.symtab.count();
+        intern_recipe_variable_names(&mut session);
+        assert_eq!(session.symtab.count(), after_first);
+    }
 
     /// The suffix list is what every derived rule is keyed on, so a duplicate
     /// would silently make the same pair twice and a missing entry would take a
