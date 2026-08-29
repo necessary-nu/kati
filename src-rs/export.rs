@@ -518,10 +518,10 @@ mod tests {
     fn environment_of(source: &str, kind: ChildKind) -> Vec<(String, Option<String>)> {
         use std::ffi::OsString;
         let mut session = Session::new();
-        session.invocation_environment = Some(vec![
+        session.invocation_environment = Some(std::sync::Arc::new(vec![
             (OsString::from("INHERITED"), OsString::from("kept")),
             (OsString::from("MAKELEVEL"), OsString::from("2")),
-        ]);
+        ]));
         let mut ev = Evaluator::new(session);
         let statements = crate::parser::parse_buf(
             &mut ev.session,

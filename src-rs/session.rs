@@ -243,7 +243,15 @@ pub struct Session {
     /// environment. A semantic submake supplies `Some` so its parent exports
     /// reach Make evaluation without launching another process or mutating the
     /// compiler's own environment.
-    pub invocation_environment: Option<Vec<(OsString, OsString)>>,
+    /// Shared rather than owned because a recursive compilation hands the same
+    /// environment to every child it composes: the parent's context, the
+    /// child's session and the child's own context all name one snapshot, and
+    /// on the `recursive` workload that snapshot was being deep-copied three
+    /// times per unit — 50 names and 50 values, two allocations each, 259
+    /// times. A child that really does change it (every child changes
+    /// `MAKELEVEL`) pays one copy through [`std::sync::Arc::make_mut`], which
+    /// is the copy that was always necessary; the other two are refcounts.
+    pub invocation_environment: Option<std::sync::Arc<Vec<(OsString, OsString)>>>,
     /// Byte strings to [`Symbol`] handles and back.
     pub symtab: Symtab,
     /// Make's outermost variable scope, keyed by interned symbol.

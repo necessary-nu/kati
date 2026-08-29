@@ -673,11 +673,23 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
     // precedence, and the origin says so only once something tries to redefine
     // the name and is refused — see `Session::set_global_var`.
     let origin = VarOrigin::Environment;
-    let environment = ev
-        .session
-        .invocation_environment
-        .clone()
-        .unwrap_or_else(|| std::env::vars_os().collect());
+    // Cloned as a refcount where the invocation supplied one, so importing an
+    // inherited environment copies the names and values once — into the
+    // variable table, which is where they were always going — rather than
+    // twice. A standalone session still snapshots the process environment, and
+    // is the only case that allocates a vector here.
+    let snapshot;
+    let environment: &[(std::ffi::OsString, std::ffi::OsString)] =
+        match &ev.session.invocation_environment {
+            Some(environment) => {
+                snapshot = std::sync::Arc::clone(environment);
+                &snapshot
+            }
+            None => {
+                snapshot = std::sync::Arc::new(std::env::vars_os().collect::<Vec<_>>());
+                &snapshot
+            }
+        };
     for (k, v) in environment {
         let v = Bytes::from(v.as_bytes().to_vec());
         let frame = ev.current_frame();
