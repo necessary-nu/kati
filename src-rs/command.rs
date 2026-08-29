@@ -1724,6 +1724,36 @@ impl<'a> CommandEvaluator<'a> {
         Ok(ret)
     }
 
+    /// Take up an evaluator again with the state an earlier command evaluator
+    /// left, without registering the autocommands a second time.
+    ///
+    /// [`Self::new`] defines `$@`, `$<` and the rest in the session's global
+    /// scope, and each of those bindings holds the very `current_dep_node` the
+    /// evaluator sets before it reads a recipe. The session travels with the
+    /// evaluator, so those bindings are already there — and defining them again
+    /// would replace them with ones pointing at a different cell, so a recipe
+    /// expanded afterwards would read `$@` from a node nobody had set. Handing
+    /// the same cells back is what makes the two halves of one emission one
+    /// evaluation.
+    pub fn resumed(
+        ev: &'a mut Evaluator,
+        evaluation: crate::ninja::BuildEvaluation,
+        current_dep_node: Arc<Mutex<Option<Arc<Mutex<DepNode>>>>>,
+        found_new_inputs: Arc<Mutex<bool>>,
+        recipe_shell: Bytes,
+    ) -> Self {
+        ev.new_inputs_timing = evaluation.new_inputs_timing;
+        ev.shell_evaluation = evaluation.shell_evaluation;
+        ev.file_evaluation = evaluation.file_evaluation;
+        ev.output_evaluation = evaluation.output_evaluation;
+        Self {
+            ev,
+            current_dep_node,
+            found_new_inputs,
+            recipe_shell,
+        }
+    }
+
     /// `$|` has no D or F form: GNU Make reads `$(|D)` as an ordinary variable
     /// nobody defined and expands it to nothing.
     fn register_bare_autocommand(&mut self, c: char, a: AutoCommand) -> Result<()> {

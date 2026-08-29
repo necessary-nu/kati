@@ -776,6 +776,78 @@ impl<'a> NinjaGenerator<'a> {
         })
     }
 
+    /// Rebuild a generator around the state an earlier population left, so the
+    /// emission runs over exactly what that population settled.
+    ///
+    /// The evaluator is handed back rather than kept because it cannot be:
+    /// [`NinjaGenerator`] borrows it, and a population that happens on another
+    /// thread has to give the borrow up to send its result. Everything else the
+    /// generator owns travels in [`PopulatedBuild`].
+    ///
+    /// [`CommandEvaluator::resumed`] rather than `new` because the autocommand
+    /// variables the population registered are in the session, which travelled
+    /// with the evaluator, and registering them a second time would replace
+    /// live bindings the population's own expansions still refer to.
+    fn resume(populated: PopulatedBuild, ev: &'a mut Evaluator) -> Self {
+        let PopulatedBuild {
+            evaluation,
+            done,
+            rule_id,
+            shell,
+            used_envs,
+            nodes,
+            phony_aliases,
+            deferred_recipes,
+            current_dep_node,
+            found_new_inputs,
+            recipe_shell,
+        } = populated;
+        // Set by `new` for the population and cleared by the generator that
+        // performed it when it was dropped. The emission reads the same
+        // makefiles' worth of expansion state and answers the same way about
+        // the disk, so it takes it back.
+        ev.avoid_io = true;
+        Self {
+            ce: CommandEvaluator::resumed(
+                ev,
+                evaluation,
+                current_dep_node,
+                found_new_inputs,
+                recipe_shell,
+            ),
+            done,
+            rule_id,
+            shell,
+            used_envs,
+            nodes,
+            phony_aliases,
+            recipe_expansion: evaluation.recipe_expansion,
+            deferred_recipes,
+        }
+    }
+
+    /// Everything the population settled, with the evaluator borrow given up.
+    ///
+    /// Taken out rather than moved out of, because this generator has a `Drop`
+    /// that puts the evaluator's own evaluation flags back where it found them
+    /// — and that has to run, here as much as at the end of a whole emission.
+    /// The generator is finished with after this and holds nothing but empties.
+    fn take_populated(&mut self, evaluation: BuildEvaluation) -> PopulatedBuild {
+        PopulatedBuild {
+            evaluation,
+            done: std::mem::take(&mut self.done),
+            rule_id: self.rule_id,
+            shell: self.shell.take(),
+            used_envs: std::mem::take(&mut self.used_envs),
+            nodes: std::mem::take(&mut self.nodes),
+            phony_aliases: std::mem::take(&mut self.phony_aliases),
+            deferred_recipes: std::mem::take(&mut self.deferred_recipes),
+            current_dep_node: Arc::clone(&self.ce.current_dep_node),
+            found_new_inputs: Arc::clone(&self.ce.found_new_inputs),
+            recipe_shell: std::mem::take(&mut self.ce.recipe_shell),
+        }
+    }
+
     fn generate(
         &mut self,
         nodes: &Vec<NamedDepNode>,
@@ -3047,6 +3119,219 @@ pub fn generate_ninja(
     Ok(())
 }
 
+/// The evaluation policy a destination asks an emission to run under.
+///
+/// Five questions the sink answers the same way every time it is asked, read
+/// once so that the half of an emission which never sees the sink can still run
+/// under the policy the sink chose. See [`populate_build`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BuildEvaluation {
+    pub new_inputs_timing: NewInputsTiming,
+    pub shell_evaluation: ShellEvaluation,
+    pub file_evaluation: FileEvaluation,
+    pub output_evaluation: OutputEvaluation,
+    pub recipe_expansion: RecipeExpansion,
+}
+
+impl BuildEvaluation {
+    /// What this sink asks for.
+    #[must_use]
+    pub fn of(sink: &dyn BuildSink) -> Self {
+        Self {
+            new_inputs_timing: sink.new_inputs_timing(),
+            shell_evaluation: sink.shell_evaluation(),
+            file_evaluation: sink.file_evaluation(),
+            output_evaluation: sink.output_evaluation(),
+            recipe_expansion: sink.recipe_expansion(),
+        }
+    }
+}
+
+/// What an emission settled before anything of it reached a sink.
+///
+/// [`emit_build`] is two passes over the dependency nodes and always was: the
+/// first walks them, expands whichever recipes the destination cannot expand
+/// for itself, and mints a rule number for each — touching no sink at all — and
+/// the second hands the result over. This is the boundary between them, carried
+/// as one value so the first pass can run on a thread the sink is not on.
+///
+/// It holds the evaluator's borrow nowhere, which is the whole point: an
+/// evaluator is `Send` and a `&mut` to one is not, so a population that crosses
+/// a thread has to give the borrow up and take it again on the far side. See
+/// [`NinjaGenerator::resume`].
+pub struct PopulatedBuild {
+    evaluation: BuildEvaluation,
+    done: HashSet<Symbol>,
+    rule_id: RuleId,
+    shell: Option<Bytes>,
+    used_envs: HashMap<Symbol, OsString>,
+    nodes: Vec<NinjaNode>,
+    phony_aliases: PhonyAliases,
+    deferred_recipes: Vec<DeferredRecipe>,
+    current_dep_node: Arc<Mutex<Option<Arc<Mutex<DepNode>>>>>,
+    found_new_inputs: Arc<Mutex<bool>>,
+    recipe_shell: Bytes,
+}
+
+/// One recursive Make invocation a populated emission will hand its sink.
+///
+/// The same four values [`SinkRule`] carries for one entry of its `subninjas`
+/// list, settled here rather than read back off the sink, so that a caller
+/// which composes recursive children can know what a unit invokes before the
+/// unit has been emitted. See [`PopulatedBuild::liftable_recursions`].
+#[derive(Clone)]
+pub struct PopulatedRecursion {
+    pub command: Bytes,
+    pub make: Bytes,
+    pub shell: Bytes,
+    pub shell_flags: Bytes,
+}
+
+impl PopulatedBuild {
+    /// The evaluation policy this population ran under.
+    #[must_use]
+    pub const fn evaluation(&self) -> BuildEvaluation {
+        self.evaluation
+    }
+
+    /// Every recursive invocation of this unit, in the order the emission will
+    /// hand them over — or `None` where any recipe of it is one whose child a
+    /// caller must not go looking for before the emission has run.
+    ///
+    /// All or nothing, because a caller reading children ahead of the emission
+    /// can only do so if the composition is certain to reach every one of them:
+    /// a recipe that could stop it would leave the recipes after it unreached,
+    /// and a child read for one of those is a Makefile GNU Make never read. The
+    /// conditions are the ones the composition itself applies, asked here of the
+    /// nodes the sink's edge and rule calls are made from:
+    ///
+    /// * the node becomes an edge at all, carries a rule, and had its recipe
+    ///   read here rather than deferred to the destination;
+    /// * the recipe splits into child graphs — `.ONESHELL` with more than one
+    ///   line and any recursion in it does not — and names exactly one
+    ///   invocation, written on its first line, so no recipe line of its own has
+    ///   to run before the child's Makefile is read;
+    /// * the edge is always dirty, so the wrapper it becomes is composed rather
+    ///   than short-circuited to a phony;
+    /// * the edge has no prerequisites of any kind, so nothing about it is
+    ///   staged and nothing can stop the composition at a boundary.
+    ///
+    /// A unit with no recursion at all answers `Some` with an empty list, which
+    /// is the honest answer: there is nothing to read ahead and nothing about
+    /// the unit that forbids it.
+    #[must_use]
+    pub fn liftable_recursions(&self, ev: &Evaluator) -> Option<Vec<PopulatedRecursion>> {
+        let mut lifted = Vec::new();
+        for nn in &self.nodes {
+            let names_recursion = nn
+                .commands
+                .iter()
+                .any(|command| !command.recursive_make.is_empty());
+            if !names_recursion {
+                // A node with no invocation to lift cannot stop a composition
+                // that reaches it either: it becomes an ordinary edge, and the
+                // recipes after it are reached whatever it does. Asked off the
+                // commands alone, so a graph with no recursion in it at all
+                // walks its nodes without locking one.
+                continue;
+            }
+            let node = nn.node.lock();
+            if !is_buildable_target(&ev.session, &node.output, node.has_rule)
+                || nn.deferred_recipe
+                || nn.rule_id.is_none()
+                || !(node.is_phony || node.unconditional_double_colon)
+                || !node.deps.is_empty()
+                || !node.order_onlys.is_empty()
+            {
+                return None;
+            }
+            // The emission's own test for whether this recipe becomes child
+            // graphs rather than running as the script it is.
+            let composable = !ev.session.flags.one_shell
+                || nn.commands.len() == 1
+                || nn
+                    .commands
+                    .iter()
+                    .all(|command| command.recursive_make.is_empty());
+            if !composable {
+                return None;
+            }
+            let mut invocations = nn
+                .commands
+                .iter()
+                .flat_map(|command| command.recursive_make.iter());
+            let invocation = invocations.next()?;
+            // One invocation, on the first line: the second is read off what the
+            // first left behind, and a line ahead of one has to have run before
+            // the child's Makefile is read.
+            if invocations.next().is_some() || nn.commands[0].recursive_make.is_empty() {
+                return None;
+            }
+            lifted.push(PopulatedRecursion {
+                command: NinjaGenerator::translate_command(
+                    invocation.command.clone(),
+                    ev.session.flags.one_shell,
+                ),
+                make: invocation.make.clone(),
+                shell: nn.shell.clone(),
+                shell_flags: NinjaGenerator::script_shell_flags(&ev.session.flags, &nn.commands),
+            });
+        }
+        Some(lifted)
+    }
+}
+
+/// Walk the graph `nodes` describes, expanding whatever the destination cannot
+/// expand for itself, and settle everything an emission can settle without a
+/// sink.
+///
+/// The expensive half, and the half that touches no [`BuildSink`]: a
+/// destination that builds its graph on one thread can run this on another and
+/// hand the result to [`emit_populated`].
+///
+/// `evaluation` is what the sink would have been asked, read before the split so
+/// both halves run under one policy. [`emit_populated`] refuses a sink that
+/// answers differently.
+pub fn populate_build(
+    nodes: &Vec<NamedDepNode>,
+    ev: &mut Evaluator,
+    evaluation: BuildEvaluation,
+) -> Result<PopulatedBuild> {
+    let mut ng = NinjaGenerator::new(
+        CommandEvaluator::new(
+            ev,
+            evaluation.new_inputs_timing,
+            evaluation.shell_evaluation,
+            evaluation.file_evaluation,
+            evaluation.output_evaluation,
+        )?,
+        evaluation.recipe_expansion,
+    )?;
+    ng.populate_ninja_nodes(nodes)?;
+    Ok(ng.take_populated(evaluation))
+}
+
+/// Hand what [`populate_build`] settled to `sink`, and write nothing.
+pub fn emit_populated(
+    populated: PopulatedBuild,
+    ev: &mut Evaluator,
+    sink: &mut dyn BuildSink,
+) -> Result<DeferredRecipes> {
+    let evaluation = populated.evaluation;
+    if BuildEvaluation::of(sink) != evaluation {
+        return Err(anyhow::Error::msg(
+            "a populated build is emitted to a sink that asked for a different evaluation",
+        ));
+    }
+    let mut ng = NinjaGenerator::resume(populated, ev);
+    ng.emit(sink)?;
+    Ok(DeferredRecipes {
+        recipes: std::mem::take(&mut ng.deferred_recipes),
+        file_evaluation: evaluation.file_evaluation,
+        output_evaluation: evaluation.output_evaluation,
+    })
+}
+
 /// Hand the graph `nodes` describes to `sink`, and write nothing.
 ///
 /// [`generate_ninja`] is this with [`NinjaWriter`] already chosen, plus the
@@ -3061,28 +3346,8 @@ pub fn emit_build(
     ev: &mut Evaluator,
     sink: &mut dyn BuildSink,
 ) -> Result<DeferredRecipes> {
-    let new_inputs_timing = sink.new_inputs_timing();
-    let shell_evaluation = sink.shell_evaluation();
-    let file_evaluation = sink.file_evaluation();
-    let output_evaluation = sink.output_evaluation();
-    let recipe_expansion = sink.recipe_expansion();
-    let mut ng = NinjaGenerator::new(
-        CommandEvaluator::new(
-            ev,
-            new_inputs_timing,
-            shell_evaluation,
-            file_evaluation,
-            output_evaluation,
-        )?,
-        recipe_expansion,
-    )?;
-    ng.populate_ninja_nodes(nodes)?;
-    ng.emit(sink)?;
-    Ok(DeferredRecipes {
-        recipes: std::mem::take(&mut ng.deferred_recipes),
-        file_evaluation,
-        output_evaluation,
-    })
+    let populated = populate_build(nodes, ev, BuildEvaluation::of(sink))?;
+    emit_populated(populated, ev, sink)
 }
 
 #[cfg(test)]
