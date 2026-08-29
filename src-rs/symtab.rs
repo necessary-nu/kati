@@ -107,7 +107,12 @@ impl Symbol {
     pub const DEFAULT_GOAL: Symbol = Symbol::well_known(8);
     pub const SUFFIXES: Symbol = Symbol::well_known(9);
 
-    /// The bytes this handle was interned from, as borrowed from `names`.
+    /// The bytes this handle was interned from, as a SECOND OWNER of them.
+    ///
+    /// A `Bytes` is a shared handle, so taking one out and dropping it again is
+    /// a pair of atomic read-modify-writes on a refcount that never went
+    /// anywhere. A caller that only reads the name wants
+    /// [`Symtab::name_bytes`], which borrows it from the interner instead.
     // [spec:ronin:req:make.no-ambient-state]
     pub fn as_bytes(&self, names: &impl Interner) -> Bytes {
         names.symtab().name(*self)

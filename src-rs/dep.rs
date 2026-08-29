@@ -1026,22 +1026,55 @@ impl PatternMatch {
             directory_length(output)
         };
         let hold_directory = path_len > 0 && !pattern.as_bytes().contains(&b'/');
-        let matched = if hold_directory {
-            output.slice(path_len..)
+        // Asked of the bytes where they lie, before any of them is handed to a
+        // second owner. The search offers this pattern to every name the trie
+        // files under a shared prefix and almost none of them match, so the
+        // shared-refcount pair a `Bytes` costs to take out and give back again
+        // is paid on the answer rather than on the question.
+        let matched: &[u8] = if hold_directory {
+            &output[path_len..]
         } else {
-            output.clone()
+            output
         };
-        if !pattern.matches(&matched) {
+        if !pattern.matches(matched) {
             return None;
         }
+        let stem = output.slice_ref(pattern.stem(matched));
         Some(Self {
             directory: if hold_directory {
                 output.slice(..path_len)
             } else {
                 Bytes::new()
             },
-            stem: matched.slice_ref(pattern.stem(&matched)),
+            stem,
         })
+    }
+
+    /// How long the whole stem would be, for a caller that wants no more of
+    /// the match than the number it ranks candidates by.
+    ///
+    /// [`PatternMatch::of`] hands back two `Bytes` cut from the name, and the
+    /// first of them promotes the name's buffer to a shared one so that a
+    /// second owner can be had at all. The ranking pass reads neither: it adds
+    /// their two lengths and drops the match. This measures the same two halves
+    /// without taking hold of either.
+    fn stem_length(pattern: &[u8], percent_index: Option<usize>, output: &Bytes) -> Option<usize> {
+        let path_len = if crate::archive::is_archive_search_name(output) {
+            0
+        } else {
+            directory_length(output)
+        };
+        let hold_directory = path_len > 0 && !pattern.contains(&b'/');
+        let matched: &[u8] = if hold_directory {
+            &output[path_len..]
+        } else {
+            output
+        };
+        if !Pattern::parsed_matches(pattern, percent_index, matched) {
+            return None;
+        }
+        let held = if hold_directory { path_len } else { 0 };
+        Some(held + Pattern::parsed_stem_length(pattern.len(), percent_index, matched.len()))
     }
 
     /// The whole of what `%` stood for: what `$*` reads, and what the search
@@ -1130,6 +1163,33 @@ struct RuleTrieEntry {
     suffix: Vec<u8>,
 }
 
+/// Whether `name` ends with what a trie entry's `suffix` holds after its `%`.
+///
+/// A trie entry is filed under the literal bytes its pattern starts with, so
+/// `suffix` is the rest of that pattern — the `%` and everything after it — and
+/// what a name has to end with is that remainder minus the `%`. An entry with
+/// no `%` at all matches only the name that has run out at the same point.
+///
+/// Compared here rather than by `[u8]::ends_with`, which reaches `bcmp` through
+/// a call. What is on the other side of that call is almost always a filename
+/// extension: two or three bytes, whose LAST one rejects nearly every candidate
+/// the walk offers. The walk scans every rule filed at every prefix level of
+/// every name the implicit search asks about, so the call itself cost more than
+/// the comparison did.
+fn ends_with_pattern_tail(name: &[u8], suffix: &[u8]) -> bool {
+    let Some(tail) = suffix.get(1..) else {
+        return name.is_empty();
+    };
+    if tail.len() > name.len() {
+        return false;
+    }
+    name[name.len() - tail.len()..]
+        .iter()
+        .rev()
+        .zip(tail.iter().rev())
+        .all(|(from_name, from_tail)| from_name == from_tail)
+}
+
 struct RuleTrie {
     rules: Vec<RuleTrieEntry>,
     children: HashMap<u8, RuleTrie>,
@@ -1178,7 +1238,7 @@ impl RuleTrie {
     /// allocator from 13.3% to 11.2%. A real reduction, and a small one.
     fn get(&self, name: &[u8], into: &mut Vec<ImplicitCandidate>) {
         for ent in &self.rules {
-            if (ent.suffix.is_empty() && name.is_empty()) || name.ends_with(&ent.suffix[1..]) {
+            if ends_with_pattern_tail(name, &ent.suffix) {
                 into.push(ent.candidate.clone());
             }
         }
@@ -1533,6 +1593,11 @@ struct DepBuilder<'a> {
     next_double_action: usize,
 
     implicit_rules: RuleTrie,
+    /// The buffer [`DepBuilder::candidate_pool`] fills, kept between calls.
+    ///
+    /// Holds no state the search reads: it is empty whenever the cell holds it,
+    /// and a call that finds it missing makes its own. See that function.
+    candidate_scratch: std::cell::Cell<Vec<ImplicitCandidate>>,
     /// Pattern rules still present after GNU Make's population-time
     /// `new_pattern_rule` replacement.
     implicit_rule_defs: Vec<Arc<Rule>>,
@@ -1834,6 +1899,7 @@ impl<'a> DepBuilder<'a> {
             next_double_action: 0,
 
             implicit_rules: RuleTrie::new(),
+            candidate_scratch: std::cell::Cell::new(Vec::new()),
             implicit_rule_defs: Vec::new(),
             implicit_rule_order: 0,
             expanded: FastMap::default(),
@@ -5039,7 +5105,8 @@ impl<'a> DepBuilder<'a> {
         // every search, so measuring inside the comparison would take the
         // pattern apart again for each of them at every comparison.
         let mut matched: Vec<(usize, usize, ImplicitCandidate)> = Vec::new();
-        for candidate in self.candidate_pool(output_str) {
+        let mut pool = self.candidate_pool(output_str);
+        for candidate in pool.drain(..) {
             // A cancelled rule — prerequisites, no recipe — and one a search
             // further out is already working through are both passed over
             // before they can be read as a match at all.
@@ -5049,24 +5116,29 @@ impl<'a> DepBuilder<'a> {
             if self.rules_in_use.contains(&Self::rule_id(&candidate.rule)) {
                 continue;
             }
-            let pattern = candidate.pattern.as_bytes(&self.ev.session);
-            // Asked before the pattern is handed over rather than after, so
-            // that `Pattern::new` can take it instead of taking a copy of it.
-            // The answer is still only used once the match has succeeded,
-            // which is where it was used before.
-            let specific = pattern.as_ref() != b"%";
-            let pat = Pattern::new(pattern);
-            let Some(matched_at) = PatternMatch::of(&pat, output_str) else {
+            // Read where the interner keeps it. This walk asks after every
+            // candidate the trie offers for every name the search is given, and
+            // it wants to READ the pattern rather than hold it: taking a `Bytes`
+            // out and giving it back is a shared-refcount pair on each of them.
+            let pattern = self.ev.session.symtab().name_bytes(candidate.pattern);
+            // Asked before the match rather than after, because the escaping
+            // may rewrite the text. The answer is still only used once the
+            // match has succeeded, which is where it was used before.
+            let specific = pattern != b"%";
+            let (rewritten, percent_index) = Pattern::parse_borrowed(pattern);
+            let pattern = rewritten.as_deref().unwrap_or(pattern);
+            // The directory the match held aside counts towards specificity:
+            // `tryrules` records `stemlen + pathlen` and sorts on that, so a
+            // rule is measured by the whole of what its `%` stood for. Measured
+            // rather than cut out, because that whole is all this pass reads of
+            // the match.
+            let Some(stem) = PatternMatch::stem_length(pattern, percent_index, output_str) else {
                 continue;
             };
             specific_rule_matched |= specific;
             if candidate.rule.cmds.is_empty() {
                 continue;
             }
-            // The directory the match held aside counts towards specificity:
-            // `tryrules` records `stemlen + pathlen` and sorts on that, so a
-            // rule is measured by the whole of what its `%` stood for.
-            let stem = matched_at.directory.len() + matched_at.stem.len();
             let order = candidate.order;
             matched.push((stem, order, candidate));
         }
@@ -5075,6 +5147,7 @@ impl<'a> DepBuilder<'a> {
                 candidate.rule.is_double_colon || !self.matches_anything(&candidate.rule)
             });
         }
+        self.candidate_scratch.set(pool);
         matched.sort_by_key(|(stem, order, _)| (*stem, *order));
         matched
             .into_iter()
@@ -5095,8 +5168,16 @@ impl<'a> DepBuilder<'a> {
     /// built afresh for every name the search asks about, so a `Vec` per walk
     /// and a `Vec` to join them is three allocations on the hottest call in
     /// the evaluator.
+    ///
+    /// The buffer itself is borrowed from [`Self::candidate_scratch`] and given
+    /// back by the caller, so a search that asks about tens of thousands of
+    /// names grows one buffer once instead of growing a new one per name. A
+    /// nested search — the chain walk asks about a candidate's prerequisites
+    /// while the pool that offered it is still being read — finds the cell
+    /// empty and allocates, which is what every call did before.
     fn candidate_pool(&self, output_str: &Bytes) -> Vec<ImplicitCandidate> {
-        let mut pool = Vec::new();
+        let mut pool = self.candidate_scratch.take();
+        pool.clear();
         self.implicit_rules.get(output_str, &mut pool);
         let path_len = directory_length(output_str);
         if path_len == 0 {
@@ -5104,6 +5185,12 @@ impl<'a> DepBuilder<'a> {
         }
         let from_whole_name = pool.len();
         self.implicit_rules.get(&output_str[path_len..], &mut pool);
+        // Nothing was filed under the file part that was not already filed
+        // under the whole name, so there is nothing to de-duplicate against and
+        // the set that would have done it is never built.
+        if pool.len() == from_whole_name {
+            return pool;
+        }
         let key =
             |candidate: &ImplicitCandidate| (Self::rule_id(&candidate.rule), candidate.pattern);
         let mut seen: FastSet<(usize, Symbol)> = pool[..from_whole_name].iter().map(key).collect();

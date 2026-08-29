@@ -244,22 +244,57 @@ impl Pattern {
     }
 
     pub fn matches(&self, str: &[u8]) -> bool {
-        if let Some(percent_index) = self.percent_index {
-            return self.match_impl(str, percent_index);
-        }
-        self.pat == str
+        Self::parsed_matches(&self.pat, self.percent_index, str)
     }
 
-    fn match_impl(&self, str: &[u8], percent_index: usize) -> bool {
-        let suffix = &self.pat[percent_index + 1..];
+    /// The parse [`Pattern::new`] performs, against bytes the caller keeps.
+    ///
+    /// Hands back the rewritten text only where the escaping had to be
+    /// compressed out to find the wildcard, which is what makes this worth
+    /// having: a pattern that escapes a `%` needs somewhere to put the rewrite
+    /// and every other pattern — the whole built-in catalogue, and all but the
+    /// strangest thing a makefile writes — is read exactly as it was interned.
+    /// The implicit-rule search asks after tens of thousands of names and wants
+    /// no second owner of any of them; see [`Pattern::parsed_matches`].
+    pub fn parse_borrowed(pat: &[u8]) -> (Option<Bytes>, Option<usize>) {
+        match memchr(b'%', pat) {
+            None => return (None, None),
+            Some(at) if at == 0 || pat[at - 1] != b'\\' => return (None, Some(at)),
+            Some(_) => {}
+        }
+        let (rewritten, percent_index) = find_percent(Bytes::copy_from_slice(pat));
+        (Some(rewritten), percent_index)
+    }
+
+    /// [`Pattern::matches`] for a caller holding the two halves of the parse
+    /// rather than a `Pattern`. `percent_index` is what [`find_percent`] or
+    /// [`Pattern::parse_borrowed`] answered for `pat`.
+    pub fn parsed_matches(pat: &[u8], percent_index: Option<usize>, str: &[u8]) -> bool {
+        let Some(percent_index) = percent_index else {
+            return pat == str;
+        };
+        let suffix = &pat[percent_index + 1..];
         // The two literal halves have to fit side by side without overlapping,
         // which is the length test GNU Make's `pattern_matches` makes before it
         // compares either half. Without it `a%a` claims to match `a` — both
         // halves find the same byte — and the stem that reading leaves is
         // shorter than nothing.
         str.len() >= percent_index + suffix.len()
-            && str.starts_with(&self.pat[..percent_index])
+            && str.starts_with(&pat[..percent_index])
             && str.ends_with(suffix)
+    }
+
+    /// [`Pattern::matched_stem_length`] for the same caller, and with the same
+    /// requirement: `str` has already been found to match.
+    pub const fn parsed_stem_length(
+        pat_len: usize,
+        percent_index: Option<usize>,
+        str_len: usize,
+    ) -> usize {
+        if percent_index.is_none() {
+            return 0;
+        }
+        str_len + 1 - pat_len
     }
 
     /// The pattern with `text` written where its wildcard is, or `None` when
@@ -275,6 +310,22 @@ impl Pattern {
         out.put_slice(text);
         out.put_slice(&self.pat[percent_index + 1..]);
         Some(out.freeze())
+    }
+
+    /// How long the stem is in a name this pattern has ALREADY been found to
+    /// match.
+    ///
+    /// [`Pattern::stem`] asks the name again whether it matches, because it is
+    /// reachable from callers that never asked. The implicit-rule search has
+    /// just been told that it does, on the line above, and asking a second time
+    /// is the whole of what this avoids.
+    ///
+    /// The answer is meaningless for a name the pattern does not match, which
+    /// is why nothing here can be told apart from a stem of zero length.
+    pub const fn matched_stem_length(&self, str: &[u8]) -> usize {
+        // A pattern with no wildcard stands for one name and leaves no stem,
+        // which is the empty slice `stem` hands back for it.
+        Self::parsed_stem_length(self.pat.len(), self.percent_index, str.len())
     }
 
     pub fn stem<'a>(&self, str: &'a [u8]) -> &'a [u8] {
@@ -306,7 +357,7 @@ impl Pattern {
             return s.clone();
         };
 
-        if self.match_impl(s, percent_index) {
+        if Self::parsed_matches(&self.pat, Some(percent_index), s) {
             if let Some(subst_percent_index) = subst_percent {
                 let mut ret = BytesMut::with_capacity(subst.len() + s.len() - self.pat.len() + 1);
                 ret.put_slice(&subst[..subst_percent_index]);
