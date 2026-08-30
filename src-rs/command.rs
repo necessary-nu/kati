@@ -17,8 +17,9 @@ limitations under the License.
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
+use crate::fasthash::{FastMap, FastSet};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fmt::Debug,
     sync::Arc,
 };
@@ -264,8 +265,8 @@ impl AutoCommandVar {
         ev: &mut Evaluator,
         node: &Arc<Mutex<DepNode>>,
         words: &[Symbol],
-    ) -> HashMap<Symbol, Bytes> {
-        let mut references = HashMap::new();
+    ) -> FastMap<Symbol, Bytes> {
+        let mut references = FastMap::default();
         if ev.new_inputs_timing != NewInputsTiming::SchedulerBoundary || ev.function_depth > 0 {
             return references;
         }
@@ -479,7 +480,7 @@ impl AutoCommandVar {
                 // 'upgrade' one that is order-only" — before it reads any of
                 // the three lists off, so the name leaves `$|` and stays in
                 // `$^`. Two lists say the same thing by leaving it out here.
-                let mut seen: HashSet<Symbol> =
+                let mut seen: FastSet<Symbol> =
                     current_dep_node.actual_inputs.iter().copied().collect();
                 let mut ww = WordWriter::new(out);
                 for oi in current_dep_node.actual_order_only_inputs.iter() {
@@ -544,7 +545,7 @@ impl AutoCommandVar {
                 found_new_inputs,
                 timing,
             } => {
-                let mut seen: HashSet<Symbol> = HashSet::new();
+                let mut seen: FastSet<Symbol> = FastSet::default();
 
                 if *timing == NewInputsTiming::Launch {
                     // The recipe is being expanded at launch. When the
@@ -827,7 +828,7 @@ pub fn expansion_can_reach_make(
     value: &Value,
     ev: &Evaluator,
     rule_vars: Option<&Vars>,
-    seen: &mut HashSet<Symbol>,
+    seen: &mut FastSet<Symbol>,
 ) -> bool {
     match value {
         Value::Literal(_, _) => false,
@@ -891,7 +892,7 @@ fn symbol_can_reach_make(
     sym: Symbol,
     ev: &Evaluator,
     rule_vars: Option<&Vars>,
-    seen: &mut HashSet<Symbol>,
+    seen: &mut FastSet<Symbol>,
 ) -> bool {
     if sym.as_bytes(&ev.session).as_ref() == b"MAKE" {
         return true;

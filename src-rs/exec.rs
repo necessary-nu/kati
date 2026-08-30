@@ -15,12 +15,13 @@ limitations under the License.
 */
 
 use std::{
-    collections::HashMap, ffi::OsStr, os::unix::ffi::OsStrExt, path::Path, sync::Arc,
+    ffi::OsStr, os::unix::ffi::OsStrExt, path::Path, sync::Arc,
     time::SystemTime,
 };
 
 use anyhow::Result;
 use parking_lot::Mutex;
+use crate::fasthash::FastMap;
 
 use crate::{
     build_sink::{FileEvaluation, NewInputsTiming, OutputEvaluation, ShellEvaluation},
@@ -60,7 +61,7 @@ impl PartialOrd for ExecStatus {
 
 struct Executor<'a> {
     ce: CommandEvaluator<'a>,
-    done: HashMap<Symbol, ExecStatus>,
+    done: FastMap<Symbol, ExecStatus>,
     num_commands: u64,
 }
 
@@ -77,7 +78,7 @@ impl<'a> Executor<'a> {
                 FileEvaluation::Expansion,
                 OutputEvaluation::Expansion,
             )?,
-            done: HashMap::new(),
+            done: FastMap::default(),
             num_commands: 0,
         })
     }

@@ -1,21 +1,21 @@
 //! Physical Ninja names for logical phony targets no filesystem can address.
 
 use crate::symtab::{Symbol, Symtab};
-use std::collections::{HashMap, HashSet};
+use crate::fasthash::{FastMap, FastSet};
 
 const PREFIX: &str = "_kati_unaddressable_phony_";
 
 // [spec:ronin:req:make.compiler-boundary]
 #[derive(Default)]
 pub(super) struct PhonyAliases {
-    aliases: HashMap<Symbol, Symbol>,
+    aliases: FastMap<Symbol, Symbol>,
 }
 
 impl PhonyAliases {
     pub(super) fn prepare(
         &mut self,
         names: &mut Symtab,
-        occupied: &HashSet<Symbol>,
+        occupied: &FastSet<Symbol>,
         phonies: &[Symbol],
     ) {
         let mut used = occupied.clone();
@@ -86,7 +86,7 @@ mod tests {
         let logical = names.intern(vec![b'x'; usize::try_from(libc::NAME_MAX).unwrap() + 1]);
         let base = format!("{PREFIX}{:016x}", stable_hash(&names.name(logical)));
         let collision = names.intern(base.clone().into_bytes());
-        let occupied = HashSet::from([logical, collision]);
+        let occupied: FastSet<_> = [logical, collision].into_iter().collect();
         let mut aliases = PhonyAliases::default();
         aliases.prepare(&mut names, &occupied, &[logical]);
 

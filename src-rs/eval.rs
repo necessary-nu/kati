@@ -47,6 +47,7 @@ use crate::strutil::{
 use crate::symtab::{Interner, Symbol, Symtab};
 use crate::var::{Var, VarExport, VarOrigin, Variable, Vars};
 use crate::{collect_stats_with_slow_report, error_loc, log, warn_loc};
+use crate::fasthash::{FastMap, FastSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RuleState {
@@ -821,7 +822,7 @@ pub(crate) struct PlannedScope {
     /// binding of its own, but only a public one shadows for the targets
     /// beneath it, because a `private` binding is stepped over rather than
     /// stopped at.
-    pub(crate) own: HashMap<Symbol, bool>,
+    pub(crate) own: FastMap<Symbol, bool>,
     /// The targets whose `file->parent` is this one, so the ones this scope is
     /// the next link for.
     pub(crate) inheritors: Vec<Symbol>,
@@ -931,7 +932,7 @@ pub struct Evaluator {
     /// the answer. Empty for every expansion nothing was searched for, which is
     /// nearly all of them, and for one no destination answered — where the name
     /// as written is the only name there is.
-    pub(crate) settled_names: HashMap<Symbol, Symbol>,
+    pub(crate) settled_names: FastMap<Symbol, Symbol>,
     /// Where the selected destination resolves `$?`.
     pub(crate) new_inputs_timing: NewInputsTiming,
     /// Who the selected destination lets answer a `$(shell)` in a recipe.
@@ -1019,7 +1020,7 @@ pub struct Evaluator {
     ///
     /// Empty until the graph is built, which is exactly when a write through it
     /// could still be read.
-    pub(crate) planned_scopes: HashMap<Symbol, PlannedScope>,
+    pub(crate) planned_scopes: FastMap<Symbol, PlannedScope>,
 
     /// Names whose exported answer a recipe has changed since the graph was
     /// compiled.
@@ -1035,7 +1036,7 @@ pub struct Evaluator {
     /// Only what a recipe touched, rather than the whole export set recomputed
     /// per job: the settled answer is still right for every name nothing since
     /// has said anything about.
-    pub(crate) exports_after_snap: HashSet<Symbol>,
+    pub(crate) exports_after_snap: FastSet<Symbol>,
 
     pub is_evaluating_command: bool,
     /// Whether expanding the current recipe referenced `MAKE`.
@@ -1278,7 +1279,7 @@ impl Evaluator {
             assignment_sep: "\n".to_string(),
 
             avoid_io: false,
-            settled_names: HashMap::new(),
+            settled_names: FastMap::default(),
             new_inputs_timing: NewInputsTiming::RecipeShell,
             shell_evaluation: ShellEvaluation::RecipeShell,
             file_evaluation: FileEvaluation::Refused,
@@ -1298,8 +1299,8 @@ impl Evaluator {
             goals: Vec::new(),
 
             rules_snapped: false,
-            planned_scopes: HashMap::new(),
-            exports_after_snap: HashSet::new(),
+            planned_scopes: FastMap::default(),
+            exports_after_snap: FastSet::default(),
             is_evaluating_command: false,
             expanded_make_in_command: Vec::new(),
         }
@@ -3576,7 +3577,7 @@ impl Evaluator {
         result
     }
 
-    pub fn used_undefined_vars(&self) -> HashSet<Symbol> {
+    pub fn used_undefined_vars(&self) -> FastSet<Symbol> {
         self.session.used_undefined_vars.clone()
     }
 }

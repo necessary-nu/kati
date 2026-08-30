@@ -125,7 +125,7 @@ struct RuleBinding {
 /// left holding is asked about — and if that carries `private`, the set
 /// contributes nothing at all to the outward view, whatever an earlier binding
 /// in it left there.
-fn commit_public(public: &mut HashMap<Symbol, Var>, set: HashMap<Symbol, (Var, bool)>) {
+fn commit_public(public: &mut FastMap<Symbol, Var>, set: FastMap<Symbol, (Var, bool)>) {
     for (sym, (var, private)) in set {
         if !private {
             public.insert(sym, var);
@@ -166,7 +166,7 @@ fn release_private(
 ) -> (Vec<ScopedVar>, Vec<(Symbol, bool)>) {
     // What each set is left holding for a name: one entry, the last written,
     // exactly as one hash table slot is.
-    let mut surviving: HashMap<(Symbol, RuleScopeKind), (Var, bool)> = HashMap::new();
+    let mut surviving: FastMap<(Symbol, RuleScopeKind), (Var, bool)> = FastMap::default();
     let mut scope = None;
     for binding in &bindings {
         surviving.insert(
@@ -1581,7 +1581,7 @@ struct DepBuilder<'a> {
     /// Every explicit double-colon record is an independent action. Grouped
     /// records can share a real member, so the graph needs the full membership
     /// set before assigning producers.
-    double_memberships: HashMap<Symbol, Vec<Arc<Rule>>>,
+    double_memberships: FastMap<Symbol, Vec<Arc<Rule>>>,
     /// One action node per exact double-colon action: one per grouped record,
     /// or one per member of an ordinary multi-target record.
     double_actions: HashMap<DoubleActionId, Arc<Mutex<DepNode>>>,
@@ -1767,7 +1767,7 @@ struct DepBuilder<'a> {
     /// `--gen_all_targets`, where every root is a target and the manifest still
     /// wants one of them written on its `default` line.
     first_rule: Option<Symbol>,
-    done: HashMap<Symbol, Arc<Mutex<DepNode>>>,
+    done: FastMap<Symbol, Arc<Mutex<DepNode>>>,
     phony: FastSet<Symbol>,
     /// The names `-o` asserted a date for, interned once.
     ///
@@ -1776,14 +1776,14 @@ struct DepBuilder<'a> {
     /// intermediate turn-off is the one conclusion the read draws from stating
     /// one. Everything else `-o` decides is a scan's business, and the scan is
     /// answered where the build runs.
-    assumed_old: HashSet<Symbol>,
+    assumed_old: FastSet<Symbol>,
     /// The names `-W` asserted a date for, interned once.
     ///
     /// Read only by [`Self::refuse_an_asserted_double_colon`]. Every other
     /// thing the switch decides is a scan's business; this one is the read's,
     /// because the `::` record the refusal is about is gone by the time the
     /// graph exists.
-    assumed_new: HashSet<Symbol>,
+    assumed_new: FastSet<Symbol>,
     /// The targets `.IGNORE` named. Empty when it named none, which is the
     /// form that means every target and sets the flag instead.
     ignore_errors: FastSet<Symbol>,
@@ -1821,7 +1821,7 @@ struct DepBuilder<'a> {
     /// string, so the rule the Makefile declared for the written name goes on
     /// making the found path. Kati keys rules by name, so the found path needs
     /// a way back to the name that carries its rule.
-    gpath_origin: HashMap<Symbol, Symbol>,
+    gpath_origin: FastMap<Symbol, Symbol>,
     /// Where the search found a name that was left where it was written.
     ///
     /// The other half of `gpath_origin`, for the answers `GPATH` did not
@@ -1830,7 +1830,7 @@ struct DepBuilder<'a> {
     /// Recorded as the search runs and read again when the node for that name
     /// is planned, which is the first moment anything asks whether the name
     /// can be remade here at all.
-    searched_at: HashMap<Symbol, Symbol>,
+    searched_at: FastMap<Symbol, Symbol>,
     /// For a found path the search took over a name that was declared too: the
     /// name the search was for.
     ///
@@ -1839,7 +1839,7 @@ struct DepBuilder<'a> {
     /// and it answers to the found name. What the searched name declared is
     /// still part of it — its prerequisites, its variables, and its recipe when
     /// the found name has none — which is what this records.
-    merged_from: HashMap<Symbol, Symbol>,
+    merged_from: FastMap<Symbol, Symbol>,
 }
 
 #[derive(Debug)]
@@ -1877,7 +1877,7 @@ impl<'a> DepBuilder<'a> {
             .clone()
             .into_iter()
             .map(|name| ev.session.intern(name.to_vec()))
-            .collect::<HashSet<_>>();
+            .collect::<FastSet<_>>();
         let assumed_new = ev
             .session
             .flags
@@ -1885,14 +1885,14 @@ impl<'a> DepBuilder<'a> {
             .clone()
             .into_iter()
             .map(|name| ev.session.intern(name.to_vec()))
-            .collect::<HashSet<_>>();
+            .collect::<FastSet<_>>();
         let mut ret = Self {
             ev,
             rules: FastMap::default(),
             rule_vars,
             pattern_var_order,
             cur_rule_vars: None,
-            double_memberships: HashMap::new(),
+            double_memberships: FastMap::default(),
             double_actions: HashMap::new(),
             double_action_creation_indices: HashMap::new(),
             next_double_action_creation: 0,
@@ -1929,7 +1929,7 @@ impl<'a> DepBuilder<'a> {
             global_extra_prereqs: (Vec::new(), Vec::new()),
 
             first_rule: None,
-            done: HashMap::new(),
+            done: FastMap::default(),
             phony: FastSet::default(),
             assumed_old,
             assumed_new,
@@ -1941,9 +1941,9 @@ impl<'a> DepBuilder<'a> {
             libpatterns_var_name,
             gpath_var_name,
             gpaths: Vec::new(),
-            gpath_origin: HashMap::new(),
-            searched_at: HashMap::new(),
-            merged_from: HashMap::new(),
+            gpath_origin: FastMap::default(),
+            searched_at: FastMap::default(),
+            merged_from: FastMap::default(),
         };
         let _tr = ScopedTimeReporter::new(&ret.ev.session, "make dep (populate)");
         ret.populate_rules()?;
@@ -3623,7 +3623,7 @@ impl<'a> DepBuilder<'a> {
         if self.wait_barriers.is_empty() {
             return;
         }
-        let mut consumers: HashMap<Symbol, usize> = HashMap::new();
+        let mut consumers: FastMap<Symbol, usize> = FastMap::default();
         for node in self.done.values() {
             let node = node.lock();
             for input in node
@@ -6025,14 +6025,14 @@ impl<'a> DepBuilder<'a> {
         // name `private` is stepped over, so a `+=` further in finds its base
         // beyond it. Committed one set at a time, because a set is one hash
         // slot per name and only what the set is left holding decides.
-        let mut public_now: HashMap<Symbol, Var> = HashMap::new();
-        let mut pending: HashMap<Symbol, (Var, bool)> = HashMap::new();
+        let mut public_now: FastMap<Symbol, Var> = FastMap::default();
+        let mut pending: FastMap<Symbol, (Var, bool)> = FastMap::default();
         let mut installing: Option<RuleScopeKind> = None;
         // What the name held before this run bound it at all, which is where
         // the outward walk lands when every set it passed was `private`. It has
         // to be taken as the name is first met: the scope is installed into as
         // the run goes, so asking again later answers with the run's own work.
-        let mut outer: HashMap<Symbol, Option<Var>> = HashMap::new();
+        let mut outer: FastMap<Symbol, Option<Var>> = FastMap::default();
         // Which origin each name was last defined WITH inside the pattern set.
         // Every matching pattern assignment lands in one set in GNU Make
         // (`file->pat_variables`), so `define_variable_in_set`'s "if the old
@@ -6042,7 +6042,7 @@ impl<'a> DepBuilder<'a> {
         // the order they compose in is sayable, which puts the answer here
         // rather than in `Vars::assign`. The target's own scopes are genuinely
         // separate sets and are not compared this way.
-        let mut pattern_set_origins: HashMap<Symbol, VarOrigin> = HashMap::new();
+        let mut pattern_set_origins: FastMap<Symbol, VarOrigin> = FastMap::default();
         for (kind, vars) in scopes.iter() {
             if installing != Some(kind) {
                 commit_public(&mut public_now, std::mem::take(&mut pending));
@@ -6936,7 +6936,7 @@ pub fn make_dep(
     // The inheritance link comes back with them, because the assignment reaches
     // more than the target it names: everything whose scope was copied from
     // that one and has not been expanded yet reads it too.
-    let mut planned: HashMap<Symbol, PlannedScope> = db
+    let mut planned: FastMap<Symbol, PlannedScope> = db
         .done
         .iter()
         .filter_map(|(target, node)| {

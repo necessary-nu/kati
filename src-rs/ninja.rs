@@ -21,7 +21,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::time::SystemTime;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::Arc,
 };
 
@@ -56,6 +56,7 @@ use crate::{
     timeutil::ScopedTimeReporter,
 };
 use path_alias::PhonyAliases;
+use crate::fasthash::{FastMap, FastSet};
 
 /// The pool kati declares for itself, so that `--remote_num_jobs` can let ninja
 /// run wide while the commands kati generated stay capped at `--jobs`.
@@ -665,11 +666,11 @@ fn node_environment(
 
 struct NinjaGenerator<'a> {
     ce: CommandEvaluator<'a>,
-    done: HashSet<Symbol>,
+    done: FastSet<Symbol>,
     rule_id: RuleId,
     /// See [`NinjaGenerator::deferred_shell`]. `None` until something asks.
     shell: Option<Bytes>,
-    used_envs: HashMap<Symbol, OsString>,
+    used_envs: FastMap<Symbol, OsString>,
     nodes: Vec<NinjaNode>,
     phony_aliases: PhonyAliases,
     recipe_expansion: RecipeExpansion,
@@ -681,10 +682,10 @@ impl<'a> NinjaGenerator<'a> {
         ce.ev.avoid_io = true;
         Ok(Self {
             ce,
-            done: HashSet::new(),
+            done: FastSet::default(),
             rule_id: 0,
             shell: None,
-            used_envs: HashMap::new(),
+            used_envs: FastMap::default(),
             nodes: Vec::new(),
             phony_aliases: PhonyAliases::default(),
             recipe_expansion,
@@ -771,7 +772,7 @@ impl<'a> NinjaGenerator<'a> {
         }
         let rule_vars = node.rule_vars.clone();
         node.cmds.iter().all(|cmd| {
-            let mut seen = HashSet::new();
+            let mut seen = FastSet::default();
             !expansion_can_reach_make(cmd, self.ce.ev, rule_vars.as_deref(), &mut seen)
         })
     }
@@ -3161,10 +3162,10 @@ impl BuildEvaluation {
 /// [`NinjaGenerator::resume`].
 pub struct PopulatedBuild {
     evaluation: BuildEvaluation,
-    done: HashSet<Symbol>,
+    done: FastSet<Symbol>,
     rule_id: RuleId,
     shell: Option<Bytes>,
-    used_envs: HashMap<Symbol, OsString>,
+    used_envs: FastMap<Symbol, OsString>,
     nodes: Vec<NinjaNode>,
     phony_aliases: PhonyAliases,
     deferred_recipes: Vec<DeferredRecipe>,

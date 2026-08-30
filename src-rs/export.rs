@@ -30,7 +30,6 @@ limitations under the License.
 //! entry means evaluating a value, and an environment variable's bytes are its
 //! own rather than something Make expands.
 
-use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -41,6 +40,7 @@ use crate::eval::Evaluator;
 use crate::expr::Evaluable;
 use crate::symtab::{Interner, Symbol};
 use crate::var::{Var, VarExport, VarOrigin, Vars, is_exportable_name};
+use crate::fasthash::{FastMap, FastSet};
 
 /// One name's fate in a child's environment: the bytes to set it to, or
 /// nothing, meaning remove whatever the caller inherited under that name.
@@ -201,8 +201,8 @@ fn exportable_bindings(
 /// about exporting and the global binding did. That second rule is why every
 /// global is visited here and not only the ones that export: a global nobody
 /// exports still lends its `unexport` to the binding in front of it.
-fn resolved_bindings(ev: &Evaluator, scope: &Vars) -> HashMap<Symbol, Var> {
-    let mut resolved: HashMap<Symbol, Var> = HashMap::new();
+fn resolved_bindings(ev: &Evaluator, scope: &Vars) -> FastMap<Symbol, Var> {
+    let mut resolved: FastMap<Symbol, Var> = FastMap::default();
     for (name, var) in scope.0.lock().iter() {
         resolved.insert(*name, var.clone());
     }
@@ -472,7 +472,7 @@ pub fn late_environment(ev: &mut Evaluator, names: &[Symbol]) -> Result<Vec<Envi
 /// The names the invocation's own environment carries that this child must not
 /// see: `unexport`ed, `undefine`d, or replaced by a binding that is not
 /// exported.
-fn withdrawn_names(ev: &Evaluator, exported: &HashSet<Symbol>) -> Vec<Symbol> {
+fn withdrawn_names(ev: &Evaluator, exported: &FastSet<Symbol>) -> Vec<Symbol> {
     // Borrowed where the invocation kept its own environment, and owned only
     // where there is none to borrow. The walk reads the names and keeps
     // nothing, so copying every name and value the process was started with in

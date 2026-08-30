@@ -27,7 +27,6 @@ limitations under the License.
 //! `plan/decisions/session-owned-evaluation.md`.
 
 use std::{
-    collections::HashSet,
     ffi::{OsStr, OsString},
     path::PathBuf,
     sync::{OnceLock, atomic::AtomicUsize},
@@ -35,6 +34,7 @@ use std::{
 
 use anyhow::Result;
 use bytes::Bytes;
+use crate::fasthash::FastSet;
 
 use crate::{
     file_cache::MakefileCache,
@@ -294,9 +294,9 @@ pub struct Session {
     /// text was told.
     pub ground_journal: GroundJournal,
     /// Environment variables an evaluation read.
-    pub used_env_vars: HashSet<Symbol>,
+    pub used_env_vars: FastSet<Symbol>,
     /// Variables an evaluation read without finding a binding.
-    pub used_undefined_vars: HashSet<Symbol>,
+    pub used_undefined_vars: FastSet<Symbol>,
     /// The exit status of the last `$(shell)`, which is what `.SHELLSTATUS`
     /// reads.
     pub shell_status: Option<i32>,
@@ -426,8 +426,8 @@ impl Session {
             find_node_count: AtomicUsize::new(0),
             command_results: Vec::new(),
             ground_journal: GroundJournal::default(),
-            used_env_vars: HashSet::new(),
-            used_undefined_vars: HashSet::new(),
+            used_env_vars: FastSet::default(),
+            used_undefined_vars: FastSet::default(),
             shell_status: None,
             vpaths: Vec::new(),
             diagnostics: std::sync::Arc::new(crate::diagnostics::Diagnostics::to_stderr()),

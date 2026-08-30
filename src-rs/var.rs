@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
     fmt::Debug,
     sync::Arc,
 };
@@ -24,6 +23,7 @@ use std::{
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
+use crate::fasthash::{FastMap, FastSet};
 
 use crate::{
     command::AutoCommandVar,
@@ -1023,7 +1023,7 @@ fn carry_regenerated_value(previous: &Var, replacement: &Var) {
     }
 }
 
-pub struct Vars(pub Mutex<HashMap<Symbol, Var>>);
+pub struct Vars(pub Mutex<FastMap<Symbol, Var>>);
 
 impl Default for Vars {
     fn default() -> Self {
@@ -1033,12 +1033,12 @@ impl Default for Vars {
 
 impl Vars {
     pub fn new() -> Self {
-        Vars(Mutex::new(HashMap::new()))
+        Vars(Mutex::new(FastMap::default()))
     }
 
     /// The binding for `sym`, recording the read in `used_env_vars` if it came
     /// from the environment.
-    pub fn lookup(&self, used_env_vars: &mut HashSet<Symbol>, sym: Symbol) -> Option<Var> {
+    pub fn lookup(&self, used_env_vars: &mut FastSet<Symbol>, sym: Symbol) -> Option<Var> {
         let ret = self.0.lock().get(&sym).cloned()?;
         match ret.read().origin() {
             VarOrigin::Environment | VarOrigin::EnvironmentOverride => {
