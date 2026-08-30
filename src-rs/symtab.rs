@@ -247,14 +247,21 @@ impl Symtab {
         symtab
     }
 
+    /// The handle for `s`, minting one if this interner has not seen it.
+    ///
+    /// The lookup reads `s` borrowed and the conversion to [`Bytes`] happens
+    /// only for a name that turns out to be new. A caller handing over a
+    /// `&[u8]`, a `&str` or a `Vec` pays an allocation and a copy to become one,
+    /// and most of what a read interns has been interned already: the same
+    /// target named by four rules, the same variable read in twenty recipes.
     pub fn intern<T: Into<Bytes> + AsRef<[u8]>>(&mut self, s: T) -> Symbol {
         if let [c] = s.as_ref() {
             return Symbol(NonZeroUsize::new(*c as usize).unwrap());
         }
-        let s = s.into();
-        if let Some(sym) = self.index.get(&s) {
+        if let Some(sym) = self.index.get(s.as_ref()) {
             return *sym;
         }
+        let s = s.into();
         let sym = Symbol(NonZeroUsize::new(self.symbols.len()).unwrap());
         self.symbols.push(s.clone());
         self.index.insert(s, sym);

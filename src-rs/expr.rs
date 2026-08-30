@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
-use memchr::memchr;
+use memchr::{memchr, memchr2, memchr3};
 
 use crate::eval::{Evaluator, FrameType};
 use crate::func::{FuncInfo, get_func_info};
@@ -787,6 +787,101 @@ fn parse_dollar(
     }
 }
 
+/// The bytes at which the scan in [`parse_expr_impl_ext`] has something to do.
+///
+/// That loop asks as many as six questions of every byte it reads, and a
+/// makefile is mostly text where the answer to all six is no: a path, a
+/// compiler flag, the prerequisite list of a rule. Which bytes can be answered
+/// yes is fixed by the parse options, the caller's terminators, and whether a
+/// parenthesis is open, so the set is computed once and the run between two of
+/// its members is stepped over whole rather than a byte at a time.
+///
+/// The set must be exactly the bytes the loop acts on. Too few and a reference
+/// is read as literal text; too many only costs a stop that decides to do
+/// nothing, which the loop already handles.
+#[derive(Clone, Copy)]
+struct Stops {
+    /// One bit per byte value, for a set too large to hand to `memchr`.
+    bits: [u64; 4],
+    /// The set itself while it still fits, because `memchr` over a run beats a
+    /// bit test per byte of it by more than the branch here costs.
+    few: [u8; 3],
+    /// How many bytes are in the set, which may exceed what `few` holds.
+    len: usize,
+}
+
+impl Stops {
+    fn new(
+        opt: ParseExprOpt,
+        terms: Option<&[u8]>,
+        terms_ignored: usize,
+        save_paren: Option<u8>,
+    ) -> Self {
+        let mut stops = Self {
+            bits: [0; 4],
+            few: [0; 3],
+            len: 0,
+        };
+        stops.add(b'$');
+        if terms.is_none() && should_handle_comments(opt) {
+            stops.add(b'#');
+        }
+        if opt != ParseExprOpt::Command {
+            stops.add(b'\\');
+        }
+        if opt == ParseExprOpt::Func {
+            stops.add(b'(');
+            stops.add(b'{');
+        }
+        if let Some(close) = save_paren {
+            stops.add(close);
+        } else if let Some(terms) = terms {
+            for term in &terms[terms_ignored..] {
+                stops.add(*term);
+            }
+        }
+        stops
+    }
+
+    fn add(&mut self, byte: u8) {
+        let word = usize::from(byte) >> 6;
+        let bit = 1u64 << (u32::from(byte) & 63);
+        if self.bits[word] & bit != 0 {
+            return;
+        }
+        self.bits[word] |= bit;
+        if let Some(slot) = self.few.get_mut(self.len) {
+            *slot = byte;
+        }
+        self.len += 1;
+    }
+
+    /// The first index at or after `from` holding a byte of the set, or the
+    /// length of `s` when there is none.
+    #[inline]
+    fn next(&self, s: &[u8], from: usize) -> usize {
+        let rest = &s[from..];
+        let found = match (self.len, self.few) {
+            (1, [a, _, _]) => memchr(a, rest),
+            (2, [a, b, _]) => memchr2(a, b, rest),
+            (3, [a, b, c]) => memchr3(a, b, c, rest),
+            _ => return self.scan(s, from),
+        };
+        found.map_or(s.len(), |at| from + at)
+    }
+
+    fn scan(&self, s: &[u8], from: usize) -> usize {
+        for (offset, byte) in s[from..].iter().enumerate() {
+            let word = usize::from(*byte) >> 6;
+            let bit = 1u64 << (u32::from(*byte) & 63);
+            if self.bits[word] & bit != 0 {
+                return from + offset;
+            }
+        }
+        s.len()
+    }
+}
+
 pub fn parse_expr_impl(
     session: &mut Session,
     loc: &mut Loc,
@@ -822,8 +917,16 @@ pub fn parse_expr_impl_ext(
     let mut i = 0usize;
     let mut list: Vec<Arc<Value>> = Vec::new();
     let mut terms_ignored = 0;
+    let mut stops = Stops::new(opt, terms, terms_ignored, save_paren);
 
     while i < s.len() {
+        // Step over the run of bytes no arm below can act on. Recomputed
+        // wherever `save_paren` or `terms_ignored` moves, which is the only
+        // thing that changes which bytes those are.
+        i = stops.next(&s, i);
+        if i >= s.len() {
+            break;
+        }
         let item_loc = loc.clone();
 
         let remaining = &s[i..];
@@ -947,6 +1050,7 @@ pub fn parse_expr_impl_ext(
                 paren_depth += 1;
                 save_paren = cp;
                 terms_ignored += 1;
+                stops = Stops::new(opt, terms, terms_ignored, save_paren);
             } else if cp == save_paren {
                 paren_depth += 1;
             }
@@ -959,6 +1063,7 @@ pub fn parse_expr_impl_ext(
             if paren_depth == 0 {
                 terms_ignored -= 1;
                 save_paren = None;
+                stops = Stops::new(opt, terms, terms_ignored, save_paren);
             }
         }
 
