@@ -14,15 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::fasthash::{FastMap, FastSet};
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
-use crate::fasthash::{FastMap, FastSet};
-use std::{
-    collections::HashSet,
-    fmt::Debug,
-    sync::Arc,
-};
+use std::{collections::HashSet, fmt::Debug, sync::Arc};
 
 use crate::{
     build_sink::{

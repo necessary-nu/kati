@@ -1192,14 +1192,19 @@ fn ends_with_pattern_tail(name: &[u8], suffix: &[u8]) -> bool {
 
 struct RuleTrie {
     rules: Vec<RuleTrieEntry>,
-    children: HashMap<u8, RuleTrie>,
+    /// One entry per byte that continues a filed pattern, hashed with the
+    /// crate's own hasher rather than SipHash: the key is a single byte, the
+    /// walk descends a level per byte of every name the implicit-rule search
+    /// tries, and a keyed cryptographic permutation over one byte is most of
+    /// what a level costs.
+    children: FastMap<u8, RuleTrie>,
 }
 
 impl RuleTrie {
     fn new() -> Self {
         Self {
             rules: Vec::new(),
-            children: HashMap::new(),
+            children: FastMap::default(),
         }
     }
 

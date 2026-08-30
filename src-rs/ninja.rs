@@ -19,11 +19,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::sync::Arc;
 use std::time::SystemTime;
-use std::{
-    collections::HashSet,
-    sync::Arc,
-};
 
 mod path_alias;
 
@@ -34,6 +31,7 @@ use parking_lot::Mutex;
 
 use crate::error;
 use crate::export::environment_prefix;
+use crate::fasthash::{FastMap, FastSet};
 use crate::func::CommandOp;
 use crate::io::{dump_int, dump_string, dump_systemtime, dump_usize, dump_vec_string};
 use crate::strutil::{Pattern, basename, concat_dir, dirname, strip_ext, strip_ext_vec};
@@ -56,7 +54,6 @@ use crate::{
     timeutil::ScopedTimeReporter,
 };
 use path_alias::PhonyAliases;
-use crate::fasthash::{FastMap, FastSet};
 
 /// The pool kati declares for itself, so that `--remote_num_jobs` can let ninja
 /// run wide while the commands kati generated stay capped at `--jobs`.
@@ -2230,7 +2227,7 @@ impl<'a> NinjaGenerator<'a> {
             // A peer is the exception and the same one the ordinary path makes:
             // a name nobody asked for neither forces the recipe by being absent
             // nor is compared against anything.
-            let peers = node.peer_outputs.iter().copied().collect::<HashSet<_>>();
+            let peers = node.peer_outputs.iter().copied().collect::<FastSet<_>>();
             let mut reached = Vec::with_capacity(1 + node.implicit_outputs.len());
             for name in std::iter::once(node.recipe_output)
                 .chain(node.implicit_outputs.iter().copied())
@@ -2256,7 +2253,7 @@ impl<'a> NinjaGenerator<'a> {
         } else {
             Vec::new()
         };
-        let visible_inputs = node.actual_inputs.iter().copied().collect::<HashSet<_>>();
+        let visible_inputs = node.actual_inputs.iter().copied().collect::<FastSet<_>>();
         let filter_out = nn
             .deferred_new_inputs_filter_out
             .iter()

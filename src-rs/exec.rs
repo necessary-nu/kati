@@ -14,14 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    ffi::OsStr, os::unix::ffi::OsStrExt, path::Path, sync::Arc,
-    time::SystemTime,
-};
+use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::Path, sync::Arc, time::SystemTime};
 
+use crate::fasthash::FastMap;
 use anyhow::Result;
 use parking_lot::Mutex;
-use crate::fasthash::FastMap;
 
 use crate::{
     build_sink::{FileEvaluation, NewInputsTiming, OutputEvaluation, ShellEvaluation},

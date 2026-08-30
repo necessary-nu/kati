@@ -30,7 +30,6 @@ limitations under the License.
 //! entry means evaluating a value, and an environment variable's bytes are its
 //! own rather than something Make expands.
 
-
 use anyhow::Result;
 use bytes::Bytes;
 
@@ -38,9 +37,9 @@ use std::os::unix::ffi::OsStrExt;
 
 use crate::eval::Evaluator;
 use crate::expr::Evaluable;
+use crate::fasthash::{FastMap, FastSet};
 use crate::symtab::{Interner, Symbol};
 use crate::var::{Var, VarExport, VarOrigin, Vars, is_exportable_name};
-use crate::fasthash::{FastMap, FastSet};
 
 /// One name's fate in a child's environment: the bytes to set it to, or
 /// nothing, meaning remove whatever the caller inherited under that name.

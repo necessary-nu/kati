@@ -29,6 +29,7 @@ use parking_lot::Mutex;
 
 use crate::build_sink::{FileEvaluation, NewInputsTiming, OutputEvaluation, ShellEvaluation};
 use crate::expr::{Evaluable, ParseExprOpt, Value, parse_expr};
+use crate::fasthash::{FastMap, FastSet};
 use crate::file::Source;
 use crate::flags::Flags;
 use crate::loc::Loc;
@@ -47,7 +48,6 @@ use crate::strutil::{
 use crate::symtab::{Interner, Symbol, Symtab};
 use crate::var::{Var, VarExport, VarOrigin, Variable, Vars};
 use crate::{collect_stats_with_slow_report, error_loc, log, warn_loc};
-use crate::fasthash::{FastMap, FastSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RuleState {
@@ -864,7 +864,7 @@ pub struct Evaluator {
     /// Each entry is a `Var`'s address, which is stable and unique for as long
     /// as it is marked: whatever put it here holds the `Arc` until it takes it
     /// out again.
-    expanding_vars: HashSet<usize>,
+    expanding_vars: FastSet<usize>,
     /// The location a diagnostic raised inside an expansion carries, as a
     /// stack of the variables an expansion is currently inside.
     ///
@@ -1255,7 +1255,7 @@ impl Evaluator {
             rule_vars: crate::fasthash::FastMap::default(),
             pattern_rule_var_sets: Vec::new(),
             rules: Vec::new(),
-            expanding_vars: HashSet::new(),
+            expanding_vars: FastSet::default(),
             expanding_var_locs: Vec::new(),
 
             rule_state: RuleState::None,

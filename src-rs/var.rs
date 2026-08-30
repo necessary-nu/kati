@@ -14,16 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    borrow::Cow,
-    fmt::Debug,
-    sync::Arc,
-};
+use std::{borrow::Cow, fmt::Debug, sync::Arc};
 
+use crate::fasthash::{FastMap, FastSet};
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
-use crate::fasthash::{FastMap, FastSet};
 
 use crate::{
     command::AutoCommandVar,

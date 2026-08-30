@@ -32,9 +32,9 @@ use std::{
     sync::{OnceLock, atomic::AtomicUsize},
 };
 
+use crate::fasthash::FastSet;
 use anyhow::Result;
 use bytes::Bytes;
-use crate::fasthash::FastSet;
 
 use crate::{
     file_cache::MakefileCache,

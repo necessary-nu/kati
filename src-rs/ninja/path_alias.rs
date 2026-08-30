@@ -1,7 +1,7 @@
 //! Physical Ninja names for logical phony targets no filesystem can address.
 
-use crate::symtab::{Symbol, Symtab};
 use crate::fasthash::{FastMap, FastSet};
+use crate::symtab::{Symbol, Symtab};
 
 const PREFIX: &str = "_kati_unaddressable_phony_";
 

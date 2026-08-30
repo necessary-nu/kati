@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use std::{
-    collections::HashMap,
     ffi::OsStr,
     fmt::Debug,
     fs::File,
@@ -34,6 +33,7 @@ use crate::{
     error_loc,
     eval::{Evaluator, FrameType},
     expr::{Evaluable, Value},
+    fasthash::FastMap,
     fileutil::{RedirectStderr, run_command},
     find::FindCommand,
     kati_warn_loc,
@@ -1678,7 +1678,7 @@ const FUNC_INFO: &[FuncInfo] = &[
 
 // no-globals-gate: read-only dispatch table built once from the const array
 // above, permitted by plan/decisions/session-owned-evaluation.md.
-static FUNC_INFO_MAP: LazyLock<HashMap<&'static [u8], &'static FuncInfo>> =
+static FUNC_INFO_MAP: LazyLock<FastMap<&'static [u8], &'static FuncInfo>> =
     LazyLock::new(|| FUNC_INFO.iter().map(|f| (f.name, f)).collect());
 
 pub fn get_func_info(name: &[u8]) -> Option<&'static FuncInfo> {
