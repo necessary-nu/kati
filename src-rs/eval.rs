@@ -1153,7 +1153,7 @@ impl Evaluator {
         variable: &Var,
         assigned: bool,
     ) -> Result<()> {
-        if !assigned || lhs.as_bytes(&self.session).as_ref() != b"MAKEFLAGS" {
+        if !assigned || lhs.name_bytes(&self.session) != b"MAKEFLAGS" {
             return Ok(());
         }
         let value = self.eval_var(lhs)?;
@@ -2454,7 +2454,7 @@ impl Evaluator {
         if !is_pattern_rule
             && targets
                 .iter()
-                .any(|t| t.as_bytes(&self.session).as_ref() == b".SECONDEXPANSION")
+                .any(|t| t.name_bytes(&self.session) == b".SECONDEXPANSION")
         {
             self.second_expansion = true;
         }
@@ -2472,7 +2472,7 @@ impl Evaluator {
         if !is_pattern_rule
             && targets
                 .iter()
-                .any(|t| t.as_bytes(&self.session).as_ref() == b".ONESHELL")
+                .any(|t| t.name_bytes(&self.session) == b".ONESHELL")
         {
             self.session.flags.one_shell = true;
         }
@@ -3149,9 +3149,9 @@ impl Evaluator {
             return true;
         }
 
-        let name = name.as_bytes(&self.session);
+        let name = name.name_bytes(&self.session);
         for pat in self.session.flags.traced_variables_pattern.iter() {
-            if pat.matches(&name) {
+            if pat.matches(name) {
                 return true;
             }
         }
@@ -3252,8 +3252,8 @@ impl Evaluator {
             b"VPATH",
             b"GPATH",
         ];
-        let text = name.as_bytes(&self.session);
-        if ALWAYS_DEFINED.contains(&text.as_ref()) {
+        let text = name.name_bytes(&self.session);
+        if ALWAYS_DEFINED.contains(&text) {
             return;
         }
         let loc = self.loc;
@@ -3261,7 +3261,7 @@ impl Evaluator {
             self,
             loc.as_ref(),
             "warning: undefined variable '{}'",
-            String::from_utf8_lossy(&text)
+            String::from_utf8_lossy(text)
         );
     }
 
@@ -3347,7 +3347,7 @@ impl Evaluator {
     /// What this name held in the environment the invocation was started with,
     /// as a binding an expansion can read.
     fn inherited_binding(&mut self, name: Symbol) -> Var {
-        let inherited = crate::export::invocation_value(self, &name.as_bytes(&self.session))
+        let inherited = crate::export::invocation_value(self, name.name_bytes(&self.session))
             .map(Bytes::from)
             .unwrap_or_default();
         Variable::with_simple_string(inherited, VarOrigin::Environment, None, None)

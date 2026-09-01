@@ -137,8 +137,8 @@ impl<'a> Executor<'a> {
         let mut latest = ExecStatus::Processing;
         let order_onlys = n.lock().order_onlys.clone();
         for (_, d) in order_onlys {
-            let dep_out = d.lock().output.as_bytes(&self.ce.ev.session);
-            let dep_path = Path::new(OsStr::from_bytes(&dep_out));
+            let dep_out = d.lock().output.name_bytes(&self.ce.ev.session);
+            let dep_path = Path::new(OsStr::from_bytes(dep_out));
             match std::fs::exists(dep_path) {
                 Ok(true) => continue,
                 Ok(false) => {}

@@ -489,7 +489,7 @@ impl DeferredRecipes {
         {
             anyhow::bail!(
                 "recipe for {} reached a recursive Make invocation the compiler could not see before expanding it",
-                String::from_utf8_lossy(&recipe.node.lock().output.as_bytes(&ce.ev.session))
+                String::from_utf8_lossy(recipe.node.lock().output.name_bytes(&ce.ev.session))
             );
         }
         let recipe_output = recipe.node.lock().recipe_output.as_bytes(&ce.ev.session);
@@ -2288,9 +2288,9 @@ impl<'a> NinjaGenerator<'a> {
             node.deps
                 .iter()
                 .filter_map(|(input, _)| {
-                    let name = input.as_bytes(&self.ce.ev.session);
+                    let name = input.name_bytes(&self.ce.ev.session);
                     (!visible_inputs.contains(input)
-                        || filter_out.iter().any(|pattern| pattern.matches(&name)))
+                        || filter_out.iter().any(|pattern| pattern.matches(name)))
                     .then(|| self.phony_aliases.resolve(*input))
                 })
                 .collect::<Vec<_>>()
@@ -2454,8 +2454,8 @@ impl<'a> NinjaGenerator<'a> {
         // PATH changes $(shell).
         used_env_vars.insert(self.ce.ev.session.intern("PATH"));
         for e in used_env_vars {
-            let k = e.as_bytes(&self.ce.ev.session);
-            let k = OsStr::from_bytes(&k);
+            let k = e.name_bytes(&self.ce.ev.session);
+            let k = OsStr::from_bytes(k);
             let val = std::env::var_os(k).unwrap();
             self.used_envs.insert(e, val);
         }
@@ -2535,11 +2535,11 @@ impl<'a> NinjaGenerator<'a> {
             let undefined = self.ce.ev.used_undefined_vars();
             dump_usize(&mut out, undefined.len())?;
             for v in &undefined {
-                dump_string(&mut out, &v.as_bytes(&self.ce.ev.session))?;
+                dump_string(&mut out, v.name_bytes(&self.ce.ev.session))?;
             }
             dump_usize(&mut out, self.used_envs.len())?;
             for (key, value) in &self.used_envs {
-                dump_string(&mut out, &key.as_bytes(&self.ce.ev.session))?;
+                dump_string(&mut out, key.name_bytes(&self.ce.ev.session))?;
                 dump_string(&mut out, value.as_bytes())?;
             }
 
@@ -2570,7 +2570,7 @@ impl<'a> NinjaGenerator<'a> {
                 dump_string(&mut out, &cr.shellflag)?;
                 dump_string(&mut out, &cr.cmd)?;
                 dump_string(&mut out, &cr.result)?;
-                dump_string(&mut out, &cr.loc.filename.as_bytes(&self.ce.ev.session))?;
+                dump_string(&mut out, cr.loc.filename.name_bytes(&self.ce.ev.session))?;
                 dump_int(&mut out, cr.loc.line)?;
 
                 if cr.op == CommandOp::Find {
@@ -2776,7 +2776,7 @@ fn escape_ninja(s: &[u8]) -> Bytes {
 }
 
 fn escape_build_target(names: &dyn Interner, s: Symbol) -> Bytes {
-    escape_ninja(&s.as_bytes(&names))
+    escape_ninja(s.name_bytes(&names))
 }
 
 /// Escape a value for the right-hand side of a `build.ninja` binding, where

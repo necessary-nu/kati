@@ -183,7 +183,7 @@ fn release_private(
     let mut public = Vec::new();
     let mut own = Vec::new();
     let mut names = surviving.keys().map(|(sym, _)| *sym).collect::<Vec<_>>();
-    names.sort_by_cached_key(|sym| sym.as_bytes(session));
+    names.sort_by_cached_key(|sym| sym.name_bytes(session));
     names.dedup();
     for sym in names {
         let mut survives = false;
@@ -1319,11 +1319,11 @@ fn pattern_rule_holds_suffix_rule(
     let [prerequisite] = existing.prerequisite_names.as_slice() else {
         return false;
     };
-    let input = input.as_bytes(names);
+    let input = input.name_bytes(names);
     let mut written = BytesMut::with_capacity(input.len() + 2);
     written.put_slice(b"%.");
-    written.put_slice(&input);
-    prerequisite.as_bytes(names) == written.freeze()
+    written.put_slice(input);
+    prerequisite.name_bytes(names) == written.freeze()
         && pattern_rule_targets_match(suffix_rule, existing)
 }
 
@@ -1346,9 +1346,9 @@ fn is_suffix_rule(names: &impl Interner, output: &Symbol) -> bool {
     if !is_special_target(names, output) {
         return false;
     }
-    let mut output = output.as_bytes(names);
+    let mut output = output.name_bytes(names);
     output.advance(1);
-    let dot_index = memchr(b'.', &output);
+    let dot_index = memchr(b'.', output);
     // If there is only a single dot or the third dot, this is not a
     // suffix rule.
     if let Some(dot_index) = dot_index {
@@ -2287,7 +2287,7 @@ impl<'a> DepBuilder<'a> {
                 self.no_intermediates = true;
             }
             for t in targets {
-                if t.as_bytes(&self.ev.session).contains(&b'%') {
+                if t.name_bytes(&self.ev.session).contains(&b'%') {
                     self.not_intermediate_patterns.push(t);
                 } else {
                     self.not_intermediate.insert(t);
@@ -2352,11 +2352,11 @@ impl<'a> DepBuilder<'a> {
         if self.no_intermediates || self.merged_flag(&self.not_intermediate, output) {
             return false;
         }
-        let name = output.as_bytes(&self.ev.session);
+        let name = output.name_bytes(&self.ev.session);
         if self
             .not_intermediate_patterns
             .iter()
-            .any(|p| Pattern::new(p.as_bytes(&self.ev.session)).matches(&name))
+            .any(|p| Pattern::new(p.as_bytes(&self.ev.session)).matches(name))
         {
             return false;
         }
@@ -2412,8 +2412,8 @@ impl<'a> DepBuilder<'a> {
         {
             return false;
         }
-        let name = output.as_bytes(&self.ev.session);
-        std::fs::exists(OsStr::from_bytes(&name)).is_ok_and(|found| found)
+        let name = output.name_bytes(&self.ev.session);
+        std::fs::exists(OsStr::from_bytes(name)).is_ok_and(|found| found)
             || self.vpath_of(output).is_some()
     }
 
@@ -2457,11 +2457,11 @@ impl<'a> DepBuilder<'a> {
     /// than it ever chooses, and a name it turns down should leave nothing
     /// behind. The one caller that goes on to use the answer interns it there.
     fn suffix_rule_name(&self, stem: &Bytes, rule: &Rule) -> Bytes {
-        let source = rule.inputs[0].as_bytes(&self.ev.session);
+        let source = rule.inputs[0].name_bytes(&self.ev.session);
         let mut name = BytesMut::with_capacity(stem.len() + source.len() + 1);
         name.put_slice(stem);
         name.put_u8(b'.');
-        name.put_slice(&source);
+        name.put_slice(source);
         name.freeze()
     }
 
@@ -2703,7 +2703,7 @@ impl<'a> DepBuilder<'a> {
         let names = &self.ev.session;
         for rules in self.suffix_rules.values_mut() {
             rules.sort_by_key(|rule| {
-                let source = rule.inputs[0].as_bytes(names);
+                let source = rule.inputs[0].name_bytes(names);
                 order
                     .iter()
                     .position(|suffix| *suffix == source)
@@ -2916,7 +2916,7 @@ impl<'a> DepBuilder<'a> {
             if self.an_implicit_rule_could_make(found)? {
                 continue;
             }
-            let written = String::from_utf8_lossy(&found.as_bytes(&self.ev.session)).into_owned();
+            let written = String::from_utf8_lossy(found.name_bytes(&self.ev.session)).into_owned();
             // `complain()` at remake.c:414, which is GNU Make's own wording for
             // a name nothing knows how to make.
             error_loc!(self.ev, None, "*** No rule to make target '{written}'.");
@@ -2970,7 +2970,7 @@ impl<'a> DepBuilder<'a> {
 
             let mut rule_keys = self.rules.keys().cloned().collect::<Vec<_>>();
             let names = &self.ev.session;
-            rule_keys.sort_by_cached_key(|k| k.as_bytes(names));
+            rule_keys.sort_by_cached_key(|k| k.name_bytes(names));
             for t in rule_keys {
                 if !non_root_targets.contains(&t) && !is_special_target(&self.ev.session, &t) {
                     targets.push(t);
@@ -3173,7 +3173,7 @@ impl<'a> DepBuilder<'a> {
                 .filter(|_| required)
                 .and_then(|include| include.loc.as_ref().map(|loc| (include, loc)))
                 .map(|(include, loc)| {
-                    let name = include.filename.as_bytes(&self.ev.session);
+                    let name = include.filename.name_bytes(&self.ev.session);
                     // The words are the read's, not this line's: GNU Make stores
                     // the open's `errno` on the goaldep and prints `strerror` of
                     // it, so a file with no permission complains in its own terms
@@ -3181,7 +3181,7 @@ impl<'a> DepBuilder<'a> {
                     crate::color_warn_text(
                         &self.ev.session,
                         Some(loc),
-                        format!("{}: {}", String::from_utf8_lossy(&name), include.reason),
+                        format!("{}: {}", String::from_utf8_lossy(name), include.reason),
                     )
                 });
             if Self::is_remakable(&node) {
@@ -3325,7 +3325,7 @@ impl<'a> DepBuilder<'a> {
             && !inputs
                 .iter()
                 .chain(&order_only)
-                .any(|input| input.as_bytes(&self.ev.session).starts_with(b"-l"))
+                .any(|input| input.name_bytes(&self.ev.session).starts_with(b"-l"))
         {
             return Ok(());
         }
@@ -3367,7 +3367,7 @@ impl<'a> DepBuilder<'a> {
             let mut ww = WordWriter::new(&mut out);
             for sym in syms {
                 if !unique || seen.insert(*sym) {
-                    ww.write(&sym.as_bytes(&self.ev.session));
+                    ww.write(sym.name_bytes(&self.ev.session));
                 }
             }
         }
@@ -3555,10 +3555,10 @@ impl<'a> DepBuilder<'a> {
                         // the answer is then read one directory down. Only a
                         // word that named the stem held a directory aside.
                         let name = if from_pattern && !directory.is_empty() {
-                            let name = name.as_bytes(&self.ev.session);
+                            let name = name.name_bytes(&self.ev.session);
                             let mut buf = BytesMut::with_capacity(directory.len() + name.len());
                             buf.put_slice(&directory);
-                            buf.put_slice(&name);
+                            buf.put_slice(name);
                             self.ev.session.intern(buf.freeze())
                         } else {
                             name
@@ -4432,7 +4432,7 @@ impl<'a> DepBuilder<'a> {
             }
         }
         for input in rule.inputs.iter().chain(&rule.order_only_inputs) {
-            if !input.as_bytes(&self.ev.session).contains(&b'%') {
+            if !input.name_bytes(&self.ev.session).contains(&b'%') {
                 self.mentioned.insert(*input);
             }
         }
@@ -4462,8 +4462,7 @@ impl<'a> DepBuilder<'a> {
         if !rule.cmds.is_empty() {
             return false;
         }
-        let i = rule.inputs[0].as_bytes(names);
-        let i = i.as_ref();
+        let i = rule.inputs[0].name_bytes(names);
         i == b"RCS/%,v" || i == b"RCS/%" || i == b"%,v" || i == b"s.%" || i == b"SCCS/s.%"
     }
 
@@ -4489,8 +4488,8 @@ impl<'a> DepBuilder<'a> {
         self.implicit_rule_defs.push(rule.clone());
 
         for output_pattern in rule.output_patterns.clone() {
-            let op = output_pattern.as_bytes(&self.ev.session);
-            if op.as_ref() != b"%" || !Self::is_ignorable_implicit_rule(&self.ev.session, &rule) {
+            let op = output_pattern.name_bytes(&self.ev.session);
+            if op != b"%" || !Self::is_ignorable_implicit_rule(&self.ev.session, &rule) {
                 if self.ev.session.flags.werror_implicit_rules {
                     error_loc!(
                         self.ev,
@@ -4510,7 +4509,7 @@ impl<'a> DepBuilder<'a> {
                 let order = self.implicit_rule_order;
                 self.implicit_rule_order += 1;
                 self.implicit_rules.add(
-                    &op,
+                    op,
                     ImplicitCandidate {
                         rule: rule.clone(),
                         pattern: output_pattern,
@@ -4626,14 +4625,14 @@ impl<'a> DepBuilder<'a> {
     /// builds is one set per TARGET, filled by replaying every matching
     /// assignment into it (`initialize_file_variables`, variable.c).
     fn matching_pattern_vars(&self, output: Symbol) -> Vec<Arc<Vars>> {
-        let name = output.as_bytes(&self.ev.session);
+        let name = output.name_bytes(&self.ev.session);
         let mut scopes = Vec::new();
         for (pattern, vars) in &self.pattern_var_order {
             // A pattern variable needs a stem to have matched: GNU Make skips
             // any pattern at least as long as the name, so `%.z` reaches `a.z`
             // and not `.z`. Pattern *rules* match the empty stem, which is why
             // this is not `Pattern::matches` alone.
-            if pattern.as_bytes().len() > name.len() || !pattern.matches(&name) {
+            if pattern.as_bytes().len() > name.len() || !pattern.matches(name) {
                 continue;
             }
             scopes.push(vars.clone());
@@ -5737,7 +5736,7 @@ impl<'a> DepBuilder<'a> {
     fn matches_anything(&self, rule: &Rule) -> bool {
         rule.output_patterns
             .iter()
-            .any(|p| p.as_bytes(&self.ev.session).as_ref() == b"%")
+            .any(|p| p.name_bytes(&self.ev.session) == b"%")
     }
 
     /// GNU Make's `try_implicit_rule` (implicit.c), over one name.
@@ -6061,7 +6060,7 @@ impl<'a> DepBuilder<'a> {
                 .iter()
                 .map(|(name, var)| (*name, var.clone()))
                 .collect::<Vec<_>>();
-            targeted.sort_by_cached_key(|(name, _)| name.as_bytes(&self.ev.session));
+            targeted.sort_by_cached_key(|(name, _)| name.name_bytes(&self.ev.session));
             // `+=` last, and its right-hand side expanded once every other
             // target-specific variable is in scope. `all: A += $(Z)` beside
             // `all: Z = changed` appends `changed`, not whatever Z was outside
@@ -6747,7 +6746,7 @@ impl<'a> DepBuilder<'a> {
         for output in implicit_outputs {
             self.done.insert(output, n.clone());
 
-            let output_str = output.as_bytes(&self.ev.session);
+            let output_str = output.name_bytes(&self.ev.session);
             if self.ev.session.flags.warn_phony_looks_real
                 && n.lock().is_phony
                 && output_str.contains(&b'/')
@@ -6813,7 +6812,7 @@ impl<'a> DepBuilder<'a> {
 
             let mut is_phony = c.lock().is_phony;
             if !is_phony && !c.lock().has_rule && self.ev.session.flags.top_level_phony {
-                is_phony = !input.as_bytes(&self.ev.session).contains(&b'/');
+                is_phony = !input.name_bytes(&self.ev.session).contains(&b'/');
             }
             if !n.lock().is_phony && is_phony {
                 if self.ev.session.flags.werror_real_to_phony {
@@ -6997,7 +6996,7 @@ fn identity(node: &Arc<Mutex<DepNode>>) -> usize {
 /// The Make target this planned record stands for, as a diagnostic names it.
 fn recipe_name(names: &impl Interner, node: &Arc<Mutex<DepNode>>) -> String {
     let output = node.lock().recipe_output;
-    String::from_utf8_lossy(&output.as_bytes(names)).into_owned()
+    String::from_utf8_lossy(output.name_bytes(names)).into_owned()
 }
 
 /// Take one prerequisite off the list it was written on.
@@ -7067,7 +7066,7 @@ fn drop_prerequisite(
 /// This is wider than the names that mean anything. To decide whether something
 /// belongs in the graph, ask [`is_buildable_target`].
 pub fn is_special_target(names: &impl Interner, output: &Symbol) -> bool {
-    let s = output.as_bytes(names);
+    let s = output.name_bytes(names);
     s.starts_with(b".") && !s[1..].starts_with(b".") && !s.contains(&b'/')
 }
 
@@ -7095,11 +7094,11 @@ const ACCEPTED_BUILTIN_TARGETS: &[&str] = &[".SILENT", ".LOW_RESOLUTION_TIME", "
 /// A closed list, because being a directive is not a property of the name's
 /// shape: `.1` looks exactly like `.PHONY` and is an ordinary target.
 pub fn is_directive_target(names: &impl Interner, output: &Symbol) -> bool {
-    let s = output.as_bytes(names);
+    let s = output.name_bytes(names);
     CONSUMED_BUILTIN_TARGETS
         .iter()
         .chain(ACCEPTED_BUILTIN_TARGETS)
-        .any(|name| name.as_bytes() == &s[..])
+        .any(|name| name.as_bytes() == s)
 }
 
 /// Whether this node belongs in the manifest, given whether anything gave it a

@@ -904,7 +904,7 @@ fn resettle_command_variables(ev: &mut Evaluator) {
             rendered.push(b' ');
         }
         rendered.extend_from_slice(&crate::flags::quote_for_makeflags(
-            &name.as_bytes(&ev.session),
+            name.name_bytes(&ev.session),
         ));
         if simple {
             rendered.push(b':');

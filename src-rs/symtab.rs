@@ -118,6 +118,22 @@ impl Symbol {
         names.symtab().name(*self)
     }
 
+    /// The bytes this handle was interned from, BORROWED from the interner.
+    ///
+    /// The one to reach for. [`Self::as_bytes`] hands back a second owner, and
+    /// a second owner is an atomic increment now and an atomic decrement later
+    /// on a refcount that never went anywhere: one vim `src` read asks the
+    /// interner for a name 33,178 times, so that is 66,356 read-modify-writes
+    /// on cache lines eight composing threads share. A caller that reads the
+    /// name and is done with it before it touches the interner again — which is
+    /// every predicate, every comparison and every write into a buffer — wants
+    /// this one, and the borrow checker refuses it exactly where an owner was
+    /// genuinely needed.
+    // [spec:ronin:req:make.no-ambient-state]
+    pub fn name_bytes<'a, T: Interner + ?Sized>(&self, names: &'a T) -> &'a [u8] {
+        names.symtab().name_bytes(*self)
+    }
+
     /// A borrowing wrapper that renders this handle through `names`.
     ///
     /// This replaces the inherent `Display` the symbol used to have, which

@@ -283,7 +283,7 @@ impl AutoCommandVar {
             // do. Nothing renames an archive down a search path here, so the
             // case is left where it was.
             if let Some(target) = target
-                && crate::archive::split_archive_name(&target.as_bytes(&ev.session)).is_none()
+                && crate::archive::split_archive_name(target.name_bytes(&ev.session)).is_none()
             {
                 let reference = Self::settled_reference(ev, node, target, view);
                 references.insert(target, reference);
@@ -333,7 +333,7 @@ impl AutoCommandVar {
             }
         };
         let mut reference = BytesMut::from(&b"${"[..]);
-        reference.put_slice(&variable.as_bytes(&ev.session));
+        reference.put_slice(variable.name_bytes(&ev.session));
         reference.put_slice(b"}");
         reference.freeze()
     }
@@ -631,11 +631,11 @@ impl AutoCommandVar {
                         ww.write(b"KATI_NEW_INPUTS=$(find");
                         for ai in current_dep_node.actual_inputs.iter() {
                             if seen.insert(*ai) {
-                                ww.write(&ai.as_bytes(names));
+                                ww.write(ai.name_bytes(names));
                             }
                         }
                         ww.write(b"$(test -e");
-                        ww.write(&current_dep_node.recipe_output.as_bytes(names));
+                        ww.write(current_dep_node.recipe_output.name_bytes(names));
                         ww.write(b"&& echo -newer");
                         ww.write(&current_dep_node.recipe_output.as_bytes(names));
                         ww.write(b")) && export KATI_NEW_INPUTS");
@@ -896,7 +896,7 @@ fn symbol_can_reach_make(
     rule_vars: Option<&Vars>,
     seen: &mut FastSet<Symbol>,
 ) -> bool {
-    if sym.as_bytes(&ev.session).as_ref() == b"MAKE" {
+    if sym.name_bytes(&ev.session) == b"MAKE" {
         return true;
     }
     if !seen.insert(sym) {
@@ -944,7 +944,7 @@ pub fn references_new_inputs(arena: &ValueArena, id: ValueId, names: &impl Inter
         // Expanding it raises rather than producing text, so it reaches nothing.
         Value::Unreadable(_, _) => false,
         Value::SymRef(_, sym) => {
-            matches!(sym.as_bytes(names).as_ref(), b"?" | b"?D" | b"?F")
+            matches!(sym.name_bytes(names), b"?" | b"?D" | b"?F")
         }
         Value::List(_, values) => arena
             .children(*values)
@@ -998,7 +998,7 @@ fn references_make(arena: &ValueArena, id: ValueId, names: &impl Interner) -> bo
         Value::Literal(_, _) => false,
         // Expanding it raises rather than producing text, so it reaches nothing.
         Value::Unreadable(_, _) => false,
-        Value::SymRef(_, sym) => sym.as_bytes(names).as_ref() == b"MAKE",
+        Value::SymRef(_, sym) => sym.name_bytes(names) == b"MAKE",
         Value::List(_, values) => arena
             .children(*values)
             .iter()

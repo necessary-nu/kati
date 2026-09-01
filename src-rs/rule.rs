@@ -191,7 +191,7 @@ impl Rule {
         let unmatched = self
             .outputs
             .iter()
-            .filter(|t| !pat.matches(&t.as_bytes(&*session)))
+            .filter(|t| !pat.matches(t.name_bytes(&*session)))
             .copied()
             .collect::<Vec<_>>();
         for target in unmatched {

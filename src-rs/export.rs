@@ -451,7 +451,7 @@ pub fn late_environment(ev: &mut Evaluator, names: &[Symbol]) -> Result<Vec<Envi
     let mut names = names.to_vec();
     // By name, so a recipe's environment does not depend on which way the hash
     // fell.
-    names.sort_by_cached_key(|name| name.as_bytes(&ev.session));
+    names.sort_by_cached_key(|name| name.name_bytes(&ev.session));
     let mut changes = Vec::with_capacity(names.len());
     for name in names {
         let global = ev
