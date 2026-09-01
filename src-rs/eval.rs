@@ -106,22 +106,28 @@ impl RuleWordExpansion {
     }
 
     fn take_after(&mut self, separator: usize) -> Bytes {
-        let command = self
-            .output
-            .drain(separator + 1..)
-            .map(|byte| byte.byte)
-            .collect::<Vec<_>>();
+        let mut command = Vec::with_capacity(self.output.len().saturating_sub(separator + 1));
+        command.extend(self.output.drain(separator + 1..).map(|byte| byte.byte));
         self.output.truncate(separator);
         Bytes::from(command)
     }
 
-    fn finish(self) -> Bytes {
-        Bytes::from(
-            self.output
-                .into_iter()
-                .map(|byte| byte.byte)
-                .collect::<Vec<_>>(),
-        )
+    /// Append the bytes accumulated so far to the head being assembled,
+    /// dropping the provenance that was only ever the colon's business.
+    ///
+    /// Written straight into the caller's buffer rather than returned as a
+    /// `Bytes` the caller then copies: the settled word had no life of its own
+    /// between those two statements, and giving it one cost an allocation per
+    /// word of every rule line in the makefile.
+    fn write_into(&mut self, head: &mut BytesMut) {
+        head.extend(self.output.iter().map(|byte| byte.byte));
+        self.output.clear();
+    }
+
+    /// Empty the buffer for the next word of the same rule line, keeping the
+    /// capacity it has already grown to.
+    fn reset(&mut self) {
+        self.output.clear();
     }
 }
 
@@ -259,6 +265,27 @@ fn find_char_unquote_by<T>(
 
 fn find_char_unquote(text: &mut Vec<u8>, needle: u8) -> Option<usize> {
     find_char_unquote_by(text, needle, |byte| *byte)
+}
+
+/// The two halves of a rule line joined, without a copy where one of them is
+/// the whole of it.
+///
+/// A rule line's targets and its prerequisites arrive as two slices of text the
+/// session already owns, and one of them is empty for most lines: the head stops
+/// at the colon, so everything after it is in the second half and the first is
+/// empty. Concatenating unconditionally allocated for every rule line in the
+/// makefile to produce bytes identical to one of the two it was given.
+fn joined(left: &Bytes, right: &Bytes) -> Bytes {
+    if right.is_empty() {
+        return left.clone();
+    }
+    if left.is_empty() {
+        return right.clone();
+    }
+    let mut both = BytesMut::with_capacity(left.len() + right.len());
+    both.put_slice(left);
+    both.put_slice(right);
+    both.freeze()
 }
 
 /// The next token GNU Make's `get_next_mword` would expand while looking for a
@@ -891,6 +918,15 @@ pub struct Evaluator {
     /// first.
     expanding_var_locs: Vec<Option<Loc>>,
 
+    /// The buffer every rule line's words are expanded through, lent out by
+    /// [`Evaluator::eval_rule_head`] and taken back however that returns.
+    ///
+    /// One per evaluator rather than one per word, which is what it was: a word
+    /// grew a vector from empty, a rule line has several words, and a makefile
+    /// has hundreds of rule lines. It never holds anything between rule lines —
+    /// it is emptied on the way out and kept only for the capacity.
+    rule_word_scratch: Vec<RuleWordByte>,
+
     rule_state: RuleState,
     /// Whether `.SECONDEXPANSION` has been read yet. It applies only to rules
     /// below the declaration, so this is a position in the file rather than a
@@ -1292,6 +1328,8 @@ impl Evaluator {
             rules: Vec::new(),
             expanding_vars: FastSet::default(),
             expanding_var_locs: Vec::new(),
+
+            rule_word_scratch: Vec::new(),
 
             rule_state: RuleState::None,
             second_expansion: false,
@@ -1750,10 +1788,22 @@ impl Evaluator {
         ))
     }
 
-    fn eval_rule_word(&mut self, source: Bytes) -> Result<RuleWordExpansion> {
+    /// Expand one source word into `expansion`, which arrives empty and is the
+    /// same buffer every word of this rule line writes into.
+    ///
+    /// A buffer per word is what this used to be, and it was the largest single
+    /// entry in the allocation census after the expression arena landed: a word
+    /// grows a vector from empty, and a rule line has several. One buffer per
+    /// line, reset between words and lent by the evaluator across lines, grows
+    /// once and is then wide enough for everything that follows.
+    fn eval_rule_word_into(
+        &mut self,
+        source: Bytes,
+        expansion: &mut RuleWordExpansion,
+    ) -> Result<()> {
+        expansion.reset();
         let mut loc = self.loc.unwrap_or_default();
         let value = parse_expr(&mut self.session, &mut loc, source, ParseExprOpt::Define)?;
-        let mut expansion = RuleWordExpansion::default();
         // The fragments are settled one at a time: a literal is written from
         // the arena under a shared borrow, and anything else lets that borrow
         // go before it expands.
@@ -1792,23 +1842,45 @@ impl Evaluator {
                 }
             }
         }
-        Ok(expansion)
+        Ok(())
     }
 
     /// Expand source words only through the one that produces the first rule
     /// colon. GNU Make leaves `rest` literal until it knows whether the line is
     /// a target-specific assignment.
+    ///
+    /// The word buffer is borrowed from the evaluator and given back however
+    /// this returns, so a read of a whole makefile grows one of them rather
+    /// than one per rule line. A `$(eval)` nested inside a word expansion finds
+    /// the slot empty and makes its own, which is correct and rare.
     fn eval_rule_head(
         &mut self,
         source: &Bytes,
         detect_expanded_command: bool,
     ) -> Result<ExpandedRuleHead> {
-        let mut output = BytesMut::new();
+        let mut expansion = RuleWordExpansion {
+            output: std::mem::take(&mut self.rule_word_scratch),
+        };
+        let head = self.eval_rule_head_with(source, detect_expanded_command, &mut expansion);
+        expansion.output.clear();
+        if expansion.output.capacity() > self.rule_word_scratch.capacity() {
+            self.rule_word_scratch = expansion.output;
+        }
+        head
+    }
+
+    fn eval_rule_head_with(
+        &mut self,
+        source: &Bytes,
+        detect_expanded_command: bool,
+        expansion: &mut RuleWordExpansion,
+    ) -> Result<ExpandedRuleHead> {
+        let mut output = BytesMut::with_capacity(source.len());
         let mut at = 0usize;
         let mut wrote_word = false;
         while let Some(word) = next_rule_word(source, at) {
             at = word.end;
-            let mut expansion = self.eval_rule_word(source.slice(word.clone()))?;
+            self.eval_rule_word_into(source.slice(word.clone()), expansion)?;
             if wrote_word {
                 output.put_u8(b' ');
             }
@@ -1819,8 +1891,7 @@ impl Evaluator {
             {
                 let mut command = BytesMut::from(expansion.take_after(semicolon));
                 let colon = expansion.find_char_unquote(b':');
-                let expanded = expansion.finish();
-                output.put_slice(&expanded);
+                expansion.write_into(&mut output);
                 command.put_slice(&self.eval_rule_suffix(source.slice(at..))?);
                 let delimiter = colon.map(|(colon, origin)| {
                     let colon = output_start + colon;
@@ -1835,8 +1906,7 @@ impl Evaluator {
                 });
             }
             let colon = expansion.find_char_unquote(b':');
-            let expanded = expansion.finish();
-            output.put_slice(&expanded);
+            expansion.write_into(&mut output);
             if let Some((colon, origin)) = colon {
                 let colon = output_start + colon;
                 return Ok(ExpandedRuleHead {
@@ -1858,6 +1928,16 @@ impl Evaluator {
     }
 
     fn split_rule_source(source: &Bytes) -> (Bytes, Option<Bytes>) {
+        // Nothing below rewrites a line holding none of these four bytes: the
+        // loop copies it byte for byte into a buffer the caller then treats as
+        // the line it already had. Most rule lines in a real makefile are
+        // exactly that, and this is what it costs them.
+        if !source
+            .iter()
+            .any(|byte| matches!(byte, b'$' | b'\\' | b'#' | b';'))
+        {
+            return (source.clone(), None);
+        }
         let mut output = BytesMut::with_capacity(source.len());
         let mut at = 0usize;
 
@@ -2312,11 +2392,8 @@ impl Evaluator {
             after_targets.advance(1);
         }
 
-        let mut candidate = BytesMut::with_capacity(after_targets.len() + rest.len());
-        candidate.put_slice(&after_targets);
-        candidate.put_slice(&rest);
         let candidate = HybridRuleText {
-            text: candidate.freeze(),
+            text: joined(&after_targets, &rest),
         };
         if let Some(assignment) = self.parse_rule_assignment(candidate, literal_command.as_ref())? {
             return self.eval_rule_specific_assign(&parsed.targets, assignment, is_pattern_rule);
@@ -2342,9 +2419,17 @@ impl Evaluator {
         let targets = parsed.targets;
 
         let scan_expanded_command = !rest.is_empty();
-        let mut rest = rest.to_vec();
-        find_char_unquote(&mut rest, b'=');
-        let expanded_rest = self.eval_rule_suffix(Bytes::from(rest))?;
+        // `find_char_unquote` rewrites nothing unless a backslash run stands in
+        // front of the `=` it finds, so a suffix holding no backslash at all —
+        // which is nearly every rule line — does not need a copy to be searched.
+        let rest = if rest.contains(&b'\\') {
+            let mut unquoted = rest.to_vec();
+            find_char_unquote(&mut unquoted, b'=');
+            Bytes::from(unquoted)
+        } else {
+            rest
+        };
+        let expanded_rest = self.eval_rule_suffix(rest)?;
         let mut prerequisites = Vec::with_capacity(after_targets.len() + expanded_rest.len());
         prerequisites.extend_from_slice(&after_targets);
         prerequisites.extend_from_slice(&expanded_rest);
@@ -3774,6 +3859,14 @@ mod tests {
         assert_eq!(command, Some(Bytes::from_static(b" tail # kept")));
     }
 
+    /// What a rule word settles to, for a test that wants the bytes rather
+    /// than a head to append them to.
+    fn settled(expansion: &mut RuleWordExpansion) -> Bytes {
+        let mut head = BytesMut::new();
+        expansion.write_into(&mut head);
+        head.freeze()
+    }
+
     #[test]
     fn rule_expansion_keeps_the_first_colons_provenance() {
         let mut written_colon = RuleWordExpansion::default();
@@ -3782,7 +3875,7 @@ mod tests {
             written_colon.find_char_unquote(b':'),
             Some((3, RuleColonOrigin::Literal))
         );
-        assert_eq!(written_colon.finish(), Bytes::from_static(b"all:"));
+        assert_eq!(settled(&mut written_colon), Bytes::from_static(b"all:"));
 
         let mut expanded_colon = RuleWordExpansion::default();
         expanded_colon.push_expansion(b"all:X=good");
@@ -3791,7 +3884,10 @@ mod tests {
             expanded_colon.find_char_unquote(b':'),
             Some((3, RuleColonOrigin::Expansion))
         );
-        assert_eq!(expanded_colon.finish(), Bytes::from_static(b"all:X=good:"));
+        assert_eq!(
+            settled(&mut expanded_colon),
+            Bytes::from_static(b"all:X=good:")
+        );
 
         let line = b"all$(COLON) $(NAME)=value";
         assert_eq!(next_rule_word(line, 0), Some(0..b"all$(COLON)".len()));
@@ -3809,7 +3905,7 @@ mod tests {
         escaped_expanded_colon.push_expansion(b":");
         assert_eq!(escaped_expanded_colon.find_char_unquote(b':'), None);
         assert_eq!(
-            escaped_expanded_colon.finish(),
+            settled(&mut escaped_expanded_colon),
             Bytes::from_static(b"target:")
         );
 
@@ -3820,7 +3916,7 @@ mod tests {
             Some((4, RuleColonOrigin::Expansion))
         );
         assert_eq!(
-            paired_expanded_colon.finish(),
+            settled(&mut paired_expanded_colon),
             Bytes::from_static(br"foo\:")
         );
 
@@ -3831,7 +3927,7 @@ mod tests {
             Some((9, RuleColonOrigin::Expansion))
         );
         assert_eq!(
-            expanded_semicolon.finish(),
+            settled(&mut expanded_semicolon),
             Bytes::from_static(br"all: one\; command")
         );
 
