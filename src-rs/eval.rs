@@ -28,7 +28,7 @@ use memchr::memchr;
 use parking_lot::Mutex;
 
 use crate::build_sink::{FileEvaluation, NewInputsTiming, OutputEvaluation, ShellEvaluation};
-use crate::expr::{Evaluable, ParseExprOpt, Value, parse_expr};
+use crate::expr::{Evaluable, ParseExprOpt, Value, ValueId, parse_expr};
 use crate::fasthash::{FastMap, FastSet};
 use crate::file::Source;
 use crate::flags::Flags;
@@ -159,14 +159,18 @@ pub(crate) const EVAL_FLAGS_NAME: &str = "-*-eval-flags-*-";
 /// A canonical switch prefix, optionally retaining GNU Make's recursive
 /// command-line override suffix.
 pub(crate) fn makeflags_value(
+    arena: &mut crate::expr::ValueArena,
     makeflags: Bytes,
     has_evals: bool,
     has_overrides: bool,
     eval_flags: Symbol,
     overrides: Symbol,
-) -> (Arc<Value>, Bytes) {
+) -> (ValueId, Bytes) {
     if !has_evals && !has_overrides {
-        return (Arc::new(Value::Literal(None, makeflags.clone())), makeflags);
+        return (
+            arena.alloc(Value::Literal(None, makeflags.clone())),
+            makeflags,
+        );
     }
     // GNU Make's `define_makeflags` writes a literal `$(-*-eval-flags-*-)`
     // where the fragments would go and a literal `$(MAKEOVERRIDES)` after a
@@ -180,17 +184,18 @@ pub(crate) fn makeflags_value(
         literal.put_slice(b" ");
         original.put_slice(&literal);
         original.put_slice(b"$(-*-eval-flags-*-)");
-        parts.push(Arc::new(Value::Literal(None, literal.split().freeze())));
-        parts.push(Arc::new(Value::SymRef(Loc::default(), eval_flags)));
+        parts.push(arena.alloc(Value::Literal(None, literal.split().freeze())));
+        parts.push(arena.alloc(Value::SymRef(Loc::default(), eval_flags)));
     }
     if has_overrides {
         literal.put_slice(b" -- ");
         original.put_slice(&literal);
         original.put_slice(b"$(MAKEOVERRIDES)");
-        parts.push(Arc::new(Value::Literal(None, literal.split().freeze())));
-        parts.push(Arc::new(Value::SymRef(Loc::default(), overrides)));
+        parts.push(arena.alloc(Value::Literal(None, literal.split().freeze())));
+        parts.push(arena.alloc(Value::SymRef(Loc::default(), overrides)));
     }
-    (Arc::new(Value::List(None, parts)), original.freeze())
+    let parts = arena.alloc_children(&parts);
+    (arena.alloc(Value::List(None, parts)), original.freeze())
 }
 
 struct HybridRuleText {
@@ -211,8 +216,8 @@ struct ScannedRuleAssignment {
 }
 
 struct RuleAssignment {
-    name: Arc<Value>,
-    rhs: Arc<Value>,
+    name: ValueId,
+    rhs: ValueId,
     orig_rhs: Bytes,
     op: AssignOp,
     modifiers: AssignModifiers,
@@ -1073,6 +1078,32 @@ impl Context for Evaluator {
 }
 
 impl Evaluator {
+    /// One argument of a call, by position.
+    ///
+    /// A handle at a time rather than the slice, because the slice lives in the
+    /// arena this evaluator owns and holding it would hold the evaluator; the
+    /// handle is `Copy` and outlives the borrow that produced it.
+    #[must_use]
+    pub fn arg(&self, args: crate::expr::Children, index: usize) -> ValueId {
+        self.session.values.child(args, index)
+    }
+
+    /// One argument of a call, or nothing where the call has fewer.
+    #[must_use]
+    pub fn arg_opt(&self, args: crate::expr::Children, index: usize) -> Option<ValueId> {
+        (index < args.len()).then(|| self.session.values.child(args, index))
+    }
+
+    /// Expand one argument of a call.
+    pub fn eval_arg(
+        &mut self,
+        args: crate::expr::Children,
+        index: usize,
+    ) -> anyhow::Result<bytes::Bytes> {
+        let arg = self.arg(args, index);
+        crate::expr::eval_value_to_buf(arg, self)
+    }
+
     /// Apply GNU Make's special post-assignment treatment of `MAKEFLAGS`.
     ///
     /// A normal recursive variable keeps the bytes assigned to it. GNU Make
@@ -1153,6 +1184,7 @@ impl Evaluator {
             state.published = decoded.makeflags.clone();
         }
         let (published, original) = makeflags_value(
+            &mut self.session.values,
             decoded.makeflags.clone(),
             has_evals,
             has_overrides,
@@ -1170,7 +1202,10 @@ impl Evaluator {
         }
 
         let mflags = self.session.intern("MFLAGS");
-        let mflags_value = Arc::new(Value::Literal(None, decoded.mflags.clone()));
+        let mflags_value = self
+            .session
+            .values
+            .alloc(Value::Literal(None, decoded.mflags.clone()));
         self.session.globals.define(
             mflags,
             Variable::new_recursive(
@@ -1229,7 +1264,7 @@ impl Evaluator {
         let Some(definition) = scan_variable_definition(word, 0) else {
             return Ok(());
         };
-        let mut loc = self.loc.clone().unwrap_or_default();
+        let mut loc = self.loc.unwrap_or_default();
         let name = parse_expr(
             &mut self.session,
             &mut loc,
@@ -1369,7 +1404,9 @@ impl Evaluator {
             .globals
             .matching(|var| var.read().origin() == VarOrigin::CommandLine);
         for (name, variable) in variables {
-            let recursive = variable.read().clone_for_recipe_environment();
+            let recursive = variable
+                .read()
+                .clone_for_recipe_environment(&mut self.session.values);
             self.session.recipe_command_line.define(name, recursive);
         }
     }
@@ -1411,7 +1448,7 @@ impl Evaluator {
     pub fn eval_rhs(
         &mut self,
         lhs: Symbol,
-        rhs_v: Arc<Value>,
+        rhs_v: ValueId,
         orig_rhs: Bytes,
         op: AssignOp,
         is_override: bool,
@@ -1422,7 +1459,7 @@ impl Evaluator {
         // `.POSIX:` above this line in evaluation order has been seen, so this is
         // the answer GNU Make's `collapse_continuations` had; nothing read below
         // can change it, which is why it is fixed now rather than at expansion.
-        let rhs_v = rhs_v.resolve_folds(self.is_posix);
+        let rhs_v = rhs_v.resolve_folds(&mut self.session.values, self.is_posix);
         let (origin, current_frame) = if self.is_bootstrap {
             (VarOrigin::Default, None)
         } else if self.is_commandline {
@@ -1447,9 +1484,9 @@ impl Evaluator {
 
         match op {
             AssignOp::ColonEq => {
-                let loc = self.loc.clone();
+                let loc = self.loc;
                 result = self.in_ambient_scope(ambient_value, |ev| {
-                    Variable::with_simple_value(origin, current_frame, loc, ev, &rhs_v)
+                    Variable::with_simple_value(origin, current_frame, loc, ev, rhs_v)
                 })?;
             }
             AssignOp::ImmediateRecursive => {
@@ -1462,21 +1499,15 @@ impl Evaluator {
                     escaped.push(byte);
                 }
                 let escaped = Bytes::from(escaped);
-                let mut loc = self.loc.clone().unwrap_or_default();
+                let mut loc = self.loc.unwrap_or_default();
                 let value = parse_expr(
                     &mut self.session,
                     &mut loc,
                     escaped.clone(),
                     ParseExprOpt::Normal,
-                )?
-                .resolve_folds(self.is_posix);
-                result = Variable::new_recursive(
-                    value,
-                    origin,
-                    current_frame,
-                    self.loc.clone(),
-                    escaped,
-                );
+                )?;
+                let value = value.resolve_folds(&mut self.session.values, self.is_posix);
+                result = Variable::new_recursive(value, origin, current_frame, self.loc, escaped);
             }
             // `V != cmd` runs the command the way `$(shell)` does, down to
             // `.SHELLSTATUS`, then reads its output as a recursive value. What
@@ -1484,31 +1515,25 @@ impl Evaluator {
             // whole of it is kept, whatever a `#` in it might have meant had
             // anyone read it as source.
             AssignOp::ShellEq => {
-                let ran = Value::Func {
-                    loc: self.loc.clone().unwrap_or_default(),
+                let args = self.session.values.alloc_children(&[rhs_v]);
+                let ran = self.session.values.alloc(Value::Func {
+                    loc: self.loc.unwrap_or_default(),
                     fi: &crate::func::SHELL_ASSIGNMENT,
-                    args: vec![rhs_v],
-                };
+                    args,
+                });
                 let output = self.in_ambient_scope(ambient_value, |ev| ran.eval_to_buf(ev))?;
-                let mut loc = self.loc.clone().unwrap_or_default();
+                let mut loc = self.loc.unwrap_or_default();
                 let value = parse_expr(
                     &mut self.session,
                     &mut loc,
                     output.clone(),
                     ParseExprOpt::Captured,
-                )?
-                .resolve_folds(self.is_posix);
-                result =
-                    Variable::new_recursive(value, origin, current_frame, self.loc.clone(), output);
+                )?;
+                let value = value.resolve_folds(&mut self.session.values, self.is_posix);
+                result = Variable::new_recursive(value, origin, current_frame, self.loc, output);
             }
             AssignOp::Eq => {
-                result = Variable::new_recursive(
-                    rhs_v,
-                    origin,
-                    current_frame,
-                    self.loc.clone(),
-                    orig_rhs,
-                );
+                result = Variable::new_recursive(rhs_v, origin, current_frame, self.loc, orig_rhs);
             }
             AssignOp::PlusEq => {
                 let prev = self.lookup_var_in_current_scope(lhs)?;
@@ -1554,17 +1579,22 @@ impl Evaluator {
                         // pastes onto the loop word and defines the answer in
                         // the global set the binding is standing in front of,
                         // which is where the copy goes too.
-                        result = prev.read().clone_for_assignment(
-                            origin,
-                            current_frame,
-                            self.loc.clone(),
-                        );
+                        result = prev
+                            .read()
+                            .clone_for_assignment(origin, current_frame, self.loc);
                         let frame = self.current_frame();
                         if let Some(expanded) = appended {
-                            result.write().append_str(&self.session, &expanded, frame)?;
+                            let Self { session, .. } = self;
+                            let names = &session.symtab;
+                            result.write().append_str(
+                                &mut session.values,
+                                names,
+                                &expanded,
+                                frame,
+                            )?;
                         } else {
                             result.write().append_var(
-                                &self.session,
+                                &mut self.session,
                                 rhs_v,
                                 &orig_rhs,
                                 frame,
@@ -1573,13 +1603,8 @@ impl Evaluator {
                         }
                     }
                 } else {
-                    result = Variable::new_recursive(
-                        rhs_v,
-                        origin,
-                        current_frame,
-                        self.loc.clone(),
-                        orig_rhs,
-                    );
+                    result =
+                        Variable::new_recursive(rhs_v, origin, current_frame, self.loc, orig_rhs);
                 }
             }
             AssignOp::QuestionEq => {
@@ -1588,13 +1613,8 @@ impl Evaluator {
                     result = prev;
                     needs_assign = false;
                 } else {
-                    result = Variable::new_recursive(
-                        rhs_v,
-                        origin,
-                        current_frame,
-                        self.loc.clone(),
-                        orig_rhs,
-                    );
+                    result =
+                        Variable::new_recursive(rhs_v, origin, current_frame, self.loc, orig_rhs);
                 }
             }
         }
@@ -1618,7 +1638,7 @@ impl Evaluator {
                 .is_some_and(|var| var.read().is_private);
         let (var, needs_assign) = self.eval_rhs(
             lhs,
-            stmt.rhs.clone(),
+            stmt.rhs,
             stmt.orig_rhs.clone(),
             stmt.op,
             is_override,
@@ -1731,25 +1751,45 @@ impl Evaluator {
     }
 
     fn eval_rule_word(&mut self, source: Bytes) -> Result<RuleWordExpansion> {
-        let mut loc = self.loc.clone().unwrap_or_default();
+        let mut loc = self.loc.unwrap_or_default();
         let value = parse_expr(&mut self.session, &mut loc, source, ParseExprOpt::Define)?;
         let mut expansion = RuleWordExpansion::default();
-        match value.as_ref() {
-            Value::List(_, values) => {
-                for value in values {
-                    match value.as_ref() {
-                        Value::Literal(_, literal) => expansion.push_literal(literal),
-                        _ => {
-                            let value = value.eval_to_buf(self)?;
+        // The fragments are settled one at a time: a literal is written from
+        // the arena under a shared borrow, and anything else lets that borrow
+        // go before it expands.
+        let items = match self.session.values.get(value) {
+            Value::List(_, values) => Some(*values),
+            _ => None,
+        };
+        match items {
+            Some(values) => {
+                for index in 0..values.len() {
+                    let item = self.session.values.child(values, index);
+                    let literal = match self.session.values.get(item) {
+                        Value::Literal(_, literal) => Some(literal.clone()),
+                        _ => None,
+                    };
+                    match literal {
+                        Some(literal) => expansion.push_literal(&literal),
+                        None => {
+                            let value = item.eval_to_buf(self)?;
                             expansion.push_expansion(&value);
                         }
                     }
                 }
             }
-            Value::Literal(_, literal) => expansion.push_literal(literal),
-            _ => {
-                let value = value.eval_to_buf(self)?;
-                expansion.push_expansion(&value);
+            None => {
+                let literal = match self.session.values.get(value) {
+                    Value::Literal(_, literal) => Some(literal.clone()),
+                    _ => None,
+                };
+                match literal {
+                    Some(literal) => expansion.push_literal(&literal),
+                    None => {
+                        let value = value.eval_to_buf(self)?;
+                        expansion.push_expansion(&value);
+                    }
+                }
             }
         }
         Ok(expansion)
@@ -1869,11 +1909,11 @@ impl Evaluator {
         hybrid: &HybridRuleText,
         range: Range<usize>,
         literal_suffix: Option<usize>,
-    ) -> Result<Arc<Value>> {
+    ) -> Result<ValueId> {
         let mut values = Vec::new();
         let parsed_end = literal_suffix.unwrap_or(range.end).min(range.end);
         if range.start < parsed_end {
-            let mut loc = self.loc.clone().unwrap_or_default();
+            let mut loc = self.loc.unwrap_or_default();
             values.push(parse_expr(
                 &mut self.session,
                 &mut loc,
@@ -1884,7 +1924,7 @@ impl Evaluator {
         if let Some(suffix_start) = literal_suffix {
             let suffix_start = range.start.max(suffix_start);
             if suffix_start < range.end {
-                let mut loc = self.loc.clone().unwrap_or_default();
+                let mut loc = self.loc.unwrap_or_default();
                 // A literal semicolon ends comment recognition before GNU
                 // Make appends it and its suffix to a target-variable value.
                 // `Define` retains `#` as value text while still parsing `$`
@@ -1898,9 +1938,16 @@ impl Evaluator {
             }
         }
         Ok(match values.len() {
-            0 => Arc::new(Value::Literal(None, Bytes::new())),
+            0 => self
+                .session
+                .values
+                .alloc(Value::Literal(None, Bytes::new())),
             1 => values.pop().unwrap(),
-            _ => Arc::new(Value::List(self.loc.clone(), values)),
+            _ => {
+                let items = self.session.values.alloc_children(&values);
+                let loc = self.loc;
+                self.session.values.alloc(Value::List(loc, items))
+            }
         })
     }
 
@@ -1945,7 +1992,7 @@ impl Evaluator {
         if suffix.is_empty() {
             return Ok(suffix);
         }
-        let mut loc = self.loc.clone().unwrap_or_default();
+        let mut loc = self.loc.unwrap_or_default();
         parse_expr(&mut self.session, &mut loc, suffix, ParseExprOpt::Define)?.eval_to_buf(self)
     }
 
@@ -1954,10 +2001,10 @@ impl Evaluator {
     /// It is continued the same way a recipe line is, onto lines that carry the
     /// recipe prefix, so the prefix comes off them here for the same reason it
     /// comes off a recipe line's continuations.
-    fn parse_rule_command(&mut self, source: Bytes, recipe_prefix: u8) -> Result<Arc<Value>> {
+    fn parse_rule_command(&mut self, source: Bytes, recipe_prefix: u8) -> Result<ValueId> {
         let source = source.slice_ref(trim_left_space(&source));
         let source = strip_recipe_prefix_continuations(source, recipe_prefix);
-        let mut loc = self.loc.clone().unwrap_or_default();
+        let mut loc = self.loc.unwrap_or_default();
         parse_expr(&mut self.session, &mut loc, source, ParseExprOpt::Command)
     }
 
@@ -2012,7 +2059,7 @@ impl Evaluator {
         }
         var.read().eval(self, &mut value)?;
         let frame = Some(self.current_frame());
-        let loc = self.loc.clone();
+        let loc = self.loc;
         *var.write() = Variable::with_simple_string(value.freeze(), origin, frame, loc)
             .read()
             .clone();
@@ -2122,7 +2169,7 @@ impl Evaluator {
             {
                 let (rhs_var, needs_assign) = self.eval_rhs(
                     var_sym,
-                    assignment.rhs.clone(),
+                    assignment.rhs,
                     assignment.orig_rhs.clone(),
                     assignment.op,
                     modifiers.directive.is_override,
@@ -2244,7 +2291,7 @@ impl Evaluator {
         }
 
         let Some(delimiter) = delimiter else {
-            let loc = self.loc.clone().unwrap();
+            let loc = self.loc.unwrap();
             Evaluator::parse_rule_targets(&mut self.session, &loc, &before_term, None)?;
             unreachable!();
         };
@@ -2252,7 +2299,7 @@ impl Evaluator {
         log!("Rule colon: {:?}", delimiter.origin);
         let is_grouped = before_term.get(delimiter.colon.wrapping_sub(1)) == Some(&b'&');
 
-        let loc = self.loc.clone().unwrap();
+        let loc = self.loc.unwrap();
         let (mut after_targets, parsed) =
             Evaluator::parse_rule_targets(&mut self.session, &loc, &before_term, Some(delimiter))?;
         let is_pattern_rule = parsed.is_pattern_rule;
@@ -2345,7 +2392,7 @@ impl Evaluator {
             self.session.flags.one_shell = true;
         }
 
-        let mut rule = Rule::new(self.loc.clone().unwrap(), is_double_colon, is_grouped);
+        let mut rule = Rule::new(self.loc.unwrap(), is_double_colon, is_grouped);
         rule.expand_again = self.second_expansion;
         if is_pattern_rule {
             rule.output_patterns = targets;
@@ -2419,7 +2466,7 @@ impl Evaluator {
                 continue;
             }
             let frame = self.current_frame();
-            let loc = self.loc.clone();
+            let loc = self.loc;
             return self.session.set_global_var(
                 Symbol::DEFAULT_GOAL,
                 Variable::with_simple_string(name, VarOrigin::File, Some(frame), loc),
@@ -2482,7 +2529,7 @@ impl Evaluator {
         }
 
         let last_rule = self.rules.last_mut().unwrap();
-        last_rule.cmds.push(stmt.expr.clone());
+        last_rule.cmds.push(stmt.expr);
         if last_rule.cmd_loc.is_none() {
             last_rule.cmd_loc = Some(stmt.loc());
         }
@@ -2581,7 +2628,7 @@ impl Evaluator {
         let filename = OsString::from_vec(fname.to_vec());
         collect_stats_with_slow_report!(self, "included makefiles", &filename);
 
-        let loc = self.loc.clone();
+        let loc = self.loc;
         let mk = match self.session.get_makefile(&filename)? {
             Source::Read(mk) => mk,
             Source::Absent => error_loc!(
@@ -2696,11 +2743,15 @@ impl Evaluator {
     pub(crate) fn note_makefile_list(&mut self, name: Bytes) -> Result<()> {
         if let Some(var_list) = self.lookup_var(Symbol::MAKEFILE_LIST)? {
             let frame = self.current_frame();
-            var_list.write().append_str(&self.session, &name, frame)?;
+            let Self { session, .. } = self;
+            let names = &session.symtab;
+            var_list
+                .write()
+                .append_str(&mut session.values, names, &name, frame)?;
             return Ok(());
         }
         let frame = self.current_frame();
-        let loc = self.loc.clone();
+        let loc = self.loc;
         self.session.set_global_var(
             Symbol::MAKEFILE_LIST,
             Variable::with_simple_string(name, VarOrigin::File, Some(frame), loc),
@@ -2990,8 +3041,7 @@ impl Evaluator {
             return Ok(());
         }
         let frame = Some(self.current_frame());
-        let var =
-            Variable::with_simple_string(Bytes::new(), VarOrigin::File, frame, self.loc.clone());
+        let var = Variable::with_simple_string(Bytes::new(), VarOrigin::File, frame, self.loc);
         var.write().export = attribute;
         self.session.set_global_var(name, var, false)
     }
@@ -3121,7 +3171,7 @@ impl Evaluator {
         if ALWAYS_DEFINED.contains(&text.as_ref()) {
             return;
         }
-        let loc = self.loc.clone();
+        let loc = self.loc;
         crate::warn_loc!(
             self,
             loc.as_ref(),
@@ -3188,7 +3238,7 @@ impl Evaluator {
     /// expands, which is one of the hottest paths there is.
     pub fn enter_expanding_var(&mut self, installed: Option<&Loc>) {
         let installed = match installed {
-            Some(loc) => Some(loc.clone()),
+            Some(loc) => Some(*loc),
             None => self.expanding_var_locs.last().cloned().flatten(),
         };
         self.expanding_var_locs.push(installed);
@@ -3206,7 +3256,7 @@ impl Evaluator {
             .last()
             .cloned()
             .flatten()
-            .or_else(|| self.loc.clone())
+            .or(self.loc)
     }
 
     /// What this name held in the environment the invocation was started with,
@@ -3482,7 +3532,7 @@ impl Evaluator {
         // middle of expanding -- and a compiler that recurses without a floor
         // is worse than one that says which variable did it.
         let var = self.begin_var_expansion(Symbol::SHELLFLAGS, var)?;
-        let mut loc = self.loc.clone().unwrap_or_default();
+        let mut loc = self.loc.unwrap_or_default();
         let parsed = parse_expr(&mut self.session, &mut loc, text, ParseExprOpt::Normal)?;
         let expanded = parsed.eval_to_buf(self);
         self.var_eval_complete(&var);

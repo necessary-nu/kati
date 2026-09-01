@@ -28,7 +28,7 @@ use crate::{
     dep::DepNode,
     eval::Evaluator,
     exec::ExecStatus,
-    expr::{Evaluable, Value},
+    expr::{Value, ValueArena, ValueId},
     fileutil::get_timestamp,
     strutil::{
         Pattern, WordWriter, basename, dirname, find_end_of_line, trim_left_space, word_scanner,
@@ -821,19 +821,22 @@ impl Command {
 /// reference, and the functions that reach a variable by a name they compute,
 /// all answer yes.
 pub fn expansion_can_reach_make(
-    value: &Value,
+    id: ValueId,
     ev: &Evaluator,
     rule_vars: Option<&Vars>,
     seen: &mut FastSet<Symbol>,
 ) -> bool {
-    match value {
+    match ev.session.values.get(id) {
         Value::Literal(_, _) => false,
         // Expanding it raises rather than producing text, so it reaches nothing.
         Value::Unreadable(_, _) => false,
         Value::SymRef(_, sym) => symbol_can_reach_make(*sym, ev, rule_vars, seen),
-        Value::List(_, values) => values
+        Value::List(_, values) => ev
+            .session
+            .values
+            .children(*values)
             .iter()
-            .any(|value| expansion_can_reach_make(value, ev, rule_vars, seen)),
+            .any(|value| expansion_can_reach_make(*value, ev, rule_vars, seen)),
         // The name is computed, so it can be `MAKE`.
         Value::VarRef(_, _) => true,
         Value::VarSubst {
@@ -842,7 +845,7 @@ pub fn expansion_can_reach_make(
             pat,
             subst,
         } => {
-            match name.as_ref() {
+            match ev.session.values.get(*name) {
                 Value::Literal(_, literal) => {
                     let Some(sym) = ev.session.symtab.peek_symbol(literal) else {
                         return false;
@@ -853,8 +856,8 @@ pub fn expansion_can_reach_make(
                 }
                 _ => return true,
             }
-            expansion_can_reach_make(pat, ev, rule_vars, seen)
-                || expansion_can_reach_make(subst, ev, rule_vars, seen)
+            expansion_can_reach_make(*pat, ev, rule_vars, seen)
+                || expansion_can_reach_make(*subst, ev, rule_vars, seen)
         }
         Value::Func { loc: _, fi, args } => {
             // `call` and `value` reach a variable by a name they are given
@@ -875,8 +878,11 @@ pub fn expansion_can_reach_make(
             // line then expands to `$(MAKE)` is beyond any static walk; the
             // check made after a deferred expansion catches that and refuses,
             // rather than handing the executor a nested Make.
-            args.iter()
-                .any(|arg| expansion_can_reach_make(arg, ev, rule_vars, seen))
+            ev.session
+                .values
+                .children(*args)
+                .iter()
+                .any(|arg| expansion_can_reach_make(*arg, ev, rule_vars, seen))
         }
         // Finished fold bytes hold no reference at all.
         Value::Folded { .. } => false,
@@ -905,7 +911,7 @@ fn symbol_can_reach_make(
     let Some(definition) = bound.read().recursive_definition() else {
         return false;
     };
-    expansion_can_reach_make(&definition, ev, rule_vars, seen)
+    expansion_can_reach_make(definition, ev, rule_vars, seen)
 }
 
 /// Whether a recipe line as written can hold no command at all.
@@ -914,10 +920,13 @@ fn symbol_can_reach_make(
 /// run: GNU Make reads it as a target with an empty recipe, which is remade by
 /// doing nothing. Text is the only case that can be answered without expanding,
 /// and it is the case Makefiles write — `all:;` — so it is worth answering.
-pub fn is_blank_recipe_line(value: &Value) -> bool {
-    match value {
+pub fn is_blank_recipe_line(arena: &ValueArena, id: ValueId) -> bool {
+    match arena.get(id) {
         Value::Literal(_, text) => text.trim_ascii().is_empty(),
-        Value::List(_, values) => values.iter().all(|value| is_blank_recipe_line(value)),
+        Value::List(_, values) => arena
+            .children(*values)
+            .iter()
+            .all(|value| is_blank_recipe_line(arena, *value)),
         _ => false,
     }
 }
@@ -929,17 +938,18 @@ pub fn is_blank_recipe_line(value: &Value) -> bool {
 /// the `D` and `F` variants are counted by name. A recipe this answers `true`
 /// for is expanded while the graph is constructed, so the scheduler binds the
 /// value and any `filter-out` around it is seen.
-pub fn references_new_inputs(value: &Value, names: &impl Interner) -> bool {
-    match value {
+pub fn references_new_inputs(arena: &ValueArena, id: ValueId, names: &impl Interner) -> bool {
+    match arena.get(id) {
         Value::Literal(_, _) => false,
         // Expanding it raises rather than producing text, so it reaches nothing.
         Value::Unreadable(_, _) => false,
         Value::SymRef(_, sym) => {
             matches!(sym.as_bytes(names).as_ref(), b"?" | b"?D" | b"?F")
         }
-        Value::List(_, values) => values
+        Value::List(_, values) => arena
+            .children(*values)
             .iter()
-            .any(|value| references_new_inputs(value, names)),
+            .any(|value| references_new_inputs(arena, *value, names)),
         // A name computed at expansion time can be `?`, and nothing here can
         // rule that out.
         Value::VarRef(_, _) => true,
@@ -949,15 +959,18 @@ pub fn references_new_inputs(value: &Value, names: &impl Interner) -> bool {
             pat,
             subst,
         } => {
-            references_new_inputs(name, names)
-                || references_new_inputs(pat, names)
-                || references_new_inputs(subst, names)
+            references_new_inputs(arena, *name, names)
+                || references_new_inputs(arena, *pat, names)
+                || references_new_inputs(arena, *subst, names)
         }
         Value::Func {
             loc: _,
             fi: _,
             args,
-        } => args.iter().any(|arg| references_new_inputs(arg, names)),
+        } => arena
+            .children(*args)
+            .iter()
+            .any(|arg| references_new_inputs(arena, *arg, names)),
         // Finished fold bytes — blanks and spaces — reach no automatic variable.
         Value::Folded { .. } => false,
     }
@@ -970,24 +983,27 @@ pub fn references_new_inputs(value: &Value, names: &impl Interner) -> bool {
 /// Read off the line AS WRITTEN, which `chop_commands` (commands.c) does at
 /// parse time over the unexpanded text. That is the whole of why a `$(FOO)`
 /// whose value is `+` is not a recursive line and a written `+` is.
-pub fn written_line_recurses(value: &Value, names: &impl Interner) -> bool {
+pub fn written_line_recurses(arena: &ValueArena, id: ValueId, names: &impl Interner) -> bool {
     let mut prefixes = LinePrefixes {
         echo: true,
         dash_prefixed: false,
-        recursive_line: references_make(value, names),
+        recursive_line: references_make(arena, id, names),
     };
-    scan_written_prefixes(value, &mut prefixes);
+    scan_written_prefixes(arena, id, &mut prefixes);
     prefixes.recursive_line
 }
 
-fn references_make(value: &Value, names: &impl Interner) -> bool {
-    match value {
+fn references_make(arena: &ValueArena, id: ValueId, names: &impl Interner) -> bool {
+    match arena.get(id) {
         Value::Literal(_, _) => false,
         // Expanding it raises rather than producing text, so it reaches nothing.
         Value::Unreadable(_, _) => false,
         Value::SymRef(_, sym) => sym.as_bytes(names).as_ref() == b"MAKE",
-        Value::List(_, values) => values.iter().any(|value| references_make(value, names)),
-        Value::VarRef(_, name) => references_make(name, names),
+        Value::List(_, values) => arena
+            .children(*values)
+            .iter()
+            .any(|value| references_make(arena, *value, names)),
+        Value::VarRef(_, name) => references_make(arena, *name, names),
         // `$(MAKE:x=y)` holds the name as a literal rather than a reference,
         // and 4.4.1 does not classify it. The pattern and replacement are
         // ordinary text and can hold a reference of their own.
@@ -996,12 +1012,15 @@ fn references_make(value: &Value, names: &impl Interner) -> bool {
             name: _,
             pat,
             subst,
-        } => references_make(pat, names) || references_make(subst, names),
+        } => references_make(arena, *pat, names) || references_make(arena, *subst, names),
         Value::Func {
             loc: _,
             fi: _,
             args,
-        } => args.iter().any(|arg| references_make(arg, names)),
+        } => arena
+            .children(*args)
+            .iter()
+            .any(|arg| references_make(arena, *arg, names)),
         // Finished fold bytes name nothing, `MAKE` included.
         Value::Folded { .. } => false,
     }
@@ -1526,8 +1545,8 @@ struct LinePrefixes {
 /// anything that is not a prefix — which is when the next piece of the line
 /// still counts as its beginning. A reference ends the run: GNU Make's scan
 /// stops at the `$` that starts one.
-fn scan_written_prefixes(value: &Value, prefixes: &mut LinePrefixes) -> bool {
-    match value {
+fn scan_written_prefixes(arena: &ValueArena, id: ValueId, prefixes: &mut LinePrefixes) -> bool {
+    match arena.get(id) {
         Value::Literal(_, text) => parse_command_prefixes(
             text.clone(),
             &mut prefixes.echo,
@@ -1535,9 +1554,10 @@ fn scan_written_prefixes(value: &Value, prefixes: &mut LinePrefixes) -> bool {
             &mut prefixes.recursive_line,
         )
         .is_empty(),
-        Value::List(_, values) => values
+        Value::List(_, values) => arena
+            .children(*values)
             .iter()
-            .all(|value| scan_written_prefixes(value, prefixes)),
+            .all(|value| scan_written_prefixes(arena, *value, prefixes)),
         _ => false,
     }
 }
@@ -1881,7 +1901,7 @@ impl<'a> CommandEvaluator<'a> {
         let node_cmds;
         {
             let node = n.lock();
-            self.ev.loc = node.loc.clone();
+            self.ev.loc = node.loc;
             self.ev.current_scope = node.rule_vars.clone();
             node_cmds = node.cmds.clone();
         }
@@ -1905,7 +1925,10 @@ impl<'a> CommandEvaluator<'a> {
         // and GNU Make's is the same one: `chop_commands` (commands.c) drops a
         // blank line before anything is expanded, while `all: ; $(EMPTY)` is a
         // command line that survives to be expanded and therefore does ask.
-        let shell = if node_cmds.iter().all(|cmd| is_blank_recipe_line(cmd)) {
+        let shell = if node_cmds
+            .iter()
+            .all(|cmd| is_blank_recipe_line(&self.ev.session.values, *cmd))
+        {
             Bytes::new()
         } else {
             self.ev.get_shell()?
@@ -1926,7 +1949,7 @@ impl<'a> CommandEvaluator<'a> {
         *self.found_new_inputs.lock() = false;
         self.ev.deferred_new_inputs_filter_out.clear();
         for v in node_cmds {
-            self.ev.loc = v.loc();
+            self.ev.loc = self.ev.session.values.get(v).loc();
             self.ev.expanded_make_in_command.clear();
             let cmds_buf = v.eval_to_buf(self.ev)?;
             let make_values = self.ev.expanded_make_in_command.clone();
@@ -1939,10 +1962,10 @@ impl<'a> CommandEvaluator<'a> {
                 dash_prefixed: false,
                 // The classification is read from the recipe as written, so it
                 // has to be taken before anything is expanded away.
-                recursive_line: references_make(&v, &self.ev.session),
+                recursive_line: references_make(&self.ev.session.values, v, &self.ev.session),
             };
             references_make_anywhere |= written.recursive_line;
-            scan_written_prefixes(&v, &mut written);
+            scan_written_prefixes(&self.ev.session.values, v, &mut written);
             let lines = ExpandedRecipeLines::new(
                 cmds_buf,
                 written,
@@ -1985,7 +2008,7 @@ impl<'a> CommandEvaluator<'a> {
                         recursive_line: prefixes.recursive_line,
                         recursive_make,
                         nesting,
-                        loc: self.ev.loc.clone(),
+                        loc: self.ev.loc,
                     })
                 }
             }
@@ -2029,7 +2052,7 @@ impl<'a> CommandEvaluator<'a> {
                     recursive_line: false,
                     recursive_make: Vec::new(),
                     nesting: None,
-                    loc: node.loc.clone(),
+                    loc: node.loc,
                 })
             }
             // Prepend |output_commands|.
@@ -2351,7 +2374,7 @@ mod tests {
             ParseExprOpt::Command,
         )
         .expect("a parsable recipe line");
-        references_make(&value, &session)
+        references_make(&session.values, value, &session)
     }
 
     /// Probed against GNU Make 4.4.1 under `-n`, which runs a classified line
@@ -2621,7 +2644,7 @@ mod tests {
             dash_prefixed: false,
             recursive_line: false,
         };
-        scan_written_prefixes(&value, &mut prefixes);
+        scan_written_prefixes(&session.values, value, &mut prefixes);
         prefixes
     }
 

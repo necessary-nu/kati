@@ -21,7 +21,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use memchr::memchr;
 
-use crate::expr::Value;
+use crate::expr::ValueId;
 use crate::loc::Loc;
 use crate::session::Session;
 use crate::strutil::{Pattern, makefile_word_scanner, trim_leading_curdir, trim_space};
@@ -474,7 +474,7 @@ mod tests {
 pub enum Recipe {
     /// The command lines, already parsed. What a makefile's own recipe always
     /// is, and what a built-in recipe becomes when it is copied line by line.
-    Read(Vec<Arc<Value>>),
+    Read(Vec<ValueId>),
     /// A built-in rule's recipe, still the table text it was written as.
     Builtin(Arc<BuiltinRecipe>),
 }
@@ -492,7 +492,7 @@ pub struct BuiltinRecipe {
     /// The parse, once one has been asked for. `OnceLock` rather than a plain
     /// cell because it is what says the parse happens exactly once per rule
     /// per session however many nodes reach it.
-    parsed: std::sync::OnceLock<Vec<Arc<Value>>>,
+    parsed: std::sync::OnceLock<Vec<ValueId>>,
 }
 
 impl Recipe {
@@ -552,7 +552,7 @@ impl Recipe {
     /// evaluator that appends lines is reading a makefile. A makefile writing
     /// its own recipe for a name the catalogue also holds builds a `Read`
     /// recipe from its own first line and never reaches the table's.
-    pub fn push(&mut self, line: Arc<Value>) {
+    pub fn push(&mut self, line: ValueId) {
         match self {
             Recipe::Read(lines) => lines.push(line),
             Recipe::Builtin(_) => {
@@ -571,7 +571,7 @@ impl Recipe {
     ///
     /// Returns a parse failure for a table entry, which is a defect in the
     /// table.
-    pub fn lines(&self, session: &mut Session) -> Result<&[Arc<Value>]> {
+    pub fn lines(&self, session: &mut Session) -> Result<&[ValueId]> {
         match self {
             Recipe::Read(lines) => Ok(lines),
             Recipe::Builtin(builtin) => {

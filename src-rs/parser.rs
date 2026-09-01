@@ -302,7 +302,7 @@ impl<'a> Parser<'a> {
         }
 
         if !self.if_stack.is_empty() {
-            let mut loc = self.loc.clone();
+            let mut loc = self.loc;
             loc.line += 1;
             // Said where GNU Make says it: at the end of the read, once every
             // line above has been read and everything those lines do has
@@ -316,7 +316,7 @@ impl<'a> Parser<'a> {
                 .push(ParseErrorStmt::new(loc, "*** missing 'endif'.".to_string()));
         }
         if self.define_name.is_some() {
-            let mut loc = self.loc.clone();
+            let mut loc = self.loc;
             loc.line = self.define_start_line;
             error_loc!(
                 &*self.session,
@@ -340,8 +340,8 @@ impl<'a> Parser<'a> {
         self.current_directive = None;
 
         if line.first() == Some(&self.cmd_prefix) && self.after_rule {
-            let loc = self.loc.clone();
-            let mut mutable_loc = self.loc.clone();
+            let loc = self.loc;
+            let mut mutable_loc = self.loc;
             // The line the prefix opened may have been continued, and every
             // line it was continued onto carries the prefix too. Only the first
             // one is this slice; the rest are still inside it.
@@ -437,7 +437,7 @@ impl<'a> Parser<'a> {
         self.note_posix_target(&line);
         self.out_stmts
             .lock()
-            .push(RuleStmt::new(self.loc.clone(), line, self.cmd_prefix));
+            .push(RuleStmt::new(self.loc, line, self.cmd_prefix));
         Ok(())
     }
 
@@ -491,8 +491,8 @@ impl<'a> Parser<'a> {
         let assign = parse_assign_statement(&line, separator_pos);
         self.note_recipe_prefix(&assign);
 
-        let assign_loc = self.loc.clone();
-        let mut mutable_loc = self.loc.clone();
+        let assign_loc = self.loc;
+        let mut mutable_loc = self.loc;
         let lhs = parse_expr(
             self.session,
             &mut mutable_loc,
@@ -544,8 +544,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_include(&mut self, line: Bytes, directive: &[u8]) -> Result<()> {
-        let loc = self.loc.clone();
-        let mut mutable_loc = loc.clone();
+        let loc = self.loc;
+        let mut mutable_loc = loc;
         let expr = parse_expr(self.session, &mut mutable_loc, line, ParseExprOpt::Normal)?;
         self.out_stmts
             .lock()
@@ -615,7 +615,7 @@ impl<'a> Parser<'a> {
             filename: self.loc.filename,
             line: self.define_start_line,
         };
-        let mut mutable_loc = assign_loc.clone();
+        let mut mutable_loc = assign_loc;
         let lhs = parse_expr(
             self.session,
             &mut mutable_loc,
@@ -658,13 +658,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_ifdef(&mut self, line: Bytes, directive: &[u8]) -> Result<()> {
-        let loc = self.loc.clone();
+        let loc = self.loc;
         let op = if directive[2] == b'n' {
             CondOp::Ifndef
         } else {
             CondOp::Ifdef
         };
-        let mut mutable_loc = loc.clone();
+        let mut mutable_loc = loc;
         let lhs = parse_expr(self.session, &mut mutable_loc, line, ParseExprOpt::Normal)?;
         let stmt = IfStmt::new(loc, op, lhs, None, None);
         self.out_stmts.lock().push(stmt.clone());
@@ -673,7 +673,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_ifeq(&mut self, line: Bytes, directive: &[u8]) -> Result<()> {
-        let loc = self.loc.clone();
+        let loc = self.loc;
         let op = if directive[2] == b'n' {
             CondOp::Ifneq
         } else {
@@ -702,7 +702,7 @@ impl<'a> Parser<'a> {
             ),
         };
 
-        let mut mutable_loc = loc.clone();
+        let mut mutable_loc = loc;
         let lhs = parse_expr(
             self.session,
             &mut mutable_loc,
@@ -796,8 +796,8 @@ impl<'a> Parser<'a> {
     }
 
     fn create_export(&mut self, line: &Bytes, is_export: bool) -> Result<()> {
-        let loc = self.loc.clone();
-        let mut mutable_loc = loc.clone();
+        let loc = self.loc;
+        let mut mutable_loc = loc;
         let is_bare = trim_space(line).is_empty();
         let expr = parse_expr(
             self.session,
@@ -883,8 +883,8 @@ impl<'a> Parser<'a> {
     /// the directories, or both. So the whole of it is carried across and the
     /// evaluator counts words.
     fn parse_vpath(&mut self, line: Bytes) -> Result<()> {
-        let loc = self.loc.clone();
-        let mut mutable_loc = loc.clone();
+        let loc = self.loc;
+        let mut mutable_loc = loc;
         let expr = parse_expr(self.session, &mut mutable_loc, line, ParseExprOpt::Normal)?;
         self.out_stmts.lock().push(VpathStmt::new(loc, expr));
         Ok(())
@@ -892,8 +892,8 @@ impl<'a> Parser<'a> {
 
     /// `undefine name`, whose name is expanded when the statement runs.
     fn parse_undefine(&mut self, line: Bytes) -> Result<()> {
-        let loc = self.loc.clone();
-        let mut mutable_loc = loc.clone();
+        let loc = self.loc;
+        let mut mutable_loc = loc;
         let expr = parse_expr(self.session, &mut mutable_loc, line, ParseExprOpt::Normal)?;
         let is_override = self.current_directive.is_some_and(|d| d.is_override);
         self.out_stmts
@@ -1531,6 +1531,8 @@ mod tests {
     /// did not crash; they waited for an `endef` that never came.
     #[test]
     fn an_assignment_operator_after_define_names_define() {
+        // The name is read out of the session's expression arena rather than
+        // off the statement's `Debug`, which now prints the handle it holds.
         let parsed = |source: &'static [u8]| {
             let mut session = Session::new();
             let stmts =
@@ -1538,7 +1540,15 @@ mod tests {
                     .expect("a parsed makefile");
             let stmts = stmts.lock();
             assert_eq!(stmts.len(), 1, "{}", source.escape_ascii());
-            format!("{:?}", stmts[0])
+            let rendered = format!("{:?}", stmts[0]);
+            let lhs = stmts[0]
+                .as_assign()
+                .and_then(|assign| assign.literal_name(&session))
+                .map_or_else(
+                    || rendered.clone(),
+                    |name| String::from_utf8_lossy(&name).into_owned(),
+                );
+            (lhs, rendered)
         };
         for (source, op) in [
             (b"define = x".as_slice(), AssignOp::Eq),
@@ -1550,12 +1560,8 @@ mod tests {
             (b"define != echo x", AssignOp::ShellEq),
             (b"define  =  x", AssignOp::Eq),
         ] {
-            let stmt = parsed(source);
-            assert!(
-                stmt.starts_with("AssignStmt(lhs=Literal(None, b\"define\")"),
-                "{}: {stmt}",
-                source.escape_ascii()
-            );
+            let (lhs, stmt) = parsed(source);
+            assert_eq!(lhs, "define", "{}: {stmt}", source.escape_ascii());
             assert!(
                 stmt.contains(&format!("opstr={op:?}")),
                 "{}: {stmt}",
@@ -1564,10 +1570,7 @@ mod tests {
         }
         // A word before the operator is the defined variable's name, which
         // leaves `define` the directive it is written as.
-        let stmt = parsed(b"define V =\nbody\nendef");
-        assert!(
-            stmt.starts_with("AssignStmt(lhs=Literal(None, b\"V\")"),
-            "{stmt}"
-        );
+        let (lhs, stmt) = parsed(b"define V =\nbody\nendef");
+        assert_eq!(lhs, "V", "{stmt}");
     }
 }

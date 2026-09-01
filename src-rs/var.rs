@@ -22,17 +22,12 @@ use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
 
 use crate::{
-    command::AutoCommandVar,
-    error, error_loc,
-    eval::Frame,
-    loc::Loc,
-    session::{Context, Session},
-    strutil::WordWriter,
-    symtab::Interner,
+    command::AutoCommandVar, error, error_loc, eval::Frame, loc::Loc, session::Session,
+    strutil::WordWriter, symtab::Interner,
 };
 use crate::{
     eval::Evaluator,
-    expr::{Evaluable, Value},
+    expr::{Children, Evaluable, Value, ValueArena, ValueId},
     stmt::AssignOp,
     symtab::Symbol,
 };
@@ -150,7 +145,7 @@ pub struct Variable {
 #[derive(Clone, Debug)]
 pub enum InnerVar {
     Simple(Vec<u8>),
-    Recursive { v: Arc<Value>, orig: Bytes },
+    Recursive { v: ValueId, orig: Bytes },
     AutoCommand(Symbol, AutoCommandVar),
     ShellStatus,
     VariableNames,
@@ -165,15 +160,17 @@ pub enum InnerVar {
 /// GNU Make asks this of the text as written rather than of what the text
 /// expands to, which is why `V = $(EMPTY)` still counts as something to append
 /// to: `V += x` reads back as `$(EMPTY) x`, and expands with the space.
-fn appended_values(prev: Arc<Value>, prev_text: &Bytes, added: Arc<Value>) -> Vec<Arc<Value>> {
+fn appended_values(
+    arena: &mut ValueArena,
+    prev: ValueId,
+    prev_text: &Bytes,
+    added: ValueId,
+) -> Children {
     if prev_text.is_empty() {
-        return vec![prev, added];
+        return arena.alloc_children(&[prev, added]);
     }
-    vec![
-        prev,
-        Arc::new(Value::Literal(None, Bytes::from_static(b" "))),
-        added,
-    ]
+    let space = arena.alloc(Value::Literal(None, Bytes::from_static(b" ")));
+    arena.alloc_children(&[prev, space, added])
 }
 
 /// The lazy shape a `+=` leaves, as an expression and the text beside it.
@@ -196,20 +193,21 @@ fn appended_values(prev: Arc<Value>, prev_text: &Bytes, added: Arc<Value>) -> Ve
 /// reads — carries the base only when `base_in_scope`. The expression carries it
 /// either way, because `$(V)` walks to the base whether it was stored or found.
 pub(crate) fn appended_recursive_value(
-    base: Arc<Value>,
+    arena: &mut ValueArena,
+    base: ValueId,
     base_text: &Bytes,
-    tail: Arc<Value>,
+    tail: ValueId,
     tail_text: &Bytes,
     base_in_scope: bool,
-) -> (Arc<Value>, Bytes) {
-    let loc = base.loc();
-    let values = appended_values(base.clone(), base_text, tail);
+) -> (ValueId, Bytes) {
+    let loc = arena.get(base).loc();
+    let values = appended_values(arena, base, base_text, tail);
     let orig = if base_in_scope {
         appended_text(base_text, tail_text)
     } else {
         tail_text.clone()
     };
-    (Arc::new(Value::List(loc, values)), orig)
+    (arena.alloc(Value::List(loc, values)), orig)
 }
 
 /// The same join over the text those values were written as.
@@ -232,7 +230,7 @@ impl Variable {
     ///
     /// GNU Make canonicalises `MAKEFLAGS` after assigning it while preserving
     /// the assignment's origin, location, `private`, and `override` metadata.
-    pub fn replace_recursive_value(&mut self, value: Arc<Value>, original: Bytes) {
+    pub fn replace_recursive_value(&mut self, value: ValueId, original: Bytes) {
         self.value = InnerVar::Recursive {
             v: value,
             orig: original,
@@ -250,7 +248,7 @@ impl Variable {
     /// write would be declined; and the flavour it would install is not the one
     /// the name goes on to have, because what stands there is still the
     /// environment's recursive import with different text in it.
-    pub fn restate_at(&mut self, origin: VarOrigin, text: Bytes) {
+    pub fn restate_at(&mut self, arena: &mut ValueArena, origin: VarOrigin, text: Bytes) {
         self.origin = origin;
         self.value = match &self.value {
             // A recursive binding holds its text and expands it afresh every
@@ -258,7 +256,7 @@ impl Variable {
             // change — the same thing GNU Make's `v->value = xstrdup (...)`
             // does to a variable whose `recursive` flag is set.
             InnerVar::Recursive { .. } => InnerVar::Recursive {
-                v: Arc::new(Value::Literal(None, text.clone())),
+                v: arena.alloc(Value::Literal(None, text.clone())),
                 orig: text,
             },
             _ => InnerVar::Simple(text.to_vec()),
@@ -303,20 +301,20 @@ impl Variable {
     /// automatic or computed variable a caller reads once and splices as a
     /// literal instead. A simple variable becomes a literal here because it is
     /// a level GNU Make's `variable_append` copies verbatim.
-    pub(crate) fn append_source(&self) -> Option<(Arc<Value>, Bytes)> {
+    pub(crate) fn append_source(&self, arena: &mut ValueArena) -> Option<(ValueId, Bytes)> {
         match &self.value {
-            InnerVar::Recursive { v, orig } => Some((v.clone(), orig.clone())),
+            InnerVar::Recursive { v, orig } => Some((*v, orig.clone())),
             InnerVar::Simple(s) => {
                 let text = Bytes::from(s.clone());
-                Some((Arc::new(Value::Literal(None, text.clone())), text))
+                Some((arena.alloc(Value::Literal(None, text.clone())), text))
             }
             _ => None,
         }
     }
 
-    pub fn recursive_definition(&self) -> Option<Arc<Value>> {
+    pub fn recursive_definition(&self) -> Option<ValueId> {
         match &self.value {
-            InnerVar::Recursive { v, orig: _ } => Some(v.clone()),
+            InnerVar::Recursive { v, orig: _ } => Some(*v),
             _ => None,
         }
     }
@@ -413,12 +411,12 @@ impl Variable {
     /// Copy a command-line value into the recursive environment form recipes
     /// receive. Recursive expressions stay deferred; simple values become
     /// literal recursive expressions without being evaluated again.
-    pub fn clone_for_recipe_environment(&self) -> Var {
+    pub fn clone_for_recipe_environment(&self, arena: &mut ValueArena) -> Var {
         let mut variable = self.clone();
         if let InnerVar::Simple(value) = &variable.value {
             let value = Bytes::from(value.clone());
             variable.value = InnerVar::Recursive {
-                v: Arc::new(Value::Literal(None, value.clone())),
+                v: arena.alloc(Value::Literal(None, value.clone())),
                 orig: value,
             };
         }
@@ -432,8 +430,8 @@ impl Variable {
     /// alongside it and which decides where the separator goes.
     pub fn append_var(
         &mut self,
-        ctx: &impl Context,
-        v: Arc<Value>,
+        session: &mut crate::session::Session,
+        v: ValueId,
         text: &Bytes,
         frame: Arc<Frame>,
         loc: Option<&Loc>,
@@ -443,19 +441,20 @@ impl Variable {
                 panic!("append_var should not be used when immediate_eval returns true")
             }
             InnerVar::Recursive { v: prev, orig } => {
-                *prev = Arc::new(Value::List(
-                    prev.loc(),
-                    appended_values(prev.clone(), orig, v),
-                ));
+                let arena = &mut session.values;
+                let loc = arena.get(*prev).loc();
+                let items = appended_values(arena, *prev, orig, v);
+                *prev = arena.alloc(Value::List(loc, items));
                 *orig = appended_text(orig, text);
                 self.definition = Some(frame);
             }
             InnerVar::AutoCommand(sym, _) => {
+                let sym = *sym;
                 error_loc!(
-                    ctx,
+                    session,
                     loc,
                     "appending to ${} is not supported",
-                    sym.display(ctx)
+                    sym.display(session)
                 );
             }
             InnerVar::ShellStatus => panic!(),
@@ -467,6 +466,7 @@ impl Variable {
     /// variable and the way the reader grows `MAKEFILE_LIST`.
     pub fn append_str(
         &mut self,
+        arena: &mut ValueArena,
         names: &impl Interner,
         buf: &Bytes,
         frame: Arc<Frame>,
@@ -480,11 +480,10 @@ impl Variable {
                 self.definition = Some(frame);
             }
             InnerVar::Recursive { v: prev, orig } => {
-                let added = Arc::new(Value::Literal(None, buf.clone()));
-                *prev = Arc::new(Value::List(
-                    prev.loc(),
-                    appended_values(prev.clone(), orig, added),
-                ));
+                let added = arena.alloc(Value::Literal(None, buf.clone()));
+                let loc = arena.get(*prev).loc();
+                let items = appended_values(arena, *prev, orig, added);
+                *prev = arena.alloc(Value::List(loc, items));
                 *orig = appended_text(orig, buf);
                 self.definition = Some(frame);
             }
@@ -584,7 +583,7 @@ impl Variable {
         frame: Option<Arc<Frame>>,
         loc: Option<Loc>,
         ev: &mut Evaluator,
-        v: &Value,
+        v: ValueId,
     ) -> Result<Arc<RwLock<Self>>> {
         let value = v.eval_to_buf(ev)?;
         Ok(Arc::new(RwLock::new(Self {
@@ -599,7 +598,7 @@ impl Variable {
     }
 
     pub fn new_recursive(
-        v: Arc<Value>,
+        v: ValueId,
         origin: VarOrigin,
         frame: Option<Arc<Frame>>,
         loc: Option<Loc>,

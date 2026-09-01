@@ -39,12 +39,10 @@ limitations under the License.
 //!
 //! The whole catalogue is what `-r` withholds — and `-R`, which implies it.
 
-use std::sync::Arc;
-
 use anyhow::Result;
 use bytes::Bytes;
 
-use crate::expr::{ParseExprOpt, Value, parse_expr};
+use crate::expr::{ParseExprOpt, ValueId, parse_expr};
 use crate::loc::Loc;
 use crate::rule::Rule;
 use crate::session::Session;
@@ -262,7 +260,7 @@ pub fn builtin_loc(session: &mut Session) -> Loc {
 /// # Errors
 ///
 /// Returns a parse failure for a table entry, which is a defect in the table.
-pub fn recipe_lines(session: &mut Session, recipe: &str) -> Result<Vec<Arc<Value>>> {
+pub fn recipe_lines(session: &mut Session, recipe: &str) -> Result<Vec<ValueId>> {
     let mut cmds = Vec::new();
     if recipe.is_empty() {
         return Ok(cmds);

@@ -22,7 +22,7 @@ use std::{fmt::Debug, sync::Arc};
 use crate::{
     error_loc,
     eval::Evaluator,
-    expr::{Evaluable, Value},
+    expr::{Value, ValueId},
     loc::Loc,
     strutil::no_line_break,
     symtab::Symbol,
@@ -35,6 +35,15 @@ pub trait Statement: Debug {
     fn orig(&self) -> Bytes;
 
     fn eval(&self, ev: &mut Evaluator) -> Result<()>;
+
+    /// This statement as an assignment, where it is one.
+    ///
+    /// A statement's `Debug` shows the handles it holds and not the expressions
+    /// they name -- those live in the session's arena -- so a reader that wants
+    /// the name a line assigns to asks the statement and then the arena.
+    fn as_assign(&self) -> Option<&AssignStmt> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +99,7 @@ pub struct RuleStmt {
 
 impl Statement for RuleStmt {
     fn loc(&self) -> Loc {
-        self.loc.clone()
+        self.loc
     }
 
     fn orig(&self) -> Bytes {
@@ -122,8 +131,8 @@ pub struct AssignStmt {
     loc: Loc,
     orig: Bytes,
 
-    pub lhs: Arc<Value>,
-    pub rhs: Arc<Value>,
+    pub lhs: ValueId,
+    pub rhs: ValueId,
     pub orig_rhs: Bytes,
     pub op: AssignOp,
     pub directive: Option<AssignDirective>,
@@ -133,7 +142,7 @@ pub struct AssignStmt {
 
 impl Statement for AssignStmt {
     fn loc(&self) -> Loc {
-        self.loc.clone()
+        self.loc
     }
 
     fn orig(&self) -> Bytes {
@@ -142,6 +151,24 @@ impl Statement for AssignStmt {
 
     fn eval(&self, ev: &mut Evaluator) -> Result<()> {
         ev.eval_assign(self)
+    }
+
+    fn as_assign(&self) -> Option<&AssignStmt> {
+        Some(self)
+    }
+}
+
+impl AssignStmt {
+    /// The name this assignment writes to, where the read settled it as text.
+    ///
+    /// The handle alone says nothing without the arena that holds it, so a
+    /// reader that has the session asks here rather than reading `Debug`.
+    #[must_use]
+    pub fn literal_name(&self, session: &crate::session::Session) -> Option<Bytes> {
+        match session.values.get(self.lhs) {
+            Value::Literal(_, name) => Some(name.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -163,8 +190,8 @@ impl Debug for AssignStmt {
 impl AssignStmt {
     pub fn new(
         loc: Loc,
-        lhs: Arc<Value>,
-        rhs: Arc<Value>,
+        lhs: ValueId,
+        rhs: ValueId,
         orig_rhs: Bytes,
         op: AssignOp,
         directive: Option<AssignDirective>,
@@ -182,14 +209,18 @@ impl AssignStmt {
     }
 
     pub fn get_lhs_symbol(&self, ev: &mut Evaluator) -> Result<Symbol> {
-        if let Value::Literal(_, v) = &*self.lhs {
+        let literal = match ev.session.values.get(self.lhs) {
+            Value::Literal(_, v) => Some(v.clone()),
+            _ => None,
+        };
+        if let Some(v) = literal {
             if v.is_empty() {
                 error_loc!(ev, Some(&self.loc), "*** empty variable name.");
             }
 
             let mut cache = self.lhs_sym_cache.lock();
             if cache.is_none() {
-                *cache = Some(ev.session.intern(v.clone()));
+                *cache = Some(ev.session.intern(v));
             }
             return Ok((*cache).unwrap());
         }
@@ -206,12 +237,12 @@ pub struct CommandStmt {
     loc: Loc,
     orig: Bytes,
 
-    pub expr: Arc<Value>,
+    pub expr: ValueId,
 }
 
 impl Statement for CommandStmt {
     fn loc(&self) -> Loc {
-        self.loc.clone()
+        self.loc
     }
     fn orig(&self) -> Bytes {
         self.orig.clone()
@@ -228,7 +259,7 @@ impl Debug for CommandStmt {
 }
 
 impl CommandStmt {
-    pub fn new(loc: Loc, orig: Bytes, expr: Arc<Value>) -> Arc<CommandStmt> {
+    pub fn new(loc: Loc, orig: Bytes, expr: ValueId) -> Arc<CommandStmt> {
         Arc::new(CommandStmt { loc, orig, expr })
     }
 }
@@ -258,8 +289,8 @@ pub struct IfStmt {
     orig: Bytes,
 
     pub op: CondOp,
-    pub lhs: Arc<Value>,
-    pub rhs: Option<Arc<Value>>,
+    pub lhs: ValueId,
+    pub rhs: Option<ValueId>,
     /// What the split owed this statement, held until the statement is reached.
     pub complaint: Option<CondComplaint>,
     pub true_stmts: Arc<Mutex<Vec<Stmt>>>,
@@ -268,7 +299,7 @@ pub struct IfStmt {
 
 impl Statement for IfStmt {
     fn loc(&self) -> Loc {
-        self.loc.clone()
+        self.loc
     }
     fn orig(&self) -> Bytes {
         self.orig.clone()
@@ -297,8 +328,8 @@ impl IfStmt {
     pub fn new(
         loc: Loc,
         op: CondOp,
-        lhs: Arc<Value>,
-        rhs: Option<Arc<Value>>,
+        lhs: ValueId,
+        rhs: Option<ValueId>,
         complaint: Option<CondComplaint>,
     ) -> Arc<IfStmt> {
         Arc::new(IfStmt {
@@ -318,13 +349,13 @@ pub struct IncludeStmt {
     loc: Loc,
     orig: Bytes,
 
-    pub expr: Arc<Value>,
+    pub expr: ValueId,
     pub should_exist: bool,
 }
 
 impl Statement for IncludeStmt {
     fn loc(&self) -> Loc {
-        self.loc.clone()
+        self.loc
     }
     fn orig(&self) -> Bytes {
         self.orig.clone()
@@ -341,7 +372,7 @@ impl Debug for IncludeStmt {
 }
 
 impl IncludeStmt {
-    pub fn new(loc: Loc, expr: Arc<Value>, should_exist: bool) -> Arc<IncludeStmt> {
+    pub fn new(loc: Loc, expr: ValueId, should_exist: bool) -> Arc<IncludeStmt> {
         Arc::new(IncludeStmt {
             loc,
             orig: Bytes::new(),
@@ -355,7 +386,7 @@ pub struct ExportStmt {
     loc: Loc,
     orig: Bytes,
 
-    pub expr: Arc<Value>,
+    pub expr: ValueId,
     pub is_export: bool,
     /// The directive named nothing at all, so it speaks for every variable
     /// rather than for a list of them.
@@ -368,7 +399,7 @@ pub struct ExportStmt {
 
 impl Statement for ExportStmt {
     fn loc(&self) -> Loc {
-        self.loc.clone()
+        self.loc
     }
     fn orig(&self) -> Bytes {
         self.orig.clone()
@@ -389,7 +420,7 @@ impl Debug for ExportStmt {
 }
 
 impl ExportStmt {
-    pub fn new(loc: Loc, expr: Arc<Value>, is_export: bool, is_bare: bool) -> Arc<ExportStmt> {
+    pub fn new(loc: Loc, expr: ValueId, is_export: bool, is_bare: bool) -> Arc<ExportStmt> {
         Arc::new(ExportStmt {
             loc,
             orig: Bytes::new(),
@@ -416,7 +447,7 @@ pub struct ParseErrorStmt {
 
 impl Statement for ParseErrorStmt {
     fn loc(&self) -> Loc {
-        self.loc.clone()
+        self.loc
     }
     fn orig(&self) -> Bytes {
         self.orig.clone()
@@ -446,13 +477,13 @@ impl ParseErrorStmt {
 pub struct UndefineStmt {
     loc: Loc,
     orig: Bytes,
-    pub expr: Arc<Value>,
+    pub expr: ValueId,
     pub is_override: bool,
 }
 
 impl Statement for UndefineStmt {
     fn loc(&self) -> Loc {
-        self.loc.clone()
+        self.loc
     }
     fn orig(&self) -> Bytes {
         self.orig.clone()
@@ -473,7 +504,7 @@ impl Debug for UndefineStmt {
 }
 
 impl UndefineStmt {
-    pub fn new(loc: Loc, expr: Arc<Value>, is_override: bool) -> Arc<UndefineStmt> {
+    pub fn new(loc: Loc, expr: ValueId, is_override: bool) -> Arc<UndefineStmt> {
         Arc::new(UndefineStmt {
             loc,
             orig: Bytes::new(),
@@ -492,12 +523,12 @@ impl UndefineStmt {
 pub struct VpathStmt {
     loc: Loc,
     orig: Bytes,
-    pub expr: Arc<Value>,
+    pub expr: ValueId,
 }
 
 impl Statement for VpathStmt {
     fn loc(&self) -> Loc {
-        self.loc.clone()
+        self.loc
     }
     fn orig(&self) -> Bytes {
         self.orig.clone()
@@ -514,7 +545,7 @@ impl Debug for VpathStmt {
 }
 
 impl VpathStmt {
-    pub fn new(loc: Loc, expr: Arc<Value>) -> Arc<VpathStmt> {
+    pub fn new(loc: Loc, expr: ValueId) -> Arc<VpathStmt> {
         Arc::new(VpathStmt {
             loc,
             orig: Bytes::new(),

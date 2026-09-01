@@ -29,7 +29,7 @@ use std::{
 use crate::{
     error_loc,
     eval::{Evaluator, FrameType, MissingInclude, PlannedScope, ReadMakefile, ScopedFrame},
-    expr::{Evaluable, Value},
+    expr::{Evaluable, Value, ValueId},
     fasthash::{FastMap, FastSet},
     loc::Loc,
     log,
@@ -540,7 +540,7 @@ pub struct DepNode {
     /// and an ordinary fresh entry under the path the search found, and the
     /// two spellings reach the same node here.
     pub declared_by_double_colon: Option<Symbol>,
-    pub cmds: Vec<Arc<Value>>,
+    pub cmds: Vec<ValueId>,
     pub deps: Vec<NamedDepNode>,
     pub order_onlys: Vec<NamedDepNode>,
     /// The order-only inputs whose failure this node is willing to outlive.
@@ -1400,11 +1400,7 @@ impl RuleMerger {
                     r.cmd_loc.as_ref(),
                     "*** overriding commands for target '{}', previously defined at {}",
                     output.display(ctx),
-                    primary_rule
-                        .cmd_loc
-                        .clone()
-                        .unwrap_or_default()
-                        .display(ctx)
+                    primary_rule.cmd_loc.unwrap_or_default().display(ctx)
                 );
             } else {
                 warn_loc!(
@@ -1471,9 +1467,9 @@ impl RuleMerger {
     }
 
     fn fill_dep_node_loc(&self, r: &Rule, n: &mut DepNode) {
-        n.loc = Some(r.loc.clone());
+        n.loc = Some(r.loc);
         if !r.cmds.is_empty()
-            && let Some(cmd_loc) = r.cmd_loc.clone()
+            && let Some(cmd_loc) = r.cmd_loc
         {
             n.loc = Some(cmd_loc);
         }
@@ -1547,7 +1543,7 @@ impl RuleMerger {
                 self.fill_grouped_outputs(output, r, &mut n);
             }
             if n.loc.is_none() {
-                n.loc = Some(r.loc.clone())
+                n.loc = Some(r.loc)
             }
         }
 
@@ -2563,8 +2559,8 @@ impl<'a> DepBuilder<'a> {
             prerequisite.put_slice(&source);
             let prerequisite = self.ev.session.intern(prerequisite.freeze());
 
-            let mut rule = Rule::new(suffix_rule.loc.clone(), false, false);
-            rule.cmd_loc = suffix_rule.cmd_loc.clone();
+            let mut rule = Rule::new(suffix_rule.loc, false, false);
+            rule.cmd_loc = suffix_rule.cmd_loc;
             rule.output_patterns.push(target);
             rule.inputs.push(prerequisite);
             rule.prerequisite_names.push(prerequisite);
@@ -2602,7 +2598,7 @@ impl<'a> DepBuilder<'a> {
             .lookup_rule_merger(name)
             .and_then(|merger| merger.lock().primary_rule.clone());
         let (loc, cmd_loc, cmds) = match written {
-            Some(rule) => (rule.loc.clone(), rule.cmd_loc.clone(), rule.cmds.clone()),
+            Some(rule) => (rule.loc, rule.cmd_loc, rule.cmds.clone()),
             None if withheld => return Ok(()),
             None => {
                 let Some(recipe) = crate::builtin_rules::suffix_recipe(suffix) else {
@@ -3439,7 +3435,7 @@ impl<'a> DepBuilder<'a> {
         ] {
             let sym = self.ev.session.intern(format!("{name}{form}"));
             let text = Bytes::from(text);
-            let mut loc = self.ev.loc.clone().unwrap_or_default();
+            let mut loc = self.ev.loc.unwrap_or_default();
             let value = crate::expr::parse_expr(
                 &mut self.ev.session,
                 &mut loc,
@@ -3523,7 +3519,7 @@ impl<'a> DepBuilder<'a> {
             let _bound = Unbind(bound);
             let mut expanded = Vec::with_capacity(texts.len());
             for (text, add_directory) in texts {
-                let mut loc = self.ev.loc.clone().unwrap_or_default();
+                let mut loc = self.ev.loc.unwrap_or_default();
                 let expr = crate::expr::parse_expr(
                     &mut self.ev.session,
                     &mut loc,
@@ -3746,13 +3742,13 @@ impl<'a> DepBuilder<'a> {
         if !keep_commands && from_primary.is_some() {
             let at = from_primary
                 .as_ref()
-                .map(|rule| rule.cmd_loc.clone().unwrap_or_else(|| rule.loc.clone()));
+                .map(|rule| rule.cmd_loc.unwrap_or_else(|| rule.loc));
             warn_loc!(
                 self.ev,
                 at.as_ref(),
                 "Recipe was specified for file '{}' at {},",
                 written.display(&self.ev.session),
-                at.clone().unwrap_or_default().display(&self.ev.session)
+                at.unwrap_or_default().display(&self.ev.session)
             );
             warn_loc!(
                 self.ev,
@@ -4195,7 +4191,7 @@ impl<'a> DepBuilder<'a> {
             ret.extend(self.declared_by(s, r)?);
         }
 
-        Ok(Some((ret, rules[0].loc.clone())))
+        Ok(Some((ret, rules[0].loc)))
     }
 
     /// GNU Make expands a special target's prerequisites once the makefiles are
@@ -4790,7 +4786,7 @@ impl<'a> DepBuilder<'a> {
                 &rule.order_only_inputs,
             );
             node.output_pattern = rule.output_patterns.first().copied();
-            node.loc = rule.cmd_loc.clone().or_else(|| Some(rule.loc.clone()));
+            node.loc = rule.cmd_loc.or_else(|| Some(rule.loc));
             node.has_rule = true;
             node.is_default_target = false;
         }
@@ -4861,7 +4857,7 @@ impl<'a> DepBuilder<'a> {
         let frame = self.ev.enter(
             FrameType::Dependency,
             trigger_text,
-            action.lock().loc.clone().unwrap_or_default(),
+            action.lock().loc.unwrap_or_default(),
         );
         self.apply_rule_vars(&vars, &action, &frame, &mut bound)?;
 
@@ -4981,9 +4977,7 @@ impl<'a> DepBuilder<'a> {
             node.grouped_double_join = true;
             node.has_rule = true;
             node.is_default_target = self.first_rule == Some(output);
-            node.loc = actions
-                .first()
-                .and_then(|(_, action)| action.lock().loc.clone());
+            node.loc = actions.first().and_then(|(_, action)| action.lock().loc);
             for (_, action) in &actions {
                 let action_output = action.lock().output;
                 node.actual_inputs.push(action_output);
@@ -6010,12 +6004,17 @@ impl<'a> DepBuilder<'a> {
     /// is expanded no further. Anything else — an automatic or a computed name,
     /// which a `+=` base is not in practice — is read once here and spliced as
     /// that literal.
-    fn append_expression(&mut self, var: &Var) -> Result<(Arc<Value>, Bytes)> {
-        if let Some(pair) = var.read().append_source() {
+    fn append_expression(&mut self, var: &Var) -> Result<(ValueId, Bytes)> {
+        if let Some(pair) = var.read().append_source(&mut self.ev.session.values) {
             return Ok(pair);
         }
         let text = var.read().eval_to_buf_mut(self.ev)?.freeze();
-        Ok((Arc::new(Value::Literal(None, text.clone())), text))
+        let literal = self
+            .ev
+            .session
+            .values
+            .alloc(Value::Literal(None, text.clone()));
+        Ok((literal, text))
     }
 
     fn apply_rule_vars(
@@ -6107,7 +6106,7 @@ impl<'a> DepBuilder<'a> {
                                 .or_else(|| public_now.get(name).cloned())
                                 .or_else(|| outer.get(name).cloned().flatten());
                             let origin = old_var.read().origin();
-                            let loc = node.lock().loc.clone();
+                            let loc = node.lock().loc;
                             // The tail as it was written, held unexpanded so it
                             // is read in the scope that reads the whole. A
                             // reader's own `$(shell)`, `$(flavor)` and any name
@@ -6130,9 +6129,10 @@ impl<'a> DepBuilder<'a> {
                                 .and_then(Option::as_ref)
                                 .is_none_or(|outer_var| !Arc::ptr_eq(&old_var, outer_var));
                             let (guard, guard_text) = crate::var::appended_recursive_value(
+                                &mut self.ev.session.values,
                                 base,
                                 &base_text,
-                                tail.clone(),
+                                tail,
                                 &tail_text,
                                 base_in_scope,
                             );
@@ -6140,7 +6140,7 @@ impl<'a> DepBuilder<'a> {
                                 guard,
                                 origin,
                                 frame.current(),
-                                loc.clone(),
+                                loc,
                                 guard_text,
                             );
                             public_var = match public_base {
@@ -6158,9 +6158,10 @@ impl<'a> DepBuilder<'a> {
                                     let (base, base_text) = self.append_expression(&pb)?;
                                     let (public, public_text) =
                                         crate::var::appended_recursive_value(
+                                            &mut self.ev.session.values,
                                             base,
                                             &base_text,
-                                            tail.clone(),
+                                            tail,
                                             &tail_text,
                                             public_base_in_scope,
                                         );
@@ -6177,7 +6178,7 @@ impl<'a> DepBuilder<'a> {
                                 // so a reader outside the target reads it in its
                                 // own scope.
                                 None => Variable::new_recursive(
-                                    tail.clone(),
+                                    tail,
                                     origin,
                                     frame.current(),
                                     loc,
@@ -6670,7 +6671,7 @@ impl<'a> DepBuilder<'a> {
         let frame = self.ev.enter(
             FrameType::Dependency,
             output_str.clone(),
-            n.lock().loc.clone().unwrap_or_default(),
+            n.lock().loc.unwrap_or_default(),
         );
 
         self.apply_rule_vars(&picked_rule_info.vars, &n, &frame, &mut bound)?;

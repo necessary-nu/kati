@@ -37,7 +37,7 @@ use parking_lot::Mutex;
 
 use crate::dep::{NamedDepNode, RegenerationRoot, make_dep};
 use crate::eval::{Evaluator, FrameType};
-use crate::expr::{Evaluable, ParseExprOpt, Value, parse_expr};
+use crate::expr::{ParseExprOpt, Value, parse_expr};
 use crate::file::Source;
 use crate::loc::Loc;
 use crate::session::Session;
@@ -509,7 +509,8 @@ fn stand_the_shell(session: &mut Session) {
             )
     };
     if came_from_the_environment {
-        var.write().restate_at(VarOrigin::File, shell);
+        var.write()
+            .restate_at(&mut session.values, VarOrigin::File, shell);
     }
 }
 
@@ -660,7 +661,7 @@ fn read_invocation_state(ev: &mut Evaluator) -> Result<()> {
     // MAKEFILE_LIST)` is told `file`, and so that the first name to arrive has
     // somewhere to be appended.
     let frame = ev.current_frame();
-    let loc = ev.loc.clone();
+    let loc = ev.loc;
     let makefile_list_sym = ev.session.intern("MAKEFILE_LIST");
     ev.session.set_global_var(
         makefile_list_sym,
@@ -956,8 +957,14 @@ fn republish_makeflags_after_read(ev: &mut Evaluator) -> Result<()> {
         state.has_overrides = true;
     }
     let eval_flags = ev.session.intern(crate::eval::EVAL_FLAGS_NAME);
-    let (value, original) =
-        crate::eval::makeflags_value(published, has_evals, true, eval_flags, overrides);
+    let (value, original) = crate::eval::makeflags_value(
+        &mut ev.session.values,
+        published,
+        has_evals,
+        true,
+        eval_flags,
+        overrides,
+    );
     let makeflags = ev.session.intern("MAKEFLAGS");
     if let Some(variable) = ev.session.globals.peek(makeflags) {
         variable.write().replace_recursive_value(value, original);
@@ -1018,10 +1025,14 @@ fn install_compiler_invocation_variables(ev: &mut Evaluator) {
         // there is no define at all, and an inherited one stays `environment`
         // in both tools.
         if crate::builtins::claimable(&mut ev.session, "MAKEOVERRIDES").is_some() {
+            let reference = ev
+                .session
+                .values
+                .alloc(Value::SymRef(Loc::default(), command_variables));
             ev.session.globals.define(
                 overrides,
                 Variable::new_recursive(
-                    Arc::new(Value::SymRef(Loc::default(), command_variables)),
+                    reference,
                     VarOrigin::Default,
                     None,
                     None,
@@ -1061,8 +1072,14 @@ fn install_compiler_invocation_variables(ev: &mut Evaluator) {
         // table carries without publishing.
         state.effective = state.protected.clone();
     }
-    let (value, original) =
-        crate::eval::makeflags_value(makeflags, has_evals, has_overrides, eval_flags, overrides);
+    let (value, original) = crate::eval::makeflags_value(
+        &mut ev.session.values,
+        makeflags,
+        has_evals,
+        has_overrides,
+        eval_flags,
+        overrides,
+    );
     let makeflags = ev.session.intern("MAKEFLAGS");
     // GNU Make defines this one at the rank `-e` gives the environment rather
     // than at the makefile's (main.c, `env_overrides ? o_env_override :

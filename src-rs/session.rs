@@ -254,6 +254,13 @@ pub struct Session {
     pub invocation_environment: Option<std::sync::Arc<Vec<(OsString, OsString)>>>,
     /// Byte strings to [`Symbol`] handles and back.
     pub symtab: Symtab,
+    /// Every expression node this session read.
+    ///
+    /// Session-owned because that is these nodes' lifetime: they are built out
+    /// of makefile text, held by the variables, rules and statements that text
+    /// describes, and freed together when the compilation is over. See
+    /// [`crate::expr::ValueArena`] and `plan/decisions/typed-graph-arenas.md`.
+    pub values: crate::expr::ValueArena,
     /// Make's outermost variable scope, keyed by interned symbol.
     pub globals: GlobalVars,
     /// Command-line values as recipes receive them through Make's exported
@@ -416,6 +423,7 @@ impl Session {
             include_path: Vec::new(),
             invocation_environment: None,
             symtab,
+            values: crate::expr::ValueArena::new(),
             globals: GlobalVars::with_builtins(),
             recipe_command_line: GlobalVars::new(),
             stats: StatsRegistry::new(),
@@ -571,7 +579,6 @@ impl Context for Session {
 mod tests {
     use super::*;
     use crate::eval::Evaluator;
-    use crate::expr::Evaluable;
     use bytes::BytesMut;
 
     fn eval_in(ev: &mut Evaluator, src: &str) -> Result<Bytes> {

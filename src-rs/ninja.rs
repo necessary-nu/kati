@@ -468,7 +468,7 @@ impl DeferredRecipes {
     ) -> Result<ExpandedRecipe> {
         let (loc, output) = {
             let node = recipe.node.lock();
-            (node.loc.clone(), node.output.as_bytes(&ce.ev.session))
+            (node.loc, node.output.as_bytes(&ce.ev.session))
         };
         let _frame = ce.ev.enter(
             crate::eval::FrameType::Ninja,
@@ -746,7 +746,11 @@ impl<'a> NinjaGenerator<'a> {
         // A recipe of nothing but whitespace is a target remade by doing
         // nothing, and the graph says that with an edge that runs nothing.
         // Deferring it would mint a rule for a command that will never exist.
-        if node.cmds.iter().all(|cmd| is_blank_recipe_line(cmd)) {
+        if node
+            .cmds
+            .iter()
+            .all(|cmd| is_blank_recipe_line(&self.ce.ev.session.values, *cmd))
+        {
             return false;
         }
         // A depfile is a dependency read at runtime — `--detect_depfiles` finds
@@ -770,7 +774,7 @@ impl<'a> NinjaGenerator<'a> {
         let rule_vars = node.rule_vars.clone();
         node.cmds.iter().all(|cmd| {
             let mut seen = FastSet::default();
-            !expansion_can_reach_make(cmd, self.ce.ev, rule_vars.as_deref(), &mut seen)
+            !expansion_can_reach_make(*cmd, self.ce.ev, rule_vars.as_deref(), &mut seen)
         })
     }
 
@@ -894,7 +898,7 @@ impl<'a> NinjaGenerator<'a> {
         let is_phony;
         {
             let node = node.lock();
-            loc = node.loc.clone();
+            loc = node.loc;
             has_rule = node.has_rule;
             is_phony = node.is_phony;
         }
@@ -951,10 +955,9 @@ impl<'a> NinjaGenerator<'a> {
                 // which `references_new_inputs` reads without expanding, and it
                 // is what declares the edge's deferred freshness so the
                 // scheduler binds the list the launch is handed.
-                node.lock()
-                    .cmds
-                    .iter()
-                    .any(|cmd| references_new_inputs(cmd, &self.ce.ev.session))
+                node.lock().cmds.iter().any(|cmd| {
+                    references_new_inputs(&self.ce.ev.session.values, *cmd, &self.ce.ev.session)
+                })
             } else {
                 *self.ce.found_new_inputs.lock()
             };
@@ -2353,10 +2356,13 @@ impl<'a> NinjaGenerator<'a> {
                 settled_names: &settled_names,
                 completion_join: node.grouped_double_join,
                 has_touchable_recipe: !node.cmds.is_empty()
-                    && !node
-                        .cmds
-                        .iter()
-                        .all(|cmd| crate::command::written_line_recurses(cmd, &self.ce.ev.session)),
+                    && !node.cmds.iter().all(|cmd| {
+                        crate::command::written_line_recurses(
+                            &self.ce.ev.session.values,
+                            *cmd,
+                            &self.ce.ev.session,
+                        )
+                    }),
                 intermediate: node.is_intermediate,
                 disposable_outputs: &node.disposable_outputs,
                 withdrawable_outputs: &withdrawable_outputs,
