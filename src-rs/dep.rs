@@ -564,6 +564,11 @@ pub struct DepNode {
     pub unconditional_double_colon: bool,
     /// `.IGNORE` named this target: a failing recipe line is not a failure.
     pub is_ignore_error: bool,
+    /// `.SILENT` named this target: GNU Make echoes none of its recipe lines,
+    /// exactly as if every one of them had been written with an `@`. This is
+    /// `COMMANDS_SILENT` in the file's `command_flags`, which `job.c` ORs into
+    /// the line's own flags before it decides whether to print.
+    pub is_silent: bool,
     /// This file's absence is no reason to remake what reads it: the implicit
     /// rule search invented the name to complete a chain, or `.INTERMEDIATE`
     /// or `.SECONDARY` said so.
@@ -716,6 +721,7 @@ impl DepNode {
         output: Symbol,
         is_phony: bool,
         is_ignore_error: bool,
+        is_silent: bool,
         is_intermediate: bool,
         is_disposable: bool,
     ) -> Arc<Mutex<Self>> {
@@ -735,6 +741,7 @@ impl DepNode {
             is_phony,
             unconditional_double_colon: false,
             is_ignore_error,
+            is_silent,
             is_intermediate,
             is_disposable,
             disposable_outputs: if is_disposable {
@@ -1788,6 +1795,9 @@ struct DepBuilder<'a> {
     /// The targets `.IGNORE` named. Empty when it named none, which is the
     /// form that means every target and sets the flag instead.
     ignore_errors: FastSet<Symbol>,
+    /// The targets `.SILENT` named. Empty when it named none, which is the
+    /// form that means every target and sets the flag instead.
+    silent: FastSet<Symbol>,
     /// The Makefile declared `.DELETE_ON_ERROR`, which is one global answer:
     /// GNU Make reads the name once, as a target rather than a prerequisite,
     /// and any prerequisites it was given mean nothing.
@@ -1935,6 +1945,7 @@ impl<'a> DepBuilder<'a> {
             assumed_old,
             assumed_new,
             ignore_errors: FastSet::default(),
+            silent: FastSet::default(),
             delete_on_error: false,
             precious: FastSet::default(),
             precious_patterns: FastSet::default(),
@@ -2016,6 +2027,21 @@ impl<'a> DepBuilder<'a> {
                 self.ev.session.flags.ignore_errors = true;
             } else {
                 self.ignore_errors.extend(targets);
+            }
+        }
+        // Bare `.SILENT:` is `-s` asked for by the Makefile; with
+        // prerequisites it silences those targets alone. Both are `file.c`'s
+        // `snap_deps`, three lines below the `.IGNORE` above and shaped the
+        // same: no deps sets `run_silent`, deps set `COMMANDS_SILENT` on each
+        // named file. `job.c` ORs that into the line's own flags before it
+        // decides whether to print, so a recipe under it echoes nothing
+        // whatever its lines were written with.
+        let silent = self.ev.session.intern(".SILENT");
+        if let Some((targets, _)) = self.get_rule_inputs(silent)? {
+            if targets.is_empty() {
+                self.ev.session.flags.is_silent_mode = true;
+            } else {
+                self.silent.extend(targets);
             }
         }
         // The bare `.WAIT:` form is what Makefiles write for older makes, so it
@@ -2939,7 +2965,7 @@ impl<'a> DepBuilder<'a> {
     fn an_implicit_rule_could_make(&mut self, name: Symbol) -> Result<bool> {
         let intermediates = self.intermediates.clone();
         let tried_implicit = self.tried_implicit.clone();
-        let scratch = DepNode::new(name, false, false, false, false);
+        let scratch = DepNode::new(name, false, false, false, false, false);
         let picked = self.implicit_rule_for(name, &scratch, &None, &[], &None);
         self.intermediates = intermediates;
         self.tried_implicit = tried_implicit;
@@ -4743,6 +4769,7 @@ impl<'a> DepBuilder<'a> {
             graph_output,
             false,
             self.moved_flag(&self.ignore_errors, trigger),
+            self.moved_flag(&self.silent, trigger),
             false,
             false,
         );
@@ -6395,6 +6422,7 @@ impl<'a> DepBuilder<'a> {
             output,
             self.phony.contains(&output),
             self.moved_flag(&self.ignore_errors, output),
+            self.moved_flag(&self.silent, output),
             is_intermediate,
             self.disposable_name(output),
         );
@@ -7077,6 +7105,7 @@ const CONSUMED_BUILTIN_TARGETS: &[&str] = &[
     ".DEFAULT",
     ".SECONDEXPANSION",
     ".IGNORE",
+    ".SILENT",
     ".EXPORT_ALL_VARIABLES",
     ".ONESHELL",
     ".NOTPARALLEL",
@@ -7087,9 +7116,8 @@ const CONSUMED_BUILTIN_TARGETS: &[&str] = &[
     ".PRECIOUS",
 ];
 
-/// Special targets asking for what already happens: we never echo a recipe, and
-/// 4.x ignores the last two.
-const ACCEPTED_BUILTIN_TARGETS: &[&str] = &[".SILENT", ".LOW_RESOLUTION_TIME", ".POSIX"];
+/// Special targets asking for what already happens: 4.x ignores both.
+const ACCEPTED_BUILTIN_TARGETS: &[&str] = &[".LOW_RESOLUTION_TIME", ".POSIX"];
 
 /// A closed list, because being a directive is not a property of the name's
 /// shape: `.1` looks exactly like `.PHONY` and is an ordinary target.

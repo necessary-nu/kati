@@ -1600,6 +1600,61 @@ impl<'a> NinjaGenerator<'a> {
     /// being dropped, because the join below counts the lines still to come
     /// while it walks them and would subshell differently if it could not see
     /// where the absorbed one was.
+    /// Exactly the bytes GNU Make would echo while running this recipe.
+    ///
+    /// `job.c`'s `start_job_command` prints one line per recipe line, and the
+    /// three things it prints are settled here rather than guessed:
+    ///
+    /// * *Whether.* `NONE_SET (flags, COMMANDS_SILENT) && !run_silent` — the
+    ///   line carried no `@` and the build is not under `-s`. That is exactly
+    ///   [`Command::echo`], which `parse_command_prefixes` reads off the
+    ///   written line and `-s` seeds false. (`just_print_flag` also prints,
+    ///   silenced or not, but `-n` is Ronin's `-n` and the command line is
+    ///   the whole of what a dry run shows, so it is not this text's job.)
+    /// * *What.* The pointer `p` that `message` is handed: the expanded line
+    ///   with its prefix characters and the blanks around them taken off, and
+    ///   nothing else done to it. Not the translated text — `translate_command`
+    ///   takes shell comments out, and GNU Make leaves them in for the shell to
+    ///   read. Not the assembled script either: the `set -e`, the subshells and
+    ///   the `;` joins are how one edge stands in for the several shells GNU
+    ///   Make would have started, and no byte of that plumbing is anything GNU
+    ///   Make ever echoed.
+    /// * *How many.* One line each, in order. `message` appends a newline, so
+    ///   two echoed lines are two lines, and joining them with a space would be
+    ///   a sentence neither Make wrote.
+    ///
+    /// A line that is empty once the prefixes are off is a line
+    /// `construct_command_argv` returns nothing for, and `start_job_command`
+    /// reaches `next_command` before it prints — so it echoes nothing. Under
+    /// `.ONESHELL` the whole recipe is one chopped line whose flags are the
+    /// first written line's, so every line shares one answer to *whether* and
+    /// a blank among them is text in the middle of that one line rather than a
+    /// line that vanished. Verified against 4.4.1 both ways.
+    ///
+    /// `None` where the recipe echoes nothing at all, which is what a wholly
+    /// silenced recipe does and what the caller must be able to tell from a
+    /// recipe that echoed an empty line.
+    fn echoed_narration(flags: &Flags, commands: &[Command]) -> Option<Bytes> {
+        let mut out = BytesMut::new();
+        let mut any = false;
+        for c in commands.iter().filter(|c| c.echo) {
+            let line = if c.keeps_indent {
+                c.cmd.clone()
+            } else {
+                c.cmd.slice_ref(c.cmd.trim_ascii_start())
+            };
+            if line.is_empty() && !flags.one_shell {
+                continue;
+            }
+            if any {
+                out.put_u8(b'\n');
+            }
+            out.put_slice(&line);
+            any = true;
+        }
+        any.then(|| out.freeze())
+    }
+
     fn translate_recipe(
         flags: &Flags,
         name: &Bytes,
@@ -1662,6 +1717,13 @@ impl<'a> NinjaGenerator<'a> {
                 force_no_subshell: c.force_no_subshell,
                 recursive_line: c.recursive_line,
             }));
+        }
+        // Nothing was hoisted, so the recipe wrote no narration of its own and
+        // what it says is what GNU Make echoes for it. The hoist and this are
+        // exclusive by construction: `hoisted_narration` declines a recipe with
+        // any loud line, and a recipe with no loud line echoes nothing.
+        if let Some(slot @ None) = description {
+            *slot = Self::echoed_narration(flags, commands);
         }
         TranslatedRecipe {
             lines,
@@ -2699,28 +2761,6 @@ pub fn script_file_flags(shell_flags: &[u8]) -> Bytes {
     out.freeze()
 }
 
-/// The script as one line of narration, or nothing when it cannot be one.
-///
-/// A description is one line wherever it is printed, and [`single_line`] takes
-/// a recipe continuation's newline back out for exactly that. What it cannot
-/// take out is a newline GNU Make put there on purpose — `.ONESHELL`'s own
-/// separator — so a script still holding one after it is a script no
-/// destination can narrate with its own text.
-///
-/// Nothing, rather than the reconstruction the command carries: that is the
-/// plumbing a manifest needs to say the recipe at all, and narrating it would
-/// tell the reader less than saying nothing does. The Makefile's own words,
-/// where it wrote any, are preferred ahead of this.
-///
-/// The writer's alone, like [`RESPONSE_FILE`]. A sink that keeps the script in
-/// memory has somewhere to put every byte of it and narrates with
-/// [`single_line`] instead, which is why the comparison between them treats a
-/// respelled rule's description as destination-specific.
-fn narrated_script(script: &[u8]) -> Option<Bytes> {
-    let line = single_line(script);
-    (!line.contains(&b'\n')).then_some(line)
-}
-
 /// The one-line command that writes `script` back out with its newlines.
 ///
 /// A `build.ninja` binding ends at a newline and no escape puts one back —
@@ -2907,13 +2947,17 @@ impl<W: std::io::Write> BuildSink for NinjaWriter<W> {
         let spelled = match rule.command {
             SinkCommand::Inline(script) | SinkCommand::ResponseFile(script) => single_line(script),
         };
+        // Only what the recipe says, never the script that runs it. A manifest
+        // binding holds one line, so a recipe GNU Make echoes over several is
+        // one this file cannot narrate — and Ninja's own answer to a rule with
+        // no description, which is to show the command, is the right answer for
+        // a reader of this manifest even though it is the wrong one for the
+        // sink that kept the recipe in memory. `destination_specific_binding`
+        // in the equivalence gate is where the two are reconciled.
         let description = rule
             .description
             .map(Bytes::copy_from_slice)
-            .or(match rule.command {
-                SinkCommand::Inline(script) => narrated_script(script),
-                SinkCommand::ResponseFile(_) => None,
-            });
+            .filter(|text| !text.contains(&b'\n'));
         if let Some(description) = description {
             self.out.write_all(b" description = ")?;
             self.out.write_all(&escape_ninja_value(&description))?;
@@ -3838,7 +3882,20 @@ mod tests {
         );
         let ignore_errors =
             NinjaGenerator::gen_shell_script(&flags, &translated, &script_flags, &mut cmd_buf);
-        assert_eq!(description, None, "no Makefile echo, so no description");
+        // Every line here is loud, so the narration is the lines themselves,
+        // one per line — never the script this helper is checking, which is
+        // the join and the subshells that stand in for GNU Make's several
+        // shells and which GNU Make never echoed.
+        let echoed = lines
+            .iter()
+            .map(|(cmd, _)| String::from_utf8_lossy(cmd).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            description.map(|d| String::from_utf8_lossy(&d).into_owned()),
+            Some(echoed),
+            "a loud recipe narrates the lines GNU Make would echo"
+        );
         ((cmd_buf.freeze(), ignore_errors), script_flags)
     }
 
@@ -3946,9 +4003,11 @@ mod tests {
         );
     }
 
-    /// A recipe that left one line loud has not taken its own narration over:
-    /// GNU Make echoes that line, and the command Ronin shows for an edge that
-    /// named no description is the counterpart of exactly that echo.
+    /// A recipe that left one line loud has not taken its own narration over,
+    /// so the hoist declines it — and what the edge narrates is the loud line
+    /// alone, which is what GNU Make echoes. The silenced echo above it stays
+    /// in the script and prints its own text at run time, exactly as it does
+    /// under 4.4.1.
     #[test]
     fn a_recipe_with_a_line_left_loud_keeps_its_command() {
         let mut names = Symtab::new();
@@ -3983,7 +4042,11 @@ mod tests {
         );
         let mut script = BytesMut::new();
         NinjaGenerator::gen_shell_script(&flags, &translated, b"-c", &mut script);
-        assert_eq!(description, None);
+        assert_eq!(
+            description.map(|d| String::from_utf8_lossy(&d).into_owned()),
+            Some("cc misc.c".to_owned()),
+            "the loud line is the whole of what GNU Make echoes here"
+        );
         assert_eq!(
             String::from_utf8_lossy(&script),
             "set -e ; (set +e ; echo '  CC      misc.o' ) ; (set +e ; cc misc.c )"
@@ -4149,13 +4212,18 @@ mod tests {
         assert_eq!(binding(&manifest, "rspfile"), RESPONSE_FILE);
     }
 
-    /// A description the Makefile chose is text and gets escaped. Without one,
-    /// use a short inline recipe itself, but do not duplicate an oversized
-    /// response-file script into the build's narration.
+    /// A description the Makefile chose is text and gets escaped. A rule that
+    /// was given none gets none: the script is not narration, and Ninja's own
+    /// answer for a rule without a description — show the command — is the
+    /// right answer for whoever reads this manifest.
+    ///
+    /// A binding ends at a newline, so narration GNU Make spreads over several
+    /// echoed lines is narration this file cannot hold, and it is declined
+    /// rather than folded onto one line.
     #[test]
     fn test_writer_uses_the_inline_recipe_as_its_default_description() {
         let manifest = declare_rule_for(SinkCommand::Inline(b"true"), None);
-        assert_eq!(binding(&manifest, "description"), "true");
+        assert!(!manifest.contains(" description = "), "{manifest}");
 
         let manifest = declare_rule_for(SinkCommand::ResponseFile(b"true"), None);
         assert!(!manifest.contains(" description = "), "{manifest}");
@@ -4166,6 +4234,9 @@ mod tests {
             ninja_unescape(binding(&manifest, "description").as_bytes()),
             b"making $PATH"
         );
+
+        let manifest = declare_rule_for(SinkCommand::Inline(b"a; b"), Some(b"echo a\necho b"));
+        assert!(!manifest.contains(" description = "), "{manifest}");
     }
 
     /// A manifest skips the blanks after a binding's `=`, so a description

@@ -1906,6 +1906,12 @@ impl<'a> CommandEvaluator<'a> {
             node_cmds = node.cmds.clone();
         }
         let node_ignores_errors = n.lock().is_ignore_error;
+        // `.SILENT` named this target, which GNU Make carries as
+        // `COMMANDS_SILENT` in the file's `command_flags` and ORs into every
+        // line's own flags. Seeding it here rather than clearing it per line is
+        // the same thing said once: `scan_written_prefixes` below can only turn
+        // echoing off, never back on.
+        let node_is_silent = n.lock().is_silent;
         // GNU Make expands `$(SHELL)` once per recipe with the target's own
         // scope — `construct_command_argv` (job.c) calls
         // `allocated_variable_expand_for_file ("$(SHELL)", file)` — so a
@@ -1958,7 +1964,7 @@ impl<'a> CommandEvaluator<'a> {
             // shell, so the two are carried separately and joined at the end.
             let ignored_without_prefix = self.ev.session.flags.ignore_errors || node_ignores_errors;
             let mut written = LinePrefixes {
-                echo: !self.ev.session.flags.is_silent_mode,
+                echo: !self.ev.session.flags.is_silent_mode && !node_is_silent,
                 dash_prefixed: false,
                 // The classification is read from the recipe as written, so it
                 // has to be taken before anything is expanded away.
