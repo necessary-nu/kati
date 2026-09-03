@@ -346,6 +346,16 @@ pub struct Session {
     /// records nothing, because a build acts on each classification and has no
     /// use for it afterwards.
     pub census: std::sync::Arc<crate::census::Census>,
+    /// The shell's reading of a recipe line, for the lifter — see
+    /// [`crate::lift`].
+    ///
+    /// Built the first time a recipe line of this session names a Make, and
+    /// not before, because building it costs a locale, a variable table and
+    /// three descriptors and most sessions never name one. On the session
+    /// because it is evaluation state, which `tests/no_globals.rs` keeps off
+    /// the process: two sessions reading on two threads each hold their own,
+    /// and nothing one reads is visible to the other.
+    pub script_reader: parking_lot::Mutex<Option<nsh::script::Reader>>,
     /// Where this unit's Makefiles sit relative to the compilation's root,
     /// for a census that has to say which `Makefile` a line is in.
     ///
@@ -441,6 +451,7 @@ impl Session {
             diagnostics: std::sync::Arc::new(crate::diagnostics::Diagnostics::to_stderr()),
             interrupts: None,
             census: std::sync::Arc::new(crate::census::Census::ignored()),
+            script_reader: parking_lot::Mutex::new(None),
             unit_prefix: Vec::new(),
             suffixes: Vec::new(),
         }

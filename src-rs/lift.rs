@@ -33,26 +33,19 @@ use nsh::script::{Assignment, Command, Piece, Reader, Script, SimpleCommand, Wor
 
 use crate::census::NestingReason;
 use crate::command::LiftedInvocation;
+use crate::session::Session;
 
-thread_local! {
-    /// One reader per thread, built on first use and kept: building a shell
-    /// costs a locale and a variable table, and a compilation reads many
-    /// lines.
-    static READER: std::cell::RefCell<Option<Reader>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Read `line` as the shell would.
-fn read(line: &[u8]) -> Result<Script, NestingReason> {
-    READER.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let reader = match slot.as_mut() {
-            Some(reader) => reader,
-            None => slot.insert(Reader::new().map_err(|_| NestingReason::Unreadable)?),
-        };
-        reader
-            .read(line.into())
-            .map_err(|_| NestingReason::Unreadable)
-    })
+/// Read `line` as the shell would, with the session's reader — built here the
+/// first time the session needs one. See [`Session::script_reader`].
+fn read(session: &Session, line: &[u8]) -> Result<Script, NestingReason> {
+    let mut slot = session.script_reader.lock();
+    let reader = match slot.as_mut() {
+        Some(reader) => reader,
+        None => slot.insert(Reader::new().map_err(|_| NestingReason::Unreadable)?),
+    };
+    reader
+        .read(line.into())
+        .map_err(|_| NestingReason::Unreadable)
 }
 
 /// The static child invocations one recipe line names, in the order the
@@ -67,6 +60,7 @@ fn read(line: &[u8]) -> Result<Script, NestingReason> {
 /// shell flags the line runs under arm `-e` before the line's own `set`.
 // [spec:ronin:req:make.recursive-invocation+3]
 pub fn lift(
+    session: &Session,
     line: &Bytes,
     make_values: &[Bytes],
     errexit: bool,
@@ -74,7 +68,7 @@ pub fn lift(
     if make_values.is_empty() {
         return Ok(Vec::new());
     }
-    let script = read(line)?;
+    let script = read(session, line)?;
     let mut walk = Walk {
         make_values,
         state: State {
@@ -997,6 +991,7 @@ mod tests {
 
     fn lifted(line: &'static [u8]) -> Result<Vec<String>, NestingReason> {
         lift(
+            &Session::new(),
             &Bytes::from_static(line),
             &[Bytes::from_static(b"make")],
             false,
@@ -1011,6 +1006,7 @@ mod tests {
 
     fn lifted_strict(line: &'static [u8]) -> Result<Vec<String>, NestingReason> {
         lift(
+            &Session::new(),
             &Bytes::from_static(line),
             &[Bytes::from_static(b"make")],
             true,
@@ -1124,6 +1120,7 @@ mod tests {
     fn a_make_value_of_several_words_is_matched_word_by_word() {
         let lifted = |line: &'static [u8]| {
             lift(
+                &Session::new(),
                 &Bytes::from_static(line),
                 &[Bytes::from_static(b"make -j8")],
                 false,

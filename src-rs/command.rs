@@ -1688,7 +1688,12 @@ impl<'a> CommandEvaluator<'a> {
                     // it, and whether that shell arms `-e` is part of what the
                     // reading decides: under `.POSIX:` a bare loop stops at its
                     // first failed iteration, and under `-c` it carries on.
-                    let lifted = crate::lift::lift(&cmd, &make_values, arms_errexit(&shell_flag));
+                    let lifted = crate::lift::lift(
+                        &self.ev.session,
+                        &cmd,
+                        &make_values,
+                        arms_errexit(&shell_flag),
+                    );
                     // Only a classified line is held to this. A `MAKE`-valued
                     // variable that GNU Make never classified is composed when
                     // the expansion makes that possible and otherwise left as
