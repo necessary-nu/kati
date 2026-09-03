@@ -1552,10 +1552,15 @@ impl<'a> NinjaGenerator<'a> {
             }
             // A line with nothing lifted out of it is in the census only when
             // it starts a Make anyway, which is exactly what `nesting` names.
-            if let Some(reason) = command.nesting {
+            if let Some(reason) = &command.nesting {
                 session.census.record(crate::census::Invocation {
                     location,
-                    disposition: crate::census::Disposition::Nested(reason),
+                    disposition: crate::census::Disposition::Nested(reason.clone()),
+                });
+            } else if command.unreached {
+                session.census.record(crate::census::Invocation {
+                    location,
+                    disposition: crate::census::Disposition::Unreached,
                 });
             }
         }
@@ -3695,6 +3700,7 @@ mod tests {
                 recursive_line: false,
                 recursive_make: Vec::new(),
                 nesting: None,
+                unreached: false,
                 loc: None,
             })
             .collect();
@@ -3744,6 +3750,7 @@ mod tests {
                 recursive_line: false,
                 recursive_make: Vec::new(),
                 nesting: None,
+                unreached: false,
                 loc: None,
             })
             .collect();
@@ -3867,6 +3874,7 @@ mod tests {
                 recursive_line: false,
                 recursive_make: Vec::new(),
                 nesting: None,
+                unreached: false,
                 loc: None,
             })
             .collect();
@@ -3923,6 +3931,7 @@ mod tests {
                 recursive_line: false,
                 recursive_make: Vec::new(),
                 nesting: None,
+                unreached: false,
                 loc: None,
             })
             .collect();
@@ -4030,6 +4039,7 @@ mod tests {
             recursive_line: false,
             recursive_make: Vec::new(),
             nesting: None,
+            unreached: false,
             loc: None,
         })
         .collect();
@@ -4392,6 +4402,7 @@ mod tests {
                 recursive_line: false,
                 recursive_make: Vec::new(),
                 nesting: None,
+                unreached: false,
                 loc: None,
             })
             .collect();
@@ -4544,6 +4555,7 @@ mod tests {
                 recursive_line: false,
                 recursive_make: Vec::new(),
                 nesting: None,
+                unreached: false,
                 loc: None,
             })
             .collect();
@@ -4701,6 +4713,7 @@ mod tests {
                 recursive_line: false,
                 recursive_make: Vec::new(),
                 nesting: None,
+                unreached: false,
                 loc: None,
             })
             .collect();

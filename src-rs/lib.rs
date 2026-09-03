@@ -68,6 +68,7 @@ pub mod flags;
 pub mod func;
 pub mod interrupt;
 pub mod io;
+pub mod lift;
 pub mod loc;
 pub mod logging;
 pub mod ninja;

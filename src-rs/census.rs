@@ -25,6 +25,11 @@ pub enum Disposition {
     /// There is no one invocation to name — that is what the reason says —
     /// and the location names the line.
     Nested(NestingReason),
+    /// Never started: the invocation stands under a condition the compiler
+    /// settled as false, or in a loop over no words, so nothing is composed
+    /// for it and nothing runs it. vim's `if test "$@" = "test" ...` guards
+    /// are this for every goal but `test`.
+    Unreached,
     /// Composed, and then there was no makefile where it pointed.
     ///
     /// Recorded by whoever went to read the child rather than by the classifier
@@ -43,22 +48,70 @@ pub enum Disposition {
 /// Why an invocation the compiler could see was not composed.
 ///
 /// Recorded where the decision is made rather than worked out afterwards from
-/// the recipe text, so what a report says is what the compile did.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// the recipe text, so what a report says is what the compile did. Each is
+/// the first construct that stopped the line's reading — see
+/// [`crate::lift`] — from proving the line equal to a list of composed
+/// children, named precisely enough that a reader knows what to change.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NestingReason {
-    /// The invocation is not the recipe line's own command: a shell construct
-    /// stands between them — a conditional, a sequence, an alternation, a
-    /// pipeline — and the compiler lifts out a line that IS an invocation,
-    /// not a line that contains one somewhere.
-    ThroughAConstruct,
-    /// The line's command is the invocation and it is written as more than
-    /// the argument list the resolver reads: an assignment or `env` prefix, a
-    /// redirection, a glob, an expansion it will not settle.
-    NotAnArgumentList,
     /// A `.ONESHELL` recipe of more than one line, whose lines share one
     /// shell, so no reading of the recipe establishes what an earlier line
     /// left for this invocation to read.
     SharedShell,
+    /// The shell could not read the line at all: it is not POSIX shell
+    /// syntax, or not complete.
+    Unreadable,
+    /// A command substitution decides what the line does — the goals, the
+    /// directory, a loop's words, a variable the invocation reads — and what
+    /// it expands to is known only by running it.
+    CommandSubstitution,
+    /// A shell variable the invocation reads has no value the line settles:
+    /// it was never assigned on the line, or assigned from something the
+    /// line cannot settle, or it is a positional or special parameter.
+    UnresolvedParameter {
+        /// The parameter as the line wrote it.
+        name: String,
+    },
+    /// A word the invocation reads would be matched against the disk — an
+    /// unquoted pattern, or a `~` — and what it matches is known only there.
+    Glob,
+    /// The invocation stands under an `if` whose condition the line does not
+    /// settle: a file test, a command's status, a value the line never gave.
+    UndecidableCondition,
+    /// `||` hands the invocation's failure to another command. Only `exit`
+    /// composes there, because a failed child fails the recipe exactly as
+    /// `exit` would; anything else runs after the failure and a composed
+    /// child has no edge to run it on.
+    Alternation,
+    /// `;` runs what follows whether or not the invocation failed, where a
+    /// composed child's failure stops everything after it.
+    Sequence,
+    /// A `for` loop runs its next iteration whether or not this one failed,
+    /// where a composed child's failure stops everything after it.
+    LoopCarriesOn,
+    /// A pipeline or a `!` stands between the line and the invocation.
+    Pipeline,
+    /// A redirection changes what the invocation reads or writes, and the
+    /// graph has nowhere to put it.
+    Redirection,
+    /// An assignment or `env` stands in front of the invocation's command,
+    /// giving the child an environment the line composes at run time.
+    Prefix,
+    /// A `cd` the compiler cannot follow: one without a directory, or with
+    /// an option.
+    DirectoryChange,
+    /// Another command runs on the line beside the invocation, and a
+    /// composed child carries nothing but the invocation.
+    BesideAnotherCommand {
+        /// The command's name.
+        command: String,
+    },
+    /// A shell form the compiler does not read: a `while`, a `case`, a
+    /// function, a command in the background.
+    Construct {
+        /// The form, as a noun phrase.
+        construct: &'static str,
+    },
 }
 
 /// One recursive invocation a compile classified, and what it decided.
@@ -164,15 +217,13 @@ mod tests {
         let census = Census::collected();
         assert!(census.is_recording());
         census.record(invocation(composed("make -C sub")));
-        census.record(invocation(Disposition::Nested(
-            NestingReason::ThroughAConstruct,
-        )));
+        census.record(invocation(Disposition::Nested(NestingReason::Sequence)));
         let taken = census.take();
         assert_eq!(taken.len(), 2);
         assert_eq!(taken[0].disposition, composed("make -C sub"));
         assert_eq!(
             taken[1].disposition,
-            Disposition::Nested(NestingReason::ThroughAConstruct)
+            Disposition::Nested(NestingReason::Sequence)
         );
         assert!(
             census.take().is_empty(),

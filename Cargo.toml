@@ -12,6 +12,11 @@ gperftools = { version = "0.2.0", features = ["heap"], optional = true }
 libc = "0.2.172"
 log = "0.4.27"
 memchr = "2.7.4"
+# The shell Ronin runs recipes through, used here for the one thing a recipe
+# line's lifting needs from a shell: its reading of the line. A git dependency
+# for the reason Ronin's own is one — nsh is upstream with a plan of its own,
+# and the `nsh` on crates.io is an unrelated shell.
+nsh = { git = "https://github.com/necessary-nu/nsh", branch = "master" }
 os_pipe = "1.2.1"
 parking_lot = { version = "0.12.3" }
 
