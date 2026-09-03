@@ -352,10 +352,13 @@ impl Walk<'_> {
         if !simple.assignments.is_empty() {
             return Err(NestingReason::Prefix);
         }
-        let mut words = simple.words.iter();
-        let Some(first) = words.next() else {
+        let words = simple.words.iter().collect::<Vec<_>>();
+        let Some(first) = words.first().copied() else {
             return Ok(());
         };
+        if let Some((make, used)) = self.make_prefix(&words)? {
+            return self.invoke_words(&make, words[used..].iter().copied(), None, context);
+        }
         let name = self.fields(first)?;
         let name = match name.as_slice() {
             [name] => name.clone(),
@@ -365,33 +368,26 @@ impl Walk<'_> {
                 });
             }
         };
+        let rest = &words[1..];
         match name.as_slice() {
             b":" | b"true" => Ok(()),
-            b"set" => self.set(words),
-            b"exec" => match words.next() {
-                Some(program) => {
-                    // `exec` in front of the invocation runs the same Make
-                    // and nothing after it; a line that IS the invocation
-                    // has nothing after it either.
-                    let program = self.fields(program)?;
-                    if program.len() == 1 && self.is_make(&program[0]) {
-                        self.invoke_words(&program[0], words, None, context)
-                    } else {
-                        Err(NestingReason::BesideAnotherCommand {
-                            command: "exec".to_owned(),
-                        })
-                    }
+            b"set" => self.set(rest.iter().copied()),
+            // `exec` in front of the invocation runs the same Make and nothing
+            // after it; a line that IS the invocation has nothing after it
+            // either.
+            b"exec" => match self.make_prefix(rest)? {
+                Some((make, used)) => {
+                    self.invoke_words(&make, rest[used..].iter().copied(), None, context)
                 }
                 None => Err(NestingReason::BesideAnotherCommand {
                     command: "exec".to_owned(),
                 }),
             },
-            b"cd" => self.change_directory(words, context),
+            b"cd" => self.change_directory(rest.iter().copied(), context),
             b"env" => Err(NestingReason::Prefix),
             b"exit" => Err(NestingReason::Construct {
                 construct: "an `exit` that ends the line",
             }),
-            _ if self.is_make(&name) => self.invoke_words(&name, words, None, context),
             _ => Err(NestingReason::BesideAnotherCommand {
                 command: String::from_utf8_lossy(&name).into_owned(),
             }),
@@ -410,8 +406,39 @@ impl Walk<'_> {
         })
     }
 
-    fn is_make(&self, name: &[u8]) -> bool {
-        self.make_values.iter().any(|make| make.as_ref() == name)
+    /// The `MAKE` value the line's leading words spell, and how many words
+    /// they take.
+    ///
+    /// `MAKE` is Make's text and not one shell word: `make -j8` is a value
+    /// kati hands a child, and a Makefile may say `MAKE = $(MAKE_COMMAND)
+    /// --no-print-directory`. The invocation is the words after the value's
+    /// words, so the value is matched word by word and passed on as the text
+    /// it is.
+    fn make_prefix(&self, words: &[&Word]) -> Result<Option<(Bytes, usize)>, NestingReason> {
+        for make in self.make_values {
+            let tokens = make
+                .split(|byte| byte.is_ascii_whitespace())
+                .filter(|token| !token.is_empty())
+                .collect::<Vec<_>>();
+            if tokens.is_empty() || words.is_empty() {
+                continue;
+            }
+            let mut fields = Vec::new();
+            let mut used = 0;
+            while fields.len() < tokens.len() && used < words.len() {
+                fields.extend(self.fields(words[used])?);
+                used += 1;
+            }
+            if fields.len() == tokens.len()
+                && fields
+                    .iter()
+                    .zip(&tokens)
+                    .all(|(field, token)| field.as_slice() == *token)
+            {
+                return Ok(Some((make.clone(), used)));
+            }
+        }
+        Ok(None)
     }
 
     /// `set -e` and `set +e` are the line arming or disarming errexit for
@@ -498,22 +525,18 @@ impl Walk<'_> {
         if !invocation.assignments.is_empty() {
             return Err(NestingReason::Prefix);
         }
-        let mut words = invocation.words.iter();
-        let Some(first) = words.next() else {
+        let mut words = invocation.words.iter().collect::<Vec<_>>();
+        let Some(first) = words.first().copied() else {
             return Err(NestingReason::DirectoryChange);
         };
-        let mut name = self.fields(first)?;
-        if name.len() == 1 && name[0] == b"exec" {
-            let Some(program) = words.next() else {
-                return Err(NestingReason::BesideAnotherCommand {
-                    command: "exec".to_owned(),
-                });
-            };
-            name = self.fields(program)?;
+        if is_literal(first, b"exec") {
+            words.remove(0);
         }
-        match name.as_slice() {
-            [name] if self.is_make(name) => self.invoke_words(name, words, directory, context),
-            _ => Err(NestingReason::BesideAnotherCommand {
+        match self.make_prefix(&words)? {
+            Some((make, used)) => {
+                self.invoke_words(&make, words[used..].iter().copied(), directory, context)
+            }
+            None => Err(NestingReason::BesideAnotherCommand {
                 command: String::from_utf8_lossy(&first.source).into_owned(),
             }),
         }
@@ -527,7 +550,9 @@ impl Walk<'_> {
         context: Context,
     ) -> Result<(), NestingReason> {
         self.admitted(context)?;
-        let mut spelled = vec![Spelled::Field(make.to_vec())];
+        // The value as Make expanded it, which is what the resolver, the census
+        // and every reader of the line before this one were handed.
+        let mut spelled = vec![Spelled::Verbatim(make.to_vec())];
         for word in words {
             spelled.extend(self.spell(word)?);
         }
@@ -547,15 +572,9 @@ impl Walk<'_> {
                 Spelled::Verbatim(source) => command.extend_from_slice(source),
             }
         }
-        let make = self
-            .make_values
-            .iter()
-            .find(|value| value.as_ref() == make)
-            .cloned()
-            .unwrap_or_else(|| Bytes::copy_from_slice(make));
         self.found.push(LiftedInvocation {
             command: Bytes::from(command),
-            make,
+            make: Bytes::copy_from_slice(make),
         });
         Ok(())
     }
@@ -1095,6 +1114,57 @@ mod tests {
         // for the resolver to run, as `$(pwd)` always did; a backquoted one
         // is the same substitution and is now spelled the same way.
         assert_eq!(lifted(b"make -C `pwd`").unwrap(), ["make -C $(pwd)"]);
+    }
+
+    /// `MAKE` is Make's text and may be several shell words: kati hands a
+    /// child `make -j8`, and a Makefile may set `MAKE = $(MAKE_COMMAND)
+    /// --no-print-directory`. The invocation begins after the value's words,
+    /// and the value goes on as the text it is.
+    #[test]
+    fn a_make_value_of_several_words_is_matched_word_by_word() {
+        let lifted = |line: &'static [u8]| {
+            lift(
+                &Bytes::from_static(line),
+                &[Bytes::from_static(b"make -j8")],
+                false,
+            )
+            .map(|invocations| {
+                invocations
+                    .into_iter()
+                    .map(|invocation| {
+                        (
+                            String::from_utf8_lossy(&invocation.command).into_owned(),
+                            String::from_utf8_lossy(&invocation.make).into_owned(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            lifted(b"make -j8 --no-print-directory -C sub0 all").unwrap(),
+            [(
+                "make -j8 --no-print-directory -C sub0 all".to_owned(),
+                "make -j8".to_owned()
+            )]
+        );
+        assert_eq!(
+            lifted(b"cd a && exec make -j8 x").unwrap(),
+            [("cd a && make -j8 x".to_owned(), "make -j8".to_owned())]
+        );
+        assert_eq!(
+            lifted(b"for d in a b; do (cd $d && make -j8) || exit 1; done").unwrap(),
+            [
+                ("cd a && make -j8".to_owned(), "make -j8".to_owned()),
+                ("cd b && make -j8".to_owned(), "make -j8".to_owned())
+            ]
+        );
+        // `make` alone is not the value `make -j8`.
+        assert_eq!(
+            lifted(b"make -C sub"),
+            Err(NestingReason::BesideAnotherCommand {
+                command: "make".to_owned()
+            })
+        );
     }
 
     /// zsh's shape, from all four of its Makefiles.
