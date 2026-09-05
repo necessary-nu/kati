@@ -772,11 +772,34 @@ pub fn strip_recipe_prefix_continuations(source: Bytes, prefix: u8) -> Bytes {
     }
 }
 
-pub fn trim_leading_curdir(mut s: &[u8]) -> &[u8] {
-    while s.starts_with(b"./") {
-        s = &s[2..];
+/// Strip the leading "this directory" references from a name, as GNU Make's
+/// `parse_file_seq` does (read.c:3303).
+///
+/// Three details of GNU's loop decide what a Makefile means, and dropping any
+/// of them changes a build. It strips only while MORE THAN TWO bytes remain, so
+/// a bare `./` is left alone rather than stripped to nothing — the Linux
+/// kernel's `scripts/Makefile.build` names its default goal `$(obj)/`, which is
+/// exactly `./` for the top directory, and a name stripped away there is a
+/// default goal lost. It skips the slashes that follow each `./`, so `.//x` is
+/// `x`. And a name that does strip to empty is `./` again, which is GNU's own
+/// `tp[0] = '.'; tp[1] = '/';` fallback for `.//`.
+///
+/// The `./` handed back for a stripped-to-empty name is a subslice of the input
+/// rather than a literal, because callers pass the result to `Bytes::slice_ref`,
+/// which requires it to lie inside the buffer it came from.
+pub fn trim_leading_curdir(s: &[u8]) -> &[u8] {
+    let mut start = 0;
+    while s.len() - start > 2 && s[start] == b'.' && s[start + 1] == b'/' {
+        start += 2;
+        while s.get(start) == Some(&b'/') {
+            start += 1;
+        }
     }
-    s
+    if start > 0 && start == s.len() {
+        &s[..2]
+    } else {
+        &s[start..]
+    }
 }
 
 /// Fold a command's output into one line, GNU Make's `fold_newlines`.
