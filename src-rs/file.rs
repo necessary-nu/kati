@@ -81,9 +81,31 @@ impl Makefile {
         session
             .makefiles
             .note_source(filename.to_os_string(), buf.clone());
-        let filename = session.intern(filename.as_bytes().to_vec());
-        let stmts = parse_file(session, &without_byte_order_mark(&buf), filename)?;
-        Ok(Arc::new(Self { filename, stmts }))
+        let posix_pedantic = session.posix_pedantic;
+        if let Some(parsed) = session
+            .makefiles
+            .already_parsed(filename, &buf, posix_pedantic)
+        {
+            return Ok(parsed);
+        }
+        let name = session.intern(filename.as_bytes().to_vec());
+        let (stmts, warned) = parse_file(session, &without_byte_order_mark(&buf), name)?;
+        let parsed = Arc::new(Self {
+            filename: name,
+            stmts,
+        });
+        // A parse that said something, or that latched `.POSIX:` and so changed
+        // what the lines after it in this same read mean, is not a function of
+        // the bytes alone and is not offered to the read that repeats this one.
+        if !warned && session.posix_pedantic == posix_pedantic {
+            session.makefiles.note_parse(
+                filename.to_os_string(),
+                buf,
+                posix_pedantic,
+                Arc::clone(&parsed),
+            );
+        }
+        Ok(parsed)
     }
 
     /// Read and parse `filename`.

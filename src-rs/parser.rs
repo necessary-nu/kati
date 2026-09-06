@@ -238,6 +238,13 @@ struct Parser<'a> {
 
     loc: Loc,
     fixed_lineno: bool,
+    /// Whether this parse said anything on its way through.
+    ///
+    /// A parse is otherwise a function of the bytes alone, so its statements
+    /// can be handed to a read that repeats it over the same text. A warning
+    /// is the one thing it does rather than produces, and a repeat that reused
+    /// the statements would swallow it, so a parse that warned is not offered.
+    warned: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -273,6 +280,7 @@ impl<'a> Parser<'a> {
 
             loc,
             fixed_lineno,
+            warned: false,
         }
     }
 
@@ -566,6 +574,7 @@ impl<'a> Parser<'a> {
             // already off and its tail already trimmed, which is what makes
             // `define NAME = # hi` and `define NAME =   ` silent on both sides.
             if !assign.rhs.is_empty() {
+                self.warned = true;
                 warn_loc!(
                     &*self.session,
                     Some(&self.loc),
@@ -604,6 +613,7 @@ impl<'a> Parser<'a> {
             &line["endef".len()..],
         )));
         if !rest.is_empty() {
+            self.warned = true;
             warn_loc!(
                 &*self.session,
                 Some(&self.loc),
@@ -742,6 +752,7 @@ impl<'a> Parser<'a> {
 
         self.num_if_nest = st.num_nest + 1;
         if !self.handle_else_if_directive(&line.slice_ref(next_if))? {
+            self.warned = true;
             warn_loc!(
                 &*self.session,
                 Some(&self.loc),
@@ -760,6 +771,7 @@ impl<'a> Parser<'a> {
         // beside it is `EXTRACMD`, which is `fatal`. Two spellings, one line
         // apart in read.c, and only the second ends the read.
         if !line.is_empty() {
+            self.warned = true;
             warn_loc!(
                 &*self.session,
                 Some(&self.loc),
@@ -985,11 +997,15 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// The statements `buf` reads as, and whether reading it said anything.
+///
+/// The second half is what decides whether the statements may be handed to a
+/// read that repeats this one: see [`Parser::warned`].
 pub fn parse_file(
     session: &mut Session,
     buf: &Bytes,
     filename: Symbol,
-) -> Result<Arc<Mutex<Vec<Stmt>>>> {
+) -> Result<(Arc<Mutex<Vec<Stmt>>>, bool)> {
     collect_stats!(&*session, "parse file time");
     let loc = Loc { filename, line: 0 };
     parse_buf_no_stats_impl(session, buf, loc, false)
@@ -997,7 +1013,7 @@ pub fn parse_file(
 
 pub fn parse_buf(session: &mut Session, buf: &Bytes, loc: Loc) -> Result<Arc<Mutex<Vec<Stmt>>>> {
     collect_stats!(&*session, "parse eval time");
-    parse_buf_no_stats_impl(session, buf, loc, true)
+    Ok(parse_buf_no_stats_impl(session, buf, loc, true)?.0)
 }
 
 pub fn parse_buf_no_stats(
@@ -1005,7 +1021,7 @@ pub fn parse_buf_no_stats(
     buf: &Bytes,
     loc: Loc,
 ) -> Result<Arc<Mutex<Vec<Stmt>>>> {
-    parse_buf_no_stats_impl(session, buf, loc, true)
+    Ok(parse_buf_no_stats_impl(session, buf, loc, true)?.0)
 }
 
 fn parse_buf_no_stats_impl(
@@ -1013,11 +1029,12 @@ fn parse_buf_no_stats_impl(
     buf: &Bytes,
     loc: Loc,
     fixed_lineno: bool,
-) -> Result<Arc<Mutex<Vec<Stmt>>>> {
+) -> Result<(Arc<Mutex<Vec<Stmt>>>, bool)> {
     let stmts = Arc::new(Mutex::new(Vec::new()));
     let mut p = Parser::with_buf(session, buf, loc, stmts.clone(), fixed_lineno);
     p.parse()?;
-    Ok(stmts)
+    let warned = p.warned;
+    Ok((stmts, warned))
 }
 
 /// Whether an assignment operator comes first, which makes the word before it a

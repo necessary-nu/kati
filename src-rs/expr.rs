@@ -99,6 +99,18 @@ impl Children {
     }
 }
 
+/// The nodes one read built, shared with the read that repeats it.
+///
+/// Parsing is a function of a file's bytes, so a repeat over text that has not
+/// moved builds the same nodes; sharing them is what lets the repeat keep the
+/// statements that name them. Immutable once made, and read through the same
+/// dense indices as the tail after it.
+#[derive(Debug, Default)]
+pub struct FrozenValues {
+    nodes: Vec<Value>,
+    kids: Vec<ValueId>,
+}
+
 /// Every expression node one session read, in two vectors.
 ///
 /// The nodes an evaluation builds all die with the session that built them:
@@ -111,8 +123,20 @@ impl Children {
 /// for one more this side has: a [`crate::session::Session`] is moved -- into a
 /// worker thread that composes a recursive unit, and out of it again -- and an
 /// index survives a move where an interior pointer would not.
+///
+/// In two halves once a read has carried one in: the nodes an earlier read of
+/// the same unit built, shared and never written to again, and the tail this
+/// session built itself. A handle is an index into the two read end to end, so
+/// nothing that holds one can tell which half it names.
 #[derive(Debug, Default)]
 pub struct ValueArena {
+    /// The nodes an earlier read of the same unit left, or `None` for an arena
+    /// that built every node it holds.
+    carried: Option<std::sync::Arc<FrozenValues>>,
+    /// The index `nodes` starts at, and the one `kids` starts at: how many of
+    /// each `carried` holds, and zero without one.
+    base_nodes: u32,
+    base_kids: u32,
     nodes: Vec<Value>,
     kids: Vec<ValueId>,
     /// Where a read under way accumulates the fragments of the expression it is
@@ -137,6 +161,9 @@ impl ValueArena {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            carried: None,
+            base_nodes: 0,
+            base_kids: 0,
             nodes: Vec::with_capacity(512),
             kids: Vec::with_capacity(512),
             scratch: Vec::with_capacity(32),
@@ -145,20 +172,38 @@ impl ValueArena {
 
     #[must_use]
     pub fn alloc(&mut self, value: Value) -> ValueId {
-        let id = ValueId(u32::try_from(self.nodes.len()).expect("an expression arena under 4G"));
+        let id = ValueId(
+            u32::try_from(self.nodes.len())
+                .ok()
+                .and_then(|tail| self.base_nodes.checked_add(tail))
+                .expect("an expression arena under 4G"),
+        );
         self.nodes.push(value);
         id
     }
 
     #[must_use]
     pub fn get(&self, id: ValueId) -> &Value {
-        &self.nodes[id.0 as usize]
+        match id.0.checked_sub(self.base_nodes) {
+            Some(tail) => &self.nodes[tail as usize],
+            None => &self.carried_half().nodes[id.0 as usize],
+        }
+    }
+
+    /// The half an index below the base names, which is there whenever one is.
+    fn carried_half(&self) -> &FrozenValues {
+        self.carried
+            .as_ref()
+            .expect("a carried half behind a carried index")
     }
 
     /// Take a run of children into the child table.
     #[must_use]
     pub fn alloc_children(&mut self, items: &[ValueId]) -> Children {
-        let start = u32::try_from(self.kids.len()).expect("an expression arena under 4G");
+        let start = u32::try_from(self.kids.len())
+            .ok()
+            .and_then(|tail| self.base_kids.checked_add(tail))
+            .expect("an expression arena under 4G");
         self.kids.extend_from_slice(items);
         Children {
             start,
@@ -168,8 +213,14 @@ impl ValueArena {
 
     #[must_use]
     pub fn children(&self, run: Children) -> &[ValueId] {
-        let start = run.start as usize;
-        &self.kids[start..start + run.len as usize]
+        let len = run.len as usize;
+        match run.start.checked_sub(self.base_kids) {
+            Some(start) => &self.kids[start as usize..start as usize + len],
+            None => {
+                let start = run.start as usize;
+                &self.carried_half().kids[start..start + len]
+            }
+        }
     }
 
     /// One child of a run, by position.
@@ -179,7 +230,10 @@ impl ValueArena {
     /// step wants; one `Copy` handle at a time is what it can keep.
     #[must_use]
     pub fn child(&self, run: Children, index: usize) -> ValueId {
-        self.kids[run.start as usize + index]
+        match run.start.checked_sub(self.base_kids) {
+            Some(start) => self.kids[start as usize + index],
+            None => self.carried_half().kids[run.start as usize + index],
+        }
     }
 
     /// The height of the fragment stack, to be handed back to
@@ -217,7 +271,10 @@ impl ValueArena {
 
     /// Take everything above `mark` into the child table as one run.
     pub fn take_scratch(&mut self, mark: usize) -> Children {
-        let start = u32::try_from(self.kids.len()).expect("an expression arena under 4G");
+        let start = u32::try_from(self.kids.len())
+            .ok()
+            .and_then(|tail| self.base_kids.checked_add(tail))
+            .expect("an expression arena under 4G");
         let len = u32::try_from(self.scratch.len() - mark).expect("an expression under 4G");
         let Self { kids, scratch, .. } = self;
         kids.extend_from_slice(&scratch[mark..]);
@@ -233,12 +290,63 @@ impl ValueArena {
     /// How many nodes this arena holds, for `--kati_stats`.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.base_nodes as usize + self.nodes.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.len() == 0
+    }
+
+    /// Hand this arena's nodes to the read that repeats this one, and stop
+    /// writing to them.
+    ///
+    /// What the session builds after this — a recipe expanded as its edge
+    /// launches, an `$(eval)` a command ran into — lands in a tail of its own
+    /// and is never carried, because it is not something the text says.
+    pub(crate) fn carry(&mut self) -> std::sync::Arc<FrozenValues> {
+        if let Some(carried) = &self.carried {
+            return std::sync::Arc::clone(carried);
+        }
+        let carried = std::sync::Arc::new(FrozenValues {
+            nodes: std::mem::take(&mut self.nodes),
+            kids: std::mem::take(&mut self.kids),
+        });
+        self.base_nodes = u32::try_from(carried.nodes.len()).expect("an arena under 4G");
+        self.base_kids = u32::try_from(carried.kids.len()).expect("an arena under 4G");
+        self.carried = Some(std::sync::Arc::clone(&carried));
+        carried
+    }
+
+    /// Whether `carried` can stand under the nodes this arena already holds.
+    ///
+    /// It can exactly when they are its first nodes, in its order: then every
+    /// handle already handed out names the node it was allocated for, and the
+    /// handles the carried statements were parsed against name theirs.
+    pub(crate) fn adopts(&self, carried: &FrozenValues) -> bool {
+        self.carried.is_none()
+            && self.nodes.len() <= carried.nodes.len()
+            && self.kids.len() <= carried.kids.len()
+            && self
+                .nodes
+                .iter()
+                .zip(&carried.nodes)
+                .all(|(mine, theirs)| mine == theirs)
+            && self
+                .kids
+                .iter()
+                .zip(&carried.kids)
+                .all(|(mine, theirs)| mine == theirs)
+    }
+
+    /// Take `carried` as this arena's nodes, having asked [`Self::adopts`].
+    pub(crate) fn adopt(&mut self, carried: &std::sync::Arc<FrozenValues>) {
+        debug_assert!(self.adopts(carried));
+        self.base_nodes = u32::try_from(carried.nodes.len()).expect("an arena under 4G");
+        self.base_kids = u32::try_from(carried.kids.len()).expect("an arena under 4G");
+        self.nodes.clear();
+        self.kids.clear();
+        self.carried = Some(std::sync::Arc::clone(carried));
     }
 }
 

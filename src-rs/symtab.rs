@@ -181,12 +181,47 @@ impl Debug for SymbolDisplay<'_> {
     }
 }
 
+/// The names one read minted, shared with the read that repeats it.
+///
+/// A read that repeats an earlier one over the same text mints the same names
+/// in the same order, so the earlier read's table is the table this one would
+/// have built. Shared rather than rebuilt because the statements the earlier
+/// read parsed name their symbols by ordinal: a repeat that reuses those
+/// statements has to be reading the ordinals they were written against.
+///
+/// Immutable once made. A read that adopts one appends its own names after it,
+/// in the tail [`Symtab`] keeps, and what it appends is never carried on.
+#[derive(Debug)]
+pub struct FrozenNames {
+    symbols: Vec<Bytes>,
+    index: FastMap<Bytes, Symbol>,
+}
+
+impl FrozenNames {
+    /// How many names this holds, which is the ordinal the tail after it
+    /// starts at.
+    fn len(&self) -> usize {
+        self.symbols.len()
+    }
+}
+
 /// The interner: byte strings to [`Symbol`] handles and back.
 ///
 /// It holds no variable bindings. A `Symtab` and a [`crate::var::GlobalVars`]
 /// are constructed, replaced, and dropped independently of each other.
+///
+/// In two parts once a read has carried one in: the names an earlier read of
+/// the same unit minted, shared and never written to again, and the tail this
+/// session minted itself. A handle is an ordinal into the two read end to end,
+/// so nothing that holds one can tell which half it names.
 // [spec:ronin:req:make.scope-separation]
 pub struct Symtab {
+    /// The names an earlier read left, or `None` for a table that minted every
+    /// name it holds.
+    carried: Option<std::sync::Arc<FrozenNames>>,
+    /// The ordinal `symbols` starts at: how many names `carried` holds, and
+    /// zero without one.
+    base: usize,
     symbols: Vec<Bytes>,
     index: FastMap<Bytes, Symbol>,
 }
@@ -240,6 +275,8 @@ impl Symtab {
     /// names afterwards costs no atomic either.
     pub fn new() -> Self {
         let mut symtab = Self {
+            carried: None,
+            base: 0,
             symbols: vec![Bytes::new()],
             index: FastMap::default(),
         };
@@ -274,14 +311,22 @@ impl Symtab {
         if let [c] = s.as_ref() {
             return Symbol(NonZeroUsize::new(*c as usize).unwrap());
         }
-        if let Some(sym) = self.index.get(s.as_ref()) {
-            return *sym;
+        if let Some(sym) = self.minted(s.as_ref()) {
+            return sym;
         }
         let s = s.into();
-        let sym = Symbol(NonZeroUsize::new(self.symbols.len()).unwrap());
+        let sym = Symbol(NonZeroUsize::new(self.base + self.symbols.len()).unwrap());
         self.symbols.push(s.clone());
         self.index.insert(s, sym);
         sym
+    }
+
+    /// The handle a multi-byte name already has, in either half of the table.
+    fn minted(&self, name: &[u8]) -> Option<Symbol> {
+        if let Some(sym) = self.index.get(name) {
+            return Some(*sym);
+        }
+        self.carried.as_ref()?.index.get(name).copied()
     }
 
     /// The symbol `name` already has, without minting one for a name nothing
@@ -291,13 +336,70 @@ impl Symtab {
         if let [c] = name {
             return Some(Symbol(NonZeroUsize::new(*c as usize).unwrap()));
         }
-        self.index.get(name).copied()
+        self.minted(name)
     }
 
     /// The bytes `sym` was interned from. Panics if `sym` came from a different
     /// interner and names a slot this one does not have.
     pub fn name(&self, sym: Symbol) -> Bytes {
-        self.symbols[sym.0.get()].clone()
+        match sym.0.get().checked_sub(self.base) {
+            Some(tail) => self.symbols[tail].clone(),
+            None => self
+                .carried
+                .as_ref()
+                .expect("a carried half behind a carried ordinal")
+                .symbols[sym.0.get()]
+            .clone(),
+        }
+    }
+
+    /// Hand this table's names to the read that repeats this one, and stop
+    /// writing to them.
+    ///
+    /// Whatever the session mints after this lands in a tail of its own and is
+    /// never carried: a repeat is the same read over the same text, so the
+    /// names it mints are the names already here, and anything minted after the
+    /// read is over — a recipe expanded as its edge launches — belongs to this
+    /// invocation rather than to the text.
+    pub(crate) fn carry(&mut self) -> std::sync::Arc<FrozenNames> {
+        if let Some(carried) = &self.carried {
+            return std::sync::Arc::clone(carried);
+        }
+        let carried = std::sync::Arc::new(FrozenNames {
+            symbols: std::mem::take(&mut self.symbols),
+            index: std::mem::take(&mut self.index),
+        });
+        self.base = carried.len();
+        self.carried = Some(std::sync::Arc::clone(&carried));
+        carried
+    }
+
+    /// Whether `carried` can stand under the names this table has already
+    /// minted.
+    ///
+    /// It can exactly when they are its first names, in its order: then every
+    /// handle already handed out keeps the name it was minted for, and the
+    /// ordinals the carried statements were parsed against are the ordinals
+    /// this table will answer with. Anything else is a table that would move a
+    /// name, which is a handle already in someone's hand meaning something
+    /// else.
+    pub(crate) fn adopts(&self, carried: &FrozenNames) -> bool {
+        self.carried.is_none()
+            && self.symbols.len() <= carried.symbols.len()
+            && self
+                .symbols
+                .iter()
+                .zip(&carried.symbols)
+                .all(|(mine, theirs)| mine == theirs)
+    }
+
+    /// Take `carried` as this table's names, having asked [`Self::adopts`].
+    pub(crate) fn adopt(&mut self, carried: &std::sync::Arc<FrozenNames>) {
+        debug_assert!(self.adopts(carried));
+        self.base = carried.len();
+        self.symbols.clear();
+        self.index.clear();
+        self.carried = Some(std::sync::Arc::clone(carried));
     }
 
     /// The same bytes, borrowed from the interner rather than handed over as a
@@ -308,12 +410,21 @@ impl Symtab {
     /// refcount that never went anywhere. A caller that reads the name and is
     /// done with it before it touches the interner again wants this one.
     pub fn name_bytes(&self, sym: Symbol) -> &[u8] {
-        &self.symbols[sym.0.get()]
+        match sym.0.get().checked_sub(self.base) {
+            Some(tail) => &self.symbols[tail],
+            None => {
+                &self
+                    .carried
+                    .as_ref()
+                    .expect("a carried half behind a carried ordinal")
+                    .symbols[sym.0.get()]
+            }
+        }
     }
 
     /// The number of interned names, counting the reserved slot 0.
     pub fn count(&self) -> usize {
-        self.symbols.len()
+        self.base + self.symbols.len()
     }
 }
 

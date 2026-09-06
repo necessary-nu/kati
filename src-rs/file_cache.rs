@@ -28,6 +28,24 @@ use crate::{
     session::Session,
 };
 
+/// One makefile as a read parsed it, kept for the read that repeats it.
+///
+/// Parsing is a function of the bytes and of `.POSIX:` — `collapse_continuations`
+/// reads the run of continuations differently once a rule has named that target
+/// — and of nothing else, so both are recorded and both are compared before the
+/// statements are handed on. See [`crate::session::Session::posix_pedantic`].
+struct ParsedFile {
+    contents: Bytes,
+    posix_pedantic: bool,
+    makefile: Arc<Makefile>,
+}
+
+/// The makefiles one read parsed, shared with the read that repeats it.
+#[derive(Default)]
+pub struct FrozenParses {
+    files: HashMap<OsString, ParsedFile>,
+}
+
 /// Parsed makefiles and extra file dependencies, for one session.
 // [spec:ronin:req:make.no-ambient-state]
 pub struct MakefileCache {
@@ -48,6 +66,12 @@ pub struct MakefileCache {
     /// nothing is cached about a file the session has not read, and a later run
     /// still has to compare their timestamps.
     unread: HashSet<OsString>,
+    /// What this read parsed, with the bytes and the `.POSIX:` state it parsed
+    /// each under, for the read that repeats this one.
+    parsed: HashMap<OsString, ParsedFile>,
+    /// What the read this one repeats parsed, or `None` for a read that is
+    /// nobody's repeat.
+    carried: Option<Arc<FrozenParses>>,
 }
 
 impl Default for MakefileCache {
@@ -63,7 +87,59 @@ impl MakefileCache {
             supplied: HashMap::new(),
             sources: HashMap::new(),
             unread: HashSet::new(),
+            parsed: HashMap::new(),
+            carried: None,
         }
+    }
+
+    /// The statements an earlier read of the same unit made of this same text,
+    /// under the same `.POSIX:` reading.
+    pub(crate) fn already_parsed(
+        &self,
+        filename: &OsStr,
+        contents: &Bytes,
+        posix_pedantic: bool,
+    ) -> Option<Arc<Makefile>> {
+        let parsed = self.carried.as_ref()?.files.get(filename)?;
+        (parsed.posix_pedantic == posix_pedantic && parsed.contents == contents)
+            .then(|| Arc::clone(&parsed.makefile))
+    }
+
+    /// Keep what this read made of a file, for the read that repeats it.
+    pub(crate) fn note_parse(
+        &mut self,
+        filename: OsString,
+        contents: Bytes,
+        posix_pedantic: bool,
+        makefile: Arc<Makefile>,
+    ) {
+        self.parsed.insert(
+            filename,
+            ParsedFile {
+                contents,
+                posix_pedantic,
+                makefile,
+            },
+        );
+    }
+
+    /// Hand what this read parsed to the read that repeats it, and stop adding
+    /// to it.
+    pub(crate) fn carry(&mut self) -> Arc<FrozenParses> {
+        if let Some(carried) = &self.carried {
+            return Arc::clone(carried);
+        }
+        let carried = Arc::new(FrozenParses {
+            files: std::mem::take(&mut self.parsed),
+        });
+        self.carried = Some(Arc::clone(&carried));
+        carried
+    }
+
+    /// Read the statements an earlier read of this unit made, rather than
+    /// making them again.
+    pub(crate) fn adopt(&mut self, carried: &Arc<FrozenParses>) {
+        self.carried = Some(Arc::clone(carried));
     }
 
     /// Supply a makefile's bytes without requiring a filesystem path.

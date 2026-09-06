@@ -207,6 +207,27 @@ impl GroundJournal {
     }
 }
 
+/// What one read made of the text it was given, for the read that repeats it.
+///
+/// A staging pass re-reads units it has read before over text that has not
+/// moved. What that repeat is TOLD is replayed — see [`GroundJournal`] — and
+/// what it READS is pinned to the same bytes, so the statements it would make
+/// of them are the statements the first read already made. This is those:
+/// the names the read minted, the expression nodes it built, and the makefiles
+/// it parsed, all shared rather than made again.
+///
+/// Nothing here was asked of the ground. The names and the nodes are what the
+/// text says; the parses are keyed by the bytes they were made from. What a
+/// read learned by looking at the disk — a `$(wildcard)`, a timestamp, whether
+/// a file is there — is not carried by this and must not be: a staged build
+/// moves files between one pass and the next.
+#[derive(Clone)]
+pub struct ReadSubstrate {
+    names: std::sync::Arc<crate::symtab::FrozenNames>,
+    values: std::sync::Arc<crate::expr::FrozenValues>,
+    parses: std::sync::Arc<crate::file_cache::FrozenParses>,
+}
+
 /// What a diagnostic, a statistics site, or a flag test needs to be reachable
 /// from: an interner to render symbols with, the flags, and the statistics
 /// registry.
@@ -387,9 +408,8 @@ impl Session {
     /// The ordinary cache still parses and records it on first use.  This is
     /// how an embedding frontend implements GNU Make's `-f -` while retaining
     /// `-` as the source name in diagnostics and `MAKEFILE_LIST`.
-    pub fn supply_makefile(&mut self, filename: OsString, contents: Vec<u8>) {
-        self.makefiles
-            .supply(filename, bytes::Bytes::from(contents));
+    pub fn supply_makefile(&mut self, filename: OsString, contents: impl Into<Bytes>) {
+        self.makefiles.supply(filename, contents.into());
     }
 
     /// Every makefile this session read, with the bytes it read, for a read
@@ -400,11 +420,45 @@ impl Session {
     /// staged child has rewritten, or removed, must still read as the text GNU
     /// Make's one read had. Handing these back to `supply_makefile` on the next
     /// pass is how that is said.
-    pub fn read_sources(&self) -> Vec<(OsString, Vec<u8>)> {
+    pub fn read_sources(&self) -> Vec<(OsString, Bytes)> {
         self.makefiles
             .sources()
-            .map(|(name, contents)| (name.clone(), contents.to_vec()))
+            .map(|(name, contents)| (name.clone(), contents.clone()))
             .collect()
+    }
+
+    /// What this read made of its text, for the read that repeats it.
+    ///
+    /// Taken where the read ends and not later. What the session builds after
+    /// that — a recipe expanded as its edge launches — is this invocation's
+    /// doing rather than the text's, and carrying it would move the ordinal of
+    /// a name a later read mints, which is the one way a symbol's ordinal is
+    /// observable: `$(.VARIABLES)` lists the global table in ordinal order.
+    pub fn read_substrate(&mut self) -> ReadSubstrate {
+        ReadSubstrate {
+            names: self.symtab.carry(),
+            values: self.values.carry(),
+            parses: self.makefiles.carry(),
+        }
+    }
+
+    /// Start this read from what the read it repeats left, where that stands
+    /// under what this session has already minted.
+    ///
+    /// It stands when the names and nodes this session made before the read
+    /// began are the first names and nodes of the carried ones, in order —
+    /// which they are when the two sessions were built from the same
+    /// invocation, and which is checked rather than assumed. A session that
+    /// refuses reads its makefiles for itself, as every session did before
+    /// there was anything to carry.
+    pub fn adopt_read_substrate(&mut self, carried: &ReadSubstrate) -> bool {
+        if !(self.symtab.adopts(&carried.names) && self.values.adopts(&carried.values)) {
+            return false;
+        }
+        self.symtab.adopt(&carried.names);
+        self.values.adopt(&carried.values);
+        self.makefiles.adopt(&carried.parses);
+        true
     }
 
     /// A session with default flags.
@@ -740,5 +794,157 @@ mod tests {
         assert_eq!(expand(&mut b, "$(.SHELLSTATUS)").unwrap().as_ref(), b"");
         assert!(!a.session.command_results.is_empty());
         assert!(b.session.command_results.is_empty());
+    }
+
+    /// Read `name` out of `session`, which must be a makefile it can get.
+    fn read_makefile(session: &mut Session, name: &str) -> std::sync::Arc<crate::file::Makefile> {
+        match crate::file_cache::get_makefile(session, OsStr::new(name))
+            .expect("a supplied makefile parses")
+        {
+            crate::file::Source::Read(makefile) => makefile,
+            _ => panic!("a supplied makefile is there"),
+        }
+    }
+
+    /// A session holding `text` under `name`, and the substrate its read left.
+    fn read_once(
+        name: &str,
+        text: &[u8],
+    ) -> (std::sync::Arc<crate::file::Makefile>, ReadSubstrate) {
+        let mut session = Session::new();
+        session.supply_makefile(OsString::from(name), text.to_vec());
+        let makefile = read_makefile(&mut session, name);
+        let substrate = session.read_substrate();
+        (makefile, substrate)
+    }
+
+    /// A read that repeats an earlier one over the same text keeps the
+    /// statements that read made, and reads the same values out of them.
+    ///
+    /// The pointer comparison is the point: an equal-but-separate parse would
+    /// pass every value check below and would be the work this exists to avoid.
+    // [spec:ronin:req:make.semantics+1/test]
+    #[test]
+    fn a_repeated_read_keeps_the_statements_the_first_read_made() {
+        let text = b"A := one\nB = $(A) two\n";
+        let (first, substrate) = read_once("m.mk", text);
+
+        let mut second = Session::new();
+        assert!(second.adopt_read_substrate(&substrate));
+        second.supply_makefile(OsString::from("m.mk"), text.to_vec());
+        let repeated = read_makefile(&mut second, "m.mk");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &repeated),
+            "a repeat over text that has not moved must keep the statements"
+        );
+
+        let mut ev = Evaluator::new(second);
+        for stmt in repeated.stmts.lock().clone() {
+            stmt.eval(&mut ev).expect("the carried statements evaluate");
+        }
+        assert_eq!(expand(&mut ev, "$(B)").unwrap().as_ref(), b"one two");
+    }
+
+    /// The carried names stand only under a session whose own names are their
+    /// first names, in their order.
+    ///
+    /// A session that minted something else has handles of its own already in
+    /// hand, and taking a table that puts a different name at that ordinal
+    /// would change what they mean. It reads its makefiles for itself instead.
+    // [spec:ronin:req:make.no-ambient-state/test]
+    #[test]
+    fn a_carried_read_is_refused_where_it_would_move_a_name() {
+        let text = b"A := one\n";
+        let (first, substrate) = read_once("m.mk", text);
+
+        let mut second = Session::new();
+        second.intern("a-name-the-first-read-never-minted");
+        assert!(!second.adopt_read_substrate(&substrate));
+        second.supply_makefile(OsString::from("m.mk"), text.to_vec());
+        let repeated = read_makefile(&mut second, "m.mk");
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &repeated),
+            "a refused session reads the text for itself"
+        );
+    }
+
+    /// A parse that said something is not carried, so the read that repeats it
+    /// says it again.
+    ///
+    /// Holding what a repeat says back is [`crate::flags::Flags`]'s decision to
+    /// make and not this cache's: reusing the statements would swallow the
+    /// warning wherever that decision is to let it through.
+    // [spec:ronin:req:make.narration+2/test]
+    #[test]
+    fn a_parse_that_warned_is_not_carried() {
+        let text = b"define X\nbody\nendef junk\n";
+        let mut first = Session::new();
+        first.diagnostics = std::sync::Arc::new(crate::diagnostics::Diagnostics::collected());
+        first.supply_makefile(OsString::from("m.mk"), text.to_vec());
+        let parsed = read_makefile(&mut first, "m.mk");
+        let substrate = first.read_substrate();
+
+        let mut second = Session::new();
+        second.diagnostics = std::sync::Arc::new(crate::diagnostics::Diagnostics::collected());
+        assert!(second.adopt_read_substrate(&substrate));
+        second.supply_makefile(OsString::from("m.mk"), text.to_vec());
+        let repeated = read_makefile(&mut second, "m.mk");
+        assert!(
+            !std::sync::Arc::ptr_eq(&parsed, &repeated),
+            "a parse that warned must be made again so the warning is made again"
+        );
+    }
+
+    /// `.POSIX:` reaches the read as well as the build — it decides how a run
+    /// of line continuations collapses — so a parse taken under one reading of
+    /// it is not the parse the other reading would make.
+    // [spec:ronin:req:make.semantics+1/test]
+    #[test]
+    fn a_carried_parse_is_refused_under_a_different_posix_reading() {
+        let text = b"A := one \\\n  two\n";
+        let (first, substrate) = read_once("m.mk", text);
+
+        let mut second = Session::new();
+        assert!(second.adopt_read_substrate(&substrate));
+        second.posix_pedantic = true;
+        second.supply_makefile(OsString::from("m.mk"), text.to_vec());
+        let repeated = read_makefile(&mut second, "m.mk");
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &repeated),
+            "a parse is a function of the text and of `.POSIX:`, so both are compared"
+        );
+    }
+
+    /// What a session builds after its read is over is not carried on.
+    ///
+    /// A recipe expanded as its edge launches mints names of its own, and a
+    /// later read that started from them would give a name it minted itself a
+    /// different ordinal. `$(.VARIABLES)` lists the global table in ordinal
+    /// order, which is the one place that shows.
+    // [spec:ronin:req:make.no-ambient-state/test]
+    #[test]
+    fn what_a_session_mints_after_its_read_is_not_carried() {
+        let text = b"A := one\n";
+        let mut first = Session::new();
+        first.supply_makefile(OsString::from("m.mk"), text.to_vec());
+        read_makefile(&mut first, "m.mk");
+        let substrate = first.read_substrate();
+        first.intern("minted-after-the-read");
+
+        let mut second = Session::new();
+        assert!(second.adopt_read_substrate(&substrate));
+        assert_eq!(
+            second.symtab.peek_symbol(b"minted-after-the-read"),
+            None,
+            "a substrate holds what the read minted and nothing after it"
+        );
+
+        // And a session that adopted one carries on what it adopted, not what
+        // it went on to add, so the same holds however many passes it crosses.
+        second.intern("minted-after-adopting");
+        let carried_on = second.read_substrate();
+        let mut third = Session::new();
+        assert!(third.adopt_read_substrate(&carried_on));
+        assert_eq!(third.symtab.peek_symbol(b"minted-after-adopting"), None);
     }
 }
