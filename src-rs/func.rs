@@ -40,7 +40,7 @@ use crate::{
     loc::Loc,
     log,
     parser::parse_buf,
-    session::{GroundQuestion, Session},
+    session::{Asked, GroundQuestion, Session},
     strutil::{
         Pattern, WordWriter, escape_printf_b, format_for_command_substitution,
         format_for_shell_assignment, is_space_byte, trim_left_space, trim_space, word_scanner,
@@ -422,14 +422,17 @@ fn wildcard_func(args: Children, ev: &mut Evaluator, out: &mut dyn BufMut) -> Re
     collect_stats!(ev, "func wildcard time");
     // Note GNU make does not delay the execution of $(wildcard) so we
     // do not need to check avoid_io here.
-    if let Some(answered) = ev
+    let slot = match ev
         .session
         .ground_journal
         .answered(GroundQuestion::Wildcard, &pat)
     {
-        out.put_slice(&answered.answer);
-        return Ok(());
-    }
+        Asked::Answered(answered) => {
+            out.put_slice(&answered.answer);
+            return Ok(());
+        }
+        Asked::Ask(slot) => slot,
+    };
     // Written into a buffer of its own rather than straight out, because the
     // answer is what a later read of this same text is handed. A fresh
     // `WordWriter` produces the same bytes either way: the separating space
@@ -449,7 +452,7 @@ fn wildcard_func(args: Children, ev: &mut Evaluator, out: &mut dyn BufMut) -> Re
     out.put_slice(&answer);
     ev.session
         .ground_journal
-        .record(GroundQuestion::Wildcard, pat, answer, None);
+        .record(slot, GroundQuestion::Wildcard, pat, answer, None);
     Ok(())
 }
 
@@ -525,14 +528,17 @@ fn addprefix_func(args: Children, ev: &mut Evaluator, out: &mut dyn BufMut) -> R
 /// shell syntax where the Makefile asked for a pathname.
 fn realpath_func(args: Children, ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
     let text = ev.eval_arg(args, 0)?;
-    if let Some(answered) = ev
+    let slot = match ev
         .session
         .ground_journal
         .answered(GroundQuestion::RealPath, &text)
     {
-        out.put_slice(&answered.answer);
-        return Ok(());
-    }
+        Asked::Answered(answered) => {
+            out.put_slice(&answered.answer);
+            return Ok(());
+        }
+        Asked::Ask(slot) => slot,
+    };
     let mut answer = BytesMut::new();
     let mut ww = WordWriter::new(&mut answer);
     for tok in word_scanner(&text) {
@@ -545,7 +551,7 @@ fn realpath_func(args: Children, ev: &mut Evaluator, out: &mut dyn BufMut) -> Re
     out.put_slice(&answer);
     ev.session
         .ground_journal
-        .record(GroundQuestion::RealPath, text, answer, None);
+        .record(slot, GroundQuestion::RealPath, text, answer, None);
     Ok(())
 }
 
@@ -863,15 +869,18 @@ fn shell_func_with(
     // same text, and its output is what that expansion was handed. Running it
     // again would perform the effect twice — GNU Make performs it once, on the
     // ground the build started with.
-    if let Some(answered) = ev
+    let slot = match ev
         .session
         .ground_journal
         .answered(GroundQuestion::Shell, &cmd)
     {
-        out.put_slice(&answered.answer);
-        ev.session.record_shell_status(answered.status)?;
-        return Ok(());
-    }
+        Asked::Answered(answered) => {
+            out.put_slice(&answered.answer);
+            ev.session.record_shell_status(answered.status)?;
+            return Ok(());
+        }
+        Asked::Ask(slot) => slot,
+    };
 
     let loc = ev.loc.unwrap_or_default();
     let shell = ev.get_shell()?;
@@ -937,7 +946,7 @@ fn shell_func_with(
     }
     ev.session
         .ground_journal
-        .record(GroundQuestion::Shell, cmd, output, Some(exit_code));
+        .record(slot, GroundQuestion::Shell, cmd, output, Some(exit_code));
     ev.session.record_shell_status(Some(exit_code))?;
     Ok(())
 }
@@ -1359,14 +1368,17 @@ fn file_read_func(
     // and a directory is where that shows: opening one succeeds and reading it
     // does not, so `$(file < adir)` fails as a `read:` rather than an `open:`.
     let asked = Bytes::from(filename.as_bytes().to_vec());
-    if let Some(answered) = ev
+    let slot = match ev
         .session
         .ground_journal
         .answered(GroundQuestion::FileRead, &asked)
     {
-        out.put_slice(&answered.answer);
-        return Ok(());
-    }
+        Asked::Answered(answered) => {
+            out.put_slice(&answered.answer);
+            return Ok(());
+        }
+        Asked::Ask(slot) => slot,
+    };
     let mut file = match File::open(filename) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1388,9 +1400,13 @@ fn file_read_func(
             // A file that was not there is an answer too, and the read after
             // this one must be told the same thing rather than find the file
             // the staged work has since written.
-            ev.session
-                .ground_journal
-                .record(GroundQuestion::FileRead, asked, Bytes::new(), None);
+            ev.session.ground_journal.record(
+                slot,
+                GroundQuestion::FileRead,
+                asked,
+                Bytes::new(),
+                None,
+            );
             return Ok(());
         }
         Err(err) => error_loc!(
@@ -1441,7 +1457,7 @@ fn file_read_func(
     out.put_slice(&buf);
     ev.session
         .ground_journal
-        .record(GroundQuestion::FileRead, asked, buf, None);
+        .record(slot, GroundQuestion::FileRead, asked, buf, None);
     Ok(())
 }
 

@@ -2913,24 +2913,27 @@ impl Evaluator {
     /// is deferred to the update exactly as absence is. Reporting it here would
     /// end the run ahead of the Makefiles the read still had to remake.
     fn include_names(&mut self, pat: &Bytes) -> (Vec<Bytes>, Option<String>) {
-        if let Some(answered) = self
+        let slot = match self
             .session
             .ground_journal
             .answered(crate::session::GroundQuestion::Include, pat)
         {
-            if answered.answer.first() == Some(&0) {
-                let reason = String::from_utf8_lossy(&answered.answer[1..]).into_owned();
-                return (Vec::new(), Some(reason));
+            crate::session::Asked::Answered(answered) => {
+                if answered.answer.first() == Some(&0) {
+                    let reason = String::from_utf8_lossy(&answered.answer[1..]).into_owned();
+                    return (Vec::new(), Some(reason));
+                }
+                return (
+                    answered
+                        .answer
+                        .split(|byte| *byte == 0)
+                        .map(|name| answered.answer.slice_ref(name))
+                        .collect(),
+                    None,
+                );
             }
-            return (
-                answered
-                    .answer
-                    .split(|byte| *byte == 0)
-                    .map(|name| answered.answer.slice_ref(name))
-                    .collect(),
-                None,
-            );
-        }
+            crate::session::Asked::Ask(slot) => slot,
+        };
 
         let globbed = self.session.glob(pat.clone());
         let (files, unread) = match globbed.as_ref() {
@@ -2953,6 +2956,7 @@ impl Evaluator {
             }
         }
         self.session.ground_journal.record(
+            slot,
             crate::session::GroundQuestion::Include,
             pat.clone(),
             answer.freeze(),

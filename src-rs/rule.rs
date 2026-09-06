@@ -376,22 +376,25 @@ fn glob_word_on_disk(session: &mut Session, word: Bytes, into: &mut Vec<Bytes>) 
     // space-separated, because a filename may hold a space and this record is
     // not something a Makefile ever reads; an empty answer is no matches at
     // all, which is the pattern standing as it was written.
-    if let Some(answered) = session
+    let slot = match session
         .ground_journal
         .answered(crate::session::GroundQuestion::Glob, &word)
     {
-        if answered.answer.is_empty() {
-            into.push(word);
-        } else {
-            into.extend(
-                answered
-                    .answer
-                    .split(|byte| *byte == 0)
-                    .map(|name| answered.answer.slice_ref(name)),
-            );
+        crate::session::Asked::Answered(answered) => {
+            if answered.answer.is_empty() {
+                into.push(word);
+            } else {
+                into.extend(
+                    answered
+                        .answer
+                        .split(|byte| *byte == 0)
+                        .map(|name| answered.answer.slice_ref(name)),
+                );
+            }
+            return;
         }
-        return;
-    }
+        crate::session::Asked::Ask(slot) => slot,
+    };
     let matched = match session.glob(word.clone()).as_ref() {
         Ok(paths) if !paths.is_empty() => paths.clone(),
         _ => Vec::new(),
@@ -404,6 +407,7 @@ fn glob_word_on_disk(session: &mut Session, word: Bytes, into: &mut Vec<Bytes>) 
         bytes::BufMut::put_slice(&mut answer, name);
     }
     session.ground_journal.record(
+        slot,
         crate::session::GroundQuestion::Glob,
         word.clone(),
         answer.freeze(),

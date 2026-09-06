@@ -77,6 +77,26 @@ pub enum GroundQuestion {
     Include,
 }
 
+/// Where in a read's record the answer to one question belongs.
+///
+/// Taken when the question is ASKED and handed back when it is ANSWERED,
+/// because the two are not the same moment. Building the environment a
+/// `$(shell)` runs under expands whatever the makefile exported, and an
+/// exported recursive value may itself read the ground — so that inner answer
+/// arrives while the shell's own answer is still being fetched. A record kept
+/// in the order answers ARRIVED puts the inner one first; a replay consults
+/// the record in the order the read ASKS, and the two orders disagree from the
+/// first such question onwards.
+pub(crate) struct GroundSlot(usize);
+
+/// What the record has for one question.
+pub(crate) enum Asked {
+    /// What an earlier read of this same text was told, in this same place.
+    Answered(GroundAnswer),
+    /// Nothing to hand back: ask the ground, and record the answer here.
+    Ask(GroundSlot),
+}
+
 /// One question a read asked the ground, and the answer it was given.
 #[derive(Clone, Debug)]
 pub struct GroundAnswer {
@@ -89,6 +109,19 @@ pub struct GroundAnswer {
     pub answer: Bytes,
     /// `.SHELLSTATUS`, for the one question that leaves one.
     pub status: Option<i32>,
+    /// How many of the answers after this one were asked WHILE it was being
+    /// answered, and are therefore not asked at all by a read this one
+    /// answers for.
+    ///
+    /// A `$(shell)` builds its child's environment out of whatever the
+    /// makefile exported, and an exported recursive value may read the ground
+    /// itself — so running one command can ask a dozen questions under it. A
+    /// read handed this answer never runs that command and never asks them, so
+    /// the replay steps over them rather than offering them to the next
+    /// question the read does ask. Without it the sequence stops meaning
+    /// anything at the first `$(shell)` a Makefile exports a recursive value
+    /// past, which is every kbuild tree.
+    nested: usize,
 }
 
 /// The answers one read got from outside itself, in the order it asked for
@@ -182,29 +215,40 @@ impl GroundJournal {
     }
 
     /// The answer an earlier read got to this same question, if it is still
-    /// the same question in the same place.
-    pub(crate) fn answered(
-        &mut self,
-        question: GroundQuestion,
-        asked: &Bytes,
-    ) -> Option<GroundAnswer> {
-        if self.diverged || self.suspended {
-            return None;
-        }
-        let recorded = self.replaying.get(self.at)?;
-        if recorded.question != question || recorded.asked != asked {
+    /// the same question in the same place — and otherwise the place to put
+    /// the answer the ground is about to give.
+    pub(crate) fn answered(&mut self, question: GroundQuestion, asked: &Bytes) -> Asked {
+        // A question the record answers is answered where it stands: nothing
+        // is asked in between, so there is no place to keep for it.
+        if !self.diverged
+            && !self.suspended
+            && let Some(recorded) = self.replaying.get(self.at)
+        {
+            if recorded.question == question && recorded.asked == asked {
+                let under = recorded.nested;
+                let answered = recorded.clone();
+                // Sub-questions and all, so the record this read hands on is
+                // the record it was handed: a repeat of a repeat is offered
+                // what the first read was asked, in the same shape.
+                self.recorded
+                    .extend(self.replaying[self.at..=self.at + under].iter().cloned());
+                self.at += 1 + under;
+                return Asked::Answered(answered);
+            }
             self.diverged = true;
-            return None;
         }
-        self.at += 1;
-        let answered = recorded.clone();
-        self.recorded.push(answered.clone());
-        Some(answered)
+        Asked::Ask(GroundSlot(self.recorded.len()))
     }
 
     /// What the ground has just said, for the reads after this one.
+    ///
+    /// Put where the question was ASKED and not where its answer arrived. See
+    /// [`GroundSlot`]: a question asked while this one was being answered has
+    /// already taken the places after it, and shifting them along is what
+    /// leaves the record in the order the next read will consult it.
     pub(crate) fn record(
         &mut self,
+        slot: GroundSlot,
         question: GroundQuestion,
         asked: Bytes,
         answer: Bytes,
@@ -214,12 +258,20 @@ impl GroundJournal {
             self.asked_while_suspended = true;
             return;
         }
-        self.recorded.push(GroundAnswer {
-            question,
-            asked,
-            answer,
-            status,
-        });
+        // Everything recorded since the slot was taken was asked while this
+        // question was outstanding, so it is exactly what a read handed this
+        // answer will not ask.
+        let nested = self.recorded.len() - slot.0;
+        self.recorded.insert(
+            slot.0,
+            GroundAnswer {
+                question,
+                asked,
+                answer,
+                status,
+                nested,
+            },
+        );
     }
 }
 
