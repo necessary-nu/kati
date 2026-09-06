@@ -123,6 +123,7 @@ pub struct GroundJournal {
     at: usize,
     diverged: bool,
     suspended: bool,
+    asked_while_suspended: bool,
 }
 
 impl GroundJournal {
@@ -131,6 +132,7 @@ impl GroundJournal {
         self.replaying = answers;
         self.at = 0;
         self.diverged = false;
+        self.asked_while_suspended = false;
     }
 
     /// End the read: hand back what it asked and was told, for the read after
@@ -150,6 +152,19 @@ impl GroundJournal {
     /// Whether the replay stopped short of the end of what it was given.
     pub const fn diverged(&self) -> bool {
         self.diverged
+    }
+
+    /// Whether this read went to the ground outside the journal, which is a
+    /// read whose answers are not a function of the text and the journal alone.
+    ///
+    /// The suspended window is a recipe's expansion, and it is suspended
+    /// precisely so that a `$(MAKE)` line reading `$(shell cat stamp)` gets the
+    /// answer the ground has NOW rather than the empty one the pass before the
+    /// staging was given. A destination that would otherwise keep this read and
+    /// use it again has to know that: keeping it would keep the stale answer
+    /// and never ask again.
+    pub const fn asked_off_journal(&self) -> bool {
+        self.asked_while_suspended
     }
 
     /// Set while a recipe is expanded, which is not part of any read.
@@ -196,6 +211,7 @@ impl GroundJournal {
         status: Option<i32>,
     ) {
         if self.suspended {
+            self.asked_while_suspended = true;
             return;
         }
         self.recorded.push(GroundAnswer {

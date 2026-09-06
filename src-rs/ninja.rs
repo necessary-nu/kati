@@ -449,11 +449,18 @@ impl DeferredRecipes {
         // `recipe_output` and not `output`: the graph's own name for the edge
         // may be a private one, and it is the Make target that automatic
         // variables and diagnostics speak of.
+        //
+        // Put back afterwards, because it is a fact about ONE launch and the
+        // node outlives every launch of it. A launch that binds no name of its
+        // own must read the node's own, and an emission of these same nodes
+        // must read what the makefile said rather than whatever the last
+        // launch was on behalf of.
+        let mut rebound = None;
         if !trigger.is_empty() {
             let bound = ev.session.intern(Bytes::copy_from_slice(trigger));
             let mut node = recipe.node.lock();
             if node.pattern_group && node.implicit_outputs.contains(&bound) {
-                node.recipe_output = bound;
+                rebound = Some(std::mem::replace(&mut node.recipe_output, bound));
             }
         }
         // Every recipe that reached this one ran and was waited for, which in
@@ -473,6 +480,9 @@ impl DeferredRecipes {
         )?;
         ce.ev.avoid_io = true;
         let expanded = Self::expand_with(&mut ce, recipe);
+        if let Some(was) = rebound {
+            recipe.node.lock().recipe_output = was;
+        }
         ce.ev.avoid_io = false;
         ce.ev.new_inputs_timing = NewInputsTiming::RecipeShell;
         ce.ev.shell_evaluation = ShellEvaluation::RecipeShell;
@@ -2538,11 +2548,18 @@ impl<'a> NinjaGenerator<'a> {
 
         if !self.ce.ev.session.flags.generate_empty_ninja {
             let mut default_target = None;
-            for node in std::mem::take(&mut self.nodes) {
-                if let Some(output) = self.sink_node(&node, sink)? {
+            // Taken out and put back rather than consumed: one population may be
+            // emitted more than once, into a destination that is building its
+            // graph again over ground that has moved. See [`emit_populated`].
+            let nodes = std::mem::take(&mut self.nodes);
+            let walked: Result<()> = nodes.iter().try_for_each(|node| {
+                if let Some(output) = self.sink_node(node, sink)? {
                     default_target = Some(output);
                 }
-            }
+                Ok(())
+            });
+            self.nodes = nodes;
+            walked?;
 
             // What the graph is aimed at is what dependency analysis resolved,
             // which is the goals the invocation named or the one
@@ -3438,8 +3455,17 @@ pub fn populate_build(
 }
 
 /// Hand what [`populate_build`] settled to `sink`, and write nothing.
+///
+/// The population is borrowed rather than consumed, and is left able to be
+/// emitted again. A front end that compiles recursive Make into one graph
+/// builds that graph more than once over the same makefiles — each pass starts
+/// a fresh destination once the work a `$(MAKE)` boundary waits for is on the
+/// ground — and what the makefiles SAY does not move between those passes. What
+/// does move is the ground, and every question about it is asked on the far
+/// side of the sink: this walk hands over the same rules and the same edges
+/// each time and lets the destination answer them against the disk it has now.
 pub fn emit_populated(
-    populated: PopulatedBuild,
+    populated: &mut PopulatedBuild,
     ev: &mut Evaluator,
     sink: &mut dyn BuildSink,
 ) -> Result<DeferredRecipes> {
@@ -3449,10 +3475,27 @@ pub fn emit_populated(
             "a populated build is emitted to a sink that asked for a different evaluation",
         ));
     }
-    let mut ng = NinjaGenerator::resume(populated, ev);
-    ng.emit(sink)?;
+    let taken = PopulatedBuild {
+        evaluation,
+        done: std::mem::take(&mut populated.done),
+        rule_id: populated.rule_id,
+        shell: populated.shell.take(),
+        used_envs: std::mem::take(&mut populated.used_envs),
+        nodes: std::mem::take(&mut populated.nodes),
+        phony_aliases: std::mem::take(&mut populated.phony_aliases),
+        deferred_recipes: std::mem::take(&mut populated.deferred_recipes),
+        current_dep_node: Arc::clone(&populated.current_dep_node),
+        found_new_inputs: Arc::clone(&populated.found_new_inputs),
+        recipe_shell: std::mem::take(&mut populated.recipe_shell),
+    };
+    let mut ng = NinjaGenerator::resume(taken, ev);
+    let emitted = ng.emit(sink);
+    *populated = ng.take_populated(evaluation);
+    emitted?;
     Ok(DeferredRecipes {
-        recipes: std::mem::take(&mut ng.deferred_recipes),
+        // Left empty behind them, so a second emission of this population
+        // mints its own set rather than handing back the first one's as well.
+        recipes: std::mem::take(&mut populated.deferred_recipes),
         file_evaluation: evaluation.file_evaluation,
         output_evaluation: evaluation.output_evaluation,
     })
@@ -3472,8 +3515,8 @@ pub fn emit_build(
     ev: &mut Evaluator,
     sink: &mut dyn BuildSink,
 ) -> Result<DeferredRecipes> {
-    let populated = populate_build(nodes, ev, BuildEvaluation::of(sink))?;
-    emit_populated(populated, ev, sink)
+    let mut populated = populate_build(nodes, ev, BuildEvaluation::of(sink))?;
+    emit_populated(&mut populated, ev, sink)
 }
 
 #[cfg(test)]
