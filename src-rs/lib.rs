@@ -76,6 +76,7 @@ pub mod parser;
 pub mod regen;
 pub mod regen_dump;
 pub mod rule;
+pub mod scripts;
 pub mod session;
 pub mod shuffle;
 pub mod simple_command;

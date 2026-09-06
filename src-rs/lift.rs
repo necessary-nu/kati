@@ -29,23 +29,16 @@
 //! an `exit` catches it, or because errexit is live there.
 
 use bytes::Bytes;
-use nsh::script::{Assignment, Command, Piece, Reader, Script, SimpleCommand, Word};
+use nsh::script::{Assignment, Command, Piece, Script, SimpleCommand, Word};
 
 use crate::census::NestingReason;
 use crate::command::LiftedInvocation;
 use crate::session::Session;
 
-/// Read `line` as the shell would, with the session's reader — built here the
-/// first time the session needs one. See [`Session::script_reader`].
-fn read(session: &Session, line: &[u8]) -> Result<Script, NestingReason> {
-    let mut slot = session.script_reader.lock();
-    let reader = match slot.as_mut() {
-        Some(reader) => reader,
-        None => slot.insert(Reader::new().map_err(|_| NestingReason::Unreadable)?),
-    };
-    reader
-        .read(line.into())
-        .map_err(|_| NestingReason::Unreadable)
+/// Read `line` as the shell would, through the readings the invocation has
+/// already made. See [`crate::scripts::Scripts`].
+fn read(session: &Session, line: &Bytes) -> Result<std::sync::Arc<Script>, NestingReason> {
+    session.scripts.read(line).ok_or(NestingReason::Unreadable)
 }
 
 /// The static child invocations one recipe line names, in the order the
@@ -84,7 +77,7 @@ pub fn lift(
         in_subshell: false,
         carrier: Carrier::Line,
     };
-    let commands = script.commands;
+    let commands = &script.commands;
     let last = commands.len().saturating_sub(1);
     for (index, command) in commands.iter().enumerate() {
         // A `.ONESHELL` recipe or a line holding a literal newline is several
