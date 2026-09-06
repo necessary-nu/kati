@@ -42,8 +42,8 @@ use crate::{
         SinkRule,
     },
     command::{
-        Command, CommandEvaluator, expansion_can_reach_make, is_blank_recipe_line,
-        references_new_inputs,
+        Command, CommandEvaluator, NewInputsUse, NewInputsWalk, expansion_can_reach_make,
+        is_blank_recipe_line,
     },
     dep::{DepNode, NamedDepNode, is_buildable_target},
     eval::Evaluator,
@@ -52,6 +52,7 @@ use crate::{
     strutil::{escape_shell, trim_left_space},
     symtab::{Interner, Symbol},
     timeutil::ScopedTimeReporter,
+    var::Vars,
 };
 use path_alias::PhonyAliases;
 
@@ -197,8 +198,9 @@ struct NinjaNode {
     deferred_new_inputs_filter_out: Vec<Bytes>,
     /// The recipe was left unexpanded for the sink to expand at launch, so
     /// `commands` is empty because nothing has read it yet rather than because
-    /// the node has none.
-    deferred_recipe: bool,
+    /// the node has none. `Some` carries why, which is what a recursion found
+    /// in the expansion will mean.
+    deferred_recipe: Option<DeferredReading>,
     /// The shell this node's recipe runs under, read with the node's own scope
     /// in hand. A target that set no `SHELL` of its own reads the global one
     /// here, so this is the whole of the answer rather than an override.
@@ -214,6 +216,26 @@ struct DeferredRecipe {
     /// Decided while the graph is constructed, because it is a fact about the
     /// graph rather than about the recipe.
     description_fallback: Option<Bytes>,
+    /// How this recipe came to be deferred, which is what a `$(MAKE)` found in
+    /// its expansion means.
+    reading: DeferredReading,
+}
+
+/// Why a recipe is read at launch, which decides what a recursion found there
+/// means.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DeferredReading {
+    /// Deferral was OFFERED: no expansion of this recipe can reach `$(MAKE)`,
+    /// so the graph is complete without reading it. A recursion at launch is
+    /// the classification having been wrong, and a graph built believing it had
+    /// no child to compose cannot grow one now.
+    NoRecursionPossible,
+    /// Deferral was REQUIRED: the recipe's `$?` decides what the command is, so
+    /// it could not be read early whatever the compiler would have preferred.
+    /// The recursion question was never answered for it, and a `$(MAKE)` the
+    /// expansion reaches is a command with no child graph behind it. It runs as
+    /// the command it is, which is what GNU Make does with every one of them.
+    RecursionRunsHere,
 }
 
 /// The recipes a [`RecipeExpansion::Launch`] sink asked to expand for itself.
@@ -478,14 +500,20 @@ impl DeferredRecipes {
         let commands = ce.eval(&recipe.node)?;
         // The classification that decided this recipe could be deferred is
         // made before anything is expanded, so it is checked here against what
-        // the expansion actually did. Deferral is only ever offered to a
-        // recipe no expansion of which can reach `MAKE`, so a recursion here
+        // the expansion actually did. Deferral OFFERED to a recipe is offered
+        // only where no expansion of it can reach `MAKE`, so a recursion here
         // is the classification having been wrong rather than a recipe with a
         // remainder to run — and a graph that was built believing it had no
         // child to compose cannot grow one now.
-        if commands
-            .iter()
-            .any(|command| !command.recursive_make.is_empty() || command.uncomposable_recursion())
+        //
+        // Deferral REQUIRED of a recipe made no such promise: its `$?` decided
+        // what the command was, so nothing could read it early enough to ask.
+        // The recursion it names is one the script starts for itself, exactly
+        // as GNU Make starts it.
+        if recipe.reading == DeferredReading::NoRecursionPossible
+            && commands.iter().any(|command| {
+                !command.recursive_make.is_empty() || command.uncomposable_recursion()
+            })
         {
             anyhow::bail!(
                 "recipe for {} reached a recursive Make invocation the compiler could not see before expanding it",
@@ -733,15 +761,28 @@ impl<'a> NinjaGenerator<'a> {
     ///
     /// A recipe naming `$?`, and a grouped `&::` action, are NOT refused. The
     /// `$?` recipe declares deferred freshness from the text —
-    /// [`references_new_inputs`] answers that without expanding — and the launch
-    /// is handed the scheduler's own list. A grouped `&::` action is one recipe
+    /// [`NewInputsWalk`] answers that without expanding — and the launch is
+    /// handed the scheduler's own list. A grouped `&::` action is one recipe
     /// for the whole group, whose `$@` is the member reached rather than a name
     /// the chain walk renames, so it too waits for launch. Either way GNU Make's
     /// rule holds: an up-to-date target expands nothing, and the name whose own
     /// state reached the rule is the one `$@` binds to.
-    fn defers_recipe(&self, node: &DepNode) -> bool {
+    ///
+    /// One kind of recipe is not offered launch expansion but REQUIRED to take
+    /// it, and it outranks the recursion refusal: a recipe that READS `$?`
+    /// rather than spelling it into the command. A scheduler-bound `$?` is a
+    /// placeholder while the recipe is expanded, so a `$(if)` over it, or any
+    /// other function that asks the list a question, is answered about the
+    /// placeholder — one word, in nobody's `$(PHONY)`, never empty. kbuild's
+    /// `if_changed` is that shape, and reading it early is what makes every one
+    /// of its targets remake itself on every run. There is no value a compiler
+    /// could put there instead: the answer depends on what the build does, so
+    /// the recipe waits for the build. The refusals ahead of it are refusals of
+    /// a rule this compiler cannot express at all rather than of an early read,
+    /// so they still stand.
+    fn defers_recipe(&self, node: &DepNode) -> Option<DeferredReading> {
         if self.recipe_expansion != RecipeExpansion::Launch || node.cmds.is_empty() {
-            return false;
+            return None;
         }
         // A recipe of nothing but whitespace is a target remade by doing
         // nothing, and the graph says that with an edge that runs nothing.
@@ -751,14 +792,14 @@ impl<'a> NinjaGenerator<'a> {
             .iter()
             .all(|cmd| is_blank_recipe_line(&self.ce.ev.session.values, *cmd))
         {
-            return false;
+            return None;
         }
         // A depfile is a dependency read at runtime — `--detect_depfiles` finds
         // it by rewriting the assembled script — and the edge it is read for has
         // to declare it, which a deferred rule has no path to. So a recipe
         // naming a depfile is read where it is built.
         if self.ce.ev.session.flags.detect_depfiles || node.grouped_double_join {
-            return false;
+            return None;
         }
         // An ordinary multi-target `::` action's `$@` is the name the chain walk
         // renames and the construction read settles; the launch cannot redo that
@@ -769,13 +810,40 @@ impl<'a> NinjaGenerator<'a> {
         if let Some(action) = &node.grouped_double_action
             && !action.is_grouped
         {
-            return false;
+            return None;
         }
         let rule_vars = node.rule_vars.clone();
-        node.cmds.iter().all(|cmd| {
+        // Asked before the recursion question, and answered the other way,
+        // because the two are refusals of different weight. Reading a recipe
+        // early to find the child it composes is how this compiler is faster
+        // than the Make it stands in for; reading one early whose `$?` decides
+        // what the command IS makes it give a different answer. A recipe that
+        // turns out to name a recursion after all is caught where it is
+        // expanded, which is the one place that can still say so.
+        let decides = self.new_inputs_use(node, rule_vars.as_deref()).decides;
+        let no_recursion_possible = node.cmds.iter().all(|cmd| {
             let mut seen = FastSet::default();
             !expansion_can_reach_make(*cmd, self.ce.ev, rule_vars.as_deref(), &mut seen)
-        })
+        });
+        match (decides, no_recursion_possible) {
+            (_, true) => Some(DeferredReading::NoRecursionPossible),
+            (true, false) => Some(DeferredReading::RecursionRunsHere),
+            (false, false) => None,
+        }
+    }
+
+    /// What this node's recipes, taken together, would do with `$?`.
+    ///
+    /// One walk for the whole recipe rather than one per line: the variables a
+    /// second line names are the ones the first named, and the answer for each
+    /// is the same both times.
+    fn new_inputs_use(&self, node: &DepNode, rule_vars: Option<&Vars>) -> NewInputsUse {
+        let mut walk = NewInputsWalk::new(self.ce.ev, rule_vars);
+        node.cmds
+            .iter()
+            .fold(NewInputsUse::default(), |so_far, cmd| {
+                so_far.merge(walk.of(*cmd))
+            })
     }
 
     /// Rebuild a generator around the state an earlier population left, so the
@@ -926,12 +994,13 @@ impl<'a> NinjaGenerator<'a> {
         // the files that exist when the command is about to run rather than
         // against the ones that existed before the build started.
         let deferred_recipe = self.defers_recipe(&node.lock());
+        let deferred_recipe_reading = deferred_recipe.is_some();
         // Said of THIS recipe by `eval`, which clears the flag before it reads,
         // so a node that skips `eval` would otherwise be handed whatever the
         // node before it found. A deferred recipe skips `eval`, so its own
         // answer is read from the text below rather than from this flag.
         *self.ce.found_new_inputs.lock() = false;
-        let commands = if deferred_recipe {
+        let commands = if deferred_recipe_reading {
             Vec::new()
         } else {
             self.ce.eval(node)?
@@ -942,28 +1011,31 @@ impl<'a> NinjaGenerator<'a> {
         // is, in `expand_with`; the value carried here is only what the
         // provisional rule is declared with, and a deferred rule's bindings
         // never look at it.
-        let shell = if deferred_recipe {
+        let shell = if deferred_recipe_reading {
             self.deferred_shell()?
         } else {
             self.ce.recipe_shell.clone()
         };
         let deferred_new_inputs = self.ce.ev.new_inputs_timing
             == NewInputsTiming::SchedulerBoundary
-            && if deferred_recipe {
+            && if deferred_recipe_reading {
                 // The recipe was not read, so `found_new_inputs` could not have
-                // been set. Whether it names `$?` is a fact about the text,
-                // which `references_new_inputs` reads without expanding, and it
-                // is what declares the edge's deferred freshness so the
-                // scheduler binds the list the launch is handed.
-                node.lock().cmds.iter().any(|cmd| {
-                    references_new_inputs(&self.ce.ev.session.values, *cmd, &self.ce.ev.session)
-                })
+                // been set. Whether it reaches `$?` is a fact about the text,
+                // which [`NewInputsWalk`] reads without expanding, and it is
+                // what declares the edge's deferred freshness so the scheduler
+                // settles the list the launch is handed. The walk follows the
+                // names the text uses, because a Makefile that reaches `$?`
+                // reaches it through its own definitions far more often than it
+                // writes `$?` in a recipe.
+                let node = node.lock();
+                let rule_vars = node.rule_vars.clone();
+                self.new_inputs_use(&node, rule_vars.as_deref()).reached
             } else {
                 *self.ce.found_new_inputs.lock()
             };
         let deferred_new_inputs_filter_out =
             std::mem::take(&mut self.ce.ev.deferred_new_inputs_filter_out);
-        let rule_id = if commands.is_empty() && !deferred_recipe {
+        let rule_id = if commands.is_empty() && !deferred_recipe_reading {
             None
         } else {
             let id = self.rule_id;
@@ -1977,7 +2049,7 @@ impl<'a> NinjaGenerator<'a> {
             return Ok(None);
         }
 
-        let rule_id = if nn.deferred_recipe {
+        let rule_id = if let Some(reading) = nn.deferred_recipe {
             let id = nn.rule_id.expect("a deferred recipe mints a rule");
             let recipe_output_str = node.recipe_output.as_bytes(&self.ce.ev.session);
             let description_fallback = (self.phony_aliases.resolve(node.output) != node.output)
@@ -1986,6 +2058,7 @@ impl<'a> NinjaGenerator<'a> {
             self.deferred_recipes.push(DeferredRecipe {
                 node: nn.node.clone(),
                 description_fallback,
+                reading,
             });
             sink.declare_rule(
                 &self.ce.ev.session,
@@ -3290,7 +3363,7 @@ impl PopulatedBuild {
             }
             let node = nn.node.lock();
             if !is_buildable_target(&ev.session, &node.output, node.has_rule)
-                || nn.deferred_recipe
+                || nn.deferred_recipe.is_some()
                 || nn.rule_id.is_none()
                 || !(node.is_phony || node.unconditional_double_colon)
                 || !node.deps.is_empty()

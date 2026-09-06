@@ -941,48 +941,237 @@ pub fn is_blank_recipe_line(arena: &ValueArena, id: ValueId) -> bool {
     }
 }
 
-/// Whether a recipe as written can reach the `$?` automatic variable.
+/// What an unexpanded recipe does with `$?`.
 ///
-/// Deliberately conservative in both directions a scan can be wrong about: a
-/// computed reference is counted, because its name is not knowable here, and
-/// the `D` and `F` variants are counted by name. A recipe this answers `true`
-/// for is expanded while the graph is constructed, so the scheduler binds the
-/// value and any `filter-out` around it is seen.
-pub fn references_new_inputs(arena: &ValueArena, id: ValueId, names: &impl Interner) -> bool {
-    match arena.get(id) {
-        Value::Literal(_, _) => false,
-        // Expanding it raises rather than producing text, so it reaches nothing.
-        Value::Unreadable(_, _) => false,
-        Value::SymRef(_, sym) => {
-            matches!(sym.name_bytes(names), b"?" | b"?D" | b"?F")
+/// Two answers rather than one, because the two have different consequences.
+/// Reaching the value at all is what makes an edge declare deferred freshness,
+/// so the destination settles the list and hands it over when it launches the
+/// edge. READING that value with a function is what takes the whole recipe out
+/// of the compiler's hands: a scheduler-bound `$?` leaves a placeholder behind,
+/// the placeholder is one word standing for a list nobody has settled yet, and
+/// a function asked about that word answers about the word.
+#[derive(Clone, Copy, Default)]
+pub struct NewInputsUse {
+    /// Expanding this may produce a value derived from `$?`.
+    ///
+    /// Conservative: a name computed at expansion time can be `?`, and nothing
+    /// here can rule it out.
+    pub reached: bool,
+    /// Expanding this DOES produce such a value — a reference to `$?` itself,
+    /// or text carrying one. Held apart from [`Self::reached`] because a name
+    /// this walk cannot follow is a reason to settle the list and not a reason
+    /// to believe the recipe reads it.
+    certain: bool,
+    /// A value certainly derived from `$?` is read by a function, so what the
+    /// expansion produces depends on more than the words the list is spelt as.
+    pub decides: bool,
+}
+
+impl NewInputsUse {
+    const NONE: Self = Self {
+        reached: false,
+        certain: false,
+        decides: false,
+    };
+    /// The list may be behind this, and nothing here can say.
+    const MAY_REACH: Self = Self {
+        reached: true,
+        certain: false,
+        decides: false,
+    };
+    /// The list is behind this.
+    const REACHES: Self = Self {
+        reached: true,
+        certain: true,
+        decides: false,
+    };
+
+    /// Both answers at once, for two values one expansion produces.
+    #[must_use]
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            reached: self.reached || other.reached,
+            certain: self.certain || other.certain,
+            decides: self.decides || other.decides,
         }
-        Value::List(_, values) => arena
-            .children(*values)
-            .iter()
-            .any(|value| references_new_inputs(arena, *value, names)),
-        // A name computed at expansion time can be `?`, and nothing here can
-        // rule that out.
-        Value::VarRef(_, _) => true,
-        Value::VarSubst {
-            loc: _,
-            name,
-            pat,
-            subst,
-        } => {
-            references_new_inputs(arena, *name, names)
-                || references_new_inputs(arena, *pat, names)
-                || references_new_inputs(arena, *subst, names)
+    }
+
+    /// The same answer, for a value a function reads rather than copies into
+    /// what it produces.
+    const fn read(self) -> Self {
+        Self {
+            reached: self.reached,
+            certain: self.certain,
+            decides: self.decides || self.certain,
         }
-        Value::Func {
-            loc: _,
-            fi: _,
-            args,
-        } => arena
-            .children(*args)
-            .iter()
-            .any(|arg| references_new_inputs(arena, *arg, names)),
-        // Finished fold bytes — blanks and spaces — reach no automatic variable.
-        Value::Folded { .. } => false,
+    }
+}
+
+/// One walk of a recipe, asking what its expansion would do with `$?`.
+///
+/// The answer for a variable is cached rather than merely marked seen: a
+/// recipe that names the same variable twice reads it in two places, and the
+/// second place is as able to be the one that reads the list as the first.
+/// `active` is the cycle guard the cache cannot be, since a self-referential
+/// definition has no answer to cache yet.
+pub struct NewInputsWalk<'a> {
+    ev: &'a Evaluator,
+    rule_vars: Option<&'a Vars>,
+    cache: FastMap<Symbol, NewInputsUse>,
+    active: FastSet<Symbol>,
+}
+
+impl<'a> NewInputsWalk<'a> {
+    /// A walk over one rule's recipes. The rule's own variables come first,
+    /// because a target-specific definition is the one its recipe expands.
+    #[must_use]
+    pub fn new(ev: &'a Evaluator, rule_vars: Option<&'a Vars>) -> Self {
+        Self {
+            ev,
+            rule_vars,
+            cache: FastMap::default(),
+            active: FastSet::default(),
+        }
+    }
+
+    /// What expanding `id` would do with `$?`.
+    ///
+    /// The same walk [`expansion_can_reach_make`] performs, asked about the
+    /// other automatic variable a compiler cannot answer early: the value's own
+    /// syntax tree, plus the tree of every recursively expanded variable it
+    /// names, plus the body of every `$(call)` whose function is named
+    /// outright. A simply expanded variable holds text, and text holds no
+    /// reference, which is where the walk stops — as it does there.
+    pub fn of(&mut self, id: ValueId) -> NewInputsUse {
+        match self.ev.session.values.get(id) {
+            Value::Literal(_, _) | Value::Folded { .. } => NewInputsUse::NONE,
+            // Expanding it raises rather than producing text, so it reaches
+            // nothing.
+            Value::Unreadable(_, _) => NewInputsUse::NONE,
+            Value::SymRef(_, sym) => self.of_symbol(*sym),
+            Value::List(_, values) => {
+                let values = self.ev.session.values.children(*values);
+                values.iter().fold(NewInputsUse::NONE, |so_far, value| {
+                    so_far.merge(self.of(*value))
+                })
+            }
+            // The name is computed, so it can be `?`. Which variable the
+            // reference stands for is not knowable here, and neither therefore
+            // is what that variable does with the list — but a name spelt out
+            // of the list is itself a reading of it, and that much is.
+            Value::VarRef(_, name) => NewInputsUse::MAY_REACH.merge(NewInputsUse {
+                decides: self.of(*name).read().decides,
+                ..NewInputsUse::NONE
+            }),
+            // `$(NAME:pat=subst)` rewrites the value it names word by word, so
+            // reaching the list through any of the three is a reading of it.
+            Value::VarSubst {
+                loc: _,
+                name,
+                pat,
+                subst,
+            } => {
+                let named = match self.ev.session.values.get(*name) {
+                    Value::Literal(_, literal) => self
+                        .ev
+                        .session
+                        .symtab
+                        .peek_symbol(literal)
+                        .map_or(NewInputsUse::NONE, |sym| self.of_symbol(sym)),
+                    _ => NewInputsUse::MAY_REACH,
+                };
+                named.merge(self.of(*pat)).merge(self.of(*subst)).read()
+            }
+            Value::Func { loc: _, fi, args } => {
+                let args = self.ev.session.values.children(*args);
+                if fi.name == b"call" {
+                    return self.of_call(args);
+                }
+                let mut result = NewInputsUse::NONE;
+                for (at, arg) in args.iter().enumerate() {
+                    let arg = self.of(*arg);
+                    // `$(filter-out pat,$?)` is the one reading a scheduler can
+                    // perform for itself: the patterns travel with the edge and
+                    // the words are struck out where the list is settled. Every
+                    // other reading — the pattern side of this very function
+                    // included — is a question about a list that does not exist
+                    // yet.
+                    result = result.merge(if fi.name == b"filter-out" && at == 1 {
+                        arg
+                    } else {
+                        arg.read()
+                    });
+                }
+                result
+            }
+        }
+    }
+
+    /// What `$(call f,...)` would do with `$?`.
+    ///
+    /// The body is walked when `f` is named outright, which is how a Makefile
+    /// that hides `$?` behind a chain of definitions is followed to it. kbuild
+    /// is the case that makes it matter: `$(call if_changed,cc_o_c)` reaches
+    /// `$?` three definitions down, in the condition of an `$(if)` that chooses
+    /// between the compile and doing nothing.
+    ///
+    /// The parameters are not bound, so a `$(1)` in the body is a reference to
+    /// a variable this walk does not hold. An argument that reaches the list is
+    /// therefore counted as read: the body receives it under a name nothing
+    /// here can follow.
+    fn of_call(&mut self, args: &[ValueId]) -> NewInputsUse {
+        let mut result = NewInputsUse::NONE;
+        for arg in args.iter().skip(1) {
+            result = result.merge(self.of(*arg).read());
+        }
+        let Some(name) = args.first() else {
+            return result;
+        };
+        // The function's own name chooses the body, so a name spelt out of the
+        // list is a reading of it — and one this walk cannot follow.
+        match self.ev.session.values.get(*name) {
+            Value::Literal(_, literal) => match self.ev.session.symtab.peek_symbol(literal) {
+                Some(sym) => result.merge(self.of_symbol(sym)),
+                // A name no symbol was ever made for names no variable, and
+                // `$(call)` on an undefined function expands to nothing.
+                None => result,
+            },
+            _ => {
+                let name = self.of(*name).read();
+                result.merge(name).merge(NewInputsUse::MAY_REACH)
+            }
+        }
+    }
+
+    /// What expanding a reference to `sym` would do with `$?`.
+    fn of_symbol(&mut self, sym: Symbol) -> NewInputsUse {
+        if matches!(sym.name_bytes(&self.ev.session), b"?" | b"?D" | b"?F") {
+            return NewInputsUse::REACHES;
+        }
+        if let Some(answer) = self.cache.get(&sym) {
+            return *answer;
+        }
+        if !self.active.insert(sym) {
+            return NewInputsUse::NONE;
+        }
+        let answer = self.definition_use(sym);
+        self.active.remove(&sym);
+        self.cache.insert(sym, answer);
+        answer
+    }
+
+    fn definition_use(&mut self, sym: Symbol) -> NewInputsUse {
+        let bound = self
+            .rule_vars
+            .and_then(|vars| vars.peek(sym))
+            .or_else(|| self.ev.session.globals.peek(sym));
+        let Some(bound) = bound else {
+            return NewInputsUse::NONE;
+        };
+        let Some(definition) = bound.read().recursive_definition() else {
+            return NewInputsUse::NONE;
+        };
+        self.of(definition)
     }
 }
 
