@@ -54,7 +54,7 @@ use crate::{
 /// skip it nor be given nothing. `$(abspath)` is deliberately absent: it is
 /// spelling, not a question — it never touches the filesystem, and it answers
 /// the same on every pass by construction.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum GroundQuestion {
     /// `$(shell)` and `!=`.
     Shell,
@@ -149,7 +149,6 @@ pub struct GroundAnswer {
 /// would mean handing back an answer from a call site that is not the one
 /// asking. Stopping is exactly what the front end did before it recorded
 /// anything, so a read that diverges is no worse off than it was.
-#[derive(Default)]
 pub struct GroundJournal {
     recorded: Vec<GroundAnswer>,
     replaying: Vec<GroundAnswer>,
@@ -157,6 +156,60 @@ pub struct GroundJournal {
     diverged: bool,
     suspended: bool,
     asked_while_suspended: bool,
+    /// What the read asked while suspended, kept apart from the sequence.
+    ///
+    /// These are NOT part of the replay and must never join it: their places
+    /// in the order would move every question after them, which is exactly why
+    /// the suspended window records nothing into `recorded`. They are still
+    /// things the read depended on, and a record that outlives the invocation
+    /// re-asks by question rather than by position, so it can use them where a
+    /// replay cannot.
+    off_journal: Vec<GroundAnswer>,
+    /// Whether a read is still open.
+    ///
+    /// The session outlives the read: a build expands recipes against it long
+    /// afterwards, and those expansions suspend the journal too. Nothing they
+    /// ask belongs to the read, so nothing is kept for them — without this the
+    /// list would grow for the length of the build.
+    reading: bool,
+}
+
+impl Default for GroundJournal {
+    fn default() -> Self {
+        Self {
+            recorded: Vec::new(),
+            replaying: Vec::new(),
+            at: 0,
+            diverged: false,
+            suspended: false,
+            asked_while_suspended: false,
+            off_journal: Vec::new(),
+            reading: true,
+        }
+    }
+}
+
+impl GroundAnswer {
+    /// An answer with nothing asked underneath it.
+    ///
+    /// The nesting count exists for the replay, which steps over the questions
+    /// a served answer means the read will not ask. An answer built here was
+    /// not served from a sequence and has no such questions under it.
+    #[must_use]
+    pub fn asked_and_told(
+        question: GroundQuestion,
+        asked: Bytes,
+        answer: Bytes,
+        status: Option<i32>,
+    ) -> Self {
+        Self {
+            question,
+            asked,
+            answer,
+            status,
+            nested: 0,
+        }
+    }
 }
 
 impl GroundJournal {
@@ -166,6 +219,7 @@ impl GroundJournal {
         self.at = 0;
         self.diverged = false;
         self.asked_while_suspended = false;
+        self.reading = true;
     }
 
     /// End the read: hand back what it asked and was told, for the read after
@@ -179,7 +233,18 @@ impl GroundJournal {
         self.replaying = Vec::new();
         self.at = 0;
         self.diverged = false;
+        self.reading = false;
         std::mem::take(&mut self.recorded)
+    }
+
+    /// What this read asked while the journal was suspended.
+    ///
+    /// Taken separately from [`Self::close_read`] because it is for a
+    /// different consumer: nothing replays these, and a destination that
+    /// carries a read still must not carry one that asked them. See
+    /// [`Self::asked_off_journal`].
+    pub fn close_off_journal(&mut self) -> Vec<GroundAnswer> {
+        std::mem::take(&mut self.off_journal)
     }
 
     /// Whether the replay stopped short of the end of what it was given.
@@ -256,6 +321,11 @@ impl GroundJournal {
     ) {
         if self.suspended {
             self.asked_while_suspended = true;
+            if self.reading {
+                self.off_journal.push(GroundAnswer::asked_and_told(
+                    question, asked, answer, status,
+                ));
+            }
             return;
         }
         // Everything recorded since the slot was taken was asked while this
@@ -641,6 +711,52 @@ impl Session {
             .into_iter()
             .map(|(sym, _)| (sym, self.symtab.name(sym)))
             .collect()
+    }
+
+    /// Every environment variable this read depended on, with what it read.
+    ///
+    /// Two kinds, and both are dependencies. A name that was read AND found is
+    /// a dependency on the value; a name that was read and NOT found is a
+    /// dependency on there being no such variable, and answers `None` — a run
+    /// that sets it would evaluate to something else. `PATH` joins the first
+    /// kind whether or not the makefile named it, because it decides what a
+    /// `$(shell)` runs.
+    ///
+    /// Read through the session's own view of the environment rather than the
+    /// process's, so a composed child is asked about the environment it was
+    /// given rather than the one this process happens to hold.
+    #[must_use]
+    pub fn environment_dependencies(&self) -> Vec<(Bytes, Option<Bytes>)> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let imported = self.invocation_environment.as_ref();
+        let value_of = |name: &Bytes| -> Option<Bytes> {
+            let name = OsStr::from_bytes(name);
+            match imported {
+                Some(environment) => environment
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| Bytes::from(value.as_bytes().to_vec())),
+                None => std::env::var_os(name).map(|value| Bytes::from(value.as_bytes().to_vec())),
+            }
+        };
+        let mut read: Vec<(Bytes, Option<Bytes>)> = self
+            .used_env_vars
+            .iter()
+            .map(|sym| self.symtab.name(*sym))
+            .chain(std::iter::once(Bytes::from_static(b"PATH")))
+            .map(|name| {
+                let value = value_of(&name);
+                (name, value)
+            })
+            .collect();
+        read.extend(
+            self.used_undefined_vars
+                .iter()
+                .map(|sym| (self.symtab.name(*sym), None)),
+        );
+        read.sort_unstable();
+        read.dedup();
+        read
     }
 
     /// Record that a variable was read without a binding.
