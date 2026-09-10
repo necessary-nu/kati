@@ -2912,11 +2912,11 @@ impl Evaluator {
     /// with no search permission arrives as `Permission denied` on the name and
     /// is deferred to the update exactly as absence is. Reporting it here would
     /// end the run ahead of the Makefiles the read still had to remake.
-    fn include_names(&mut self, pat: &Bytes) -> (Vec<Bytes>, Option<String>) {
+    fn include_names(&mut self, word: &Bytes) -> (Vec<Bytes>, Option<String>) {
         let slot = match self
             .session
             .ground_journal
-            .answered(crate::session::GroundQuestion::Include, pat)
+            .answered(crate::session::GroundQuestion::Include, word)
         {
             crate::session::Asked::Answered(answered) => {
                 if answered.answer.first() == Some(&0) {
@@ -2935,6 +2935,15 @@ impl Evaluator {
             crate::session::Asked::Ask(slot) => slot,
         };
 
+        // The include-path search is part of THIS question rather than
+        // something done to the word before it is asked. It reads the ground —
+        // it keeps the first `-I` directory that has the name — so a read
+        // repeating itself would search again over a ground a staged build had
+        // moved, resolve to a file the first read never opened, and then ask a
+        // question the record has no answer for. Asking about the word the
+        // makefile wrote, and letting the answer carry whatever the search
+        // reached, is what makes the replay answer the whole of it.
+        let pat = self.at_include_dirs(word.clone());
         let globbed = self.session.glob(pat.clone());
         let (files, unread) = match globbed.as_ref() {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => (Vec::new(), Some(absent())),
@@ -2958,7 +2967,7 @@ impl Evaluator {
         self.session.ground_journal.record(
             slot,
             crate::session::GroundQuestion::Include,
-            pat.clone(),
+            word.clone(),
             answer.freeze(),
             None,
         );
@@ -2972,7 +2981,6 @@ impl Evaluator {
         let pats = stmt.expr.eval_to_buf(self)?;
         for pat in word_scanner(&pats) {
             let pat = pats.slice_ref(pat);
-            let pat = self.at_include_dirs(pat);
             let (files, unread) = self.include_names(&pat);
             if let Some(reason) = unread {
                 self.note_unread_include(pat, stmt.should_exist, Some(stmt.loc()), &reason);

@@ -912,6 +912,57 @@ mod tests {
         assert!(b.session.used_undefined_vars.is_empty());
     }
 
+    /// The include-path search reads the ground, so it belongs INSIDE the
+    /// question rather than being done to the word before the question is
+    /// asked. A record filed under the resolved name is a record of a search
+    /// that already happened: the read that repeats it searches again over a
+    /// ground the staged build has moved, and then asks about a name the
+    /// record has never heard of.
+    // [spec:ronin:req:make.semantics+1/test]
+    #[test]
+    fn an_include_is_recorded_under_the_word_written() {
+        let directory = std::env::temp_dir().join(format!(
+            "kati-include-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let searched = directory.join("inc");
+        std::fs::create_dir_all(&searched).unwrap();
+        std::fs::write(searched.join("carried.mk"), "FOUND := yes\n").unwrap();
+
+        let mut session = Session::new();
+        session.flags.include_dirs = vec![searched.clone()];
+        crate::evaluate::construct_include_path(&mut session);
+        let mut ev = Evaluator::new(session);
+        eval_in(&mut ev, "include carried.mk\n").unwrap();
+        assert_eq!(
+            expand(&mut ev, "$(FOUND)").unwrap().as_ref(),
+            b"yes",
+            "the include path is what reached the file at all"
+        );
+
+        let recorded = ev.session.ground_journal.close_read();
+        let include = recorded
+            .iter()
+            .find(|answer| answer.question == GroundQuestion::Include)
+            .expect("the include asked the ground");
+        assert_eq!(
+            include.asked.as_ref(),
+            b"carried.mk",
+            "filed under the word the makefile wrote, not under where the search reached"
+        );
+        assert_eq!(
+            include.answer.as_ref(),
+            std::os::unix::ffi::OsStrExt::as_bytes(searched.join("carried.mk").as_os_str()),
+            "and the answer carries where the search reached"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     /// A repeated read is answered by position, and the question recorded
     /// beside each answer is the check that the positions still mean anything.
     // [spec:ronin:req:make.semantics+1/test]
