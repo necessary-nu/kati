@@ -70,6 +70,13 @@ struct ShellResult {
 struct StampChecker {
     gen_time: Option<SystemTime>,
     globs: Vec<GlobResult>,
+    /// Patterns whose glob answered `Err` when the ninja file was generated.
+    ///
+    /// Kept apart from `globs` because there is no file list to compare: the
+    /// recorded answer IS the absence, so the question a later run asks is
+    /// whether the name is still absent rather than whether the same names
+    /// came back.
+    absent_globs: Vec<Bytes>,
     commands: Vec<ShellResult>,
     needs_regen: bool,
 }
@@ -91,6 +98,7 @@ impl StampChecker {
         Self {
             gen_time: None,
             globs: Vec::new(),
+            absent_globs: Vec::new(),
             commands: Vec::new(),
             needs_regen: false,
         }
@@ -278,6 +286,44 @@ impl StampChecker {
             return true;
         }
 
+        // Files the recorded read wanted and did not get. The question here is
+        // the opposite of the one asked of the files it DID get: those are
+        // dirty once they are newer than the generation, and these are dirty
+        // once they are there at all. A run whose `include` found nothing
+        // would evaluate text it never saw if the name arrived, and GNU Make's
+        // `eval_makefile` opens the name on every read, so the absence is a
+        // dependency like any other.
+        let unread = load!(load_vec_string(fp));
+        for s in unread {
+            if !std::fs::exists(&s).unwrap_or(false) {
+                if session.flags.dump_kati_stamp {
+                    println!("missing file {s:?}: clean (still absent)");
+                }
+                continue;
+            }
+            if should_ignore_dirty(session, s.as_bytes()) {
+                if session.flags.regen_debug {
+                    println!("missing file {s:?}: ignored");
+                }
+                continue;
+            }
+            if session.flags.dump_kati_stamp {
+                println!("missing file {s:?}: dirty (appeared)");
+            } else {
+                eprintln!("{} was created, regenerating...", s.to_string_lossy());
+            }
+            return true;
+        }
+
+        // Patterns that globbed to nothing at all. Checked in step 2 with the
+        // globs that answered, because both go to the filesystem and the
+        // session's glob cache is the thing that reads it.
+        let absent = load!(load_vec_string(fp));
+        self.absent_globs = absent
+            .into_iter()
+            .map(|pat| Bytes::from(pat.into_vec()))
+            .collect();
+
         self.needs_regen
     }
 
@@ -308,6 +354,37 @@ impl StampChecker {
             println!("wildcard {:?}: clean", gr.pat);
         }
         needs_regen
+    }
+
+    /// Whether a pattern that answered nothing now answers something.
+    ///
+    /// `GlobCache::glob` answers `Err` only where a pattern holding no
+    /// metacharacter would not `stat`, so this asks whether that plain name
+    /// has arrived. A pattern that is still absent is clean; one that now
+    /// globs to anything at all changes what the makefile expanded to.
+    fn check_absent_glob(session: &Session, pat: &Bytes, err: &mut String) -> bool {
+        collect_stats!(session, "glob time (regen)");
+        if session.glob(pat.clone()).is_err() {
+            if session.flags.dump_kati_stamp {
+                println!("wildcard {pat:?}: clean (still absent)");
+            }
+            return false;
+        }
+        if should_ignore_dirty(session, pat) {
+            if session.flags.dump_kati_stamp {
+                println!("wildcard {pat:?}: ignored");
+            }
+            return false;
+        }
+        if session.flags.dump_kati_stamp {
+            println!("wildcard {pat:?}: dirty (appeared)");
+        } else {
+            *err = format!(
+                "wildcard({}) was changed, regenerating...",
+                String::from_utf8_lossy(pat)
+            );
+        }
+        true
     }
 
     fn should_run_command(session: &Session, sr: &ShellResult, gen_time: SystemTime) -> bool {
@@ -485,14 +562,19 @@ impl StampChecker {
         std::thread::scope(|s| {
             s.spawn(|| {
                 let mut err = String::new();
-                for gr in &self.globs {
-                    if Self::check_glob_result(session, gr, &mut err) {
-                        let mut needs_regen = needs_regen.lock();
-                        if let Ok(false) = *needs_regen {
-                            *needs_regen = Ok(true);
-                            eprintln!("{err}");
-                        }
-                        break;
+                let dirty = self
+                    .globs
+                    .iter()
+                    .any(|gr| Self::check_glob_result(session, gr, &mut err))
+                    || self
+                        .absent_globs
+                        .iter()
+                        .any(|pat| Self::check_absent_glob(session, pat, &mut err));
+                if dirty {
+                    let mut needs_regen = needs_regen.lock();
+                    if let Ok(false) = *needs_regen {
+                        *needs_regen = Ok(true);
+                        eprintln!("{err}");
                     }
                 }
             });

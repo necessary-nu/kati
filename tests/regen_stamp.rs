@@ -60,6 +60,25 @@ fn run(directory: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr)
 }
 
+/// Run kati as [`run`] does, with `MAKEFILES` naming a makefile as well.
+///
+/// `MAKEFILES` is the one entry point that reaches a read's makefile cache
+/// with a name nothing globbed first, so it is how a test puts a genuinely
+/// absent path into the set of files the read wanted and did not get.
+fn run_with_makefiles(directory: &Path, makefiles: &str) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_rkati"))
+        .current_dir(directory)
+        .args(["--ninja", "--regen", "--regen_debug"])
+        .env("MAKEFILES", makefiles)
+        .env_remove("MAKEFLAGS")
+        .env_remove("MFLAGS")
+        .env_remove("CARGO_MAKEFLAGS")
+        .env_remove("MAKELEVEL")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr)
+}
+
 /// Generate the ninja file and its stamp, then run the regeneration check with
 /// nothing changed, and return what the check said.
 fn generate_then_check(name: &str, makefile: &str) -> String {
@@ -132,5 +151,108 @@ fn a_one_shell_shell_regenerates_when_its_answer_moves() {
     assert!(
         moved.contains("was changed, regenerating"),
         "a changed $(shell) answer did not regenerate: {moved}"
+    );
+}
+
+/// A file an `include` looked for and did not find is a file the read
+/// depended on, and the stamp records it. Recording it among the files that
+/// WERE read makes the check stat it, fail, and call the read dirty — so a
+/// makefile with one optional include regenerates on every single run,
+/// whatever the disk says. An absence is clean while it is still an absence.
+#[test]
+fn a_recorded_absence_alone_does_not_regenerate() {
+    let said = generate_then_check(
+        "absent-include",
+        "-include missing.mk\nall:\n\t@echo x > out\n",
+    );
+    assert!(
+        said.contains("No need to regenerate ninja file"),
+        "an include that was absent both times regenerated: {said}"
+    );
+}
+
+/// The other half of the same rule: the absence is what the read depended on,
+/// so the file appearing is a change. GNU Make's `eval_makefile` opens the
+/// name every time, and a run that would now read a file the recorded run did
+/// not is compiling different text.
+#[test]
+fn an_absent_include_that_appears_regenerates() {
+    let directory = scratch("absent-include-appears");
+    fs::write(
+        directory.join("Makefile"),
+        "-include missing.mk\nall:\n\t@echo x > out\n",
+    )
+    .unwrap();
+    run(&directory);
+    let clean = run(&directory);
+    assert!(
+        clean.contains("No need to regenerate ninja file"),
+        "an include that was absent both times regenerated: {clean}"
+    );
+    fs::write(directory.join("missing.mk"), "V := 1\n").unwrap();
+    let appeared = run(&directory);
+    assert!(
+        appeared.contains("regenerating"),
+        "an include that appeared did not regenerate: {appeared}"
+    );
+}
+
+/// A `$(wildcard)` over a plain name that is not there answers `Err` rather
+/// than an empty list, because the name has no metacharacter and the glob is
+/// a `stat`. Dropping those from the stamp drops the whole dependency: the
+/// file appearing changes what the makefile expanded to and nothing notices.
+/// Isolated from the include case above, which records the same absence twice.
+#[test]
+fn an_absent_wildcard_that_appears_regenerates() {
+    let directory = scratch("absent-wildcard-appears");
+    fs::write(
+        directory.join("Makefile"),
+        "V := $(wildcard absent.txt)\nall:\n\t@echo $(V) > out\n",
+    )
+    .unwrap();
+    run(&directory);
+    let clean = run(&directory);
+    assert!(
+        clean.contains("No need to regenerate ninja file"),
+        "a wildcard that was absent both times regenerated: {clean}"
+    );
+    fs::write(directory.join("absent.txt"), "here\n").unwrap();
+    let appeared = run(&directory);
+    assert!(
+        appeared.contains("regenerating"),
+        "a wildcard whose name appeared did not regenerate: {appeared}"
+    );
+}
+
+/// `MAKEFILES` naming a file that is not there is forgiven by the read —
+/// `read_makefiles_entry` notes it and goes on — but it is still something the
+/// read depended on, so the stamp records the name. Recording it among the
+/// files that WERE read makes the check stat it, get nothing, and call the
+/// read dirty; and since the file is still not there, it does that on every
+/// run for ever. An absence is clean while it is still an absence.
+#[test]
+fn an_absent_named_makefile_alone_does_not_regenerate() {
+    let directory = scratch("absent-named");
+    fs::write(directory.join("Makefile"), "all:\n\t@echo x > out\n").unwrap();
+    run_with_makefiles(&directory, "absent.mk");
+    let clean = run_with_makefiles(&directory, "absent.mk");
+    assert!(
+        clean.contains("No need to regenerate ninja file"),
+        "a named makefile absent both times regenerated: {clean}"
+    );
+}
+
+/// And the other half: the read depended on the absence, so the file arriving
+/// is a change, because the next read would evaluate text this one never saw.
+#[test]
+fn an_absent_named_makefile_that_appears_regenerates() {
+    let directory = scratch("absent-named-appears");
+    fs::write(directory.join("Makefile"), "all:\n\t@echo x > out\n").unwrap();
+    run_with_makefiles(&directory, "absent.mk");
+    fs::write(directory.join("absent.mk"), "V := 1\n").unwrap();
+    let appeared = run_with_makefiles(&directory, "absent.mk");
+    assert!(
+        appeared.contains("regenerating"),
+        "a named makefile that appeared did not regenerate: {appeared}"
     );
 }

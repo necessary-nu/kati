@@ -2682,7 +2682,7 @@ impl<'a> NinjaGenerator<'a> {
             dump_systemtime(&mut out, &start_time)?;
 
             let kati_binary = std::env::current_exe()?;
-            let makefiles = self.ce.ev.session.makefiles.all_filenames();
+            let makefiles = self.ce.ev.session.makefiles.read_filenames();
             dump_usize(&mut out, makefiles.len() + 1)?;
             dump_string(&mut out, kati_binary.as_os_str().as_bytes())?;
             for makefile in makefiles {
@@ -2700,17 +2700,25 @@ impl<'a> NinjaGenerator<'a> {
                 dump_string(&mut out, value.as_bytes())?;
             }
 
-            let globs: Vec<(Bytes, crate::fileutil::GlobResults)> = self
+            // A pattern that answered `Err` is recorded too, and separately,
+            // below. `GlobCache::glob` answers `Err` only where the pattern
+            // holds no metacharacter and its `stat` failed — a plain name that
+            // is not there — so an `Err` here IS the answer the expansion was
+            // given, and one this run depended on. Dropping it drops the
+            // dependency: `include missing.mk` would go on saying the ninja
+            // file is fresh after `missing.mk` arrived. It cannot join the
+            // list below because that one is checked by comparing file lists,
+            // and there is no list to compare.
+            let (globbed, absent): (Vec<_>, Vec<_>) = self
                 .ce
                 .ev
                 .session
                 .glob_cache
                 .recorded()
                 .into_iter()
-                .filter(|(_, files)| files.is_ok())
-                .collect();
-            dump_usize(&mut out, globs.len())?;
-            for (key, files) in &globs {
+                .partition(|(_, files)| files.is_ok());
+            dump_usize(&mut out, globbed.len())?;
+            for (key, files) in &globbed {
                 dump_string(&mut out, key)?;
                 let Ok(files) = files.as_ref() else { continue };
                 dump_vec_string(&mut out, files)?;
@@ -2755,6 +2763,25 @@ impl<'a> NinjaGenerator<'a> {
             }
 
             dump_string(&mut out, orig_args)?;
+
+            // The two records of absence go last, so a stamp written before
+            // they existed simply runs out here. `load_vec_string` answers
+            // `None` at end of file and the check's `load!` turns that into a
+            // regeneration, which is the safe direction and is what an
+            // unreadable stamp has always done.
+            let unread: Vec<Vec<u8>> = self
+                .ce
+                .ev
+                .session
+                .makefiles
+                .unread_filenames()
+                .into_iter()
+                .map(std::os::unix::ffi::OsStringExt::into_vec)
+                .collect();
+            dump_vec_string(&mut out, &unread)?;
+
+            let absent: Vec<Bytes> = absent.into_iter().map(|(pat, _)| pat).collect();
+            dump_vec_string(&mut out, &absent)?;
         }
         std::fs::rename(
             self.get_stamp_temp_filename(),

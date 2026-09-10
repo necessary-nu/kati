@@ -158,17 +158,26 @@ impl MakefileCache {
         self.sources.iter()
     }
 
-    /// Every file the session read, which is what the regeneration stamp
-    /// records.
-    pub fn all_filenames(&self) -> HashSet<OsString> {
-        let mut ret = HashSet::new();
-        for p in self.cache.keys() {
-            ret.insert(p.clone());
-        }
-        for f in &self.unread {
-            ret.insert(f.clone());
-        }
-        ret
+    /// Every makefile the session READ, which the regeneration stamp records
+    /// so a later run can compare their timestamps.
+    ///
+    /// Separate from [`Self::unread_filenames`] because the two are different
+    /// questions and a later run answers them differently. A file that was
+    /// read is stale once it is newer than the generation, and a path that
+    /// will not stat at all is stale outright — there is no file to compare.
+    /// A file the read did NOT get is the opposite: its absence is what the
+    /// read depended on, so it is stale exactly when it appears, and folding
+    /// it in here would make every recorded absence unstattable, dirty, and
+    /// regenerating on every run for ever.
+    pub fn read_filenames(&self) -> HashSet<OsString> {
+        self.cache.keys().cloned().collect()
+    }
+
+    /// Every file the session wanted and did not get.
+    ///
+    /// See [`Self::read_filenames`] for why these are kept apart.
+    pub fn unread_filenames(&self) -> HashSet<OsString> {
+        self.unread.clone()
     }
 }
 
