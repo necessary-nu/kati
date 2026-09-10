@@ -755,6 +755,36 @@ pub struct MissingInclude {
 /// Taken from the errno rather than written out, so that a file which was there
 /// when the read looked and gone by the time it opened reports in exactly the
 /// same terms as one that was never there at all.
+/// Where the include search reaches for one word, if anywhere.
+///
+/// GNU Make's `construct_include_path` order: every `-I` directory that
+/// exists, then the built-in defaults that exist. A word that is already
+/// there relative to the working directory, or absolute, is not searched for
+/// at all.
+///
+/// This READS THE GROUND, so it is part of the question the journal records
+/// rather than something done to the word beforehand. A read repeating itself
+/// must be handed where the search reached the first time, not search again
+/// over a ground a staged build has moved. See [`Evaluator::include_names`].
+pub(crate) fn at_include_dirs(session: &Session, pat: Bytes) -> Bytes {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::path::Path;
+
+    if session.include_path.is_empty()
+        || pat.starts_with(b"/")
+        || Path::new(OsStr::from_bytes(&pat)).exists()
+    {
+        return pat;
+    }
+    for dir in &session.include_path {
+        let candidate = dir.join(OsStr::from_bytes(&pat));
+        if candidate.exists() {
+            return Bytes::from(candidate.into_os_string().into_vec());
+        }
+    }
+    pat
+}
+
 pub(crate) fn absent() -> String {
     crate::strerror(&std::io::Error::from_raw_os_error(libc::ENOENT))
 }
@@ -2801,22 +2831,7 @@ impl Evaluator {
     /// that matters beyond the read: a makefile found down the path is entered
     /// under that path, so it is that path a rule has to name to remake it.
     fn at_include_dirs(&self, pat: Bytes) -> Bytes {
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
-        use std::path::Path;
-
-        if self.session.include_path.is_empty()
-            || pat.starts_with(b"/")
-            || Path::new(OsStr::from_bytes(&pat)).exists()
-        {
-            return pat;
-        }
-        for dir in &self.session.include_path {
-            let candidate = dir.join(OsStr::from_bytes(&pat));
-            if candidate.exists() {
-                return Bytes::from(candidate.into_os_string().into_vec());
-            }
-        }
-        pat
+        at_include_dirs(&self.session, pat)
     }
 
     /// Add a Makefile that opened to `MAKEFILE_LIST`, as GNU Make does.

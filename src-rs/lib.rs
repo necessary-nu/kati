@@ -73,6 +73,7 @@ pub mod loc;
 pub mod logging;
 pub mod ninja;
 pub mod parser;
+pub mod reask;
 pub mod regen;
 pub mod regen_dump;
 pub mod rule;
